@@ -37,6 +37,17 @@ use moraine_clickhouse::canonical_derivations::{self as cd, DerivationColumns};
 /// indexes carry the physical `actor_kind`/`event_kind`/`tool_name` names).
 const COLS: DerivationColumns = DerivationColumns::EVENTS;
 
+/// Temporal-pruning slack around a hydration page's display-time bounds. A
+/// page's events are temporally contiguous, so their canonical `events` rows
+/// fall inside the page's `[min(display_time), max(display_time)]` window —
+/// except rows whose `record_ts` failed BestEffort parsing: their
+/// `events.event_ts` falls back near ingestion time, which is the same
+/// fallback `display_time` uses, so one hour of slack absorbs the residual
+/// drift between the two fallbacks (the malformed-record_ts parity fixture
+/// pins this). The hydration statement keeps the uid list as its exact
+/// filter; the widened `BETWEEN` exists only for granule pruning.
+const HYDRATION_TEMPORAL_SLACK_MS: i64 = 3_600_000;
+
 // ---------------------------------------------------------------------------
 // Forward derivation arithmetic (design §5.3) — pure, unit-tested.
 // ---------------------------------------------------------------------------
@@ -207,6 +218,9 @@ pub(super) struct LocatorRow {
 }
 
 /// One row of a navigation window chunk. Payload-free by construction.
+/// `event_version` rides along because the window scan runs without `FINAL`:
+/// the chunk-stream loop deduplicates adjacent duplicate versions client-side
+/// (see [`dedup_adjacent_navigation_versions`]).
 #[derive(Debug, Clone, Deserialize)]
 pub(super) struct NavWindowRow {
     pub(super) event_uid: String,
@@ -215,6 +229,7 @@ pub(super) struct NavWindowRow {
     pub(super) source_generation: u32,
     pub(super) source_offset: u64,
     pub(super) source_line_no: u64,
+    pub(super) event_version: u64,
     pub(super) sort_time_ms: i64,
     pub(super) display_time: String,
     pub(super) display_time_ms: i64,
@@ -237,10 +252,12 @@ pub(super) struct NavWindowRow {
 
 impl ClickHouseConversationRepository {
     /// The pinned as-of published source-generation set, as a derived table the
-    /// content-free index scans inner-join against to keep only live-generation
-    /// rows (design §5.2). Mirrors the `published` subquery inside
-    /// [`Self::live_events_source`] but is a standalone relation for the
-    /// navigation / directory / locator statements.
+    /// content-free index scans filter against to keep only live-generation
+    /// rows (design §5.2) — inner-joined by the aggregate statements, and used
+    /// as a tuple-`IN` set by the prunable window read (an `IN` filter, unlike
+    /// a join, does not block KeyCondition primary-key range pruning). Mirrors
+    /// the `published` subquery inside [`Self::live_events_source`] but is a
+    /// standalone relation for the navigation / directory / locator statements.
     pub(super) fn published_generations_subquery(&self) -> String {
         let snapshot = require_active_publication_snapshot("canonical index reads");
         let history = self.table_ref("v_published_source_generation_history");
@@ -251,8 +268,13 @@ impl ClickHouseConversationRepository {
     }
 
     /// `FROM mcp_event_navigation AS n FINAL ALL INNER JOIN <published> …` — the
-    /// live-head-filtered navigation scan prefix. The `WHERE n.session_id = …`
-    /// each caller appends prunes the navigation primary key.
+    /// live-head-filtered navigation scan prefix for the AGGREGATE statements
+    /// (boundary guard, totals, terminal, event prefix position), which consume
+    /// whole session-pruned ranges anyway. The window chunk read deliberately
+    /// does NOT use this shape: the `ALL INNER JOIN` defeats KeyCondition
+    /// granule pruning on the navigation primary key, so
+    /// [`Self::build_navigation_window_sql`] filters the pinned heads with a
+    /// tuple-`IN` predicate instead and deduplicates versions client-side.
     fn navigation_live_from(&self) -> String {
         let nav = self.table_ref("mcp_event_navigation");
         let published = self.published_generations_subquery();
@@ -322,9 +344,27 @@ impl ClickHouseConversationRepository {
     }
 
     /// §5.2.3 window chunk read: one navigation page of at most `limit + 1`
-    /// rows strictly after `after` (keyset), bounded above by a closed
-    /// `sort_time` window so the input is granule-bounded regardless of FINAL
-    /// read-in-order behavior. Content-free; every classification column is a
+    /// physical rows strictly after `after` (keyset). The statement is shaped
+    /// so its input is bounded by KeyCondition pruning plus read-in-order —
+    /// never by optimizer goodwill against a join:
+    ///
+    /// * the pinned live-head filter is a tuple-`IN (<published heads>)`
+    ///   predicate — unlike the `ALL INNER JOIN` the aggregate statements use,
+    ///   an `IN` filter does not block primary-key range pruning on the scan;
+    /// * a keyset continuation carries an explicit closed lower bound
+    ///   `n.sort_time >= anchor.sort_time` (`sort_time` is PK column 2 after
+    ///   `session_id`) alongside the exact strictly-greater ordering-tuple
+    ///   comparison, so the granules before the anchor are pruned even where
+    ///   the tuple comparison alone cannot prune;
+    /// * the scan runs WITHOUT `FINAL`, and the `ORDER BY` lists the
+    ///   navigation primary-key columns verbatim (no wrapping expressions), so
+    ///   read-in-order + `LIMIT limit + 1` bounds each chunk's reads.
+    ///
+    /// Because `FINAL` is dropped, duplicate versions of one event may both be
+    /// returned; they share the identical full ordering tuple, so the ordered
+    /// result keeps them adjacent and the chunk-stream loop collapses them via
+    /// [`dedup_adjacent_navigation_versions`] (max `event_version` wins) before
+    /// any forward derivation. Content-free; every classification column is a
     /// per-row scalar or a WI-01 fragment over the live-head-filtered rows.
     ///
     /// `after` is `None` for a first page (session start). The `LIMIT` is
@@ -336,11 +376,21 @@ impl ClickHouseConversationRepository {
         window_upper_ms: Option<i64>,
         limit: u16,
     ) -> String {
-        let from = self.navigation_live_from();
+        let nav = self.table_ref("mcp_event_navigation");
+        let published = self.published_generations_subquery();
         let tuple = Self::navigation_sort_tuple("n");
         let sid = sql_quote(session_id);
-        let mut predicates = vec![format!("n.session_id = {sid}")];
+        let mut predicates = vec![
+            format!("n.session_id = {sid}"),
+            format!(
+                "(n.source_host, n.source_name, n.source_file, n.source_generation) IN {published}"
+            ),
+        ];
         if let Some(after) = after {
+            predicates.push(format!(
+                "n.sort_time >= toDateTime64({} / 1000.0, 3)",
+                after.sort_time_ms
+            ));
             predicates.push(format!("{tuple} > {}", self.anchor_tuple_literal(after)));
         }
         if let Some(upper_ms) = window_upper_ms {
@@ -353,14 +403,15 @@ impl ClickHouseConversationRepository {
         // Inner derived table exposes the physical `events` column names plus
         // `phase` (the WI-01 turn-summary predicates reference `phase`, which
         // the navigation index stores as `tool_phase`). Keyset + ORDER BY +
-        // LIMIT live on the inner scan so the navigation PK is pruned.
+        // LIMIT live on the inner scan so the navigation PK is pruned and the
+        // ORDER BY matches the primary key column-for-column (read-in-order).
         let inner = format!(
-            "SELECT\n    n.event_uid AS event_uid,\n    n.source_host AS source_host,\n    n.source_file AS source_file,\n    n.source_generation AS source_generation,\n    n.source_offset AS source_offset,\n    n.source_line_no AS source_line_no,\n    n.sort_time AS sort_time,\n    n.display_time AS display_time,\n    n.turn_index AS turn_index,\n    n.is_user_message AS is_user_message,\n    n.actor_kind AS actor_kind,\n    n.event_kind AS event_kind,\n    n.payload_type AS payload_type,\n    n.tool_name AS tool_name,\n    n.tool_phase AS phase\n  {from}\n  WHERE {where_clause}\n  ORDER BY {tuple} ASC\n  LIMIT {k_plus_one}"
+            "SELECT\n    n.event_uid AS event_uid,\n    n.source_host AS source_host,\n    n.source_file AS source_file,\n    n.source_generation AS source_generation,\n    n.source_offset AS source_offset,\n    n.source_line_no AS source_line_no,\n    n.event_version AS event_version,\n    n.sort_time AS sort_time,\n    n.display_time AS display_time,\n    n.turn_index AS turn_index,\n    n.is_user_message AS is_user_message,\n    n.actor_kind AS actor_kind,\n    n.event_kind AS event_kind,\n    n.payload_type AS payload_type,\n    n.tool_name AS tool_name,\n    n.tool_phase AS phase\n  FROM {nav} AS n\n  WHERE {where_clause}\n  ORDER BY n.session_id ASC, n.sort_time ASC, n.source_host ASC, n.source_file ASC, n.source_generation ASC, n.source_offset ASC, n.source_line_no ASC, n.event_uid ASC\n  LIMIT {k_plus_one}"
         );
         let event_type = cd::event_type_expr(COLS);
         let predicates = cd::TurnSummaryPredicates::new(COLS);
         format!(
-            "SELECT\n  ev.event_uid AS event_uid,\n  ev.source_host AS source_host,\n  ev.source_file AS source_file,\n  ev.source_generation AS source_generation,\n  ev.source_offset AS source_offset,\n  ev.source_line_no AS source_line_no,\n  toInt64(toUnixTimestamp64Milli(ev.sort_time)) AS sort_time_ms,\n  toString(ev.display_time) AS display_time,\n  toInt64(toUnixTimestamp64Milli(ev.display_time)) AS display_time_ms,\n  toUInt32(ev.turn_index) AS turn_index,\n  toUInt8(ev.is_user_message) AS is_user_message,\n  ev.actor_kind AS actor_kind,\n  ev.event_kind AS event_kind,\n  ev.payload_type AS payload_type,\n  ev.tool_name AS tool_name,\n  {event_type} AS event_type,\n  toUInt8({user_input}) AS is_user_input,\n  toUInt8({final_response}) AS is_final_response,\n  toUInt8(ev.payload_type IN ('task_complete', 'turn_aborted')) AS is_terminal,\n  toUInt8(ev.payload_type = 'task_complete') AS is_completed\nFROM (\n  {inner}\n) AS ev\nORDER BY {inner_tuple} ASC\nFORMAT JSONEachRow",
+            "SELECT\n  ev.event_uid AS event_uid,\n  ev.source_host AS source_host,\n  ev.source_file AS source_file,\n  ev.source_generation AS source_generation,\n  ev.source_offset AS source_offset,\n  ev.source_line_no AS source_line_no,\n  toUInt64(ev.event_version) AS event_version,\n  toInt64(toUnixTimestamp64Milli(ev.sort_time)) AS sort_time_ms,\n  toString(ev.display_time) AS display_time,\n  toInt64(toUnixTimestamp64Milli(ev.display_time)) AS display_time_ms,\n  toUInt32(ev.turn_index) AS turn_index,\n  toUInt8(ev.is_user_message) AS is_user_message,\n  ev.actor_kind AS actor_kind,\n  ev.event_kind AS event_kind,\n  ev.payload_type AS payload_type,\n  ev.tool_name AS tool_name,\n  {event_type} AS event_type,\n  toUInt8({user_input}) AS is_user_input,\n  toUInt8({final_response}) AS is_final_response,\n  toUInt8(ev.payload_type IN ('task_complete', 'turn_aborted')) AS is_terminal,\n  toUInt8(ev.payload_type = 'task_complete') AS is_completed\nFROM (\n  {inner}\n) AS ev\nORDER BY {inner_tuple} ASC\nFORMAT JSONEachRow",
             user_input = predicates.user_input,
             final_response = predicates.final_response,
             inner_tuple = Self::navigation_sort_tuple("ev"),
@@ -436,12 +487,27 @@ impl ClickHouseConversationRepository {
     /// `event_uid`s — the only place besides the bounded metadata read that
     /// touches wide columns. `event_order` / `turn_seq` are NOT read here; they
     /// are reader-derived.
+    ///
+    /// The uid list cannot prune the `events` primary key `(session_id,
+    /// event_ts, …)`, so the caller passes the page's `[min, max]`
+    /// `display_time` bounds: a page's events are temporally contiguous, and
+    /// the bounds — widened by [`HYDRATION_TEMPORAL_SLACK_MS`] — become a
+    /// closed `event_ts BETWEEN` emitted INSIDE the live-events derived table
+    /// (C2-R0), pruning the `FINAL` scan by granule. The uid `IN` list remains
+    /// the exact filter; the `BETWEEN` exists only for pruning.
     pub(super) fn build_wide_hydration_sql(
         &self,
         session_id: &str,
         event_uids: &[String],
+        display_bounds_ms: Option<(i64, i64)>,
     ) -> String {
-        let events = self.live_events_source_scoped(Some(session_id));
+        let event_ts_bounds_ms = display_bounds_ms.map(|(min_ms, max_ms)| {
+            (
+                min_ms.saturating_sub(HYDRATION_TEMPORAL_SLACK_MS),
+                max_ms.saturating_add(HYDRATION_TEMPORAL_SLACK_MS),
+            )
+        });
+        let events = self.live_events_source_bounded(Some(session_id), event_ts_bounds_ms);
         let uid_list = sql_array_strings(event_uids);
         let text_cap = cd::MAX_PROJECTED_TEXT_SUMMARY_CHARS;
         let payload_cap = cd::MAX_PROJECTED_PAYLOAD_SUMMARY_CHARS;
@@ -628,6 +694,60 @@ fn forward_from_anchor(anchor: &CanonicalReadAnchor) -> ForwardDerived {
         prefix_user_message_count: anchor.prefix_user_message_count,
         event_ordinal: anchor.event_ordinal,
     }
+}
+
+/// True when two window rows carry the identical full navigation ordering
+/// tuple (`sort_time`, host, file, generation, offset, line_no, uid) — i.e.
+/// they are duplicate versions of one logical event.
+fn same_navigation_tuple(a: &NavWindowRow, b: &NavWindowRow) -> bool {
+    a.sort_time_ms == b.sort_time_ms
+        && a.source_host == b.source_host
+        && a.source_file == b.source_file
+        && a.source_generation == b.source_generation
+        && a.source_offset == b.source_offset
+        && a.source_line_no == b.source_line_no
+        && a.event_uid == b.event_uid
+}
+
+/// Collapse duplicate versions of one event in a window chunk (the window scan
+/// runs without `FINAL` — [`ClickHouseConversationRepository::build_navigation_window_sql`]).
+/// Duplicate versions share the identical full ordering tuple, and the chunk is
+/// ordered by that tuple, so duplicates are always adjacent: keep the max
+/// `event_version` row.
+///
+/// A duplicate pair split by a chunk boundary cannot double-serve: the keyset
+/// resume bound is strictly greater than the last served tuple, so the second
+/// copy is skipped on the next chunk. The page may then have served the OLDER
+/// version's row — the same event identity, which is accepted (a re-inserted
+/// version differs at most in ingestion-time-derived display metadata).
+fn dedup_adjacent_navigation_versions(rows: Vec<NavWindowRow>) -> Vec<NavWindowRow> {
+    let mut out: Vec<NavWindowRow> = Vec::with_capacity(rows.len());
+    for row in rows {
+        if let Some(last) = out.last_mut() {
+            if same_navigation_tuple(last, &row) {
+                if row.event_version > last.event_version {
+                    *last = row;
+                }
+                continue;
+            }
+        }
+        out.push(row);
+    }
+    out
+}
+
+/// The `[min, max]` display-time bounds (ms) of a hydration candidate row set,
+/// passed to the wide hydration statement for temporal granule pruning (raw
+/// bounds — the SQL builder applies [`HYDRATION_TEMPORAL_SLACK_MS`]).
+fn display_bounds_ms(rows: &[(NavWindowRow, ForwardDerived)]) -> Option<(i64, i64)> {
+    rows.iter()
+        .map(|(row, _)| row.display_time_ms)
+        .fold(None, |bounds, ms| {
+            Some(match bounds {
+                None => (ms, ms),
+                Some((lo, hi)) => (lo.min(ms), hi.max(ms)),
+            })
+        })
 }
 
 fn nav_row_to_anchor(row: &NavWindowRow, der: &ForwardDerived) -> CanonicalReadAnchor {
@@ -908,8 +1028,9 @@ impl ClickHouseConversationRepository {
         let mut anchor_state = start_derived;
         let mut after = start_after;
         loop {
-            let sql = self.build_navigation_window_sql(session_id, after.as_ref(), None, CHUNK);
-            let chunk = self.map_backend(self.query_rows::<NavWindowRow>(&sql, None).await)?;
+            let (chunk, has_more) = self
+                .fetch_navigation_window(session_id, after.as_ref(), CHUNK)
+                .await?;
             if chunk.is_empty() {
                 break;
             }
@@ -921,7 +1042,6 @@ impl ClickHouseConversationRepository {
                 })
                 .collect();
             let derived = derive_forward(anchor_state, &inputs);
-            let has_more = chunk.len() > usize::from(CHUNK);
             for (row, der) in chunk.into_iter().zip(derived.iter().copied()) {
                 out.push((row, der));
             }
@@ -934,6 +1054,25 @@ impl ClickHouseConversationRepository {
             }
         }
         Ok(out)
+    }
+
+    /// Fetch one navigation window chunk: at most `limit + 1` PHYSICAL rows,
+    /// collapsed to logical events client-side (the window scan runs without
+    /// `FINAL`; see [`dedup_adjacent_navigation_versions`]). Returns the
+    /// deduplicated rows plus a has-more flag judged on the PHYSICAL row count,
+    /// so a chunk whose dedup collapsed rows still advances the keyset loop —
+    /// the resume anchor (the last logical row) shares its ordering tuple with
+    /// the last physical row, so the strictly-greater keyset bound is exact.
+    async fn fetch_navigation_window(
+        &self,
+        session_id: &str,
+        after: Option<&CanonicalReadAnchor>,
+        limit: u16,
+    ) -> RepoResult<(Vec<NavWindowRow>, bool)> {
+        let sql = self.build_navigation_window_sql(session_id, after, None, limit);
+        let physical = self.map_backend(self.query_rows::<NavWindowRow>(&sql, None).await)?;
+        let has_more = physical.len() > usize::from(limit);
+        Ok((dedup_adjacent_navigation_versions(physical), has_more))
     }
 
     /// Output-sized `open(session)` page collection (design §5.2.3/§5.5): stream
@@ -968,23 +1107,21 @@ impl ClickHouseConversationRepository {
         let mut after = start_after;
         let mut distinct_new: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
         'outer: loop {
-            let sql = self.build_navigation_window_sql(session_id, after.as_ref(), None, chunk);
-            let rows = self.map_backend(self.query_rows::<NavWindowRow>(&sql, None).await)?;
+            let (rows, has_more_chunk) = self
+                .fetch_navigation_window(session_id, after.as_ref(), chunk)
+                .await?;
             if rows.is_empty() {
                 break;
             }
-            let take = rows.len().min(usize::from(chunk));
-            let has_more_chunk = rows.len() > usize::from(chunk);
             let inputs: Vec<ForwardInput> = rows
                 .iter()
-                .take(take)
                 .map(|row| ForwardInput {
                     turn_index: row.turn_index,
                     is_user_message: row.is_user_message != 0,
                 })
                 .collect();
             let derived = derive_forward(anchor_state, &inputs);
-            for (row, der) in rows.into_iter().take(take).zip(derived.iter().copied()) {
+            for (row, der) in rows.into_iter().zip(derived.iter().copied()) {
                 if der.turn_seq > after_turn_seq {
                     distinct_new.insert(der.turn_seq);
                 }
@@ -1009,15 +1146,19 @@ impl ClickHouseConversationRepository {
     }
 
     /// Hydrate the wide content columns for exactly `event_uids`.
+    /// `display_bounds_ms` is the covering rows' `[min, max]` display time,
+    /// used purely for temporal granule pruning of the `events` scan
+    /// ([`Self::build_wide_hydration_sql`]).
     async fn canonical_hydrate(
         &self,
         session_id: &str,
         event_uids: &[String],
+        display_bounds_ms: Option<(i64, i64)>,
     ) -> RepoResult<HashMap<String, WideRow>> {
         if event_uids.is_empty() {
             return Ok(HashMap::default());
         }
-        let sql = self.build_wide_hydration_sql(session_id, event_uids);
+        let sql = self.build_wide_hydration_sql(session_id, event_uids, display_bounds_ms);
         let rows = self.map_backend(self.query_rows::<WideRow>(&sql, None).await)?;
         Ok(rows
             .into_iter()
@@ -1207,16 +1348,24 @@ impl ClickHouseConversationRepository {
         let has_more = turns.len() > limit;
         let page_turns = &turns[..turns.len().min(limit)];
 
-        // Hydrate the page's per-turn summary events only.
+        // Hydrate the page's per-turn summary events only, temporally pruned to
+        // the page's own display-time window.
         let mut summary_uids: Vec<String> = Vec::new();
+        let mut page_bounds: Option<(i64, i64)> = None;
         for (_, bucket) in page_turns {
             for (row, _) in bucket {
+                page_bounds = Some(match page_bounds {
+                    None => (row.display_time_ms, row.display_time_ms),
+                    Some((lo, hi)) => (lo.min(row.display_time_ms), hi.max(row.display_time_ms)),
+                });
                 if row.is_user_input != 0 || row.is_final_response != 0 {
                     summary_uids.push(row.event_uid.clone());
                 }
             }
         }
-        let summaries = self.canonical_hydrate(session_id, &summary_uids).await?;
+        let summaries = self
+            .canonical_hydrate(session_id, &summary_uids, page_bounds)
+            .await?;
 
         let compact_turns: Vec<McpTurnCompact> = page_turns
             .iter()
@@ -1326,7 +1475,11 @@ impl ClickHouseConversationRepository {
         if include_events {
             hydrate_uids.extend(page_rows.iter().map(|(row, _)| row.event_uid.clone()));
         }
-        let hydrated = self.canonical_hydrate(session_id, &hydrate_uids).await?;
+        // Every hydrated uid is a member of this turn, so the turn's own
+        // display-time window bounds the temporal pruning.
+        let hydrated = self
+            .canonical_hydrate(session_id, &hydrate_uids, display_bounds_ms(&turn_rows))
+            .await?;
 
         let compact = self.assemble_turn_compact(session_id, &turn_rows, &hydrated);
         let events = if include_events {
@@ -1463,13 +1616,23 @@ impl ClickHouseConversationRepository {
             .map(|(row, _)| row.event_uid.clone())
             .collect();
         let summaries = self
-            .canonical_hydrate(&locator.session_id, &summary_uids)
+            .canonical_hydrate(
+                &locator.session_id,
+                &summary_uids,
+                display_bounds_ms(&turn_rows),
+            )
             .await?;
         let parent_turn = self.assemble_turn_compact(&locator.session_id, &turn_rows, &summaries);
 
-        // Hydrate the target event's full content only.
+        // Hydrate the target event's full content only, pruned to its own
+        // display instant.
+        let target_display_ms = rows[target_index].0.display_time_ms;
         let hydrated = self
-            .canonical_hydrate(&locator.session_id, &[event_uid.to_string()])
+            .canonical_hydrate(
+                &locator.session_id,
+                &[event_uid.to_string()],
+                Some((target_display_ms, target_display_ms)),
+            )
             .await?;
         let Some(wide) = hydrated.get(event_uid) else {
             return Ok(None);
@@ -1717,6 +1880,32 @@ mod tests {
             turn_seq: 5,
             prefix_user_message_count: 5,
             event_ordinal: 2,
+        }
+    }
+
+    fn nav_row(uid: &str, sort_time_ms: i64, event_version: u64) -> NavWindowRow {
+        NavWindowRow {
+            event_uid: uid.to_string(),
+            source_host: "host-a".to_string(),
+            source_file: "/s/a.jsonl".to_string(),
+            source_generation: 1,
+            source_offset: 0,
+            source_line_no: 1,
+            event_version,
+            sort_time_ms,
+            display_time: "2026-07-20 12:00:00.000".to_string(),
+            display_time_ms: sort_time_ms,
+            turn_index: 0,
+            is_user_message: 0,
+            actor_kind: "assistant".to_string(),
+            event_kind: "message".to_string(),
+            payload_type: "message".to_string(),
+            tool_name: String::new(),
+            event_type: "assistant_message".to_string(),
+            is_user_input: 0,
+            is_final_response: 0,
+            is_terminal: 0,
+            is_completed: 0,
         }
     }
 
@@ -2011,7 +2200,28 @@ mod tests {
         assert_no_projection(&sql);
         // K + 1 in SQL.
         assert!(sql.contains("LIMIT 26"), "expected LIMIT 26:\n{sql}");
-        assert!(sql.contains("`moraine`.`mcp_event_navigation` AS n FINAL"));
+        // Prunable window contract: the live-head filter is a tuple-IN
+        // predicate — never a join, which defeats KeyCondition granule
+        // pruning — and the scan runs WITHOUT FINAL (versions are collapsed
+        // client-side from the returned event_version).
+        assert!(
+            !sql.contains("FINAL"),
+            "window read must not use FINAL:\n{sql}"
+        );
+        assert!(
+            !sql.contains("ALL INNER JOIN"),
+            "window read must not join the published heads:\n{sql}"
+        );
+        assert!(sql.contains(
+            "(n.source_host, n.source_name, n.source_file, n.source_generation) IN (SELECT"
+        ));
+        assert!(sql.contains("AS event_version"));
+        // Read-in-order contract: the inner ORDER BY lists the navigation
+        // PRIMARY KEY columns verbatim, no wrapping expressions, so LIMIT
+        // bounds each chunk's reads.
+        assert!(sql.contains(
+            "ORDER BY n.session_id ASC, n.sort_time ASC, n.source_host ASC, n.source_file ASC, n.source_generation ASC, n.source_offset ASC, n.source_line_no ASC, n.event_uid ASC"
+        ));
         assert!(sql.contains("is_user_input"));
         assert!(sql.contains("is_final_response"));
         assert!(sql.contains("AS event_type"));
@@ -2024,11 +2234,41 @@ mod tests {
         })
         .await;
         assert_payload_free(&sql);
-        // keyset: strictly after the anchor tuple.
+        // keyset: strictly after the anchor tuple …
         assert!(sql.contains(") > tuple(toDateTime64"));
+        // … with an explicit closed lower bound on `sort_time` (PK column 2)
+        // so granule pruning never depends on tuple-comparison support.
+        assert!(sql.contains("n.sort_time >= toDateTime64(1700000000000 / 1000.0, 3)"));
         // closed upper window bound.
         assert!(sql.contains("n.sort_time < toDateTime64(1700000100000 / 1000.0, 3)"));
         assert!(sql.contains("LIMIT 11"));
+    }
+
+    #[test]
+    fn window_dedup_collapses_adjacent_duplicate_versions_to_the_max() {
+        let rows = vec![
+            nav_row("uid-a", 1_000, 1),
+            nav_row("uid-a", 1_000, 3),
+            nav_row("uid-a", 1_000, 2),
+            nav_row("uid-b", 2_000, 1),
+        ];
+        let deduped = dedup_adjacent_navigation_versions(rows);
+        assert_eq!(deduped.len(), 2);
+        assert_eq!(deduped[0].event_uid, "uid-a");
+        assert_eq!(deduped[0].event_version, 3);
+        assert_eq!(deduped[1].event_uid, "uid-b");
+        assert_eq!(deduped[1].event_version, 1);
+    }
+
+    #[test]
+    fn window_dedup_keeps_same_uid_rows_at_distinct_ordering_tuples() {
+        // A same-uid row at a DIFFERENT ordering tuple (e.g. re-normalized to a
+        // new offset) is a distinct navigation row, not a version duplicate —
+        // exactly the FINAL semantics of the ReplacingMergeTree key.
+        let mut moved = nav_row("uid-a", 1_000, 2);
+        moved.source_offset = 4_096;
+        let deduped = dedup_adjacent_navigation_versions(vec![nav_row("uid-a", 1_000, 1), moved]);
+        assert_eq!(deduped.len(), 2);
     }
 
     #[tokio::test]
@@ -2059,13 +2299,28 @@ mod tests {
     #[tokio::test]
     async fn wide_hydration_reads_content_only_for_the_selected_uids() {
         let uids = vec!["uid-1".to_string(), "uid-2".to_string()];
-        let sql = build(|r| r.build_wide_hydration_sql("session-a", &uids)).await;
+        let sql = build(|r| {
+            r.build_wide_hydration_sql(
+                "session-a",
+                &uids,
+                Some((1_700_000_000_000, 1_700_000_600_000)),
+            )
+        })
+        .await;
         assert_no_projection(&sql);
         assert!(sql.contains("text_content"));
         assert!(sql.contains("payload_json"));
         assert!(sql.contains("token_usage_buckets"));
         // Bounded to the explicit uid set — never the whole session.
         assert!(sql.contains("WHERE e.event_uid IN ['uid-1','uid-2']"));
+        // Temporal pruning: the page's display-time bounds, widened by the
+        // one-hour slack, land INSIDE the live-events derived table as a
+        // closed `event_ts BETWEEN` so the events primary key
+        // `(session_id, event_ts, …)` prunes the FINAL scan by granule. The
+        // uid list above stays the exact filter.
+        assert!(sql.contains(
+            "e.event_ts BETWEEN toDateTime64(1699996400000 / 1000.0, 3) AND toDateTime64(1700004200000 / 1000.0, 3)"
+        ));
         // event_order / turn_seq are reader-derived, never hydrated.
         assert!(!sql.contains("event_order"));
         assert!(!sql.contains("turn_seq"));
@@ -2076,6 +2331,14 @@ mod tests {
         assert!(sql.contains("e.tool_name AS name"));
         assert!(sql.contains("e.tool_phase AS phase"));
         assert!(!sql.contains("e.call_id AS"));
+    }
+
+    #[tokio::test]
+    async fn wide_hydration_without_bounds_omits_the_temporal_prune() {
+        let uids = vec!["uid-1".to_string()];
+        let sql = build(|r| r.build_wide_hydration_sql("session-a", &uids, None)).await;
+        assert!(!sql.contains("BETWEEN"));
+        assert!(sql.contains("WHERE e.event_uid IN ['uid-1']"));
     }
 
     #[tokio::test]
