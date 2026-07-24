@@ -1315,7 +1315,9 @@ async fn assert_unrelated_publication_does_not_reopen(
         .source("fixture", "/fixtures/cont-other.jsonl")
         .generation(2)];
     seed_events(clickhouse, &unrelated_gen2).await?;
-    publish_missing_schema_fixture_sources(clickhouse, database).await?;
+    // The unrelated source already has a published gen-1 head; advancing it to
+    // gen 2 is a replacement publication (superseded gen 1 stays unpublished).
+    publish_replaced_schema_fixture_sources(clickhouse, database).await?;
 
     let second = repository
         .canonical_open_session_page("cont-session", 2, Some(continuation))
@@ -1434,7 +1436,9 @@ async fn assert_revision_move_reopens(
             .generation(2),
     ];
     seed_events(clickhouse, &replacement).await?;
-    publish_missing_schema_fixture_sources(clickhouse, database).await?;
+    // Publishing generation 2 over the live generation-1 head is a
+    // replacement; the superseded generation legitimately stays unpublished.
+    publish_replaced_schema_fixture_sources(clickhouse, database).await?;
 
     let second = repository
         .canonical_open_session_page("fence-session", 2, Some(continuation))
