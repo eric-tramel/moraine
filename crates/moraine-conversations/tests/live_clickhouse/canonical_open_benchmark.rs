@@ -231,11 +231,14 @@ async fn traverse_session(
 
 /// Fetch exactly one continuation page (page 2) of a session, so the caller can
 /// assert a mid-traversal page's read cost is bounded by the page size.
-async fn one_continuation_page(
+/// Mint a page-1 continuation cursor. Runs OUTSIDE the measured midpage
+/// envelope: page 1 legitimately pays the one-time session header cost; the
+/// output-sized gate is about what a CONTINUATION page reads.
+async fn mint_continuation(
     repository: &ClickHouseConversationRepository,
     session_id: &str,
     limit: u16,
-) -> Result<()> {
+) -> Result<moraine_conversations::CanonicalContinuation> {
     let first = repository
         .canonical_open_session_page(session_id, limit, None)
         .await?
@@ -244,9 +247,17 @@ async fn one_continuation_page(
         moraine_conversations::CanonicalReadOutcome::Page(page) => page,
         moraine_conversations::CanonicalReadOutcome::Reopen => bail!("unexpected reopen on page 1"),
     };
-    let after = page1
+    page1
         .continuation
-        .context("monster session did not paginate past page 1")?;
+        .context("monster session did not paginate past page 1")
+}
+
+async fn one_continuation_page(
+    repository: &ClickHouseConversationRepository,
+    session_id: &str,
+    limit: u16,
+    after: moraine_conversations::CanonicalContinuation,
+) -> Result<()> {
     let _ = repository
         .canonical_open_session_page(session_id, limit, Some(after))
         .await?
@@ -373,8 +384,17 @@ pub(super) async fn boundedness() -> Result<()> {
         })
         .await?;
         // --- monster: one continuation page (bounded by page size) --------
+        // The cursor is minted OUTSIDE the measured envelope: page 1 pays the
+        // one-time header cost by design; the gate bounds the continuation.
+        let midpage_cursor = QueryEnvelope::new(
+            "issue598-midpage-mint",
+            QueryClass::Interactive,
+            &default_interactive_budget(),
+        )
+        .scope(mint_continuation(&repository, MONSTER_SESSION, PAGE_LIMIT))
+        .await?;
         let ((), _) = phase("midpage", async {
-            one_continuation_page(&repository, MONSTER_SESSION, PAGE_LIMIT).await
+            one_continuation_page(&repository, MONSTER_SESSION, PAGE_LIMIT, midpage_cursor).await
         })
         .await?;
         // --- monster: full traversal at the default page size -------------
