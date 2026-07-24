@@ -416,8 +416,17 @@ impl ClickHouseConversationRepository {
     pub(super) fn build_session_terminal_sql(&self, session_id: &str) -> String {
         let from = self.navigation_live_from();
         let tuple = Self::navigation_sort_tuple("n");
+        // v1's session rule is two-level (R1(b) / session_terminal_selection):
+        // per-TURN completed = the turn's latest terminal event being
+        // task_complete, then the session takes `argMax(completed, turn_seq)`
+        // — the LAST turn's flag. A session-wide latest-terminal argMax
+        // diverges when the terminal event sits in a middle turn (caught by
+        // the canonical-open-parity terminal-mid fixture). turn_seq is derived
+        // per event with the projector's shared windowed rule, using the
+        // navigation index's precomputed is_user_message (identical predicate
+        // by MV construction).
         format!(
-            "SELECT\n  toUInt8(argMaxIf(toUInt8(n.payload_type = 'task_complete'), {tuple}, n.payload_type IN ('task_complete', 'turn_aborted'))) AS completed,\n  ifNull(argMaxIf(nullIf(n.event_uid, ''), {tuple}, n.payload_type IN ('task_complete', 'turn_aborted')), '') AS terminal_event_uid,\n  toUInt64(countIf(n.payload_type IN ('task_complete', 'turn_aborted'))) AS terminal_count\n{from}\nWHERE n.session_id = {sid}\nFORMAT JSONEachRow",
+            "SELECT\n  toUInt8(argMax(turn_completed, turn_seq)) AS completed,\n  ifNull(argMax(nullIf(turn_terminal_uid, ''), turn_seq), '') AS terminal_event_uid,\n  toUInt64(sum(turn_terminal_count)) AS terminal_count\nFROM (\n  SELECT\n    turn_seq,\n    argMaxIf(toUInt8(payload_type = 'task_complete'), sort_key, payload_type IN ('task_complete', 'turn_aborted')) AS turn_completed,\n    ifNull(argMaxIf(nullIf(event_uid, ''), sort_key, payload_type IN ('task_complete', 'turn_aborted')), '') AS turn_terminal_uid,\n    countIf(payload_type IN ('task_complete', 'turn_aborted')) AS turn_terminal_count\n  FROM (\n    SELECT\n      n.event_uid AS event_uid,\n      n.payload_type AS payload_type,\n      {tuple} AS sort_key,\n      if(toUInt32(n.turn_index) > 0, toUInt32(n.turn_index), greatest(toUInt32(1), toUInt32(sum(if(n.is_user_message = 1, 1, 0)) OVER turn_window))) AS turn_seq\n    {from}\n    WHERE n.session_id = {sid}\n    WINDOW turn_window AS (ORDER BY {tuple} ASC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)\n  )\n  GROUP BY turn_seq\n)\nFORMAT JSONEachRow",
             sid = sql_quote(session_id),
         )
     }
@@ -2067,6 +2076,20 @@ mod tests {
         assert!(sql.contains("e.tool_name AS name"));
         assert!(sql.contains("e.tool_phase AS phase"));
         assert!(!sql.contains("e.call_id AS"));
+    }
+
+    #[tokio::test]
+    async fn session_terminal_uses_the_last_turns_flag_not_a_session_wide_argmax() {
+        let sql = build(|r| r.build_session_terminal_sql("session-a")).await;
+        assert_payload_free(&sql);
+        // Two-level rule: per-turn completed grouped by the windowed turn_seq,
+        // then the LAST turn's flag wins (R1(b)); a terminal event in a middle
+        // turn must not mark the session completed.
+        assert!(sql.contains("argMax(turn_completed, turn_seq)"));
+        assert!(sql.contains("GROUP BY turn_seq"));
+        assert!(sql.contains("OVER turn_window"));
+        assert!(sql.contains("n.is_user_message = 1"));
+        assert!(sql.contains("toUInt32(n.turn_index) > 0"));
     }
 
     #[tokio::test]
