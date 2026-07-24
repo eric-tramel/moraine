@@ -141,7 +141,8 @@ async fn bootstrap_schema_through_030(
                  ('032', 'fixture-hold-032'), \
                  ('033', 'fixture-hold-033'), \
                  ('034', 'fixture-hold-034'), \
-                 ('035', 'fixture-hold-035')"
+                 ('035', 'fixture-hold-035'), \
+                 ('036', 'fixture-hold-036')"
             ),
             None,
             Some("system"),
@@ -952,6 +953,17 @@ pub(super) async fn run(clickhouse: &ClickHouseClient, database: &OwnedDatabaseN
     if applied_035 != ["035"] {
         bail!("legacy fixture expected migration 035 exactly, got {applied_035:?}");
     }
+
+    remove_migration_ledger_rows(clickhouse, database.as_str(), &["036"]).await?;
+    let migration_036_started = Instant::now();
+    let applied_036 = clickhouse
+        .run_migrations()
+        .await
+        .context("failed to apply migration 036 to legacy fixture")?;
+    let migration_036_elapsed = migration_036_started.elapsed();
+    if applied_036 != ["036"] {
+        bail!("legacy fixture expected migration 036 exactly, got {applied_036:?}");
+    }
     let migration_032_035_elapsed = migration_032_elapsed
         + migration_033_elapsed
         + migration_034_elapsed
@@ -974,7 +986,8 @@ pub(super) async fn run(clickhouse: &ClickHouseClient, database: &OwnedDatabaseN
     }
 
     let projection = current_projection_state(clickhouse).await?;
-    let migration_elapsed = migration_031_elapsed + migration_032_035_elapsed;
+    let migration_elapsed =
+        migration_031_elapsed + migration_032_035_elapsed + migration_036_elapsed;
     eprintln!(
         "{}",
         json!({
@@ -988,11 +1001,13 @@ pub(super) async fn run(clickhouse: &ClickHouseClient, database: &OwnedDatabaseN
                 "legacy_mcp_session_heads": 1,
                 "interrupted_032_stranded_documents": 1,
             },
-            "migrations": ["031", "032", "033", "034", "035"],
+            "migrations": ["031", "032", "033", "034", "035", "036"],
             "migration_031_us": migration_031_elapsed.as_micros(),
             "migration_031_ms": migration_031_elapsed.as_millis(),
             "migration_032_035_us": migration_032_035_elapsed.as_micros(),
             "migration_032_035_ms": migration_032_035_elapsed.as_millis(),
+            "migration_036_us": migration_036_elapsed.as_micros(),
+            "migration_036_ms": migration_036_elapsed.as_millis(),
             "forced_032_idempotency_replay_us": replay_032_elapsed.as_micros(),
             "forced_032_idempotency_replay_ms": replay_032_elapsed.as_millis(),
             "interrupted_032_repaired_postings": STRANDED_POSTINGS,
