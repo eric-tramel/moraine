@@ -560,6 +560,59 @@ FORMAT JSONEachRow"#
     Ok(())
 }
 
+/// Publish-and-verify variant for REPLACEMENT fixtures: publishes each
+/// source's max generation (same statement as
+/// `publish_missing_schema_fixture_sources`) but verifies only that every
+/// source's LATEST generation is published — superseded generations are the
+/// expected residue of a replacement and stay unpublished by design.
+async fn publish_replaced_schema_fixture_sources(
+    clickhouse: &ClickHouseClient,
+    database: &OwnedDatabaseName,
+) -> Result<()> {
+    match publish_missing_schema_fixture_sources(clickhouse, database).await {
+        Ok(()) => return Ok(()),
+        Err(error)
+            if error
+                .to_string()
+                .contains("unpublished source generation(s)") => {}
+        Err(error) => return Err(error),
+    }
+    let database = database.as_str();
+    #[derive(Deserialize)]
+    struct MissingHeadCount {
+        value: u64,
+    }
+    let missing_latest = clickhouse
+        .query_rows::<MissingHeadCount>(
+            &format!(
+                r#"SELECT count() AS value
+FROM
+(
+  SELECT source_host, source_name, source_file, max(source_generation) AS source_generation
+  FROM `{database}`.`events` FINAL
+  GROUP BY source_host, source_name, source_file
+) AS latest
+LEFT ANTI JOIN `{database}`.`v_current_published_source_generations` AS heads
+  ON latest.source_host = heads.source_host
+ AND latest.source_name = heads.source_name
+ AND latest.source_file = heads.source_file
+ AND latest.source_generation = heads.source_generation
+FORMAT JSONEachRow"#
+            ),
+            Some(database),
+        )
+        .await
+        .context("failed to verify replaced-fixture latest source heads")?
+        .into_iter()
+        .next()
+        .context("replaced-fixture head verification returned no row")?
+        .value;
+    if missing_latest != 0 {
+        bail!("replaced fixture has {missing_latest} source(s) whose latest generation is unpublished");
+    }
+    Ok(())
+}
+
 async fn assert_omp_session_metadata(repository: &ClickHouseConversationRepository) -> Result<()> {
     let listed = repository
         .list_mcp_sessions(

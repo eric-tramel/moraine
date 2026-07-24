@@ -923,8 +923,9 @@ pub(super) async fn locator() -> Result<()> {
             assert_eq!(pre_activation.event.event_uid, "loc-g1-a1");
 
             // --- Phase 3: activate generation 2 (publish its head). Generation 1 is
-            // now superseded and rejected; generation 2 resolves. Never a mix. ---
-            publish_missing_schema_fixture_sources(&clickhouse, &database).await?;
+            // now superseded and rejected; generation 2 resolves. Never a mix.
+            // Superseded generation 1 legitimately stays unpublished. ---
+            publish_replaced_schema_fixture_sources(&clickhouse, &database).await?;
             assert!(
                 repository
                     .canonical_open_event("loc-g1-a1")
@@ -1103,13 +1104,26 @@ async fn assert_quiescent_continuation_is_directory_only(
     clickhouse
         .request_text("SYSTEM FLUSH LOGS", None, None, false, None)
         .await?;
+    // The quiescent contract (BINDING D1): the staleness DECISION is a
+    // directory point-read; serving the page still reads its bounded
+    // navigation window. What a quiescent page must NEVER do: run the prefix
+    // boundary guard, or recompute the session-wide header scans (totals /
+    // metadata / terminal — the carried header is reused verbatim).
     #[derive(serde::Deserialize)]
-    struct CountRow {
-        value: u64,
+    struct CensusRow {
+        guard_statements: u64,
+        header_scans: u64,
+        navigation_read_rows: u64,
     }
-    let navigation_reads = clickhouse
-        .query_rows::<CountRow>(
-            "SELECT toUInt64(countIf(position(query, 'mcp_event_navigation') > 0)) AS value \
+    let census = clickhouse
+        .query_rows::<CensusRow>(
+            "SELECT \
+               toUInt64(countIf(position(query, 'count_le_anchor') > 0)) AS guard_statements, \
+               toUInt64(countIf( \
+                 position(query, 'counter_user_messages') > 0 \
+                 OR position(query, 'turn_completed') > 0 \
+                 OR position(query, 'is_metadata_bearing') > 0)) AS header_scans, \
+               toUInt64(sumIf(read_rows, position(query, 'mcp_event_navigation') > 0)) AS navigation_read_rows \
              FROM system.query_log \
              WHERE type = 'QueryFinish' \
                AND startsWith(query_id, 'moraine-issue598-quiescent-page') \
@@ -1120,11 +1134,21 @@ async fn assert_quiescent_continuation_is_directory_only(
         .await?
         .into_iter()
         .next()
-        .map(|row| row.value)
-        .unwrap_or_default();
+        .context("quiescent census returned no row")?;
     assert_eq!(
-        navigation_reads, 0,
-        "a quiescent continuation must not scan mcp_event_navigation (directory point-read only)"
+        census.guard_statements, 0,
+        "a quiescent continuation must not run the prefix boundary guard"
+    );
+    assert_eq!(
+        census.header_scans, 0,
+        "a quiescent continuation must reuse the carried header (no totals/metadata/terminal scan)"
+    );
+    // Bounded window reads only: the WI-09 chunk floor is 1024 rows; the
+    // 14-event fixture must come in far below one chunk.
+    assert!(
+        census.navigation_read_rows <= 1024,
+        "quiescent page-2 navigation reads must stay window-bounded, read {} rows",
+        census.navigation_read_rows
     );
     Ok(())
 }
