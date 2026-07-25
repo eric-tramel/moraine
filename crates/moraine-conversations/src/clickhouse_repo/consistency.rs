@@ -614,11 +614,6 @@ impl ClickHouseConversationRepository {
         session_id: Option<&str>,
         event_ts_bounds_ms: Option<EventTsBounds>,
     ) -> String {
-        let snapshot = require_active_publication_snapshot("live event reads");
-
-        let history = self.table_ref("v_published_source_generation_history");
-        let revision_predicate = snapshot.publication_revision_predicate("history");
-        let events = self.table_ref("events");
         let mut inner_predicates: Vec<String> = Vec::new();
         if let Some(session_id) = session_id {
             inner_predicates.push(format!("e.session_id = {}", sql_quote(session_id)));
@@ -636,6 +631,33 @@ impl ClickHouseConversationRepository {
                 (None, false) => {}
             }
         }
+        self.live_events_source_filtered(&inner_predicates)
+    }
+
+    /// The K-session form of [`Self::live_events_source_scoped`]: `e.session_id
+    /// IN <array>` emitted **inside** the derived table. `events` leads its
+    /// primary key with `session_id`, so the `IN` prunes the `FINAL` scan to K
+    /// key ranges; the identical predicate on the OUTER query prunes nothing,
+    /// because the optimizer is not trusted to push it through the publication
+    /// join (issue-598 C2-R0 "no optimizer trust"). An empty slice emits
+    /// `IN []`, which authorizes no rows — callers must not open the relation
+    /// for an empty batch.
+    pub(super) fn live_events_source_sessions(&self, session_ids: &[String]) -> String {
+        self.live_events_source_filtered(&[format!(
+            "e.session_id IN {}",
+            sql_array_strings(session_ids)
+        )])
+    }
+
+    /// The published-generation-authorized `events` relation, with every
+    /// caller-supplied predicate emitted inside the derived table. An empty
+    /// slice reproduces the v1 `live_events_source` SQL byte-for-byte.
+    fn live_events_source_filtered(&self, inner_predicates: &[String]) -> String {
+        let snapshot = require_active_publication_snapshot("live event reads");
+
+        let history = self.table_ref("v_published_source_generation_history");
+        let revision_predicate = snapshot.publication_revision_predicate("history");
+        let events = self.table_ref("events");
         let session_filter = if inner_predicates.is_empty() {
             String::new()
         } else {
@@ -1415,6 +1437,13 @@ mod tests {
                     );
                 assert!(bounded.ends_with(
                     "AND published.source_generation = e.source_generation\nWHERE e.session_id = 'session-a' AND e.event_ts BETWEEN fromUnixTimestamp64Milli(1000) AND fromUnixTimestamp64Milli(2000))"
+                ));
+                // The K-session form lands in the same place, for the same
+                // reason: an outer `session_id IN` cannot prune the FINAL scan.
+                let batched = repository
+                    .live_events_source_sessions(&["sess-a".to_string(), "sess-b".to_string()]);
+                assert!(batched.ends_with(
+                    "AND published.source_generation = e.source_generation\nWHERE e.session_id IN ['sess-a','sess-b'])"
                 ));
             })
             .await;

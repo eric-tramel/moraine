@@ -1,4 +1,5 @@
 use super::*;
+use moraine_conversations::{ClickHouseConversationRepository, McpSessionListItem, Page};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn publication_snapshot_combines_head_and_fence_round_trips() {
@@ -285,6 +286,816 @@ async fn list_mcp_sessions_uses_overlap_filter_and_cursor_pagination() {
     })
     .await;
 }
+/// The issue-599 filter: every dimension populated, so the assertions below
+/// exercise each one's recall predicate and exact re-check.
+fn directory_filter() -> McpSessionListFilter {
+    McpSessionListFilter {
+        start_unix_ms: 1767261600000_i64,
+        end_unix_ms: 1767500000000_i64,
+        mode: Some(ConversationMode::WebSearch),
+        harness: Some("codex".to_string()),
+        source_name: Some("codex".to_string()),
+        sort: ConversationListSort::Desc,
+    }
+}
+
+/// The two `list_sessions` implementations behind
+/// [`ClickHouseConversationRepository::list_mcp_sessions`].
+///
+/// The semantics-preservation checklist (issue-599 §4) is a contract on the
+/// OPERATION, not on one implementation of it, so every shared assertion runs
+/// against both. The mock serves the same three fixture sessions to each path,
+/// which is what makes a field-for-field page comparison meaningful.
+#[derive(Copy, Clone, Debug)]
+enum ListPath {
+    /// Pre-#599 `mcp_open_publication_headers` reader (`open_v2` unpublished).
+    Headers,
+    /// Issue-599 `mcp_session_directory` reader (`open_v2` published).
+    Directory,
+}
+
+impl ListPath {
+    const ALL: [Self; 2] = [Self::Headers, Self::Directory];
+
+    async fn repo(self) -> (ClickHouseConversationRepository, Arc<MockState>) {
+        match self {
+            Self::Headers => build_repo().await,
+            Self::Directory => build_directory_repo().await,
+        }
+    }
+
+    async fn scoped_repo(
+        self,
+        roots: &[&str],
+    ) -> (ClickHouseConversationRepository, Arc<MockState>) {
+        match self {
+            Self::Headers => build_scoped_repo(roots).await,
+            Self::Directory => build_scoped_directory_repo(roots).await,
+        }
+    }
+}
+
+/// The issue-599 §4 semantics-preservation checklist, expressed as behavioral
+/// assertions so it runs unchanged against either implementation: argument
+/// validation, overlap filtering, keyset continuation, the exact
+/// cursor-mismatch contract string, and the additive monitor facets. Returns
+/// the first page so the caller can compare the two paths directly.
+async fn assert_shared_list_sessions_semantics(
+    repo: &ClickHouseConversationRepository,
+    path: ListPath,
+) -> Page<McpSessionListItem> {
+    let filter = directory_filter();
+
+    // Argument validation runs before any read on both paths.
+    for (start_unix_ms, end_unix_ms) in [(1_767_500_000_000_i64, 1_767_261_600_000_i64), (7, 7)] {
+        let error = repo
+            .list_mcp_sessions(
+                McpSessionListFilter {
+                    start_unix_ms,
+                    end_unix_ms,
+                    ..filter.clone()
+                },
+                PageRequest {
+                    limit: 2,
+                    cursor: None,
+                },
+            )
+            .await
+            .expect_err("an empty or inverted window must be rejected");
+        assert_eq!(
+            error.to_string(),
+            "invalid argument: start_unix_ms must be strictly less than end_unix_ms",
+            "{path:?}"
+        );
+    }
+
+    let first = repo
+        .list_mcp_sessions(
+            filter.clone(),
+            PageRequest {
+                limit: 2,
+                cursor: None,
+            },
+        )
+        .await
+        .expect("first page");
+
+    assert_eq!(first.items.len(), 2, "{path:?}");
+    assert_eq!(first.items[0].session_id, "sess_c", "{path:?}");
+    assert_eq!(first.items[1].session_id, "sess_b", "{path:?}");
+    assert_eq!(
+        first.items[0].title.as_deref(),
+        Some("Session C title"),
+        "{path:?}"
+    );
+    assert_eq!(
+        first.items[0].session_summary.as_deref(),
+        Some("Session C summary"),
+        "{path:?}"
+    );
+    assert_eq!(
+        first.items[0].session_slug.as_deref(),
+        Some("project-c"),
+        "{path:?}"
+    );
+    assert_eq!(first.items[0].source.as_deref(), Some("codex"), "{path:?}");
+    assert_eq!(first.items[0].harness.as_deref(), Some("codex"), "{path:?}");
+    assert_eq!(first.items[0].total_turns, 3, "{path:?}");
+    assert_eq!(first.items[0].total_events, 30, "{path:?}");
+    assert_eq!(first.items[0].mode, ConversationMode::WebSearch, "{path:?}");
+    assert!(first.items[0].completed, "{path:?}");
+    assert_eq!(
+        first.items[0].inference_provider.as_deref(),
+        Some("openai"),
+        "{path:?}"
+    );
+    assert_eq!(first.items[0].tool_calls, 6, "{path:?}");
+
+    // Private projection columns never reach the public item on either path.
+    let public_items = serde_json::to_string(&first.items).expect("serialize public list items");
+    assert!(!public_items.contains("\"originator\":"), "{path:?}");
+    assert!(!public_items.contains("\"project\":"), "{path:?}");
+    assert!(!public_items.contains("acme-secret-merger"), "{path:?}");
+
+    let cursor = first.next_cursor.clone().expect("next cursor");
+
+    let second = repo
+        .list_mcp_sessions(
+            filter.clone(),
+            PageRequest {
+                limit: 2,
+                cursor: Some(cursor.clone()),
+            },
+        )
+        .await
+        .expect("second page");
+    assert_eq!(second.items.len(), 1, "{path:?}");
+    assert_eq!(second.items[0].session_id, "sess_a", "{path:?}");
+    assert!(!second.items[0].completed, "{path:?}");
+    assert!(second.items[0].title.is_none(), "{path:?}");
+    assert!(second.next_cursor.is_none(), "{path:?}");
+
+    // The exact contract string, for a changed filter dimension and for the
+    // absent-vs-sentinel distinction the tool tests depend on.
+    for changed in [
+        McpSessionListFilter {
+            mode: Some(ConversationMode::Chat),
+            ..filter.clone()
+        },
+        McpSessionListFilter {
+            source_name: Some("__none__".to_string()),
+            ..filter.clone()
+        },
+    ] {
+        let error = repo
+            .list_mcp_sessions(
+                changed,
+                PageRequest {
+                    limit: 2,
+                    cursor: Some(cursor.clone()),
+                },
+            )
+            .await
+            .expect_err("a cursor must not resume under a different filter");
+        assert_eq!(
+            error.to_string(),
+            "invalid cursor: cursor does not match current list_sessions filter",
+            "{path:?}"
+        );
+    }
+
+    first
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_sessions_semantics_are_identical_on_both_paths() {
+    scoped(async {
+        let mut pages: Vec<(ListPath, Page<McpSessionListItem>)> = Vec::new();
+        for path in ListPath::ALL {
+            let (repo, _state) = path.repo().await;
+            pages.push((
+                path,
+                assert_shared_list_sessions_semantics(&repo, path).await,
+            ));
+        }
+
+        // Same filter, same fixture corpus: the two readers must agree field
+        // for field, including the minted continuation token. The cursor is
+        // part of the comparison because both paths anchor it on the same
+        // `(updated_at, session_id)` value — that equality is what lets an
+        // in-flight token survive the cutover.
+        let (reference_path, reference) = &pages[0];
+        for (path, page) in &pages[1..] {
+            assert_eq!(
+                serde_json::to_value(page).expect("serialize page"),
+                serde_json::to_value(reference).expect("serialize page"),
+                "{path:?} diverged from {reference_path:?}"
+            );
+        }
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_sessions_rejects_foreign_scope_cursors_on_both_paths() {
+    scoped(async {
+        for path in ListPath::ALL {
+            let (unscoped_repo, _unscoped_state) = path.repo().await;
+            let (scoped_repo, _scoped_state) = path.scoped_repo(&["/work/project"]).await;
+            let filter = directory_filter();
+
+            let first = unscoped_repo
+                .list_mcp_sessions(
+                    filter.clone(),
+                    PageRequest {
+                        limit: 1,
+                        cursor: None,
+                    },
+                )
+                .await
+                .expect("first page from unscoped repo");
+            let cursor = first.next_cursor.expect("next cursor");
+
+            let error = scoped_repo
+                .list_mcp_sessions(
+                    filter,
+                    PageRequest {
+                        limit: 1,
+                        cursor: Some(cursor),
+                    },
+                )
+                .await
+                .expect_err("cursor minted without the scope must be rejected");
+            assert_eq!(
+                error.to_string(),
+                "invalid cursor: cursor does not match current list_sessions filter",
+                "{path:?}"
+            );
+        }
+    })
+    .await;
+}
+
+/// A batched-totals fixture row for a session with no metadata and one turn.
+fn totals_row(session_id: &str, harness: &str) -> serde_json::Value {
+    json!({
+        "session_id": session_id,
+        "total_events": 4_u64,
+        "tool_calls": 1_u64,
+        "max_override": 0_u32,
+        "counter_user_messages": 1_u64,
+        "first_event_time": "2026-01-02 10:00:00",
+        "first_event_unix_ms": 1_767_348_000_000_i64,
+        "last_event_time": "2026-01-02 10:10:00",
+        "last_event_unix_ms": 1_767_348_600_000_i64,
+        "source": "codex",
+        "harness": harness,
+        "inference_provider": "openai",
+        "omp_dispatch_title": "",
+        "mode": "chat"
+    })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_mcp_sessions_directory_path_emits_the_content_free_candidate_page() {
+    scoped(async {
+        // The page's OUTPUT is asserted against the projected-header page by
+        // `list_sessions_semantics_are_identical_on_both_paths`; this test
+        // pins the SQL that produces it.
+        let (repo, state) = build_directory_repo().await;
+
+        repo.list_mcp_sessions(
+            directory_filter(),
+            PageRequest {
+                limit: 2,
+                cursor: None,
+            },
+        )
+        .await
+        .expect("directory page");
+
+        let queries = state.queries.lock().expect("queries lock").clone();
+        let directory_query = queries
+            .iter()
+            .find(|query| query.contains("FROM `moraine`.`mcp_session_directory` AS d"))
+            .expect("directory candidate query should be captured");
+        assert!(directory_query.contains("cand_last_ms >= 1767261600000"));
+        assert!(directory_query.contains("cand_first_ms < 1767500000000"));
+        assert!(directory_query.contains("mode_hint >= 3"));
+        assert!(directory_query.contains("has(harnesses, 'codex')"));
+        assert!(directory_query.contains("has(sources, 'codex')"));
+        assert!(directory_query.contains("notEmpty(trimBoth(d.session_id))"));
+        assert!(directory_query.contains("argMinIfMerge(d.origin_cwd_state)"));
+        assert!(directory_query.contains("ORDER BY cand_last_ms DESC, session_id DESC"));
+        // One statement fetches the page's whole hydration budget
+        // (hydration_chunk_size(2) = 6, x MAX_HYDRATION_CHUNKS = 24).
+        assert!(directory_query.contains("LIMIT 24"));
+        assert_eq!(
+            queries
+                .iter()
+                .filter(|query| query.contains("FROM `moraine`.`mcp_session_directory` AS d"))
+                .count(),
+            1,
+            "Phase A must run once per page — a second pass re-aggregates the whole directory: {queries:#?}"
+        );
+
+        // The events relation is opened only for the bounded metadata read, and
+        // only with its session filter INSIDE the derived table: `SELECT e.*`
+        // republishes every wide column, so an outer-only filter is a
+        // whole-corpus FINAL scan that no column-name grep can see.
+        for query in queries
+            .iter()
+            .filter(|query| query.contains("FROM `moraine`.`events` AS e FINAL"))
+        {
+            assert!(
+                query.contains(
+                    "AND published.source_generation = e.source_generation\nWHERE e.session_id IN ["
+                ),
+                "unpruned events scan on the discovery path: {query}"
+            );
+        }
+
+        // The whole point of the cutover: no statement of the page touches the
+        // projector, the legacy view chain, or transcript content.
+        for query in &queries {
+            assert!(
+                !query.contains("mcp_open_"),
+                "list_sessions must not read the projector: {query}"
+            );
+            assert!(
+                !query.contains("v_session_summary")
+                    && !query.contains("v_conversation_trace")
+                    && !query.contains("v_turn_summary"),
+                "list_sessions must not read the legacy view chain: {query}"
+            );
+            assert!(
+                !query.contains("text_content"),
+                "list_sessions must not read transcript content: {query}"
+            );
+            assert!(
+                !query.contains("argMin(cwd"),
+                "list_sessions must not run the corpus-wide scope subquery: {query}"
+            );
+        }
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_mcp_sessions_directory_page_uses_batched_hydration() {
+    scoped(async {
+        let (repo, state) = build_directory_repo().await;
+
+        repo.list_mcp_sessions(
+            directory_filter(),
+            PageRequest {
+                limit: 25,
+                cursor: None,
+            },
+        )
+        .await
+        .expect("directory page");
+
+        let queries = state.queries.lock().expect("queries lock").clone();
+        // One directory pass plus three batched hydration statements. The
+        // ceiling is 1 + MAX_HYDRATION_CHUNKS x 3 = 13; anything above it means
+        // a per-session loop or a repeated directory aggregation crept back in.
+        assert_eq!(queries.len(), 4, "captured queries: {queries:#?}");
+        let hydration = queries
+            .iter()
+            .filter(|query| query.contains("['sess_c','sess_b','sess_a']"))
+            .count();
+        assert_eq!(
+            hydration, 3,
+            "totals, metadata and terminal must each batch the whole chunk: {queries:#?}"
+        );
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_mcp_sessions_directory_page_applies_session_origin_scope_exactly() {
+    scoped(async {
+        let (repo, state) = build_scoped_directory_repo(&["/work/project"]).await;
+
+        repo.list_mcp_sessions(
+            McpSessionListFilter {
+                mode: None,
+                harness: None,
+                source_name: None,
+                ..directory_filter()
+            },
+            PageRequest {
+                limit: 5,
+                cursor: None,
+            },
+        )
+        .await
+        .expect("scoped directory page");
+
+        let queries = state.queries.lock().expect("queries lock").clone();
+        let directory_query = queries
+            .iter()
+            .find(|query| query.contains("FROM `moraine`.`mcp_session_directory` AS d"))
+            .expect("directory candidate query should be captured");
+        assert!(directory_query.contains("origin_cwd = '/work/project'"));
+        assert!(directory_query.contains("startsWith(origin_cwd, '/work/project/')"));
+        assert!(
+            !directory_query.contains("argMin(cwd"),
+            "scope is served by the merged directory state, not a corpus scan"
+        );
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_mcp_sessions_directory_page_never_prefilters_mcp_internal_mode() {
+    scoped(async {
+        let (repo, state) = build_directory_repo().await;
+
+        repo.list_mcp_sessions(
+            McpSessionListFilter {
+                mode: Some(ConversationMode::McpInternal),
+                harness: None,
+                source_name: None,
+                ..directory_filter()
+            },
+            PageRequest {
+                limit: 5,
+                cursor: None,
+            },
+        )
+        .await
+        .expect("mcp_internal page");
+
+        let queries = state.queries.lock().expect("queries lock").clone();
+        let directory_query = queries
+            .iter()
+            .find(|query| query.contains("FROM `moraine`.`mcp_session_directory` AS d"))
+            .expect("directory candidate query should be captured");
+        // sql/036:156 freezes the internal-tool allowlist inside the MV body,
+        // so a session using a tool added later carries a hint BELOW its live
+        // rank. Any hint predicate would silently drop it.
+        assert!(
+            !directory_query.contains("mode_hint >="),
+            "mcp_internal must not push a mode_hint predicate: {directory_query}"
+        );
+    })
+    .await;
+}
+
+/// One Phase-A candidate row.
+fn candidate_row(session_id: &str, cand_last_ms: i64) -> serde_json::Value {
+    json!({ "session_id": session_id, "cand_last_ms": cand_last_ms })
+}
+
+/// [`totals_row`] with explicit exact `display_time` bounds, for the case where
+/// hydration's `max(display_time)` is BELOW the directory's
+/// `max(max_observed_event_time)` — what a superseded event version leaves
+/// behind, since the directory aggregate can never retract one.
+fn totals_row_at(
+    session_id: &str,
+    first_event_unix_ms: i64,
+    last_event_unix_ms: i64,
+) -> serde_json::Value {
+    let mut row = totals_row(session_id, "codex");
+    row["first_event_unix_ms"] = json!(first_event_unix_ms);
+    row["last_event_unix_ms"] = json!(last_event_unix_ms);
+    row
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_mcp_sessions_directory_page_orders_and_anchors_on_the_directory_keyset() {
+    scoped(async {
+        // The directory aggregate and the hydrated aggregate are different
+        // numbers whenever an event version has been superseded. Ordering and
+        // the cursor MUST use the directory value — it is the only one the next
+        // page's `HAVING` can compare against — while the item still REPORTS
+        // the exact hydrated value.
+        //
+        // sess-p: directory 1_767_400_000_000, exact 1_767_300_000_000
+        // sess-q: directory 1_767_350_000_000, exact 1_767_350_000_000
+        // Keyset DESC is (p, q); hydrated DESC would be (q, p).
+        let responses = {
+            let mut responses = vec![ScriptedResponse::rows(
+                &["FROM `moraine`.`mcp_session_directory` AS d", "LIMIT 16"],
+                json!([
+                    candidate_row("sess-p", 1_767_400_000_000_i64),
+                    candidate_row("sess-q", 1_767_350_000_000_i64),
+                ]),
+            )];
+            responses.extend(hydration_script(
+                "'sess-p','sess-q'",
+                json!([
+                    totals_row_at("sess-p", 1_767_290_000_000_i64, 1_767_300_000_000_i64),
+                    totals_row_at("sess-q", 1_767_340_000_000_i64, 1_767_350_000_000_i64),
+                ]),
+            ));
+            responses
+        };
+        let (repo, _state) = build_scripted_directory_repo(responses).await;
+
+        let page = repo
+            .list_mcp_sessions(
+                McpSessionListFilter {
+                    mode: None,
+                    source_name: None,
+                    ..directory_filter()
+                },
+                PageRequest {
+                    limit: 1,
+                    cursor: None,
+                },
+            )
+            .await
+            .expect("keyset page");
+
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(
+            page.items[0].session_id, "sess-p",
+            "survivors must be ordered by the directory keyset, not the hydrated timestamp"
+        );
+        assert_eq!(
+            page.items[0].last_event_unix_ms, 1_767_300_000_000_i64,
+            "the item still reports the EXACT aggregate"
+        );
+
+        let cursor = page.next_cursor.expect("next cursor");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(&cursor).expect("cursor is base64"))
+                .expect("cursor payload is json");
+        assert_eq!(payload["session_id"], json!("sess-p"));
+        assert_eq!(
+            payload["last_event_unix_ms"],
+            json!(1_767_400_000_000_i64),
+            "the cursor must be minted from the directory keyset value; anchoring on the \
+             hydrated value skips every session whose aggregate falls between the two"
+        );
+    })
+    .await;
+}
+
+/// The three batched hydration responses for one chunk, in issue order. `ids`
+/// is a substring that must appear in each statement's `session_id IN` array so
+/// the script cannot silently accept a mis-chunked batch.
+fn hydration_script(ids: &'static str, totals: serde_json::Value) -> Vec<ScriptedResponse> {
+    vec![
+        ScriptedResponse::rows(&["AS counter_user_messages", ids], totals),
+        ScriptedResponse::rows(&["n.is_metadata_bearing = 1", ids], json!([])),
+        ScriptedResponse::rows(&["GROUP BY session_id, turn_seq", ids], json!([])),
+    ]
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_mcp_sessions_directory_page_advances_through_eliminated_chunks() {
+    scoped(async {
+        // limit 1 -> hydration_chunk_size(1) == 4, candidate_fetch_size(1) == 16.
+        // ONE Phase-A pass fetches 8 candidates; the first hydration chunk is
+        // eliminated wholesale by the exact harness re-filter, so the page must
+        // hydrate the next chunk rather than return empty — WITHOUT re-running
+        // the directory aggregation.
+        let candidates = (1..=4)
+            .map(|i| candidate_row(&format!("sess-x{i}"), 1_767_400_000_000_i64 - i))
+            .chain((1..=4).map(|i| candidate_row(&format!("sess-y{i}"), 1_767_300_000_000_i64 - i)))
+            .collect::<Vec<_>>();
+        let mut responses = vec![ScriptedResponse::rows(
+            &["FROM `moraine`.`mcp_session_directory` AS d", "LIMIT 16"],
+            json!(candidates),
+        )];
+        responses.extend(hydration_script(
+            "'sess-x1','sess-x2','sess-x3','sess-x4'",
+            json!((1..=4)
+                .map(|i| totals_row(&format!("sess-x{i}"), "claude-code"))
+                .collect::<Vec<_>>()),
+        ));
+        responses.extend(hydration_script(
+            "'sess-y1','sess-y2','sess-y3','sess-y4'",
+            json!([
+                totals_row("sess-y1", "codex"),
+                totals_row("sess-y2", "claude-code"),
+                totals_row("sess-y3", "claude-code"),
+                totals_row("sess-y4", "claude-code"),
+            ]),
+        ));
+        let (repo, state) = build_scripted_directory_repo(responses).await;
+
+        let page = repo
+            .list_mcp_sessions(
+                McpSessionListFilter {
+                    mode: None,
+                    source_name: None,
+                    ..directory_filter()
+                },
+                PageRequest {
+                    limit: 1,
+                    cursor: None,
+                },
+            )
+            .await
+            .expect("chunked page");
+
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].session_id, "sess-y1");
+        // The candidate page was short, so the directory is exhausted: no cursor.
+        assert!(page.next_cursor.is_none());
+        // 1 directory + 2 x 3 hydration. A second directory statement here
+        // would be a full re-aggregation of the whole table.
+        assert_script_consumed(&state, 7);
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_mcp_sessions_directory_page_exhausts_the_hydration_budget_with_a_cursor() {
+    scoped(async {
+        // Every candidate is eliminated by the exact re-filter. Once the whole
+        // over-fetch is hydrated the page returns empty but WITH a cursor, so
+        // the caller can keep going instead of reading it as "no more results".
+        // The cursor anchors on the last RESOLVED CANDIDATE, which is what
+        // guarantees the next request makes progress rather than re-examining
+        // the same rejects forever.
+        let candidates = (1..=16_i64)
+            .map(|i| candidate_row(&format!("sess-c{i:02}"), 1_767_400_000_000_i64 - i))
+            .collect::<Vec<_>>();
+        let mut responses = vec![ScriptedResponse::rows(
+            &["FROM `moraine`.`mcp_session_directory` AS d", "LIMIT 16"],
+            json!(candidates),
+        )];
+        for chunk in 0..4_i64 {
+            let ids: &'static str = match chunk {
+                0 => "'sess-c01','sess-c02','sess-c03','sess-c04'",
+                1 => "'sess-c05','sess-c06','sess-c07','sess-c08'",
+                2 => "'sess-c09','sess-c10','sess-c11','sess-c12'",
+                _ => "'sess-c13','sess-c14','sess-c15','sess-c16'",
+            };
+            responses.extend(hydration_script(
+                ids,
+                json!((1..=4_i64)
+                    .map(|i| totals_row(&format!("sess-c{:02}", chunk * 4 + i), "claude-code"))
+                    .collect::<Vec<_>>()),
+            ));
+        }
+        let (repo, state) = build_scripted_directory_repo(responses).await;
+
+        let page = repo
+            .list_mcp_sessions(
+                McpSessionListFilter {
+                    mode: None,
+                    source_name: None,
+                    ..directory_filter()
+                },
+                PageRequest {
+                    limit: 1,
+                    cursor: None,
+                },
+            )
+            .await
+            .expect("budget-exhausted page");
+
+        assert!(page.items.is_empty());
+        let cursor = page
+            .next_cursor
+            .expect("an exhausted hydration budget must still hand back a continuation");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(&cursor).expect("cursor is base64"))
+                .expect("cursor payload is json");
+        assert_eq!(payload["session_id"], json!("sess-c16"));
+        assert_eq!(
+            payload["last_event_unix_ms"],
+            json!(1_767_400_000_000_i64 - 16)
+        );
+        // 1 directory pass + MAX_HYDRATION_CHUNKS x 3 hydration = 13, the
+        // ceiling. The pre-fix shape ran Phase A once per chunk for 16.
+        assert_script_consumed(&state, 13);
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_mcp_sessions_accepts_legacy_cursors_and_rejects_unknown_versions() {
+    scoped(async {
+        let (repo, _state) = build_directory_repo().await;
+        let filter = directory_filter();
+
+        let first = repo
+            .list_mcp_sessions(
+                filter.clone(),
+                PageRequest {
+                    limit: 2,
+                    cursor: None,
+                },
+            )
+            .await
+            .expect("first page");
+        let cursor = first.next_cursor.expect("next cursor");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(&cursor).expect("cursor is base64"))
+                .expect("cursor payload is json");
+        assert_eq!(payload["version"], json!(2));
+
+        let retoken = |version: Option<u64>| {
+            let mut payload = payload.clone();
+            match version {
+                Some(version) => payload["version"] = json!(version),
+                None => {
+                    payload
+                        .as_object_mut()
+                        .expect("cursor object")
+                        .remove("version");
+                }
+            }
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).expect("re-encode cursor"))
+        };
+
+        // A pre-#599 token carries no `version` key and must still resume: the
+        // ordering value is identical under both implementations.
+        let legacy = repo
+            .list_mcp_sessions(
+                filter.clone(),
+                PageRequest {
+                    limit: 2,
+                    cursor: Some(retoken(None)),
+                },
+            )
+            .await
+            .expect("legacy cursor resumes");
+        assert_eq!(legacy.items.len(), 1);
+        assert_eq!(legacy.items[0].session_id, "sess_a");
+
+        for version in [1_u64, 3] {
+            let error = repo
+                .list_mcp_sessions(
+                    filter.clone(),
+                    PageRequest {
+                        limit: 2,
+                        cursor: Some(retoken(Some(version))),
+                    },
+                )
+                .await
+                .expect_err("unknown cursor versions are rejected");
+            assert_eq!(
+                error.to_string(),
+                format!("invalid cursor: unsupported list_sessions cursor version {version}")
+            );
+        }
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_sessions_gates_on_the_same_readiness_key_as_the_open_cutover() {
+    scoped(async {
+        let (repo, state) = build_directory_repo().await;
+
+        repo.list_mcp_sessions(
+            directory_filter(),
+            PageRequest {
+                limit: 2,
+                cursor: None,
+            },
+        )
+        .await
+        .expect("directory page");
+
+        let probes = state
+            .readiness_probe_queries
+            .lock()
+            .expect("readiness probe lock")
+            .clone();
+        let state_read = probes
+            .iter()
+            .find(|query| !query.contains("FROM system.tables"))
+            .expect("readiness probe should be captured");
+        // `open_v2`, not `core_indexes`: the weaker coverage key is published
+        // before the overlap audit runs, so gating on it would let listing read
+        // indexes the `open` path refuses.
+        assert!(
+            state_read.contains("WHERE state_key = 'open_v2'"),
+            "list_sessions must share the open cutover's readiness authority: {state_read}"
+        );
+        // Latched per repository: paging does not re-probe.
+        repo.list_mcp_sessions(
+            directory_filter(),
+            PageRequest {
+                limit: 2,
+                cursor: None,
+            },
+        )
+        .await
+        .expect("second directory page");
+        assert_eq!(
+            state
+                .readiness_probe_queries
+                .lock()
+                .expect("readiness probe lock")
+                .len(),
+            probes.len(),
+            "the readiness verdict must be latched for the process"
+        );
+    })
+    .await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn list_mcp_sessions_rejects_cursor_filter_mismatch() {
     scoped(async {

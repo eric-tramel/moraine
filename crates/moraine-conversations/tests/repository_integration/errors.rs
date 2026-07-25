@@ -132,7 +132,8 @@ async fn typed_budget_errors_take_the_consistency_non_retry_arm() {
         // Only ReadModelChanged re-runs the publication-consistent operation.
         // A typed deadline error must propagate after exactly one attempt: one
         // snapshot capture, one operation read, no revalidation, no retry.
-        let (repo, state) = build_scripted_repo(vec![ScriptedResponse::failure(
+        // The readiness gate is declared, so the probe never consumes a script.
+        let (repo, state) = build_scripted_header_repo(vec![ScriptedResponse::failure(
             &[],
             "Code: 159. DB::Exception: Timeout exceeded: elapsed 2.0 seconds",
         )])

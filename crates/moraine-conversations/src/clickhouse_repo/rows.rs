@@ -60,9 +60,13 @@ pub(super) struct McpSessionListRow {
     #[serde(default)]
     pub(super) harness: String,
     #[serde(default)]
+    pub(super) inference_provider: String,
+    #[serde(default)]
     pub(super) session_slug: String,
     #[serde(default)]
     pub(super) session_summary: String,
+    #[serde(default)]
+    pub(super) tool_calls: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -636,8 +640,10 @@ impl ClickHouseConversationRepository {
             title: non_empty_string(row.title),
             source: non_empty_string(row.source),
             harness: non_empty_string(row.harness),
+            inference_provider: non_empty_string(row.inference_provider),
             session_slug: non_empty_string(row.session_slug),
             session_summary: non_empty_string(row.session_summary),
+            tool_calls: row.tool_calls,
         }
     }
 

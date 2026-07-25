@@ -118,6 +118,16 @@ impl ConversationRepository for ClickHouseConversationRepository {
         filter: McpSessionListFilter,
         page: PageRequest,
     ) -> RepoResult<Page<McpSessionListItem>> {
+        // MovingFeed, not AnchoredSession: that class exists for a single
+        // anchored session and a K-session page has no single scope.
+        //
+        // No deadline narrowing here. Callers scope the envelope around this
+        // whole call (`list_sessions_v1` narrows to `LIST_SESSIONS_DEADLINE_MS`),
+        // which already puts every statement of the page — snapshot capture and
+        // revalidation, the directory pass, and the batched hydration — under
+        // one wall with the server-side `max_execution_time` tracking it.
+        // A second narrowing inside the repository would be that same bound
+        // applied twice.
         self.run_publication_consistent(PublicationReadClass::MovingFeed, || {
             self.list_mcp_sessions_impl(filter.clone(), page.clone())
         })

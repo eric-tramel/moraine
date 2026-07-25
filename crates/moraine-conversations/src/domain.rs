@@ -53,6 +53,16 @@ pub struct ConversationListFilter {
     pub sort: ConversationListSort,
 }
 
+/// Every field here is a QUERY dimension and participates in the cursor filter
+/// signature.
+///
+/// It deliberately carries neither an execution budget nor a cancellation
+/// token, unlike [`FileAttentionQuery`]. Callers narrow the ambient
+/// [`QueryEnvelope`](crate::QueryEnvelope) around the whole operation, which
+/// already bounds every statement of a page, and the transport injects the
+/// active envelope's `request_id` as each statement's `query_id`. Listing has
+/// nothing left to override. `file_attention` needs both only because it mints
+/// its own token and issues the KILL itself.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpSessionListFilter {
     pub start_unix_ms: i64,
@@ -420,10 +430,18 @@ pub struct McpSessionListItem {
     pub source: Option<String>,
     #[serde(default)]
     pub harness: Option<String>,
+    /// Latest `inference_provider` by `(event_ts, event_uid)`. Carried for the
+    /// monitor's provider facet; MCP's `session_json` does not emit it.
+    #[serde(default)]
+    pub inference_provider: Option<String>,
     #[serde(default)]
     pub session_slug: Option<String>,
     #[serde(default)]
     pub session_summary: Option<String>,
+    /// Session-wide `tool_call` event count, for the monitor's per-card badge.
+    /// MCP's `session_json` does not emit it.
+    #[serde(default)]
+    pub tool_calls: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -98,6 +98,7 @@ use crate::repo::ConversationRepository;
 
 mod analytics;
 mod cache;
+mod canonical_list;
 mod canonical_open;
 mod consistency;
 mod file_attention;
@@ -137,6 +138,10 @@ pub struct ClickHouseConversationRepository {
     /// replaces the prior revision for the same session, and the total entry
     /// count is bounded. Negative results are not cached.
     scoped_session_cache: Arc<RwLock<HashMap<String, String>>>,
+    /// One-shot canonical read-index readiness latch (issue #598 `open_v2`),
+    /// gating the issue-599 directory session-listing path.
+    /// See [`Self::canonical_list_path_ready`].
+    canonical_list_ready: Arc<OnceLock<bool>>,
 }
 
 impl ClickHouseConversationRepository {
@@ -164,11 +169,55 @@ impl ClickHouseConversationRepository {
             search_doc_extra_cache: Arc::new(RwLock::new(HashMap::new())),
             analytics_cache: Arc::new(std::array::from_fn(|_| Mutex::new(None))),
             scoped_session_cache: Arc::new(RwLock::new(HashMap::new())),
+            canonical_list_ready: Arc::new(OnceLock::new()),
         }
     }
 
     pub fn config(&self) -> &RepoConfig {
         &self.cfg
+    }
+
+    /// Whether session listing may use the issue-599 directory path.
+    ///
+    /// The gate is the issue-598 `open_v2` readiness key — the SAME authority
+    /// the `open` cutover uses ([`crate::probe_open_v2_ready`]), deliberately
+    /// not the weaker `core_indexes` coverage flag. `open_v2.ready` is
+    /// published only when the backfill sweep has completed AND the persisted
+    /// overlap audit passed (`ClickHouseClient::promote_open_v2_reader`), so
+    /// gating on `core_indexes` alone would let listing read indexes the
+    /// `open` path refuses — including a store whose audit is failing. Both
+    /// cutovers read `mcp_session_directory` / `mcp_event_navigation`; one
+    /// readiness authority, one verdict.
+    ///
+    /// The verdict is latched on the first SUCCESSFUL probe, for this
+    /// repository and every clone of it — one instance per routed backend, so
+    /// in practice one point read per backend per process.
+    ///
+    /// A transport failure is deliberately NOT latched: it degrades to the
+    /// header path and re-probes on the next request. That diverges from the
+    /// `open` cutover, where [`crate::probe_open_v2_ready`] collapses an
+    /// unreachable backend to `false` and the caller's `OnceCell` latches it
+    /// for the process. The divergence is intentional and one-way-safe: that
+    /// probe runs once at startup and cannot retry, while this one is already
+    /// on a request path that can. Both latch a genuine `false`, so neither
+    /// gate can flap open and shut mid-process.
+    pub(super) async fn canonical_list_path_ready(&self) -> bool {
+        if let Some(ready) = self.canonical_list_ready.get() {
+            return *ready;
+        }
+        match self.ch.open_v2_reader_ready().await {
+            Ok(ready) => {
+                let _ = self.canonical_list_ready.set(ready);
+                ready
+            }
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    "open_v2 reader readiness probe failed; session listing stays on the projected-header path"
+                );
+                false
+            }
+        }
     }
 
     pub(super) fn table_ref(&self, table: &str) -> String {

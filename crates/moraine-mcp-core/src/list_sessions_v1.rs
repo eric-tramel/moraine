@@ -527,8 +527,10 @@ mod tests {
                 title: Some("Build failure triage".to_string()),
                 source: Some("codex".to_string()),
                 harness: Some("codex".to_string()),
+                inference_provider: None,
                 session_slug: Some("build-failure".to_string()),
                 session_summary: Some("Build failure triage summary.".to_string()),
+                tool_calls: 0,
             }],
             next_cursor: None,
         };
@@ -616,8 +618,10 @@ mod tests {
                 title: None,
                 source: Some("codex".to_string()),
                 harness: Some("codex".to_string()),
+                inference_provider: None,
                 session_slug: None,
                 session_summary: None,
+                tool_calls: 0,
             }],
             next_cursor: None,
         };
@@ -665,8 +669,10 @@ mod tests {
                 title: Some("   ".to_string()),
                 source: Some("codex".to_string()),
                 harness: Some("codex".to_string()),
+                inference_provider: None,
                 session_slug: Some("useful-slug".to_string()),
                 session_summary: Some("\t\n".to_string()),
+                tool_calls: 0,
             }],
             next_cursor: None,
         };
@@ -743,8 +749,10 @@ mod tests {
             title: None,
             source: Some("claude-code".to_string()),
             harness: Some("claude-code".to_string()),
+            inference_provider: None,
             session_slug: None,
             session_summary: None,
+            tool_calls: 0,
         };
 
         // A leading empty-session_id orphan (the #386 junk) must be dropped,
@@ -796,8 +804,10 @@ mod tests {
             title: None,
             source: Some("claude-code".to_string()),
             harness: Some("claude-code".to_string()),
+            inference_provider: None,
             session_slug: None,
             session_summary: None,
+            tool_calls: 0,
         };
 
         // A whitespace-only id (rejected by the contract's trim check) and a

@@ -57,6 +57,21 @@ pub trait ConversationRepository: Send + Sync {
 
     async fn get_mcp_session(&self, session_id: &str) -> RepoResult<Option<McpSessionOpen>>;
 
+    /// Session DISCOVERY, and the operation the monitor feed is being
+    /// consolidated onto (issue-599 WI-03; it still reads
+    /// [`Self::list_session_analytics`] today). The `mcp_` prefix is already
+    /// historical; renaming it is recorded as a post-epic cleanup.
+    ///
+    /// Whether more results exist is `Page::next_cursor.is_some()` — there is
+    /// deliberately no `total`, because a corpus-wide count is exactly the
+    /// corpus-sized work this operation exists to remove. An empty `items`
+    /// carrying a `next_cursor` is a legal "keep going" signal, not "no
+    /// results".
+    ///
+    /// The cursor is a VALUE anchor over `(updated_at, session_id)`, not a
+    /// snapshot: concurrent appends may move a session ahead of an existing
+    /// cursor, and it will not be seen again until the caller restarts from
+    /// page 1.
     async fn list_mcp_sessions(
         &self,
         filter: McpSessionListFilter,
