@@ -248,7 +248,7 @@ impl ClickHouseConversationRepository {
         // aggregates read, so `cd::*` fragments (which name the raw `events`
         // columns) resolve against the single derived relation unqualified.
         let inner = format!(
-            "SELECT\n    n.session_id AS session_id,\n    n.turn_index AS turn_index,\n    n.is_user_message AS is_user_message,\n    n.actor_kind AS actor_kind,\n    n.event_kind AS event_kind,\n    n.payload_type AS payload_type,\n    n.tool_name AS tool_name,\n    n.source_name AS source_name,\n    n.source_file AS source_file,\n    n.harness AS harness,\n    n.inference_provider AS inference_provider,\n    n.display_time AS display_time,\n    n.event_ts AS event_ts,\n    n.event_uid AS event_uid,\n    {sort_tuple} AS sort_key,\n    sum(if(n.is_user_message = 1, 1, 0)) OVER counter_window AS running_u\n  {from}\n  WHERE n.session_id IN {ids}\n  WINDOW counter_window AS (PARTITION BY n.session_id ORDER BY {sort_tuple} ASC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)"
+            "SELECT\n    n.session_id AS session_id,\n    n.turn_index AS turn_index,\n    n.is_user_message AS is_user_message,\n    n.actor_kind AS actor_kind,\n    n.event_kind AS event_kind,\n    n.payload_type AS payload_type,\n    n.tool_name AS tool_name,\n    n.source_name AS source_name,\n    n.source_file AS source_file,\n    n.harness AS harness,\n    n.inference_provider AS inference_provider,\n    n.cwd AS cwd,\n    n.display_time AS display_time,\n    n.event_ts AS event_ts,\n    n.event_uid AS event_uid,\n    {sort_tuple} AS sort_key,\n    sum(if(n.is_user_message = 1, 1, 0)) OVER counter_window AS running_u\n  {from}\n  WHERE n.session_id IN {ids}\n  WINDOW counter_window AS (PARTITION BY n.session_id ORDER BY {sort_tuple} ASC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)"
         );
         format!(
             "SELECT\n  nav.session_id AS session_id,\n  toUInt64(count()) AS total_events,\n  toUInt64(countIf({umsg})) AS user_messages,\n  toUInt64(countIf({assistant_msg})) AS assistant_messages,\n  toUInt64(countIf(nav.event_kind = 'tool_call')) AS tool_calls,\n  toUInt64(countIf(nav.event_kind = 'tool_result')) AS tool_results,\n  toUInt32(max(nav.turn_index)) AS max_override,\n  toUInt64(argMaxIf(nav.running_u, nav.sort_key, nav.turn_index = 0)) AS counter_user_messages,\n  toString(min(nav.display_time)) AS first_event_time,\n  toInt64(toUnixTimestamp64Milli(min(nav.display_time))) AS first_event_unix_ms,\n  toInt64(toUnixTimestamp64Milli(max(nav.display_time))) AS last_event_unix_ms,\n  ifNull(argMinIf(nav.cwd, {event_ts_tuple}, nav.cwd != ''), '') AS origin_cwd,\n  ifNull(argMax(nullIf(nav.source_name, ''), {event_ts_tuple}), '') AS source,\n  ifNull(argMax(nullIf(nav.harness, ''), {event_ts_tuple}), '') AS harness,\n  ifNull(argMax(nullIf(nav.inference_provider, ''), {event_ts_tuple}), '') AS inference_provider,\n  ifNull(argMinIf(nullIf(trimBoth(replaceRegexpOne(arrayElement(splitByChar('/', replaceAll(nav.source_file, '\\\\', '/')), -1), '[.]jsonl$', '')), ''), {event_ts_tuple}, nav.source_name = 'omp' AND notEmpty(nav.session_id) AND endsWith(nav.source_file, '.jsonl') AND NOT endsWith(nav.source_file, concat(nav.session_id, '.jsonl'))), '') AS omp_dispatch_title,\n  {mode} AS mode\nFROM (\n  {inner}\n) AS nav\nGROUP BY nav.session_id\nFORMAT JSONEachRow"
@@ -474,6 +474,47 @@ mod tests {
     /// its own body (issue-598 C2-R0): an outer `WHERE` sits above the
     /// publication join and prunes nothing, so the statement would scan the
     /// whole `events` table with `FINAL`.
+    /// Every `nav.<column>` the OUTER query references must be projected by
+    /// the inner derived table it selects from.
+    ///
+    /// ClickHouse resolves this only at execution time, so a missing
+    /// projection passes every text-matching shape assertion and fails in the
+    /// functional stack. That has now happened twice — `ev.event_ts` in the
+    /// #598 navigation window and `nav.cwd` here — which is why this is a
+    /// structural check rather than another literal.
+    fn assert_outer_columns_are_projected_by_inner(sql: &str, alias: &str) {
+        let Some(inner_start) = sql.find("FROM (") else {
+            panic!("no derived table to check in:\n{sql}");
+        };
+        let (outer, inner) = sql.split_at(inner_start);
+
+        let needle = format!("{alias}.");
+        let mut referenced: Vec<String> = Vec::new();
+        let mut rest = outer;
+        while let Some(at) = rest.find(&needle) {
+            let tail = &rest[at + needle.len()..];
+            let end = tail
+                .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .unwrap_or(tail.len());
+            let column = &tail[..end];
+            if !column.is_empty() && !referenced.iter().any(|seen| seen == column) {
+                referenced.push(column.to_string());
+            }
+            rest = &tail[end..];
+        }
+        assert!(
+            !referenced.is_empty(),
+            "found no {alias}.<column> references to check in:\n{sql}"
+        );
+        for column in referenced {
+            assert!(
+                inner.contains(&format!("AS {column}")),
+                "outer references {alias}.{column} but the inner derived table does not project it \
+                 — ClickHouse would fail this at execution time:\n{sql}"
+            );
+        }
+    }
+
     fn assert_events_scan_is_key_pruned(sql: &str) {
         // Only statements that actually open `events` are in scope…
         if !sql.contains("`events`") {
@@ -657,6 +698,7 @@ mod tests {
         let sql = build(repo(), |r| r.build_session_totals_batch_sql(&ids())).await;
         assert_content_free(&sql);
         assert_no_projection(&sql);
+        assert_outer_columns_are_projected_by_inner(&sql, "nav");
         assert!(!sql.contains("payload_json"));
         assert!(sql.contains("`moraine`.`mcp_event_navigation` AS n FINAL"));
         assert!(sql.contains("WHERE n.session_id IN ['sess-a','sess-b']"));
