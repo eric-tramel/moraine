@@ -47,11 +47,20 @@ const COLS: DerivationColumns = DerivationColumns::EVENTS;
 /// design invariant.
 pub(super) const MAX_HYDRATION_CHUNKS: usize = 4;
 
-/// Ceiling on one hydration chunk, bounding a single batched statement's cost.
+/// Ceiling on one hydration chunk — but the caller's page size WINS when it is
+/// larger. `hydration_chunk_size` floors the chunk at `limit + 1` so a single
+/// chunk can always answer "is there more", so a request for a page bigger than
+/// this constant is hydrated in `limit + 1` rows, not clamped to 256. The
+/// effective bound is therefore `max(256, limit + 1)`, and `limit` is itself
+/// bounded by the configured `max_results`.
 const MAX_HYDRATION_CHUNK_ROWS: u32 = 256;
 
-/// Ceiling on the single Phase-A over-fetch, bounding the candidate page's
-/// deserialization cost independently of `limit`.
+/// Ceiling on the single Phase-A over-fetch. Same caveat as
+/// [`MAX_HYDRATION_CHUNK_ROWS`]: `candidate_fetch_size` floors the fetch at one
+/// chunk, so the effective bound is `max(1024, chunk)`. It bounds the candidate
+/// page independently of `limit` only while `limit + 1 <= 1024`; past that the
+/// caller's page size governs, which is the intended trade (a caller asking for
+/// N sessions must be able to receive N).
 const MAX_CANDIDATE_FETCH_ROWS: u32 = 1024;
 
 /// Sessions hydrated per batched round trip:
@@ -242,7 +251,7 @@ impl ClickHouseConversationRepository {
             "SELECT\n    n.session_id AS session_id,\n    n.turn_index AS turn_index,\n    n.is_user_message AS is_user_message,\n    n.actor_kind AS actor_kind,\n    n.event_kind AS event_kind,\n    n.payload_type AS payload_type,\n    n.tool_name AS tool_name,\n    n.source_name AS source_name,\n    n.source_file AS source_file,\n    n.harness AS harness,\n    n.inference_provider AS inference_provider,\n    n.display_time AS display_time,\n    n.event_ts AS event_ts,\n    n.event_uid AS event_uid,\n    {sort_tuple} AS sort_key,\n    sum(if(n.is_user_message = 1, 1, 0)) OVER counter_window AS running_u\n  {from}\n  WHERE n.session_id IN {ids}\n  WINDOW counter_window AS (PARTITION BY n.session_id ORDER BY {sort_tuple} ASC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)"
         );
         format!(
-            "SELECT\n  nav.session_id AS session_id,\n  toUInt64(count()) AS total_events,\n  toUInt64(countIf({umsg})) AS user_messages,\n  toUInt64(countIf({assistant_msg})) AS assistant_messages,\n  toUInt64(countIf(nav.event_kind = 'tool_call')) AS tool_calls,\n  toUInt64(countIf(nav.event_kind = 'tool_result')) AS tool_results,\n  toUInt32(max(nav.turn_index)) AS max_override,\n  toUInt64(argMaxIf(nav.running_u, nav.sort_key, nav.turn_index = 0)) AS counter_user_messages,\n  toString(min(nav.display_time)) AS first_event_time,\n  toInt64(toUnixTimestamp64Milli(min(nav.display_time))) AS first_event_unix_ms,\n  toInt64(toUnixTimestamp64Milli(max(nav.display_time))) AS last_event_unix_ms,\n  ifNull(argMax(nullIf(nav.source_name, ''), {event_ts_tuple}), '') AS source,\n  ifNull(argMax(nullIf(nav.harness, ''), {event_ts_tuple}), '') AS harness,\n  ifNull(argMax(nullIf(nav.inference_provider, ''), {event_ts_tuple}), '') AS inference_provider,\n  ifNull(argMinIf(nullIf(trimBoth(replaceRegexpOne(arrayElement(splitByChar('/', replaceAll(nav.source_file, '\\\\', '/')), -1), '[.]jsonl$', '')), ''), {event_ts_tuple}, nav.source_name = 'omp' AND notEmpty(nav.session_id) AND endsWith(nav.source_file, '.jsonl') AND NOT endsWith(nav.source_file, concat(nav.session_id, '.jsonl'))), '') AS omp_dispatch_title,\n  {mode} AS mode\nFROM (\n  {inner}\n) AS nav\nGROUP BY nav.session_id\nFORMAT JSONEachRow"
+            "SELECT\n  nav.session_id AS session_id,\n  toUInt64(count()) AS total_events,\n  toUInt64(countIf({umsg})) AS user_messages,\n  toUInt64(countIf({assistant_msg})) AS assistant_messages,\n  toUInt64(countIf(nav.event_kind = 'tool_call')) AS tool_calls,\n  toUInt64(countIf(nav.event_kind = 'tool_result')) AS tool_results,\n  toUInt32(max(nav.turn_index)) AS max_override,\n  toUInt64(argMaxIf(nav.running_u, nav.sort_key, nav.turn_index = 0)) AS counter_user_messages,\n  toString(min(nav.display_time)) AS first_event_time,\n  toInt64(toUnixTimestamp64Milli(min(nav.display_time))) AS first_event_unix_ms,\n  toInt64(toUnixTimestamp64Milli(max(nav.display_time))) AS last_event_unix_ms,\n  ifNull(argMinIf(nav.cwd, {event_ts_tuple}, nav.cwd != ''), '') AS origin_cwd,\n  ifNull(argMax(nullIf(nav.source_name, ''), {event_ts_tuple}), '') AS source,\n  ifNull(argMax(nullIf(nav.harness, ''), {event_ts_tuple}), '') AS harness,\n  ifNull(argMax(nullIf(nav.inference_provider, ''), {event_ts_tuple}), '') AS inference_provider,\n  ifNull(argMinIf(nullIf(trimBoth(replaceRegexpOne(arrayElement(splitByChar('/', replaceAll(nav.source_file, '\\\\', '/')), -1), '[.]jsonl$', '')), ''), {event_ts_tuple}, nav.source_name = 'omp' AND notEmpty(nav.session_id) AND endsWith(nav.source_file, '.jsonl') AND NOT endsWith(nav.source_file, concat(nav.session_id, '.jsonl'))), '') AS omp_dispatch_title,\n  {mode} AS mode\nFROM (\n  {inner}\n) AS nav\nGROUP BY nav.session_id\nFORMAT JSONEachRow"
         )
     }
 
@@ -343,6 +352,15 @@ pub(super) struct SessionTotalsBatchRow {
     pub(super) first_event_time: String,
     pub(super) first_event_unix_ms: i64,
     pub(super) last_event_unix_ms: i64,
+    /// The session's origin cwd under the EXACT rule `scope.rs` applies —
+    /// `argMin(cwd, (event_ts, event_uid))` over rows with a non-empty cwd,
+    /// here over the navigation index read `FINAL`. Phase A's
+    /// `argMinIfMerge(origin_cwd_state)` is the same rule merged over the
+    /// directory's live-generation rows, but a `SimpleAggregateFunction`-style
+    /// merge cannot see a superseded version the way `FINAL` can, so scope is
+    /// re-checked against THIS value before a session is served. Scope decides
+    /// what a caller is allowed to see; it must not rest on a recall filter.
+    pub(super) origin_cwd: String,
     pub(super) source: String,
     pub(super) harness: String,
     pub(super) inference_provider: String,
@@ -457,8 +475,16 @@ mod tests {
     /// publication join and prunes nothing, so the statement would scan the
     /// whole `events` table with `FINAL`.
     fn assert_events_scan_is_key_pruned(sql: &str) {
-        let Some(start) = sql.find("(SELECT e.*") else {
+        // Only statements that actually open `events` are in scope…
+        if !sql.contains("`events`") {
             return;
+        }
+        // …and for those, an unrecognized derived-table shape is a FAILURE, not
+        // a pass. Returning early here would let any future shape through
+        // unexamined, which is exactly how the unpruned scan this guard exists
+        // for slipped past the `text_content` grep.
+        let Some(start) = sql.find("(SELECT e.*") else {
+            panic!("events scan is not in the recognized live-events derived-table shape:\n{sql}");
         };
         let body = &sql[start..];
         let end = body
@@ -664,6 +690,10 @@ mod tests {
             "max_override",
             "first_event_time",
             "first_event_unix_ms",
+            // `origin_cwd` is intentionally absent: it is batch-only, hydrated
+            // for the exact project-scope re-check. The single-session builder
+            // has no equivalent because `open(session)` is already scoped
+            // before it runs.
             // `last_event_time` is deliberately absent: the directory path
             // reports the value it orders by (`cand_last_time`), so hydrating
             // the display string here would transfer bytes that are discarded.
