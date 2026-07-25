@@ -479,18 +479,34 @@ async fn list_sessions_semantics_are_identical_on_both_paths() {
             ));
         }
 
-        // Same filter, same fixture corpus: the two readers must agree field
-        // for field, including the minted continuation token. The cursor is
-        // part of the comparison because both paths anchor it on the same
-        // `(updated_at, session_id)` value — that equality is what lets an
-        // in-flight token survive the cutover.
+        // Same filter, same fixture corpus: the two readers must agree on the
+        // session set and on every per-item field.
+        //
+        // The CURSOR is deliberately excluded from that comparison and asserted
+        // to differ instead. The two paths anchor on different values — the
+        // header path on the projector's exact aggregate, the directory path on
+        // the live-generation `max_observed_event_time` it also reports — so a
+        // token is only meaningful to the path that minted it. Comparing the
+        // tokens for equality would re-assert the false premise this test used
+        // to carry, and would fail the moment the anchors legitimately diverge.
         let (reference_path, reference) = &pages[0];
         for (path, page) in &pages[1..] {
             assert_eq!(
-                serde_json::to_value(page).expect("serialize page"),
-                serde_json::to_value(reference).expect("serialize page"),
+                serde_json::to_value(&page.items).expect("serialize items"),
+                serde_json::to_value(&reference.items).expect("serialize items"),
                 "{path:?} diverged from {reference_path:?}"
             );
+            assert_eq!(
+                page.next_cursor.is_some(),
+                reference.next_cursor.is_some(),
+                "{path:?} and {reference_path:?} must agree on whether more pages exist"
+            );
+            if let (Some(theirs), Some(ours)) = (&page.next_cursor, &reference.next_cursor) {
+                assert_ne!(
+                    theirs, ours,
+                    "{path:?} must mint a path-tagged token distinct from {reference_path:?}"
+                );
+            }
         }
     })
     .await;
@@ -1007,9 +1023,16 @@ async fn list_mcp_sessions_accepts_legacy_cursors_and_rejects_unknown_versions()
             URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).expect("re-encode cursor"))
         };
 
-        // A pre-#599 token carries no `version` key and must still resume: the
-        // ordering value is identical under both implementations.
-        let legacy = repo
+        // This repository serves the DIRECTORY path. A pre-#599 token carries
+        // no `version` key, which decodes to the header path's version — so it
+        // is a token this path did not mint, and it must be REFUSED rather
+        // than resumed. The two paths anchor on different values (the header
+        // path on the projector's exact aggregate, the directory path on the
+        // live-generation `max_observed_event_time` it also reports), so
+        // resuming it here would silently skip every session whose two anchors
+        // straddle it — a gap the caller cannot see. A mismatch is recoverable:
+        // restart the feed.
+        let error = repo
             .list_mcp_sessions(
                 filter.clone(),
                 PageRequest {
@@ -1018,9 +1041,30 @@ async fn list_mcp_sessions_accepts_legacy_cursors_and_rejects_unknown_versions()
                 },
             )
             .await
-            .expect("legacy cursor resumes");
-        assert_eq!(legacy.items.len(), 1);
-        assert_eq!(legacy.items[0].session_id, "sess_a");
+            .expect_err("a header-minted token must not resume on the directory path");
+        assert!(
+            error
+                .to_string()
+                .contains("different list_sessions read path"),
+            "cross-path cursor must report a path mismatch, got: {error}"
+        );
+
+        // The path's OWN token still resumes, so the rejection above is about
+        // provenance and not a blanket refusal.
+        let resumed = repo
+            .list_mcp_sessions(
+                filter.clone(),
+                PageRequest {
+                    limit: 2,
+                    // 2 = MCP_SESSION_LIST_CURSOR_VERSION_DIRECTORY (the
+                    // cursor module is crate-private, so the literal stands in
+                    // here the same way the rejected versions below do).
+                    cursor: Some(retoken(Some(2))),
+                },
+            )
+            .await
+            .expect("a directory-minted token resumes on the directory path");
+        assert!(resumed.items.len() <= 2);
 
         for version in [1_u64, 3] {
             let error = repo
