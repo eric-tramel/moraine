@@ -14,14 +14,39 @@ pub struct ConversationCursor {
     pub sort: ConversationListSort,
 }
 
+/// Keyset anchor over `(updated_at, session_id)` for `list_sessions`.
+///
+/// `version` separates the pre-#599 projected-header token (key absent, decoded
+/// as `0`) from the #599 directory token (`2`). Any other value is rejected as
+/// an invalid cursor.
+///
+/// Both are accepted because the anchor is the same `cd::DISPLAY_TIME_EXPR`
+/// maximum under either implementation — the header path projects it, the
+/// directory path re-aggregates it. The two differ only where an event version
+/// has been superseded: the directory's `SimpleAggregateFunction(max)` cannot
+/// retract one, so a v2 anchor can sit above the header path's exact value.
+/// Resuming a v0 token on the directory path may therefore re-serve the
+/// boundary session, the same duplicate class the moving-feed contract already
+/// accepts across a #602 generation replay. WITHIN one implementation the
+/// anchor is always the value that implementation filters on, which is what
+/// makes paging skip-free.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpSessionListCursor {
+    #[serde(default)]
+    pub version: u8,
     pub last_event_unix_ms: i64,
     pub session_id: String,
     pub filter_sig: String,
     #[serde(default)]
     pub sort: ConversationListSort,
 }
+
+/// The token version this build mints.
+pub const MCP_SESSION_LIST_CURSOR_VERSION: u8 = 2;
+
+/// Token versions this build accepts: the legacy header token (`0`) and the
+/// directory token ([`MCP_SESSION_LIST_CURSOR_VERSION`]).
+pub const ACCEPTED_MCP_SESSION_LIST_CURSOR_VERSIONS: [u8; 2] = [0, MCP_SESSION_LIST_CURSOR_VERSION];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TurnCursor {

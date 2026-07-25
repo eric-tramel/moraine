@@ -92,12 +92,23 @@ pub(crate) struct MockOptions {
     pub(crate) repeat_duplicate_search_pages: bool,
     pub(crate) scripted_responses: Vec<ScriptedResponse>,
     pub(crate) query_barrier: Option<QueryBarrier>,
+    /// Verdict for the issue-598 `open_v2` readiness key, which gates the
+    /// issue-599 directory session-listing path. `Some` answers the
+    /// `mcp_read_index_state` probe out of band, so it neither consumes a
+    /// scripted response nor lands in the recorded query log; `None` leaves the
+    /// probe visible to the scripts, which is what the store health tests
+    /// assert on directly.
+    pub(crate) open_v2_reader_ready: Option<bool>,
 }
 
 #[derive(Default)]
 pub(crate) struct MockState {
     pub(crate) queries: Mutex<Vec<String>>,
     pub(crate) publication_snapshot_queries: Mutex<Vec<String>>,
+    /// `mcp_read_index_state` reads answered out of band by
+    /// [`MockOptions::open_v2_reader_ready`]. Kept out of `queries` so the
+    /// per-test statement budgets stay about the operation under test.
+    pub(crate) readiness_probe_queries: Mutex<Vec<String>>,
     pub(crate) query_ids: Mutex<Vec<Option<String>>>,
     pub(crate) request_params: Mutex<Vec<HashMap<String, String>>>,
     pub(crate) options: MockOptions,
@@ -151,6 +162,21 @@ pub(crate) fn test_clickhouse_config(url: String) -> ClickHouseConfig {
         allow_newer_server: false,
     }
 }
+/// The subset of `rows` whose `session_id` appears in a batched statement's
+/// `session_id IN ['…']` array literal — the mock's stand-in for the
+/// primary-key prune the real hydration statements get.
+fn rows_for_requested_sessions(query: &str, rows: &serde_json::Value) -> Vec<serde_json::Value> {
+    rows.as_array()
+        .expect("fixture rows are an array")
+        .iter()
+        .filter(|row| {
+            let session_id = row["session_id"].as_str().unwrap_or_default();
+            query.contains(&format!("'{session_id}'"))
+        })
+        .cloned()
+        .collect()
+}
+
 pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<MockState>) {
     async fn handler(
         State(state): State<Arc<MockState>>,
@@ -233,6 +259,32 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
                     }
                 ])),
             );
+        }
+        // The issue-599 readiness gate probes `mcp_read_index_state` once per
+        // repository before the first session-list page. It is repository
+        // infrastructure like the publication snapshot above, so a mock that
+        // declares a verdict answers it out of band and keeps the per-test
+        // query scripts focused on the operation under test.
+        if let Some(ready) = state.options.open_v2_reader_ready {
+            if query.contains("mcp_read_index_state") {
+                state
+                    .readiness_probe_queries
+                    .lock()
+                    .expect("readiness probe lock")
+                    .push(query.clone());
+                if query.contains("FROM system.tables") {
+                    return (StatusCode::OK, json_each_row(json!([{ "value": "1" }])));
+                }
+                return (
+                    StatusCode::OK,
+                    json_each_row(json!([{
+                        "state_key": "open_v2",
+                        "ready": u8::from(ready),
+                        "generation": "1",
+                        "cursor": ""
+                    }])),
+                );
+            }
         }
         state
             .queries
@@ -488,6 +540,138 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
             );
         }
 
+        // --- issue-599 canonical-first session discovery -------------------
+        // Phase A: the content-free directory candidate page. The same three
+        // fixture sessions the projected-header page serves, so the two paths
+        // can be asserted against identical expectations.
+        if query.contains("FROM `moraine`.`mcp_session_directory` AS d")
+            && query.contains("AS cand_last_ms")
+        {
+            let candidates = json!([
+                { "session_id": "sess_c", "cand_last_ms": 1_767_435_000_000_i64 },
+                { "session_id": "sess_b", "cand_last_ms": 1_767_348_600_000_i64 },
+                { "session_id": "sess_a", "cand_last_ms": 1_767_262_200_000_i64 }
+            ]);
+            let rows = candidates
+                .as_array()
+                .expect("candidate rows")
+                .iter()
+                .filter(|row| {
+                    let session_id = row["session_id"].as_str().unwrap_or_default();
+                    // Honor whichever keyset the page carries.
+                    if query.contains("session_id < 'sess_b'") {
+                        return session_id < "sess_b";
+                    }
+                    if query.contains("session_id > 'sess_b'") {
+                        return session_id > "sess_b";
+                    }
+                    true
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            return (StatusCode::OK, json_each_row(json!(rows)));
+        }
+
+        // Phase B1: batched totals.
+        if query.contains("AS counter_user_messages") && query.contains("GROUP BY nav.session_id") {
+            let totals = json!([
+                {
+                    "session_id": "sess_c",
+                    "total_events": 30_u64,
+                    "tool_calls": 6_u64,
+                    "max_override": 0_u32,
+                    "counter_user_messages": 3_u64,
+                    "first_event_time": "2026-01-03 10:00:00",
+                    "first_event_unix_ms": 1_767_434_400_000_i64,
+                    "last_event_time": "2026-01-03 10:10:00",
+                    "last_event_unix_ms": 1_767_435_000_000_i64,
+                    "source": "codex",
+                    "harness": "codex",
+                    "inference_provider": "openai",
+                    "omp_dispatch_title": "",
+                    "mode": "web_search"
+                },
+                {
+                    "session_id": "sess_b",
+                    "total_events": 22_u64,
+                    "tool_calls": 4_u64,
+                    "max_override": 0_u32,
+                    "counter_user_messages": 2_u64,
+                    "first_event_time": "2026-01-02 10:00:00",
+                    "first_event_unix_ms": 1_767_348_000_000_i64,
+                    "last_event_time": "2026-01-02 10:10:00",
+                    "last_event_unix_ms": 1_767_348_600_000_i64,
+                    "source": "codex",
+                    "harness": "codex",
+                    "inference_provider": "openai",
+                    "omp_dispatch_title": "",
+                    "mode": "web_search"
+                },
+                {
+                    "session_id": "sess_a",
+                    "total_events": 20_u64,
+                    "tool_calls": 2_u64,
+                    "max_override": 0_u32,
+                    "counter_user_messages": 2_u64,
+                    "first_event_time": "2026-01-01 10:00:00",
+                    "first_event_unix_ms": 1_767_261_600_000_i64,
+                    "last_event_time": "2026-01-01 10:10:00",
+                    "last_event_unix_ms": 1_767_262_200_000_i64,
+                    "source": "codex",
+                    "harness": "codex",
+                    "inference_provider": "openai",
+                    "omp_dispatch_title": "",
+                    "mode": "web_search"
+                }
+            ]);
+            return (
+                StatusCode::OK,
+                json_each_row(json!(rows_for_requested_sessions(&query, &totals))),
+            );
+        }
+
+        // Phase B2: batched metadata, bounded to metadata-bearing rows.
+        if query.contains("n.is_metadata_bearing = 1")
+            && query.contains("e.payload_json AS payload_json")
+            && query.contains("WHERE e.session_id IN [")
+        {
+            let metadata = json!([
+                {
+                    "session_id": "sess_c",
+                    "event_ts": "2026-01-03 10:00:00",
+                    "event_uid": "evt-c-meta",
+                    "event_kind": "session_meta",
+                    "payload_json": "{\"title\":\"Session C title\",\"summary\":\"Session C summary\",\"slug\":\"project-c\"}"
+                },
+                {
+                    "session_id": "sess_b",
+                    "event_ts": "2026-01-02 10:00:00",
+                    "event_uid": "evt-b-meta",
+                    "event_kind": "session_meta",
+                    "payload_json": "{\"title\":\"Session B title\",\"summary\":\"Session B summary\",\"slug\":\"project-b\"}"
+                }
+            ]);
+            return (
+                StatusCode::OK,
+                json_each_row(json!(rows_for_requested_sessions(&query, &metadata))),
+            );
+        }
+
+        // Phase B3: batched terminal state.
+        if query.contains("argMax(turn_completed, turn_seq)")
+            && query.contains("GROUP BY session_id, turn_seq")
+        {
+            let terminal = json!([
+                { "session_id": "sess_c", "completed": 1_u8 },
+                { "session_id": "sess_b", "completed": 1_u8 },
+                { "session_id": "sess_a", "completed": 0_u8 }
+            ]);
+            return (
+                StatusCode::OK,
+                json_each_row(json!(rows_for_requested_sessions(&query, &terminal))),
+            );
+        }
+
         if query.contains("FROM `moraine`.`mcp_open_publication_headers` AS h FINAL")
             && query.contains("current_headers AS")
             && query.contains("toUInt8(s.completed) AS completed")
@@ -509,6 +693,8 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
                             "title": "",
                             "source": "codex",
                             "harness": "codex",
+                            "inference_provider": "openai",
+                            "tool_calls": 2,
                             "session_slug": "",
                             "session_summary": ""
                         }
@@ -532,6 +718,8 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
                         "title": "Session C title",
                         "source": "codex",
                         "harness": "codex",
+                        "inference_provider": "openai",
+                        "tool_calls": 6,
                         "originator": "Codex Desktop",
                         "origin_cwd": "/work/acme-secret-merger",
                         "project": "acme-secret-merger",
@@ -551,6 +739,8 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
                         "title": "Session B title",
                         "source": "codex",
                         "harness": "codex",
+                        "inference_provider": "openai",
+                        "tool_calls": 4,
                         "session_slug": "project-b",
                         "session_summary": "Session B summary"
                     },
@@ -567,6 +757,8 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
                         "title": "",
                         "source": "codex",
                         "harness": "codex",
+                        "inference_provider": "openai",
+                        "tool_calls": 2,
                         "session_slug": "",
                         "session_summary": ""
                     }
@@ -2271,6 +2463,7 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
     let state = Arc::new(MockState {
         queries: Mutex::default(),
         publication_snapshot_queries: Mutex::default(),
+        readiness_probe_queries: Mutex::default(),
         query_ids: Mutex::default(),
         request_params: Mutex::default(),
         options,
@@ -2295,7 +2488,16 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
 pub(crate) async fn build_repo_with_max_results(
     max_results: u16,
 ) -> (ClickHouseConversationRepository, Arc<MockState>) {
-    build_repo_with_options(max_results, MockOptions::default()).await
+    build_repo_with_options(
+        max_results,
+        MockOptions {
+            // Not-ready store: session listing stays on the projected-header
+            // path, which is what the pre-#599 fixtures below describe.
+            open_v2_reader_ready: Some(false),
+            ..MockOptions::default()
+        },
+    )
+    .await
 }
 
 pub(crate) async fn build_repo_with_options(
@@ -2337,7 +2539,69 @@ pub(crate) async fn build_repo() -> (ClickHouseConversationRepository, Arc<MockS
 pub(crate) async fn build_scoped_repo(
     roots: &[&str],
 ) -> (ClickHouseConversationRepository, Arc<MockState>) {
-    let (base_url, state) = spawn_mock_server(MockOptions::default()).await;
+    build_scoped_repo_with_readiness(roots, Some(false)).await
+}
+
+/// Repository whose backend reports the issue-598 `open_v2` key ready, so
+/// session listing takes the issue-599 directory path.
+pub(crate) async fn build_directory_repo() -> (ClickHouseConversationRepository, Arc<MockState>) {
+    build_repo_with_options(
+        100,
+        MockOptions {
+            open_v2_reader_ready: Some(true),
+            ..MockOptions::default()
+        },
+    )
+    .await
+}
+
+/// [`build_directory_repo`] with a `--project-only` session origin scope.
+pub(crate) async fn build_scoped_directory_repo(
+    roots: &[&str],
+) -> (ClickHouseConversationRepository, Arc<MockState>) {
+    build_scoped_repo_with_readiness(roots, Some(true)).await
+}
+
+/// [`build_scripted_repo`] against a directory-ready backend.
+pub(crate) async fn build_scripted_directory_repo(
+    scripted_responses: Vec<ScriptedResponse>,
+) -> (ClickHouseConversationRepository, Arc<MockState>) {
+    build_repo_with_options(
+        100,
+        MockOptions {
+            scripted_responses,
+            open_v2_reader_ready: Some(true),
+            ..MockOptions::default()
+        },
+    )
+    .await
+}
+
+/// [`build_scripted_repo`] against a backend whose `open_v2` reader is not
+/// published, so scripts describe the projected-header path.
+pub(crate) async fn build_scripted_header_repo(
+    scripted_responses: Vec<ScriptedResponse>,
+) -> (ClickHouseConversationRepository, Arc<MockState>) {
+    build_repo_with_options(
+        100,
+        MockOptions {
+            scripted_responses,
+            open_v2_reader_ready: Some(false),
+            ..MockOptions::default()
+        },
+    )
+    .await
+}
+
+async fn build_scoped_repo_with_readiness(
+    roots: &[&str],
+    open_v2_reader_ready: Option<bool>,
+) -> (ClickHouseConversationRepository, Arc<MockState>) {
+    let (base_url, state) = spawn_mock_server(MockOptions {
+        open_v2_reader_ready,
+        ..MockOptions::default()
+    })
+    .await;
     let client =
         ClickHouseClient::new(test_clickhouse_config(base_url)).expect("valid clickhouse client");
 

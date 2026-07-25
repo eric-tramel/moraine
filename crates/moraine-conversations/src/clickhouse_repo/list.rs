@@ -1,4 +1,10 @@
+use super::canonical_list::{
+    candidate_fetch_size, hydration_chunk_size, DirectoryCandidateRow, DirectoryPageParams,
+    HydratedSession, SessionMetaBatchRow, SessionTerminalBatchRow, SessionTotalsBatchRow,
+};
+use super::canonical_open::{list_title_and_summary, total_turns_from_parts, MetaRow};
 use super::*;
+use crate::cursor::{ACCEPTED_MCP_SESSION_LIST_CURSOR_VERSIONS, MCP_SESSION_LIST_CURSOR_VERSION};
 
 impl ClickHouseConversationRepository {
     pub(super) async fn list_conversations_impl(
@@ -148,6 +154,20 @@ FORMAT JSONEachRow",
         })
     }
 
+    /// Session DISCOVERY. MCP `list_sessions` pages through it today; the
+    /// monitor feed still reads `list_session_analytics` and moves here in
+    /// WI-03 (issue-599 §1.1), which is why the `mcp_` prefix is already
+    /// historical and the operation carries no MCP-specific behavior.
+    ///
+    /// **Cursor contract (issue-599 §1.2).** The token is a VALUE anchor over
+    /// `(updated_at, session_id)`, not a snapshot. A session that receives
+    /// events while a caller pages moves its `updated_at` ahead of the anchor
+    /// and will not be seen again on a later page; restarting from page 1
+    /// observes the new order. Unrelated appends never invalidate the cursor.
+    /// A session can repeat across a paging run only if its `updated_at` moves
+    /// backwards, which append-only ingest cannot do under a fixed generation
+    /// — across a #602 generation replay it can, and that duplicate is
+    /// accepted rather than de-duplicated with server-side state.
     pub(super) async fn list_mcp_sessions_impl(
         &self,
         filter: McpSessionListFilter,
@@ -158,24 +178,355 @@ FORMAT JSONEachRow",
         let limit = page.normalized_limit(self.cfg.max_results);
         let filter_sig = self.mcp_session_list_filter_sig(&filter);
         let sort = filter.sort;
+        let cursor = Self::decode_session_list_cursor(page.cursor.as_deref(), &filter_sig, sort)?;
 
-        let cursor = if let Some(token) = page.cursor.as_deref() {
-            let cursor: McpSessionListCursor = decode_cursor(token)?;
-            if cursor.filter_sig != filter_sig {
-                return Err(RepoError::invalid_cursor(
-                    "cursor does not match current list_sessions filter",
-                ));
+        // Canonical-first when the issue-598 backfill has published coverage;
+        // otherwise the projected-header path still serves the page. The
+        // fallback is short-lived by design — it is deleted once the live
+        // gates are green (issue-599 open question 4).
+        if self.canonical_list_path_ready().await {
+            self.list_mcp_sessions_directory(&filter, filter_sig, sort, limit, cursor)
+                .await
+        } else {
+            self.list_mcp_sessions_headers(&filter, filter_sig, sort, limit, cursor)
+                .await
+        }
+    }
+
+    /// Decode and validate a `list_sessions` continuation token.
+    ///
+    /// Both cursor versions are accepted (see [`McpSessionListCursor`]); the
+    /// two mismatch messages are contract surface asserted by the tool tests.
+    fn decode_session_list_cursor(
+        token: Option<&str>,
+        filter_sig: &str,
+        sort: ConversationListSort,
+    ) -> RepoResult<Option<McpSessionListCursor>> {
+        let Some(token) = token else {
+            return Ok(None);
+        };
+        let cursor: McpSessionListCursor = decode_cursor(token)?;
+        if !ACCEPTED_MCP_SESSION_LIST_CURSOR_VERSIONS.contains(&cursor.version) {
+            return Err(RepoError::invalid_cursor(format!(
+                "unsupported list_sessions cursor version {}",
+                cursor.version
+            )));
+        }
+        if cursor.filter_sig != filter_sig {
+            return Err(RepoError::invalid_cursor(
+                "cursor does not match current list_sessions filter",
+            ));
+        }
+        if cursor.sort != sort {
+            return Err(RepoError::invalid_cursor(
+                "cursor sort does not match requested sort order",
+            ));
+        }
+        Ok(Some(cursor))
+    }
+
+    fn mint_session_list_cursor(
+        last_event_unix_ms: i64,
+        session_id: &str,
+        filter_sig: String,
+        sort: ConversationListSort,
+    ) -> RepoResult<String> {
+        encode_cursor(&McpSessionListCursor {
+            version: MCP_SESSION_LIST_CURSOR_VERSION,
+            last_event_unix_ms,
+            session_id: session_id.to_string(),
+            filter_sig,
+            sort,
+        })
+    }
+
+    /// The issue-599 canonical-first discovery page: content-free candidate
+    /// selection from `mcp_session_directory` (Phase A), batched hydration of
+    /// the bounded candidate chunks (Phase B), then the exact re-filter, title
+    /// fold, trim, and cursor mint (Phase C).
+    ///
+    /// **Phase A runs exactly once.** Its keyset predicate is post-aggregation
+    /// and the directory's sort key leads with `session_id`, so re-running it
+    /// with an advanced keyset would re-aggregate the whole directory without
+    /// pruning anything. The single pass therefore over-fetches the page's
+    /// entire hydration budget ([`candidate_fetch_size`]) and only HYDRATION is
+    /// chunked. Worst case per page: `1 + MAX_HYDRATION_CHUNKS × 3 = 13`
+    /// statements.
+    ///
+    /// Chunked hydration exists because the directory's recall filters are
+    /// inexact: a chunk can be eliminated wholesale by the exact re-filter and
+    /// the page must still make progress. When the budget runs out with
+    /// candidates remaining, the page returns what survived WITH a continuation
+    /// cursor (possibly on an empty `items`) rather than a short page that
+    /// reads as "no more results".
+    async fn list_mcp_sessions_directory(
+        &self,
+        filter: &McpSessionListFilter,
+        filter_sig: String,
+        sort: ConversationListSort,
+        limit: u16,
+        cursor: Option<McpSessionListCursor>,
+    ) -> RepoResult<Page<McpSessionListItem>> {
+        let fetch = candidate_fetch_size(limit);
+        let sql = {
+            let params = DirectoryPageParams {
+                start_unix_ms: filter.start_unix_ms,
+                end_unix_ms: filter.end_unix_ms,
+                mode: filter.mode,
+                harness: filter.harness.as_deref(),
+                source_name: filter.source_name.as_deref(),
+                sort,
+                after: cursor
+                    .as_ref()
+                    .map(|cursor| (cursor.last_event_unix_ms, cursor.session_id.as_str())),
+                limit: fetch,
+            };
+            self.build_session_directory_page_sql(&params)
+        };
+        let candidates: Vec<DirectoryCandidateRow> =
+            self.map_backend(self.query_rows(&sql, None).await)?;
+        // A short candidate page proves the directory holds nothing further
+        // under this filter and keyset.
+        let directory_exhausted = candidates.len() < fetch as usize;
+
+        let mut survivors: Vec<SurvivingCandidate> = Vec::new();
+        let mut last_resolved: Option<(i64, String)> = None;
+        for batch in candidates.chunks(hydration_chunk_size(limit) as usize) {
+            if survivors.len() > usize::from(limit) {
+                // The page is full and provably has more; the untouched tail of
+                // the over-fetch is resolved by the next request.
+                break;
             }
-            if cursor.sort != sort {
-                return Err(RepoError::invalid_cursor(
-                    "cursor sort does not match requested sort order",
-                ));
+            let session_ids: Vec<String> = batch
+                .iter()
+                .map(|candidate| candidate.session_id.clone())
+                .collect();
+            let hydrated = self.hydrate_session_list_chunk(&session_ids).await?;
+            survivors.extend(
+                batch
+                    .iter()
+                    .filter_map(|candidate| Self::session_list_item(candidate, &hydrated, filter)),
+            );
+            last_resolved = batch
+                .last()
+                .map(|candidate| (candidate.cand_last_ms, candidate.session_id.clone()));
+        }
+
+        // Phase A ordered CANDIDATES; hydration is unordered, so re-establish
+        // the keyset order here — on the directory value Phase A ordered and
+        // filtered by, never on the hydrated timestamp, which the next page's
+        // `HAVING` cannot compare against (see `DirectoryCandidateRow`).
+        survivors.sort_by(|a, b| {
+            let ordering = a
+                .keyset_ms
+                .cmp(&b.keyset_ms)
+                .then_with(|| a.item.session_id.cmp(&b.item.session_id));
+            match sort {
+                ConversationListSort::Desc => ordering.reverse(),
+                ConversationListSort::Asc => ordering,
             }
-            Some(cursor)
+        });
+        let has_more_survivors = survivors.len() > usize::from(limit);
+        survivors.truncate(usize::from(limit));
+
+        let next_cursor = if has_more_survivors {
+            // Anchored on the LAST KEPT item, so the trailing survivors this
+            // page dropped are served by the next one.
+            survivors
+                .last()
+                .map(|survivor| {
+                    Self::mint_session_list_cursor(
+                        survivor.keyset_ms,
+                        &survivor.item.session_id,
+                        filter_sig,
+                        sort,
+                    )
+                })
+                .transpose()?
+        } else if !directory_exhausted {
+            // The hydration budget ran out with directory candidates left, so
+            // the page returns short (possibly empty) but WITH a continuation.
+            //
+            // The anchor is the last RESOLVED CANDIDATE, not the last kept
+            // item: every candidate up to it has already been hydrated and
+            // judged, so resuming strictly after it loses nothing, and it is
+            // what guarantees forward progress. Anchoring on the last kept item
+            // instead would make the next request re-examine the same rejects
+            // and, when a filter is selective enough to eliminate the whole
+            // budget, hand back the identical cursor forever.
+            last_resolved
+                .as_ref()
+                .map(|(last_ms, session_id)| {
+                    Self::mint_session_list_cursor(*last_ms, session_id, filter_sig, sort)
+                })
+                .transpose()?
         } else {
             None
         };
 
+        Ok(Page {
+            items: survivors
+                .into_iter()
+                .map(|survivor| survivor.item)
+                .collect(),
+            next_cursor,
+        })
+    }
+
+    /// Phase B (issue-599 §1.4): three batched statements hydrate the whole
+    /// candidate chunk. Never a per-session loop — 3 × K sequential round trips
+    /// cannot fit a 3 s tool deadline.
+    async fn hydrate_session_list_chunk(
+        &self,
+        session_ids: &[String],
+    ) -> RepoResult<HashMap<String, HydratedSession>> {
+        if session_ids.is_empty() {
+            return Ok(HashMap::default());
+        }
+        let totals_sql = self.build_session_totals_batch_sql(session_ids);
+        let totals: Vec<SessionTotalsBatchRow> =
+            self.map_backend(self.query_rows(&totals_sql, None).await)?;
+        let mut hydrated: HashMap<String, HydratedSession> = totals
+            .into_iter()
+            .map(|totals| {
+                (
+                    totals.session_id.clone(),
+                    HydratedSession {
+                        totals,
+                        metadata: Vec::new(),
+                        completed: false,
+                    },
+                )
+            })
+            .collect();
+        // Every candidate failed the published-generation join: nothing to
+        // hydrate, and the two remaining statements would read nothing.
+        if hydrated.is_empty() {
+            return Ok(hydrated);
+        }
+
+        let metadata_sql = self.build_session_metadata_batch_sql(session_ids);
+        let metadata: Vec<SessionMetaBatchRow> =
+            self.map_backend(self.query_rows(&metadata_sql, None).await)?;
+        for row in metadata {
+            if let Some(session) = hydrated.get_mut(&row.session_id) {
+                session.metadata.push(MetaRow {
+                    event_ts: row.event_ts,
+                    event_uid: row.event_uid,
+                    event_kind: row.event_kind,
+                    payload_json: row.payload_json,
+                });
+            }
+        }
+
+        let terminal_sql = self.build_session_terminal_batch_sql(session_ids);
+        let terminal: Vec<SessionTerminalBatchRow> =
+            self.map_backend(self.query_rows(&terminal_sql, None).await)?;
+        for row in terminal {
+            if let Some(session) = hydrated.get_mut(&row.session_id) {
+                session.completed = row.completed != 0;
+            }
+        }
+
+        Ok(hydrated)
+    }
+
+    /// Phase C (issue-599 §1.5): re-apply the exact filters to one candidate's
+    /// hydrated values and fold it into a list item, or drop it. The candidate's
+    /// keyset value travels with the item because ordering and cursor minting
+    /// must read it, not the hydrated timestamp.
+    fn session_list_item(
+        candidate: &DirectoryCandidateRow,
+        hydrated: &HashMap<String, HydratedSession>,
+        filter: &McpSessionListFilter,
+    ) -> Option<SurvivingCandidate> {
+        let session_id = candidate.session_id.as_str();
+        // Belt-and-braces with the SQL guard: a blank session_id never appears,
+        // never consumes a LIMIT slot, and never anchors a cursor. mcp-core
+        // applies the same `trim().is_empty()` rejection and the two halves
+        // must agree, or the contiguous-`rank` and `result_count` invariants
+        // break.
+        if session_id.trim().is_empty() {
+            return None;
+        }
+        // A candidate with no live navigation rows under the pinned
+        // publication has no totals row at all — the canonical replacement for
+        // the retired `tombstone` column (issue-599 §2.7).
+        let session = hydrated.get(session_id)?;
+        let totals = &session.totals;
+        if totals.total_events == 0 {
+            return None;
+        }
+        // The directory aggregates ALL generations while hydration is
+        // published-filtered, so re-check the overlap on the exact bounds: a
+        // session whose only in-window generation is unpublished drops here.
+        if totals.last_event_unix_ms < filter.start_unix_ms
+            || totals.first_event_unix_ms >= filter.end_unix_ms
+        {
+            return None;
+        }
+        // Exact, case-sensitive equality against the hydrated aggregates: the
+        // directory's `mode_hint` / `groupUniqArray` predicates are recall
+        // filters only. Project scope is NOT re-applied — Phase A's
+        // `argMinIfMerge(origin_cwd_state)` is already the exact rule.
+        if filter.mode.is_some_and(|mode| totals.mode != mode.as_str()) {
+            return None;
+        }
+        if filter
+            .harness
+            .as_deref()
+            .is_some_and(|harness| totals.harness != harness)
+        {
+            return None;
+        }
+        if filter
+            .source_name
+            .as_deref()
+            .is_some_and(|source_name| totals.source != source_name)
+        {
+            return None;
+        }
+
+        let precedence = session.precedence();
+        let (title, session_summary) = list_title_and_summary(&totals.source, &precedence);
+        Some(SurvivingCandidate {
+            keyset_ms: candidate.cand_last_ms,
+            item: McpSessionListItem {
+                session_id: session_id.to_string(),
+                first_event_time: totals.first_event_time.clone(),
+                first_event_unix_ms: totals.first_event_unix_ms,
+                last_event_time: totals.last_event_time.clone(),
+                last_event_unix_ms: totals.last_event_unix_ms,
+                total_turns: total_turns_from_parts(
+                    totals.total_events,
+                    totals.max_override,
+                    totals.counter_user_messages,
+                ),
+                total_events: totals.total_events,
+                mode: Self::parse_mode(&totals.mode),
+                completed: session.completed,
+                title: non_empty_string(title),
+                source: non_empty_string(totals.source.clone()),
+                harness: non_empty_string(totals.harness.clone()),
+                inference_provider: non_empty_string(totals.inference_provider.clone()),
+                session_slug: non_empty_string(precedence.session_slug),
+                session_summary: non_empty_string(session_summary),
+                tool_calls: totals.tool_calls,
+            },
+        })
+    }
+
+    /// The pre-#599 projected-header discovery page, kept behind the
+    /// canonical read-index readiness gate for stores whose issue-598 backfill
+    /// has not published coverage yet.
+    async fn list_mcp_sessions_headers(
+        &self,
+        filter: &McpSessionListFilter,
+        filter_sig: String,
+        sort: ConversationListSort,
+        limit: u16,
+        cursor: Option<McpSessionListCursor>,
+    ) -> RepoResult<Page<McpSessionListItem>> {
         let snapshot = require_active_publication_snapshot("projected MCP session list reads");
         let headers = self.table_ref("mcp_open_publication_headers");
         let history = self.table_ref("v_published_source_generation_history");
@@ -289,9 +640,11 @@ SELECT
   toUInt64(s.total_events) AS total_events,
   s.mode AS mode,
   toUInt8(s.completed) AS completed,
+  toUInt64(s.tool_calls) AS tool_calls,
   s.list_title AS title,
   s.source AS source,
   s.harness AS harness,
+  s.inference_provider AS inference_provider,
   s.session_slug AS session_slug,
   s.list_session_summary AS session_summary
 FROM current_headers AS s
@@ -317,16 +670,17 @@ FORMAT JSONEachRow",
             .collect();
 
         let next_cursor = if rows.len() > limit as usize {
-            if let Some(last) = items.last() {
-                Some(encode_cursor(&McpSessionListCursor {
-                    last_event_unix_ms: last.last_event_unix_ms,
-                    session_id: last.session_id.clone(),
-                    filter_sig,
-                    sort,
-                })?)
-            } else {
-                None
-            }
+            items
+                .last()
+                .map(|last| {
+                    Self::mint_session_list_cursor(
+                        last.last_event_unix_ms,
+                        &last.session_id,
+                        filter_sig,
+                        sort,
+                    )
+                })
+                .transpose()?
         } else {
             None
         };
@@ -571,4 +925,14 @@ FORMAT JSONEachRow",
         let items = rows.into_iter().map(Self::map_trace_event).collect();
         Ok(Page { items, next_cursor })
     }
+}
+
+/// A Phase-A candidate that survived Phase C, paired with the directory keyset
+/// value it was selected by. `keyset_ms` — not `item.last_event_unix_ms` —
+/// orders the page and mints the continuation cursor, because it is the only
+/// value the next page's Phase A can filter on
+/// ([`DirectoryCandidateRow::cand_last_ms`]).
+struct SurvivingCandidate {
+    keyset_ms: i64,
+    item: McpSessionListItem,
 }

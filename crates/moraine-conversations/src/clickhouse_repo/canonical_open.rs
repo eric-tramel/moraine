@@ -266,7 +266,7 @@ impl ClickHouseConversationRepository {
     /// granule pruning on the navigation primary key, so
     /// [`Self::build_navigation_window_sql`] filters the pinned heads with a
     /// tuple-`IN` predicate instead and deduplicates versions client-side.
-    fn navigation_live_from(&self) -> String {
+    pub(super) fn navigation_live_from(&self) -> String {
         let nav = self.table_ref("mcp_event_navigation");
         let published = self.published_generations_subquery();
         format!(
@@ -276,7 +276,7 @@ impl ClickHouseConversationRepository {
 
     /// The navigation ordering tuple (the primary key with `sort_time`
     /// substituted for event_time) qualified to alias `n`.
-    fn navigation_sort_tuple(alias: &str) -> String {
+    pub(super) fn navigation_sort_tuple(alias: &str) -> String {
         format!(
             "tuple({a}.sort_time, {a}.source_host, {a}.source_file, {a}.source_generation, {a}.source_offset, {a}.source_line_no, {a}.event_uid)",
             a = alias
@@ -771,21 +771,36 @@ fn json_field(payload_json: &str, key: &str) -> String {
 }
 
 #[derive(Debug, Clone, Default)]
-struct MetadataPrecedence {
-    latest_metadata_title: String,
-    latest_metadata_name: String,
-    latest_metadata_summary: String,
-    session_slug: String,
-    omp_dispatch_title: String,
+pub(super) struct MetadataPrecedence {
+    pub(super) latest_metadata_title: String,
+    pub(super) latest_metadata_name: String,
+    pub(super) latest_metadata_summary: String,
+    /// LIST-only input: latest non-empty `coalesce(title, name, summary)` over
+    /// `session_meta` rows only (projector `latest_session_meta_title`).
+    pub(super) latest_session_meta_title: String,
+    /// LIST-only input: latest non-empty `coalesce(summary, title, name)` over
+    /// `session_meta` rows only (projector `latest_session_meta_summary`).
+    pub(super) latest_session_meta_summary: String,
+    pub(super) session_slug: String,
+    pub(super) omp_dispatch_title: String,
 }
 
-/// Reproduce the projector's OPEN metadata-precedence inputs
-/// (`projection.rs`) in Rust over the bounded metadata-bearing rows: latest
-/// non-empty per field by `(event_ts, event_uid)`, session-meta-only for
-/// name/summary/slug. The omp dispatch-title fallback is NOT derived here —
-/// v1 computes it over all canonical rows, so the caller seeds it from the
-/// session-totals pass (which scans every navigation row).
-fn metadata_precedence(rows: &[MetaRow]) -> MetadataPrecedence {
+/// Reproduce the projector's metadata-precedence inputs
+/// (`cd::session_header_rollup_columns`) in Rust over the bounded
+/// metadata-bearing rows: latest non-empty per field by `(event_ts,
+/// event_uid)`, session-meta-only for name/summary/slug and for the two
+/// `latest_session_meta_*` LIST inputs. The omp dispatch-title fallback is NOT
+/// derived here — v1 computes it over all canonical rows, so the caller seeds
+/// it from the session-totals pass (which scans every navigation row).
+///
+/// The two `latest_session_meta_*` fields are per-row coalesces resolved BEFORE
+/// the latest-wins selection, exactly as the projector's
+/// `argMaxIf(coalesce(...), tuple(event_ts, event_uid), event_kind =
+/// 'session_meta')` does. They are therefore NOT aliases of
+/// `latest_metadata_title` / `latest_metadata_summary`: a later `session_meta`
+/// row carrying only a `name` overrides an earlier row's `title` here, and the
+/// summary chain falls through to `title`/`name` on the same row.
+pub(super) fn metadata_precedence(rows: &[MetaRow]) -> MetadataPrecedence {
     let mut ordered: Vec<&MetaRow> = rows.iter().collect();
     ordered.sort_by(|a, b| {
         (a.event_ts.as_str(), a.event_uid.as_str())
@@ -795,55 +810,53 @@ fn metadata_precedence(rows: &[MetaRow]) -> MetadataPrecedence {
     for row in ordered {
         let title = json_field(&row.payload_json, "title");
         if !title.is_empty() {
-            precedence.latest_metadata_title = title;
+            precedence.latest_metadata_title = title.clone();
         }
         if row.event_kind == "session_meta" {
             let name = json_field(&row.payload_json, "name");
             if !name.is_empty() {
-                precedence.latest_metadata_name = name;
+                precedence.latest_metadata_name = name.clone();
             }
             let summary = json_field(&row.payload_json, "summary");
             if !summary.is_empty() {
-                precedence.latest_metadata_summary = summary;
+                precedence.latest_metadata_summary = summary.clone();
             }
             let slug = json_field(&row.payload_json, "slug");
             if !slug.is_empty() {
                 precedence.session_slug = slug;
+            }
+            let meta_title = first_non_empty(&[&title, &name, &summary]);
+            if !meta_title.is_empty() {
+                precedence.latest_session_meta_title = meta_title;
+            }
+            let meta_summary = first_non_empty(&[&summary, &title, &name]);
+            if !meta_summary.is_empty() {
+                precedence.latest_session_meta_summary = meta_summary;
             }
         }
     }
     precedence
 }
 
+/// The first non-empty candidate, or the empty string — the Rust form of the
+/// projector's `coalesce(nullIf(x, ''), …, '')` chains.
+fn first_non_empty(candidates: &[&str]) -> String {
+    candidates
+        .iter()
+        .find(|value| !value.is_empty())
+        .map(|value| (*value).to_string())
+        .unwrap_or_default()
+}
+
 /// The projector's OPEN title/summary coalesce chains (`projection.rs`):
 /// omp sources fall through to the dispatch title, non-omp sources do not.
 fn open_title_and_summary(source: &str, p: &MetadataPrecedence) -> (String, String) {
-    let coalesce = |candidates: &[&str]| -> String {
-        candidates
-            .iter()
-            .find(|value| !value.is_empty())
-            .map(|value| value.to_string())
-            .unwrap_or_default()
-    };
     let (title, summary) = if source == "omp" {
-        (
-            coalesce(&[
-                &p.latest_metadata_title,
-                &p.latest_metadata_name,
-                &p.latest_metadata_summary,
-                &p.omp_dispatch_title,
-            ]),
-            coalesce(&[
-                &p.latest_metadata_summary,
-                &p.latest_metadata_title,
-                &p.latest_metadata_name,
-                &p.omp_dispatch_title,
-            ]),
-        )
+        omp_title_and_summary(p)
     } else {
         (
-            coalesce(&[&p.latest_metadata_title, &p.latest_metadata_name]),
-            coalesce(&[
+            first_non_empty(&[&p.latest_metadata_title, &p.latest_metadata_name]),
+            first_non_empty(&[
                 &p.latest_metadata_summary,
                 &p.latest_metadata_title,
                 &p.latest_metadata_name,
@@ -851,6 +864,43 @@ fn open_title_and_summary(source: &str, p: &MetadataPrecedence) -> (String, Stri
         )
     };
     (title, summary)
+}
+
+/// The projector's LIST title/summary chains — `list_title` /
+/// `list_session_summary` in the `mcp_open_publication_headers` INSERT
+/// (`mcp_open_projection.rs`, golden
+/// `testdata/projector_golden/projected_publication_header.sql`). Migration
+/// `sql/035_mcp_list_metadata_projection.sql` exists precisely to preserve this
+/// divergence from [`open_title_and_summary`]: the omp branch is shared, while
+/// the non-omp branch reads the session-meta-only inputs instead of the
+/// metadata-bearing ones (so an OMP `title`/`title_change` payload on a
+/// non-omp source cannot become a listed title).
+pub(super) fn list_title_and_summary(source: &str, p: &MetadataPrecedence) -> (String, String) {
+    if source == "omp" {
+        return omp_title_and_summary(p);
+    }
+    (
+        p.latest_session_meta_title.clone(),
+        p.latest_session_meta_summary.clone(),
+    )
+}
+
+/// The omp branch, shared byte-for-byte by the OPEN and LIST chains.
+fn omp_title_and_summary(p: &MetadataPrecedence) -> (String, String) {
+    (
+        first_non_empty(&[
+            &p.latest_metadata_title,
+            &p.latest_metadata_name,
+            &p.latest_metadata_summary,
+            &p.omp_dispatch_title,
+        ]),
+        first_non_empty(&[
+            &p.latest_metadata_summary,
+            &p.latest_metadata_title,
+            &p.latest_metadata_name,
+            &p.omp_dispatch_title,
+        ]),
+    )
 }
 
 /// A per-event preview from a hydrated wide row: `text_content` if present,
@@ -2412,6 +2462,145 @@ mod tests {
         assert!(sql.contains("prefix_user_message_count"));
         assert!(sql.contains("WHERE n.session_id = 'session-a'"));
         assert!(sql.contains("n.sort_time <= fromUnixTimestamp64Milli"));
+    }
+
+    // --- metadata precedence: OPEN vs LIST (issue-599 §2.6) ----------------
+
+    fn meta_row(event_ts: &str, event_uid: &str, event_kind: &str, payload: Value) -> MetaRow {
+        MetaRow {
+            event_ts: event_ts.to_string(),
+            event_uid: event_uid.to_string(),
+            event_kind: event_kind.to_string(),
+            payload_json: payload.to_string(),
+        }
+    }
+
+    #[test]
+    fn session_meta_inputs_coalesce_per_row_before_latest_wins() {
+        // The projector's `latest_session_meta_*` are
+        // `argMaxIf(coalesce(...), tuple(event_ts, event_uid), event_kind =
+        // 'session_meta')`: the coalesce resolves PER ROW, then the latest
+        // non-empty result wins. They are therefore NOT aliases of
+        // `latest_metadata_title` / `latest_metadata_summary`.
+        let precedence = metadata_precedence(&[
+            meta_row(
+                "2026-01-01 00:00:00",
+                "evt-1",
+                "session_meta",
+                json!({ "title": "Earlier title" }),
+            ),
+            meta_row(
+                "2026-01-02 00:00:00",
+                "evt-2",
+                "session_meta",
+                json!({ "name": "Later name" }),
+            ),
+        ]);
+        assert_eq!(precedence.latest_metadata_title, "Earlier title");
+        assert_eq!(precedence.latest_metadata_name, "Later name");
+        assert_eq!(precedence.latest_session_meta_title, "Later name");
+        assert_eq!(precedence.latest_session_meta_summary, "Later name");
+    }
+
+    #[test]
+    fn omp_title_payloads_never_reach_the_session_meta_inputs() {
+        // `is_metadata_bearing` also admits omp `title`/`title_change`
+        // payloads. They feed `latest_metadata_title` (and so the OPEN chain)
+        // but must not feed the session-meta-only LIST inputs.
+        let precedence = metadata_precedence(&[
+            meta_row(
+                "2026-01-01 00:00:00",
+                "evt-1",
+                "session_meta",
+                json!({ "slug": "the-slug", "summary": "Meta summary" }),
+            ),
+            meta_row(
+                "2026-01-02 00:00:00",
+                "evt-2",
+                "event_msg",
+                json!({ "type": "title_change", "title": "Dispatch retitle" }),
+            ),
+        ]);
+        assert_eq!(precedence.latest_metadata_title, "Dispatch retitle");
+        assert_eq!(precedence.latest_session_meta_title, "Meta summary");
+        assert_eq!(precedence.session_slug, "the-slug");
+    }
+
+    /// A `MetadataPrecedence` with only the named fields populated.
+    fn precedence(
+        metadata_title: &str,
+        metadata_name: &str,
+        metadata_summary: &str,
+        session_meta_title: &str,
+        session_meta_summary: &str,
+        omp_dispatch_title: &str,
+    ) -> MetadataPrecedence {
+        MetadataPrecedence {
+            latest_metadata_title: metadata_title.to_string(),
+            latest_metadata_name: metadata_name.to_string(),
+            latest_metadata_summary: metadata_summary.to_string(),
+            latest_session_meta_title: session_meta_title.to_string(),
+            latest_session_meta_summary: session_meta_summary.to_string(),
+            session_slug: String::new(),
+            omp_dispatch_title: omp_dispatch_title.to_string(),
+        }
+    }
+
+    #[test]
+    fn list_and_open_chains_agree_for_omp_and_diverge_for_everything_else() {
+        // (metadata_title, metadata_name, metadata_summary,
+        //  session_meta_title, session_meta_summary, omp_dispatch_title)
+        //  -> expected non-omp LIST (title, summary)
+        let cases: [(MetadataPrecedence, (&str, &str)); 5] = [
+            // title only
+            (precedence("T", "", "", "T", "T", "Dispatch"), ("T", "T")),
+            // summary only
+            (precedence("", "", "S", "S", "S", "Dispatch"), ("S", "S")),
+            // name only
+            (precedence("", "N", "", "N", "N", "Dispatch"), ("N", "N")),
+            // dispatch title only: the non-omp chain must NOT fall through to it
+            (precedence("", "", "", "", "", "Dispatch"), ("", "")),
+            // all empty
+            (precedence("", "", "", "", "", ""), ("", "")),
+        ];
+        for (input, expected_list) in cases {
+            let (list_title, list_summary) = list_title_and_summary("codex", &input);
+            assert_eq!(
+                (list_title.as_str(), list_summary.as_str()),
+                expected_list,
+                "non-omp LIST chain for {input:?}"
+            );
+            // The omp branch is shared byte-for-byte by both chains.
+            assert_eq!(
+                list_title_and_summary("omp", &input),
+                open_title_and_summary("omp", &input),
+                "omp branch must not diverge for {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn list_chain_diverges_from_open_where_the_golden_says_it_does() {
+        // Non-omp, latest session_meta row carries only a `name`: OPEN keeps
+        // the earlier `title` (its chain reads `latest_metadata_title` first),
+        // LIST takes the later per-row coalesce. Getting this backwards
+        // silently changes every listed title.
+        let input = precedence(
+            "Earlier title",
+            "Later name",
+            "",
+            "Later name",
+            "Later name",
+            "",
+        );
+        assert_eq!(
+            open_title_and_summary("codex", &input),
+            ("Earlier title".to_string(), "Earlier title".to_string())
+        );
+        assert_eq!(
+            list_title_and_summary("codex", &input),
+            ("Later name".to_string(), "Later name".to_string())
+        );
     }
 
     #[test]
