@@ -593,55 +593,58 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
         // Phase B1: batched totals.
         if query.contains("AS counter_user_messages") && query.contains("GROUP BY nav.session_id") {
             let totals = json!([
-                {
-                    "session_id": "sess_c",
-                    "total_events": 30_u64,
-                    "tool_calls": 6_u64,
-                    "max_override": 0_u32,
-                    "counter_user_messages": 3_u64,
-                    "first_event_time": "2026-01-03 10:00:00",
-                    "first_event_unix_ms": 1_767_434_400_000_i64,
-                    "last_event_time": "2026-01-03 10:10:00",
-                    "last_event_unix_ms": 1_767_435_000_000_i64,
-                    "source": "codex",
-                    "harness": "codex",
-                    "inference_provider": "openai",
-                    "omp_dispatch_title": "",
-                    "mode": "web_search"
-                },
-                {
-                    "session_id": "sess_b",
-                    "total_events": 22_u64,
-                    "tool_calls": 4_u64,
-                    "max_override": 0_u32,
-                    "counter_user_messages": 2_u64,
-                    "first_event_time": "2026-01-02 10:00:00",
-                    "first_event_unix_ms": 1_767_348_000_000_i64,
-                    "last_event_time": "2026-01-02 10:10:00",
-                    "last_event_unix_ms": 1_767_348_600_000_i64,
-                    "source": "codex",
-                    "harness": "codex",
-                    "inference_provider": "openai",
-                    "omp_dispatch_title": "",
-                    "mode": "web_search"
-                },
-                {
-                    "session_id": "sess_a",
-                    "total_events": 20_u64,
-                    "tool_calls": 2_u64,
-                    "max_override": 0_u32,
-                    "counter_user_messages": 2_u64,
-                    "first_event_time": "2026-01-01 10:00:00",
-                    "first_event_unix_ms": 1_767_261_600_000_i64,
-                    "last_event_time": "2026-01-01 10:10:00",
-                    "last_event_unix_ms": 1_767_262_200_000_i64,
-                    "source": "codex",
-                    "harness": "codex",
-                    "inference_provider": "openai",
-                    "omp_dispatch_title": "",
-                    "mode": "web_search"
-                }
-            ]);
+                    {
+                        "session_id": "sess_c",
+                        "total_events": 30_u64,
+                        "tool_calls": 6_u64,
+                        "max_override": 0_u32,
+                        "counter_user_messages": 3_u64,
+                        "first_event_time": "2026-01-03 10:00:00",
+                        "first_event_unix_ms": 1_767_434_400_000_i64,
+                        "last_event_time": "2026-01-03 10:10:00",
+                        "last_event_unix_ms": 1_767_435_000_000_i64,
+                        "origin_cwd": "/repo",
+            "source": "codex",
+                        "harness": "codex",
+                        "inference_provider": "openai",
+                        "omp_dispatch_title": "",
+                        "mode": "web_search"
+                    },
+                    {
+                        "session_id": "sess_b",
+                        "total_events": 22_u64,
+                        "tool_calls": 4_u64,
+                        "max_override": 0_u32,
+                        "counter_user_messages": 2_u64,
+                        "first_event_time": "2026-01-02 10:00:00",
+                        "first_event_unix_ms": 1_767_348_000_000_i64,
+                        "last_event_time": "2026-01-02 10:10:00",
+                        "last_event_unix_ms": 1_767_348_600_000_i64,
+                        "origin_cwd": "/repo",
+            "source": "codex",
+                        "harness": "codex",
+                        "inference_provider": "openai",
+                        "omp_dispatch_title": "",
+                        "mode": "web_search"
+                    },
+                    {
+                        "session_id": "sess_a",
+                        "total_events": 20_u64,
+                        "tool_calls": 2_u64,
+                        "max_override": 0_u32,
+                        "counter_user_messages": 2_u64,
+                        "first_event_time": "2026-01-01 10:00:00",
+                        "first_event_unix_ms": 1_767_261_600_000_i64,
+                        "last_event_time": "2026-01-01 10:10:00",
+                        "last_event_unix_ms": 1_767_262_200_000_i64,
+                        "origin_cwd": "/repo",
+            "source": "codex",
+                        "harness": "codex",
+                        "inference_provider": "openai",
+                        "omp_dispatch_title": "",
+                        "mode": "web_search"
+                    }
+                ]);
             return (
                 StatusCode::OK,
                 json_each_row(json!(rows_for_requested_sessions(&query, &totals))),
@@ -698,89 +701,93 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
                 return (
                     StatusCode::OK,
                     json_each_row(json!([
-                        {
-                            "session_id": "sess_a",
-                            "first_event_time": "2026-01-01 10:00:00",
-                            "first_event_unix_ms": 1767261600000_i64,
-                            "last_event_time": "2026-01-01 10:10:00",
-                            "last_event_unix_ms": 1767262200000_i64,
-                            "total_turns": 2,
-                            "total_events": 20,
-                            "mode": "web_search",
-                            "completed": 0_u8,
-                            "title": "",
-                            "source": "codex",
-                            "harness": "codex",
-                            "inference_provider": "openai",
-                            "tool_calls": 2,
-                            "session_slug": "",
-                            "session_summary": ""
-                        }
-                    ])),
+                                    {
+                                        "session_id": "sess_a",
+                                        "first_event_time": "2026-01-01 10:00:00",
+                                        "first_event_unix_ms": 1767261600000_i64,
+                                        "last_event_time": "2026-01-01 10:10:00",
+                                        "last_event_unix_ms": 1767262200000_i64,
+                                        "total_turns": 2,
+                                        "total_events": 20,
+                                        "mode": "web_search",
+                                        "completed": 0_u8,
+                                        "title": "",
+                                        "origin_cwd": "/repo",
+                    "source": "codex",
+                                        "harness": "codex",
+                                        "inference_provider": "openai",
+                                        "tool_calls": 2,
+                                        "session_slug": "",
+                                        "session_summary": ""
+                                    }
+                                ])),
                 );
             }
 
             return (
                 StatusCode::OK,
                 json_each_row(json!([
-                    {
-                        "session_id": "sess_c",
-                        "first_event_time": "2026-01-03 10:00:00",
-                        "first_event_unix_ms": 1767434400000_i64,
-                        "last_event_time": "2026-01-03 10:10:00",
-                        "last_event_unix_ms": 1767435000000_i64,
-                        "total_turns": 3,
-                        "total_events": 30,
-                        "mode": "web_search",
-                        "completed": 1_u8,
-                        "title": "Session C title",
-                        "source": "codex",
-                        "harness": "codex",
-                        "inference_provider": "openai",
-                        "tool_calls": 6,
-                        "originator": "Codex Desktop",
-                        "origin_cwd": "/work/acme-secret-merger",
-                        "project": "acme-secret-merger",
-                        "session_slug": "project-c",
-                        "session_summary": "Session C summary"
-                    },
-                    {
-                        "session_id": "sess_b",
-                        "first_event_time": "2026-01-02 10:00:00",
-                        "first_event_unix_ms": 1767348000000_i64,
-                        "last_event_time": "2026-01-02 10:10:00",
-                        "last_event_unix_ms": 1767348600000_i64,
-                        "total_turns": 2,
-                        "total_events": 22,
-                        "mode": "web_search",
-                        "completed": 1_u8,
-                        "title": "Session B title",
-                        "source": "codex",
-                        "harness": "codex",
-                        "inference_provider": "openai",
-                        "tool_calls": 4,
-                        "session_slug": "project-b",
-                        "session_summary": "Session B summary"
-                    },
-                    {
-                        "session_id": "sess_a",
-                        "first_event_time": "2026-01-01 10:00:00",
-                        "first_event_unix_ms": 1767261600000_i64,
-                        "last_event_time": "2026-01-01 10:10:00",
-                        "last_event_unix_ms": 1767262200000_i64,
-                        "total_turns": 2,
-                        "total_events": 20,
-                        "mode": "web_search",
-                        "completed": 0_u8,
-                        "title": "",
-                        "source": "codex",
-                        "harness": "codex",
-                        "inference_provider": "openai",
-                        "tool_calls": 2,
-                        "session_slug": "",
-                        "session_summary": ""
-                    }
-                ])),
+                            {
+                                "session_id": "sess_c",
+                                "first_event_time": "2026-01-03 10:00:00",
+                                "first_event_unix_ms": 1767434400000_i64,
+                                "last_event_time": "2026-01-03 10:10:00",
+                                "last_event_unix_ms": 1767435000000_i64,
+                                "total_turns": 3,
+                                "total_events": 30,
+                                "mode": "web_search",
+                                "completed": 1_u8,
+                                "title": "Session C title",
+                                "origin_cwd": "/repo",
+                "source": "codex",
+                                "harness": "codex",
+                                "inference_provider": "openai",
+                                "tool_calls": 6,
+                                "originator": "Codex Desktop",
+                                "origin_cwd": "/work/acme-secret-merger",
+                                "project": "acme-secret-merger",
+                                "session_slug": "project-c",
+                                "session_summary": "Session C summary"
+                            },
+                            {
+                                "session_id": "sess_b",
+                                "first_event_time": "2026-01-02 10:00:00",
+                                "first_event_unix_ms": 1767348000000_i64,
+                                "last_event_time": "2026-01-02 10:10:00",
+                                "last_event_unix_ms": 1767348600000_i64,
+                                "total_turns": 2,
+                                "total_events": 22,
+                                "mode": "web_search",
+                                "completed": 1_u8,
+                                "title": "Session B title",
+                                "origin_cwd": "/repo",
+                "source": "codex",
+                                "harness": "codex",
+                                "inference_provider": "openai",
+                                "tool_calls": 4,
+                                "session_slug": "project-b",
+                                "session_summary": "Session B summary"
+                            },
+                            {
+                                "session_id": "sess_a",
+                                "first_event_time": "2026-01-01 10:00:00",
+                                "first_event_unix_ms": 1767261600000_i64,
+                                "last_event_time": "2026-01-01 10:10:00",
+                                "last_event_unix_ms": 1767262200000_i64,
+                                "total_turns": 2,
+                                "total_events": 20,
+                                "mode": "web_search",
+                                "completed": 0_u8,
+                                "title": "",
+                                "origin_cwd": "/repo",
+                "source": "codex",
+                                "harness": "codex",
+                                "inference_provider": "openai",
+                                "tool_calls": 2,
+                                "session_slug": "",
+                                "session_summary": ""
+                            }
+                        ])),
             );
         }
 
@@ -2609,6 +2616,32 @@ pub(crate) async fn build_scripted_header_repo(
         },
     )
     .await
+}
+
+/// [`build_scripted_directory_repo`] with a configured project scope, so a
+/// test can script a candidate that Phase A's recall predicate admitted and
+/// assert the exact Phase C re-check still rejects it.
+pub(crate) async fn build_scoped_scripted_directory_repo(
+    roots: &[&str],
+    scripted_responses: Vec<ScriptedResponse>,
+) -> (ClickHouseConversationRepository, Arc<MockState>) {
+    let (base_url, state) = spawn_mock_server(MockOptions {
+        scripted_responses,
+        open_v2_reader_ready: Some(true),
+        ..MockOptions::default()
+    })
+    .await;
+    let client =
+        ClickHouseClient::new(test_clickhouse_config(base_url)).expect("valid clickhouse client");
+    let repo = ClickHouseConversationRepository::new(
+        client,
+        RepoConfig {
+            max_results: 100,
+            session_scope: SessionOriginScope::from_roots(roots.iter().copied()),
+            ..RepoConfig::default()
+        },
+    );
+    (repo, state)
 }
 
 async fn build_scoped_repo_with_readiness(

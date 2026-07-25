@@ -564,6 +564,7 @@ fn totals_row(session_id: &str, harness: &str) -> serde_json::Value {
         "first_event_unix_ms": 1_767_348_000_000_i64,
         "last_event_time": "2026-01-02 10:10:00",
         "last_event_unix_ms": 1_767_348_600_000_i64,
+        "origin_cwd": "/repo",
         "source": "codex",
         "harness": harness,
         "inference_provider": "openai",
@@ -813,13 +814,76 @@ fn totals_row_at(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn list_mcp_sessions_directory_page_rechecks_origin_scope_against_the_hydrated_cwd() {
+    scoped(async {
+        // Phase A's `argMinIfMerge(origin_cwd_state)` is a RECALL filter: it
+        // merges the directory's live-generation rows, which cannot see a
+        // superseded version the way navigation read `FINAL` can. So a
+        // candidate can survive Phase A while its exact origin cwd lies
+        // OUTSIDE the configured scope.
+        //
+        // Scope decides what a caller is allowed to see, so the exact re-check
+        // must drop it. Scripting the candidate directly is what models "Phase
+        // A admitted it" without having to reproduce the aggregate skew.
+        let responses = {
+            let mut responses = vec![ScriptedResponse::rows(
+                &["FROM `moraine`.`mcp_session_directory` AS d"],
+                json!([
+                    candidate_row("sess-inside", 1_767_400_000_000_i64),
+                    candidate_row("sess-outside", 1_767_350_000_000_i64),
+                ]),
+            )];
+            let mut inside = totals_row("sess-inside", "codex");
+            inside["origin_cwd"] = json!("/work/project/sub");
+            let mut outside = totals_row("sess-outside", "codex");
+            outside["origin_cwd"] = json!("/work/other");
+            responses.extend(hydration_script(
+                "'sess-inside','sess-outside'",
+                json!([inside, outside]),
+            ));
+            responses
+        };
+        let (repo, _state) =
+            build_scoped_scripted_directory_repo(&["/work/project"], responses).await;
+
+        let page = repo
+            .list_mcp_sessions(
+                McpSessionListFilter {
+                    mode: None,
+                    harness: None,
+                    source_name: None,
+                    ..directory_filter()
+                },
+                PageRequest {
+                    limit: 5,
+                    cursor: None,
+                },
+            )
+            .await
+            .expect("scoped directory page");
+
+        let served: Vec<&str> = page
+            .items
+            .iter()
+            .map(|item| item.session_id.as_str())
+            .collect();
+        assert_eq!(
+            served,
+            vec!["sess-inside"],
+            "a candidate whose EXACT origin cwd is outside the scope must not be served"
+        );
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn list_mcp_sessions_directory_page_orders_and_anchors_on_the_directory_keyset() {
     scoped(async {
         // The directory aggregate and the hydrated aggregate are different
         // numbers whenever an event version has been superseded. Ordering and
         // the cursor MUST use the directory value — it is the only one the next
-        // page's `HAVING` can compare against — while the item still REPORTS
-        // the exact hydrated value.
+        // page's `HAVING` can compare against — and the item REPORTS that same
+        // directory value, so the page is sorted by the field it returns (B1).
         //
         // sess-p: directory 1_767_400_000_000, exact 1_767_300_000_000
         // sess-q: directory 1_767_350_000_000, exact 1_767_350_000_000
@@ -1171,7 +1235,7 @@ async fn list_sessions_gates_on_the_same_readiness_key_as_the_open_cutover() {
                 .expect("readiness probe lock")
                 .len(),
             probes.len(),
-            "the readiness verdict must be latched for the process"
+            "the readiness verdict must be latched for this repository and its clones"
         );
     })
     .await;

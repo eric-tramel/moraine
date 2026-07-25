@@ -331,11 +331,14 @@ FORMAT JSONEachRow",
                 .map(|candidate| candidate.session_id.clone())
                 .collect();
             let hydrated = self.hydrate_session_list_chunk(&session_ids).await?;
-            survivors.extend(
-                batch
-                    .iter()
-                    .filter_map(|candidate| Self::session_list_item(candidate, &hydrated, filter)),
-            );
+            survivors.extend(batch.iter().filter_map(|candidate| {
+                Self::session_list_item(
+                    candidate,
+                    &hydrated,
+                    filter,
+                    self.cfg.session_scope.as_ref(),
+                )
+            }));
             last_resolved = batch
                 .last()
                 .map(|candidate| (candidate.cand_last_ms, candidate.session_id.clone()));
@@ -475,6 +478,7 @@ FORMAT JSONEachRow",
         candidate: &DirectoryCandidateRow,
         hydrated: &HashMap<String, HydratedSession>,
         filter: &McpSessionListFilter,
+        session_scope: Option<&SessionOriginScope>,
     ) -> Option<SurvivingCandidate> {
         let session_id = candidate.session_id.as_str();
         // Belt-and-braces with the SQL guard: a blank session_id never appears,
@@ -503,10 +507,25 @@ FORMAT JSONEachRow",
         {
             return None;
         }
+        // Project scope is re-checked EXACTLY here. Phase A's
+        // `argMinIfMerge(origin_cwd_state)` applies the same rule, but merged
+        // over the directory's live-generation rows rather than the
+        // `FINAL`-deduped navigation rows, so it is a recall filter like the
+        // others. Scope decides what a caller may see, so a false positive is
+        // not acceptable and it does not rest on recall.
+        if let Some(scope) = session_scope {
+            let cwd = totals.origin_cwd.as_str();
+            let in_scope = scope
+                .roots
+                .iter()
+                .any(|root| cwd == root.as_str() || cwd.starts_with(&format!("{root}/")));
+            if !in_scope {
+                return None;
+            }
+        }
         // Exact, case-sensitive equality against the hydrated aggregates: the
         // directory's `mode_hint` / `groupUniqArray` predicates are recall
-        // filters only. Project scope is NOT re-applied — Phase A's
-        // `argMinIfMerge(origin_cwd_state)` is already the exact rule.
+        // filters only.
         if filter.mode.is_some_and(|mode| totals.mode != mode.as_str()) {
             return None;
         }
