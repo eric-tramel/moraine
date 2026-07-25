@@ -493,9 +493,11 @@ FORMAT JSONEachRow",
         if totals.total_events == 0 {
             return None;
         }
-        // The directory aggregates ALL generations while hydration is
-        // published-filtered, so re-check the overlap on the exact bounds: a
-        // session whose only in-window generation is unpublished drops here.
+        // Both passes are published-filtered (Phase A carries the same
+        // `(host, name, file, generation) IN published` tuple-IN), so this is
+        // not a generation-visibility re-check. It refines the window on the
+        // EXACT hydrated bounds, which can sit inside the directory's
+        // aggregate when a re-inserted event lowered a display time.
         if totals.last_event_unix_ms < filter.start_unix_ms
             || totals.first_event_unix_ms >= filter.end_unix_ms
         {
@@ -531,8 +533,17 @@ FORMAT JSONEachRow",
                 session_id: session_id.to_string(),
                 first_event_time: totals.first_event_time.clone(),
                 first_event_unix_ms: totals.first_event_unix_ms,
-                last_event_time: totals.last_event_time.clone(),
-                last_event_unix_ms: totals.last_event_unix_ms,
+                // Report the value this page was ORDERED and KEYSET by, not
+                // the hydrated exact one: the published contract sorts by the
+                // `updated_at` the response reports, and Phase A can only
+                // order on the directory aggregate. The two differ only when
+                // an event is re-inserted within one live generation with a
+                // decreased display time — `SimpleAggregateFunction(max)`
+                // cannot retract that, navigation read `FINAL` can — so
+                // `cand_last_ms >= totals.last_event_unix_ms`, equal in every
+                // ordinary case (issue-599 B1).
+                last_event_time: candidate.cand_last_time.clone(),
+                last_event_unix_ms: candidate.cand_last_ms,
                 total_turns: total_turns_from_parts(
                     totals.total_events,
                     totals.max_override,

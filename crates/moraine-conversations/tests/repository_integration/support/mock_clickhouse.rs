@@ -547,10 +547,28 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
         if query.contains("FROM `moraine`.`mcp_session_directory` AS d")
             && query.contains("AS cand_last_ms")
         {
+            // `cand_last_time` is the display form of `cand_last_ms` — the
+            // value the directory path both orders by and reports. It matches
+            // the projected header fixture exactly, because the aggregate and
+            // the hydrated value agree for every session that was not
+            // re-ingested; they diverge only when a re-inserted event lowered
+            // a display time within one live generation.
             let candidates = json!([
-                { "session_id": "sess_c", "cand_last_ms": 1_767_435_000_000_i64 },
-                { "session_id": "sess_b", "cand_last_ms": 1_767_348_600_000_i64 },
-                { "session_id": "sess_a", "cand_last_ms": 1_767_262_200_000_i64 }
+                {
+                    "session_id": "sess_c",
+                    "cand_last_ms": 1_767_435_000_000_i64,
+                    "cand_last_time": "2026-01-03 10:10:00"
+                },
+                {
+                    "session_id": "sess_b",
+                    "cand_last_ms": 1_767_348_600_000_i64,
+                    "cand_last_time": "2026-01-02 10:10:00"
+                },
+                {
+                    "session_id": "sess_a",
+                    "cand_last_ms": 1_767_262_200_000_i64,
+                    "cand_last_time": "2026-01-01 10:10:00"
+                }
             ]);
             let rows = candidates
                 .as_array()
