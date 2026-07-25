@@ -4,7 +4,10 @@ use super::canonical_list::{
 };
 use super::canonical_open::{list_title_and_summary, total_turns_from_parts, MetaRow};
 use super::*;
-use crate::cursor::{ACCEPTED_MCP_SESSION_LIST_CURSOR_VERSIONS, MCP_SESSION_LIST_CURSOR_VERSION};
+use crate::cursor::{
+    ACCEPTED_MCP_SESSION_LIST_CURSOR_VERSIONS, MCP_SESSION_LIST_CURSOR_VERSION_DIRECTORY,
+    MCP_SESSION_LIST_CURSOR_VERSION_HEADERS,
+};
 
 impl ClickHouseConversationRepository {
     pub(super) async fn list_conversations_impl(
@@ -178,16 +181,30 @@ FORMAT JSONEachRow",
         let limit = page.normalized_limit(self.cfg.max_results);
         let filter_sig = self.mcp_session_list_filter_sig(&filter);
         let sort = filter.sort;
-        let cursor = Self::decode_session_list_cursor(page.cursor.as_deref(), &filter_sig, sort)?;
-
         // Canonical-first when the issue-598 backfill has published coverage;
         // otherwise the projected-header path still serves the page. The
         // fallback is short-lived by design — it is deleted once the live
         // gates are green (issue-599 open question 4).
+        //
+        // The token is decoded against the SERVING path's version, so a
+        // readiness flip mid-pagination surfaces as a cursor mismatch rather
+        // than a silent gap.
         if self.canonical_list_path_ready().await {
+            let cursor = Self::decode_session_list_cursor(
+                page.cursor.as_deref(),
+                &filter_sig,
+                sort,
+                MCP_SESSION_LIST_CURSOR_VERSION_DIRECTORY,
+            )?;
             self.list_mcp_sessions_directory(&filter, filter_sig, sort, limit, cursor)
                 .await
         } else {
+            let cursor = Self::decode_session_list_cursor(
+                page.cursor.as_deref(),
+                &filter_sig,
+                sort,
+                MCP_SESSION_LIST_CURSOR_VERSION_HEADERS,
+            )?;
             self.list_mcp_sessions_headers(&filter, filter_sig, sort, limit, cursor)
                 .await
         }
@@ -195,12 +212,18 @@ FORMAT JSONEachRow",
 
     /// Decode and validate a `list_sessions` continuation token.
     ///
-    /// Both cursor versions are accepted (see [`McpSessionListCursor`]); the
-    /// two mismatch messages are contract surface asserted by the tool tests.
+    /// `serving_version` is the version the path about to use this token mints.
+    /// A token minted by the OTHER path anchors on a different value (see
+    /// [`McpSessionListCursor`]), so resuming it here would silently skip every
+    /// session whose two anchors straddle it. It is rejected as a cursor
+    /// mismatch instead, which a caller can recover from by restarting the
+    /// feed. The mismatch messages are contract surface asserted by the tool
+    /// tests.
     fn decode_session_list_cursor(
         token: Option<&str>,
         filter_sig: &str,
         sort: ConversationListSort,
+        serving_version: u8,
     ) -> RepoResult<Option<McpSessionListCursor>> {
         let Some(token) = token else {
             return Ok(None);
@@ -211,6 +234,11 @@ FORMAT JSONEachRow",
                 "unsupported list_sessions cursor version {}",
                 cursor.version
             )));
+        }
+        if cursor.version != serving_version {
+            return Err(RepoError::invalid_cursor(
+                "cursor was minted by a different list_sessions read path",
+            ));
         }
         if cursor.filter_sig != filter_sig {
             return Err(RepoError::invalid_cursor(
@@ -230,9 +258,10 @@ FORMAT JSONEachRow",
         session_id: &str,
         filter_sig: String,
         sort: ConversationListSort,
+        version: u8,
     ) -> RepoResult<String> {
         encode_cursor(&McpSessionListCursor {
-            version: MCP_SESSION_LIST_CURSOR_VERSION,
+            version,
             last_event_unix_ms,
             session_id: session_id.to_string(),
             filter_sig,
@@ -340,6 +369,7 @@ FORMAT JSONEachRow",
                         &survivor.item.session_id,
                         filter_sig,
                         sort,
+                        MCP_SESSION_LIST_CURSOR_VERSION_DIRECTORY,
                     )
                 })
                 .transpose()?
@@ -357,7 +387,13 @@ FORMAT JSONEachRow",
             last_resolved
                 .as_ref()
                 .map(|(last_ms, session_id)| {
-                    Self::mint_session_list_cursor(*last_ms, session_id, filter_sig, sort)
+                    Self::mint_session_list_cursor(
+                        *last_ms,
+                        session_id,
+                        filter_sig,
+                        sort,
+                        MCP_SESSION_LIST_CURSOR_VERSION_DIRECTORY,
+                    )
                 })
                 .transpose()?
         } else {
@@ -678,6 +714,7 @@ FORMAT JSONEachRow",
                         &last.session_id,
                         filter_sig,
                         sort,
+                        MCP_SESSION_LIST_CURSOR_VERSION_HEADERS,
                     )
                 })
                 .transpose()?
