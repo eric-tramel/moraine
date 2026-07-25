@@ -792,6 +792,12 @@ Rules:
   same semantics as `search_sessions`. Blank provided values return
   `invalid_request`; when both are present, both must match.
 - `sort` is `desc` or `asc`, ordered by session `updated_at` and session ID.
+  The response is always sorted by the `updated_at` it reports. For session
+  discovery that value is the session's latest observed event time across its
+  live source generations — the value the page is both ordered and paged by.
+  It equals the session's latest event timestamp except where an event was
+  re-ingested within one live generation with an earlier display time, in
+  which case it can sit slightly above that timestamp; it never sits below.
 
 ### Response Shape
 

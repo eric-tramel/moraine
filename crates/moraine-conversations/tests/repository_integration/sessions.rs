@@ -761,8 +761,40 @@ async fn list_mcp_sessions_directory_page_never_prefilters_mcp_internal_mode() {
 }
 
 /// One Phase-A candidate row.
+/// Render a millisecond instant the way ClickHouse renders `DateTime64(3)`.
+fn format_directory_display_time(unix_ms: i64) -> String {
+    let secs = unix_ms.div_euclid(1_000);
+    let millis = unix_ms.rem_euclid(1_000);
+    let days = secs.div_euclid(86_400);
+    let time_of_day = secs.rem_euclid(86_400);
+    // 1970-01-01 + `days`, via the civil-from-days algorithm.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!(
+        "{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02}.{millis:03}",
+        time_of_day / 3_600,
+        (time_of_day % 3_600) / 60,
+        time_of_day % 60
+    )
+}
+
 fn candidate_row(session_id: &str, cand_last_ms: i64) -> serde_json::Value {
-    json!({ "session_id": session_id, "cand_last_ms": cand_last_ms })
+    // `cand_last_time` is the display form of the same instant: the directory
+    // path orders by `cand_last_ms` and reports its display form, so a fixture
+    // that let them describe different instants would not model the real row.
+    json!({
+        "session_id": session_id,
+        "cand_last_ms": cand_last_ms,
+        "cand_last_time": format_directory_display_time(cand_last_ms),
+    })
 }
 
 /// [`totals_row`] with explicit exact `display_time` bounds, for the case where
@@ -831,9 +863,14 @@ async fn list_mcp_sessions_directory_page_orders_and_anchors_on_the_directory_ke
             page.items[0].session_id, "sess-p",
             "survivors must be ordered by the directory keyset, not the hydrated timestamp"
         );
+        // B1: the response reports the value the page was ORDERED and KEYSET
+        // by, so it is sorted by the field it returns. sess-p's directory
+        // aggregate (1_767_400_000_000) sits above its hydrated exact value
+        // (1_767_300_000_000) — the re-inserted-event case — and it is the
+        // aggregate that is reported.
         assert_eq!(
-            page.items[0].last_event_unix_ms, 1_767_300_000_000_i64,
-            "the item still reports the EXACT aggregate"
+            page.items[0].last_event_unix_ms, 1_767_400_000_000_i64,
+            "the item must report the directory aggregate it was ordered by"
         );
 
         let cursor = page.next_cursor.expect("next cursor");

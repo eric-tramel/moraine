@@ -199,7 +199,7 @@ impl ClickHouseConversationRepository {
             ConversationListSort::Asc => "ASC",
         };
         format!(
-            "SELECT\n  d.session_id AS session_id,\n  toInt64(toUnixTimestamp64Milli(max(d.max_observed_event_time))) AS cand_last_ms,\n  toInt64(toUnixTimestamp64Milli(min(d.min_observed_event_time))) AS cand_first_ms,\n  toUInt8(max(d.mode_hint)) AS mode_hint,\n  argMinIfMerge(d.origin_cwd_state) AS origin_cwd,\n  groupUniqArray(d.harness) AS harnesses,\n  groupUniqArray(d.source_name) AS sources\nFROM {directory} AS d\nWHERE notEmpty(trimBoth(d.session_id))\n  AND (d.source_host, d.source_name, d.source_file, d.source_generation) IN {published}\nGROUP BY d.session_id\nHAVING {having}\nORDER BY cand_last_ms {order_dir}, session_id {order_dir}\nLIMIT {limit}\nFORMAT JSONEachRow",
+            "SELECT\n  d.session_id AS session_id,\n  toInt64(toUnixTimestamp64Milli(max(d.max_observed_event_time))) AS cand_last_ms,\n  toString(max(d.max_observed_event_time)) AS cand_last_time,\n  toInt64(toUnixTimestamp64Milli(min(d.min_observed_event_time))) AS cand_first_ms,\n  toUInt8(max(d.mode_hint)) AS mode_hint,\n  argMinIfMerge(d.origin_cwd_state) AS origin_cwd,\n  groupUniqArray(d.harness) AS harnesses,\n  groupUniqArray(d.source_name) AS sources\nFROM {directory} AS d\nWHERE notEmpty(trimBoth(d.session_id))\n  AND (d.source_host, d.source_name, d.source_file, d.source_generation) IN {published}\nGROUP BY d.session_id\nHAVING {having}\nORDER BY cand_last_ms {order_dir}, session_id {order_dir}\nLIMIT {limit}\nFORMAT JSONEachRow",
             having = having.join("\n   AND "),
             limit = params.limit,
         )
@@ -242,7 +242,7 @@ impl ClickHouseConversationRepository {
             "SELECT\n    n.session_id AS session_id,\n    n.turn_index AS turn_index,\n    n.is_user_message AS is_user_message,\n    n.actor_kind AS actor_kind,\n    n.event_kind AS event_kind,\n    n.payload_type AS payload_type,\n    n.tool_name AS tool_name,\n    n.source_name AS source_name,\n    n.source_file AS source_file,\n    n.harness AS harness,\n    n.inference_provider AS inference_provider,\n    n.display_time AS display_time,\n    n.event_ts AS event_ts,\n    n.event_uid AS event_uid,\n    {sort_tuple} AS sort_key,\n    sum(if(n.is_user_message = 1, 1, 0)) OVER counter_window AS running_u\n  {from}\n  WHERE n.session_id IN {ids}\n  WINDOW counter_window AS (PARTITION BY n.session_id ORDER BY {sort_tuple} ASC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)"
         );
         format!(
-            "SELECT\n  nav.session_id AS session_id,\n  toUInt64(count()) AS total_events,\n  toUInt64(countIf({umsg})) AS user_messages,\n  toUInt64(countIf({assistant_msg})) AS assistant_messages,\n  toUInt64(countIf(nav.event_kind = 'tool_call')) AS tool_calls,\n  toUInt64(countIf(nav.event_kind = 'tool_result')) AS tool_results,\n  toUInt32(max(nav.turn_index)) AS max_override,\n  toUInt64(argMaxIf(nav.running_u, nav.sort_key, nav.turn_index = 0)) AS counter_user_messages,\n  toString(min(nav.display_time)) AS first_event_time,\n  toInt64(toUnixTimestamp64Milli(min(nav.display_time))) AS first_event_unix_ms,\n  toString(max(nav.display_time)) AS last_event_time,\n  toInt64(toUnixTimestamp64Milli(max(nav.display_time))) AS last_event_unix_ms,\n  ifNull(argMax(nullIf(nav.source_name, ''), {event_ts_tuple}), '') AS source,\n  ifNull(argMax(nullIf(nav.harness, ''), {event_ts_tuple}), '') AS harness,\n  ifNull(argMax(nullIf(nav.inference_provider, ''), {event_ts_tuple}), '') AS inference_provider,\n  ifNull(argMinIf(nullIf(trimBoth(replaceRegexpOne(arrayElement(splitByChar('/', replaceAll(nav.source_file, '\\\\', '/')), -1), '[.]jsonl$', '')), ''), {event_ts_tuple}, nav.source_name = 'omp' AND notEmpty(nav.session_id) AND endsWith(nav.source_file, '.jsonl') AND NOT endsWith(nav.source_file, concat(nav.session_id, '.jsonl'))), '') AS omp_dispatch_title,\n  {mode} AS mode\nFROM (\n  {inner}\n) AS nav\nGROUP BY nav.session_id\nFORMAT JSONEachRow"
+            "SELECT\n  nav.session_id AS session_id,\n  toUInt64(count()) AS total_events,\n  toUInt64(countIf({umsg})) AS user_messages,\n  toUInt64(countIf({assistant_msg})) AS assistant_messages,\n  toUInt64(countIf(nav.event_kind = 'tool_call')) AS tool_calls,\n  toUInt64(countIf(nav.event_kind = 'tool_result')) AS tool_results,\n  toUInt32(max(nav.turn_index)) AS max_override,\n  toUInt64(argMaxIf(nav.running_u, nav.sort_key, nav.turn_index = 0)) AS counter_user_messages,\n  toString(min(nav.display_time)) AS first_event_time,\n  toInt64(toUnixTimestamp64Milli(min(nav.display_time))) AS first_event_unix_ms,\n  toInt64(toUnixTimestamp64Milli(max(nav.display_time))) AS last_event_unix_ms,\n  ifNull(argMax(nullIf(nav.source_name, ''), {event_ts_tuple}), '') AS source,\n  ifNull(argMax(nullIf(nav.harness, ''), {event_ts_tuple}), '') AS harness,\n  ifNull(argMax(nullIf(nav.inference_provider, ''), {event_ts_tuple}), '') AS inference_provider,\n  ifNull(argMinIf(nullIf(trimBoth(replaceRegexpOne(arrayElement(splitByChar('/', replaceAll(nav.source_file, '\\\\', '/')), -1), '[.]jsonl$', '')), ''), {event_ts_tuple}, nav.source_name = 'omp' AND notEmpty(nav.session_id) AND endsWith(nav.source_file, '.jsonl') AND NOT endsWith(nav.source_file, concat(nav.session_id, '.jsonl'))), '') AS omp_dispatch_title,\n  {mode} AS mode\nFROM (\n  {inner}\n) AS nav\nGROUP BY nav.session_id\nFORMAT JSONEachRow"
         )
     }
 
@@ -301,6 +301,11 @@ impl ClickHouseConversationRepository {
 #[derive(Debug, Clone, Deserialize)]
 pub(super) struct DirectoryCandidateRow {
     pub(super) session_id: String,
+    /// Display form of [`Self::cand_last_ms`], reported as the item's
+    /// `last_event_time` so the response's timestamp is the value the page was
+    /// ordered and keyset by (issue-599 B1). Reporting the hydrated exact value
+    /// instead would leave the page sorted by a field it does not return.
+    pub(super) cand_last_time: String,
     /// **The operation's one keyset time source.** Phase A orders by it, its
     /// `HAVING` keyset resumes strictly after it, Phase C sorts survivors by
     /// it, and the continuation cursor is minted from it. Candidate filtering,
@@ -337,7 +342,6 @@ pub(super) struct SessionTotalsBatchRow {
     pub(super) counter_user_messages: u64,
     pub(super) first_event_time: String,
     pub(super) first_event_unix_ms: i64,
-    pub(super) last_event_time: String,
     pub(super) last_event_unix_ms: i64,
     pub(super) source: String,
     pub(super) harness: String,
@@ -660,7 +664,9 @@ mod tests {
             "max_override",
             "first_event_time",
             "first_event_unix_ms",
-            "last_event_time",
+            // `last_event_time` is deliberately absent: the directory path
+            // reports the value it orders by (`cand_last_time`), so hydrating
+            // the display string here would transfer bytes that are discarded.
             "last_event_unix_ms",
             "source",
             "harness",
