@@ -29,6 +29,10 @@ mod canonical_open_parity;
 mod envelope_gates;
 #[path = "live_clickhouse/search_host_identity.rs"]
 mod search_host_identity;
+#[path = "live_clickhouse/session_list_benchmark.rs"]
+mod session_list_benchmark;
+#[path = "live_clickhouse/session_list_parity.rs"]
+mod session_list_parity;
 #[path = "live_clickhouse/source_publication.rs"]
 mod source_publication;
 #[path = "live_clickhouse/source_publication_migration.rs"]
@@ -2517,6 +2521,29 @@ async fn live_canonical_open_fsync_to_open_valid() -> Result<()> {
 #[ignore = "requires wrapper-owned live ClickHouse, destructive opt-in, and ~2 GB free"]
 async fn live_canonical_open_boundedness_benchmark() -> Result<()> {
     with_live_fixture_envelope(canonical_open_benchmark::boundedness()).await
+}
+
+// Issue #599 WI-07 exit-gate live tests (599-discovery-cutover.md §5.1-§5.3).
+// The bodies live in live_clickhouse/session_list_{parity,benchmark}.rs; these
+// root-level wrappers keep the exact `--exact` libtest paths that
+// scripts/dev/sandbox/run-live-test dispatches on.
+
+#[tokio::test]
+#[ignore = "requires wrapper-owned live ClickHouse and destructive opt-in"]
+async fn live_session_list_directory_parity() -> Result<()> {
+    with_live_fixture_envelope(session_list_parity::directory_parity()).await
+}
+
+#[tokio::test]
+#[ignore = "requires wrapper-owned live ClickHouse and destructive opt-in"]
+async fn live_session_list_query_log_clean() -> Result<()> {
+    with_live_fixture_envelope(session_list_parity::query_log_clean()).await
+}
+
+#[tokio::test]
+#[ignore = "requires wrapper-owned live ClickHouse, destructive opt-in, and ~2 GB free"]
+async fn live_session_list_boundedness_benchmark() -> Result<()> {
+    with_live_fixture_envelope(session_list_benchmark::boundedness()).await
 }
 
 #[cfg(test)]

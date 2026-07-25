@@ -49,8 +49,13 @@ fn dt(secs: u32) -> String {
 /// Every field the navigation / directory / locator MVs read is representable
 /// here, so the corpus is seeded purely through `events` + publication control
 /// (never by writing the derived tables directly).
+///
+/// Shared with the issue-599 session-list gates
+/// ([`session_list_parity`](super::session_list_parity)): both corpora are
+/// seeded the same way, and one row DSL is what keeps a fixture written for
+/// one gate meaningful to the other.
 #[derive(Clone)]
-struct Ev {
+pub(super) struct Ev {
     session_id: String,
     source_host: String,
     source_name: String,
@@ -79,7 +84,7 @@ struct Ev {
 }
 
 impl Ev {
-    fn new(session_id: &str, event_uid: &str, secs: u32) -> Self {
+    pub(super) fn new(session_id: &str, event_uid: &str, secs: u32) -> Self {
         Self {
             session_id: session_id.to_string(),
             source_host: HOST_A.to_string(),
@@ -109,14 +114,14 @@ impl Ev {
         }
     }
 
-    fn user(mut self) -> Self {
+    pub(super) fn user(mut self) -> Self {
         self.actor_kind = "user".to_string();
         self.payload_type = "message".to_string();
         self.text_content = format!("user prompt for {}", self.event_uid);
         self
     }
 
-    fn tool_call(mut self, tool: &str, call_id: &str) -> Self {
+    pub(super) fn tool_call(mut self, tool: &str, call_id: &str) -> Self {
         self.event_kind = "tool_call".to_string();
         self.actor_kind = "assistant".to_string();
         self.payload_type = "function_call".to_string();
@@ -126,64 +131,74 @@ impl Ev {
         self
     }
 
-    fn turn(mut self, turn_index: u32) -> Self {
+    pub(super) fn turn(mut self, turn_index: u32) -> Self {
         self.turn_index = turn_index;
         self
     }
 
-    fn host(mut self, host: &str) -> Self {
+    pub(super) fn host(mut self, host: &str) -> Self {
         self.source_host = host.to_string();
         self
     }
 
-    fn generation(mut self, generation: u32) -> Self {
+    pub(super) fn generation(mut self, generation: u32) -> Self {
         self.source_generation = generation;
         self
     }
 
-    fn record_ts(mut self, raw: &str) -> Self {
+    pub(super) fn record_ts(mut self, raw: &str) -> Self {
         self.record_ts = raw.to_string();
         self
     }
 
-    fn event_ts(mut self, raw: &str) -> Self {
+    pub(super) fn event_ts(mut self, raw: &str) -> Self {
         self.event_ts = raw.to_string();
         self
     }
 
-    fn ingested_at_secs(mut self, secs: u32) -> Self {
+    pub(super) fn ingested_at_secs(mut self, secs: u32) -> Self {
         self.ingested_at = dt(secs);
         self
     }
 
-    fn version(mut self, version: u64) -> Self {
+    pub(super) fn version(mut self, version: u64) -> Self {
         self.event_version = version;
         self
     }
 
-    fn cwd(mut self, cwd: &str) -> Self {
+    pub(super) fn cwd(mut self, cwd: &str) -> Self {
         self.cwd = cwd.to_string();
         self
     }
 
-    fn source(mut self, name: &str, file: &str) -> Self {
+    pub(super) fn source(mut self, name: &str, file: &str) -> Self {
         self.source_name = name.to_string();
         self.source_file = file.to_string();
         self
     }
 
-    fn payload(mut self, kind: &str, payload_json: &str) -> Self {
+    pub(super) fn payload(mut self, kind: &str, payload_json: &str) -> Self {
         self.event_kind = kind.to_string();
         self.payload_json = payload_json.to_string();
         self
     }
 
-    fn payload_type(mut self, payload_type: &str) -> Self {
+    pub(super) fn payload_type(mut self, payload_type: &str) -> Self {
         self.payload_type = payload_type.to_string();
         self
     }
 
-    fn value(&self) -> Value {
+    pub(super) fn harness(mut self, harness: &str) -> Self {
+        self.harness = harness.to_string();
+        self
+    }
+
+    pub(super) fn provider(mut self, inference_provider: &str) -> Self {
+        self.inference_provider = inference_provider.to_string();
+        self
+    }
+
+    pub(super) fn value(&self) -> Value {
         serde_json::json!({
             "ingested_at": self.ingested_at,
             "source_host": self.source_host,
@@ -218,7 +233,7 @@ impl Ev {
 
 /// Insert a batch of fixture events synchronously (each raw statement rides the
 /// ambient live-fixture envelope).
-async fn seed_events(clickhouse: &ClickHouseClient, rows: &[Ev]) -> Result<()> {
+pub(super) async fn seed_events(clickhouse: &ClickHouseClient, rows: &[Ev]) -> Result<()> {
     let values: Vec<Value> = rows.iter().map(Ev::value).collect();
     clickhouse
         .insert_json_rows_sync("events", &values)
@@ -441,7 +456,7 @@ async fn assert_event_parity(
 
 // --- shared prep/cleanup scaffolding ---------------------------------------
 
-async fn with_owned_live_db<F, Fut>(phase: &str, body: F) -> Result<()>
+pub(super) async fn with_owned_live_db<F, Fut>(phase: &str, body: F) -> Result<()>
 where
     F: FnOnce(ClickHouseClient, OwnedDatabaseName) -> Fut,
     Fut: std::future::Future<Output = Result<()>>,

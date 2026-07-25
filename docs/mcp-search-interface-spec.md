@@ -854,6 +854,30 @@ When a session has no explicit title, summary, or slug, `session.display_label`
 uses already exposed metadata such as harness, mode, update time, and turn count
 rather than transcript text.
 
+### Pagination
+
+`next_cursor` is an opaque keyset token over `(updated_at, session_id)`. The
+feed terminates on `next_cursor: null` and on nothing else:
+
+- An **empty `sessions` array carrying a non-null `next_cursor` is a valid
+  page**, not the end of the feed. The server bounds how much candidate state
+  one request may resolve, so a selective filter can consume that budget without
+  producing a row. Callers redeem the cursor rather than stopping; `truncated`
+  is `next_cursor != null` and reports exactly this.
+- The token is a **value anchor, not a snapshot**. A session that receives
+  events while a caller pages moves its `updated_at` ahead of the anchor and is
+  therefore not seen again on a later page; restarting from page 1 observes the
+  new order. Activity in sessions already passed, or in sessions outside the
+  filter, neither invalidates a cursor nor changes what later pages return.
+- A session can appear on two pages of one traversal only if its `updated_at`
+  moves backwards, which append-only ingest cannot do. A source-generation
+  replay can, so a caller that must dedupe across a replay does so client-side;
+  the server keeps no per-cursor state.
+- A cursor is bound to the filter and the sort that minted it, and to the server
+  read path that minted it. A changed filter, a changed sort, or a token minted
+  under a different read path each return `invalid_request`; the recovery is to
+  restart the feed from page 1, never to retry the token.
+
 ## Tool: `file_attention`
 
 ### Purpose
@@ -1872,6 +1896,7 @@ Missing object:
 | `start_datetime` + `end_datetime` | List sessions overlapping the datetime range with defaults. |
 | range + `limit` | Return at most `limit` sessions. |
 | range + `cursor` | Return the next deterministic page for the same filter and sort. |
+| range + `cursor`, no session resolvable within the request's candidate budget | Return `sessions: []` with a non-null `next_cursor`; the caller redeems it. |
 | range + `mode` | Return only sessions with that mode. |
 | range + `sort=asc` | Return oldest matching sessions first by `updated_at`, then ID. |
 | range + `harness` | Return only sessions from the exact normalized harness. |
@@ -1884,6 +1909,7 @@ Missing object:
 | unknown field | Return `invalid_request`. |
 | invalid `mode` or `sort` | Return `invalid_request`. |
 | cursor with changed filter or sort | Return `invalid_request`. |
+| cursor minted under a different server read path | Return `invalid_request`; restart the feed from page 1. |
 
 ### `file_attention`
 

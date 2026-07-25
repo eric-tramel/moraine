@@ -75,9 +75,35 @@ cross-surface switch. As of this build:
 - **`open(session|turn|event)` is cut over.** When `open_reader` resolves to v2
   (published and Local, or forced), the `open` tool family reads canonical rows
   through the page-aware reader. This is a one-way flip per process.
-- **`list_sessions` and the monitor still read v1** (issue #599). Session
-  discovery and monitor session lists continue to authorize and read against the
-  `mcp_open_*` projection.
+- **Session discovery is cut over** (issue #599). MCP `list_sessions` and the
+  monitor `/api/v1/sessions` feed are now one shared repository operation that
+  selects candidates from `mcp_session_directory` and hydrates only the
+  candidate page from `mcp_event_navigation` plus the metadata-bearing `events`
+  rows. It reads no `mcp_open_*` relation and no `v_session_summary` /
+  `v_conversation_trace` / `v_turn_summary` view.
+  - **Readiness gate.** The shared operation selects the directory path only
+    when the `open_v2` key reads ready — the same key `open` consults — and
+    otherwise serves the pre-#599 `mcp_open_publication_headers` page. The
+    negative is never cached, so the flip needs no restart; the positive is
+    latched per process.
+  - **Continuation tokens are path-tagged.** A cursor minted by one path is
+    refused by the other with a cursor mismatch rather than silently resuming,
+    because the two paths anchor on values that a readiness flip can move
+    apart. A client that sees a mismatch restarts its feed from page 1.
+  - **`mcp_open_publication_headers` is still written and read** by that
+    fallback, so a store whose backfill has not published readiness keeps
+    working unchanged. The fallback is deliberately short-lived; it is removed
+    once the #599 live gates are green in CI.
+  - **Directory scan cost is linear in sessions, not in event bytes.**
+    `mcp_session_directory` leads its sort key with `session_id`, so a
+    time-windowed candidate page cannot be granule-pruned and the candidate
+    pass groups every directory row. Directory rows grow with
+    `sessions × source-files` and are narrow scalars, so adding transcript
+    content to existing sessions adds none. If the `list-bench` gate ever
+    measures the candidate pass reading more than 3× the directory's row count,
+    or its wall time exceeds 500 ms at 100k sessions, that is the trigger to
+    add a time-leading projection in a follow-up migration — not something to
+    tune here.
 - **Search still reads v1** (issue #597). Search ranking and result hydration
   continue to use the projected read model.
 - **The v1 projector, its dirty-session materialized view, the janitor, and the
@@ -86,11 +112,16 @@ cross-surface switch. As of this build:
   makes a binary downgrade a safe full rollback for this whole change (see
   [Rollback](#rollback)).
 
-Only after list/monitor (#599) and search (#597) have both cut over does a
-later, separate retirement change stop the projector and dirty writes and drop
-the compatibility tables. Until then, expect steady-state reads and writes
-against `mcp_open_*` from the not-yet-migrated consumers; they are not a sign
-the canonical `open` reader is inactive.
+Only after search (#597) has cut over, and after the #599 readiness-gated
+fallback has been removed, does a later, separate retirement change stop the
+projector and dirty writes and drop the compatibility tables. Until then, expect
+steady-state reads and writes against `mcp_open_*` from search, from the
+projector itself, and from any backend that has not published readiness; they
+are not a sign the canonical reader is inactive.
+
+The cutover is validated by three live gates —
+`scripts/dev/sandbox/run-live-test list-parity`, `… list-query-log`, and
+`… list-bench`. See [Testing and benchmarking](../development/testing.md).
 
 ## Append-to-visible latency contract
 
@@ -169,6 +200,13 @@ it does **not** fail the doctor exit code.
 > serves correctly) but means doctor output describes the state a *newly
 > started* process would adopt, not necessarily what a long-running daemon is
 > doing right now.
+>
+> **Session discovery is the one exception.** Its readiness gate caches only a
+> ready answer, never a not-ready one, so a long-running daemon adopts the
+> directory path on the first `list_sessions` or `/api/v1/sessions` request
+> after readiness is published — no restart, and no window in which the monitor
+> session-detail route is pinned to `503`. While readiness is 0 each such
+> request pays one point-read of `mcp_read_index_state`.
 
 > **Monitor `/api/v1/health`** is intended to expose the same readiness fields.
 > Wiring that endpoint requires an additive `StoreHealth` field in the
