@@ -103,55 +103,175 @@ json_ok_true() {
   "$python_bin" -c 'import json,sys; data=json.load(sys.stdin); sys.exit(0 if data.get("ok") is True else 1)'
 }
 
-assert_monitor_api_alias() {
+# The monitor's effective session page size. `limit=200` is inside the route's
+# own 1..=200 bound but above `[mcp] max_results`, so the feed serves at most
+# this many sessions per page and membership assertions must page.
+MONITOR_SESSIONS_MAX_RESULTS=25
+
+# How many filler sessions the paging fixture source seeds. It must exceed
+# MONITOR_SESSIONS_MAX_RESULTS: the filler sessions are timestamped after every
+# other fixture, so they fill page 1 entirely and every harness fixture session
+# is reachable only by redeeming a cursor. Below the page size, the traversal
+# below would exercise no cursor at all against a real repository.
+MONITOR_SESSIONS_PAGING_FIXTURES=30
+
+# Page /api/v1/sessions to exhaustion and print the union as one JSON document
+# on stdout. Extra arguments are passed to curl (the project-dir header for the
+# named-backend route).
+#
+# On the default backend this genuinely pages — see
+# MONITOR_SESSIONS_PAGING_FIXTURES — so it is where a monitor cursor is redeemed
+# against a real repository: the repository binds a token to the filter that
+# minted it, so a handler that re-derived its time window per request would 400
+# here on page 2. Callers that pass a project-dir header may reach a backend
+# holding fewer sessions than one page, where this exhausts in a single request
+# and asserts nothing about cursors; assert_monitor_session_feed_pages is the
+# explicit gate.
+monitor_sessions_all() {
+  local python_bin="$1"
+  local base_url="$2"
+  shift 2
+  local cursor="" page pages=0 url sessions=""
+
+  while true; do
+    url="${base_url}/api/v1/sessions?since=all&limit=200"
+    if [[ -n "$cursor" ]]; then
+      url+="&cursor=$("$python_bin" -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$cursor")"
+    fi
+    if ! page="$(curl -fsS "$@" "$url")"; then
+      echo "[e2e] monitor session feed request failed at page $((pages + 1))" >&2
+      return 1
+    fi
+    pages=$((pages + 1))
+
+    local page_sessions
+    page_sessions="$(printf '%s' "$page" | "$python_bin" -c '
+import json
+import sys
+
+data = json.load(sys.stdin)
+limit = data.get("limit")
+sessions = data.get("sessions", [])
+expected_limit = int(sys.argv[1])
+if limit != expected_limit:
+    print(f"monitor session feed must report the effective limit {expected_limit}; got {limit!r}", file=sys.stderr)
+    raise SystemExit(1)
+if len(sessions) > expected_limit:
+    print(f"monitor session feed served {len(sessions)} sessions above its own limit {limit}", file=sys.stderr)
+    raise SystemExit(1)
+for session in sessions:
+    print(json.dumps(session))
+' "$MONITOR_SESSIONS_MAX_RESULTS")" || return 1
+    if [[ -n "$page_sessions" ]]; then
+      sessions+="${page_sessions}"$'\n'
+    fi
+
+    cursor="$(printf '%s' "$page" | "$python_bin" -c 'import json,sys; print(json.load(sys.stdin).get("next_cursor") or "")')" || return 1
+    [[ -n "$cursor" ]] || break
+    if (( pages >= 50 )); then
+      echo "[e2e] monitor session feed did not terminate within 50 pages" >&2
+      return 1
+    fi
+  done
+
+  printf '%s' "$sessions" | "$python_bin" -c '
+import json
+import sys
+
+sessions = [json.loads(line) for line in sys.stdin if line.strip()]
+print(json.dumps({"ok": True, "sessions": sessions}))
+'
+}
+
+# Prove the session feed pages against a real ClickHouse: page 1 fills the
+# effective limit and reports more, and the cursor it mints redeems into a
+# non-empty page 2 that repeats nothing. This is what makes the traversal above
+# a cursor gate rather than a single-request membership check — the repository
+# refuses a token whose filter moved, so a handler that re-derived its window
+# per request, or a cursor that failed to advance the keyset, fails here.
+assert_monitor_session_feed_pages() {
+  local python_bin="$1"
+  local base_url="$2"
+  local page_one cursor page_two
+
+  if ! page_one="$(curl -fsS "${base_url}/api/v1/sessions?since=all&limit=200")"; then
+    echo "[e2e] monitor session feed page 1 request failed" >&2
+    return 1
+  fi
+  cursor="$(printf '%s' "$page_one" | "$python_bin" -c '
+import json
+import sys
+
+data = json.load(sys.stdin)
+sessions = data.get("sessions", [])
+expected = int(sys.argv[1])
+# A short page carrying a cursor is LEGAL: the directory reader may exhaust its
+# hydration budget before filling the page. What this gate needs is that page 2
+# is genuinely exercised, which the cursor below establishes — so require a
+# non-empty page that does not exceed the limit, not an exactly-full one.
+if not sessions or len(sessions) > expected:
+    print(
+        f"page 1 must be non-empty and within the effective limit {expected}; "
+        f"got {len(sessions)}",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+token = data.get("next_cursor")
+if data.get("has_more") is not True or not token:
+    print("a full page 1 must report more sessions and mint a cursor", file=sys.stderr)
+    raise SystemExit(1)
+print(token)
+' "$MONITOR_SESSIONS_MAX_RESULTS")" || return 1
+
+  if ! page_two="$(curl -fsS "${base_url}/api/v1/sessions?since=all&limit=200&cursor=$("$python_bin" -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$cursor")")"; then
+    echo "[e2e] monitor session feed page 2 request failed" >&2
+    return 1
+  fi
+  "$python_bin" -c '
+import json
+import sys
+
+first = [s.get("id") for s in json.loads(sys.argv[1]).get("sessions", [])]
+second = [s.get("id") for s in json.loads(sys.argv[2]).get("sessions", [])]
+if not second:
+    print("redeeming page 1 cursor returned no sessions", file=sys.stderr)
+    raise SystemExit(1)
+overlap = sorted(set(first) & set(second))
+if overlap:
+    print(f"page 2 repeated sessions from page 1: {overlap}", file=sys.stderr)
+    raise SystemExit(1)
+' "$page_one" "$page_two"
+}
+
+assert_monitor_api_path_gone() {
   local python_bin="$1"
   local base_url="$2"
   local tmp_root="$3"
-  local canonical_path="$4"
-  local legacy_path="$5"
-  local canonical_body_file
-  local legacy_body_file
-  canonical_body_file="$(mktemp "$tmp_root/canonical-api.XXXXXX")"
-  legacy_body_file="$(mktemp "$tmp_root/legacy-api.XXXXXX")"
+  local legacy_path="$4"
+  local body_file
+  body_file="$(mktemp "$tmp_root/legacy-api.XXXXXX")"
 
-  local canonical_status
-  local legacy_status
-  # Deliberately omit --location: compatibility aliases must respond directly,
-  # not pass by redirecting curl to the canonical route.
-  if ! canonical_status="$(curl -sS --max-time 30 -o "$canonical_body_file" -w '%{http_code}' -- "${base_url}${canonical_path}")"; then
-    echo "[e2e] canonical monitor request failed: ${canonical_path}" >&2
-    rm -f "$canonical_body_file" "$legacy_body_file"
-    return 1
-  fi
-  if ! legacy_status="$(curl -sS --max-time 30 -o "$legacy_body_file" -w '%{http_code}' -- "${base_url}${legacy_path}")"; then
-    echo "[e2e] legacy monitor request failed: ${legacy_path}" >&2
-    rm -f "$canonical_body_file" "$legacy_body_file"
+  local status
+  # Deliberately omit --location: a removed path must answer directly, not
+  # redirect a client onward to the canonical route.
+  if ! status="$(curl -sS --max-time 30 -o "$body_file" -w '%{http_code}' -- "${base_url}${legacy_path}")"; then
+    echo "[e2e] removed-alias request failed to complete: ${legacy_path}" >&2
+    rm -f "$body_file"
     return 1
   fi
 
-  if [[ "$canonical_status" != "$legacy_status" ]]; then
-    echo "[e2e] monitor alias status mismatch: ${legacy_path} (${legacy_status}) != ${canonical_path} (${canonical_status})" >&2
-    rm -f "$canonical_body_file" "$legacy_body_file"
+  if [[ "$status" != "404" ]]; then
+    echo "[e2e] removed monitor alias is still served: ${legacy_path} (${status})" >&2
+    rm -f "$body_file"
+    return 1
+  fi
+  if ! "$python_bin" -c 'import json,sys; data=json.load(sys.stdin); sys.exit(0 if data.get("ok") is False else 1)' <"$body_file"; then
+    echo "[e2e] removed monitor alias did not use the JSON error envelope: ${legacy_path}" >&2
+    rm -f "$body_file"
     return 1
   fi
 
-  if [[ "$canonical_status" != "200" ]]; then
-    echo "[e2e] monitor alias returned unexpected status: ${canonical_path} (${canonical_status})" >&2
-    rm -f "$canonical_body_file" "$legacy_body_file"
-    return 1
-  fi
-  if ! json_ok_true "$python_bin" <"$canonical_body_file"; then
-    echo "[e2e] canonical monitor response is not successful JSON: ${canonical_path}" >&2
-    rm -f "$canonical_body_file" "$legacy_body_file"
-    return 1
-  fi
-  if ! json_ok_true "$python_bin" <"$legacy_body_file"; then
-    echo "[e2e] legacy monitor response is not successful JSON: ${legacy_path}" >&2
-    rm -f "$canonical_body_file" "$legacy_body_file"
-    return 1
-  fi
-
-  rm -f "$canonical_body_file" "$legacy_body_file"
+  rm -f "$body_file"
 }
 
 wait_for_endpoint_ok() {
@@ -584,6 +704,7 @@ main() {
   local pi_keyword="${base_keyword}_pi_${run_stamp}"
   local hermes_keyword="${base_keyword}_hermes_trajectory_${run_stamp}"
   local hermes_session_keyword="${base_keyword}_hermes_session_${run_stamp}"
+  local paging_keyword="${base_keyword}_paging_${run_stamp}"
   local clickhouse_database="moraine"
   local routed_clickhouse_database="moraine_routed"
   local codex_session_suffix
@@ -703,6 +824,12 @@ main() {
   local hermes_session_fixture_file="$fixtures_root/hermes/sessions/${hermes_session_id}.json"
   local nac_fixture_dir="$fixtures_root/nac"
   local nac_fixture_file="$nac_fixture_dir/store.db"
+  # Filler sessions whose only job is to push the corpus past one monitor page.
+  # Their own directory, source name, cwd and keyword keep them out of every
+  # other assertion: nothing else greps their text, and their timestamps sit
+  # after the window mcp_smoke.py lists over.
+  local paging_fixture_dir="$fixtures_root/paging/sessions"
+  local paging_project_dir="$tmp_root/paging-project"
   local nac_project_dir="$tmp_root/nac-project"
   # Codex records the launch cwd in session_meta. Keep this as a plain Git
   # repository with no .moraine.toml so bundled MCP project identity and ingest
@@ -730,7 +857,29 @@ main() {
   mkdir -p "$(dirname "$hermes_fixture_file")"
   mkdir -p "$(dirname "$hermes_session_fixture_file")"
   mkdir -p "$nac_fixture_dir"
+  mkdir -p "$paging_fixture_dir"
+  mkdir -p "$paging_project_dir"
   mkdir -p "$runtime_root"
+
+  # 12:02:00Z onward: strictly after the 11:59-12:01 window mcp_smoke.py's
+  # list_sessions calls bound, so these never compete for a slot in its
+  # `limit: 20` page, and strictly after every harness fixture, so a DESC feed
+  # ranks them ahead of the sessions the membership assertions look for.
+  local paging_index
+  for (( paging_index = 0; paging_index < MONITOR_SESSIONS_PAGING_FIXTURES; paging_index++ )); do
+    local paging_session_id
+    paging_session_id="$(printf '00000000-0000-4000-9000-%012x' "$paging_index")"
+    local paging_second
+    paging_second="$(printf '%02d' "$(( paging_index % 60 ))")"
+    local paging_minute
+    paging_minute="$(printf '%02d' "$(( 2 + paging_index / 60 ))")"
+    cat > "${paging_fixture_dir}/session-${paging_session_id}.jsonl" <<EOF
+{"timestamp":"2026-02-16T12:${paging_minute}:${paging_second}.000Z","type":"session_meta","payload":{"id":"${paging_session_id}","cwd":"${paging_project_dir}","source":"cli"}}
+{"timestamp":"2026-02-16T12:${paging_minute}:${paging_second}.100Z","type":"turn_context","payload":{"turn_id":"1","model":"gpt-5.3-codex"}}
+{"timestamp":"2026-02-16T12:${paging_minute}:${paging_second}.200Z","type":"response_item","payload":{"type":"message","role":"user","id":"paging-user-${paging_index}-${run_stamp}","content":[{"type":"text","text":"${paging_keyword} filler prompt ${paging_index}"}],"phase":"completed"}}
+{"timestamp":"2026-02-16T12:${paging_minute}:${paging_second}.300Z","type":"response_item","parent_id":"paging-user-${paging_index}-${run_stamp}","payload":{"type":"message","role":"assistant","id":"paging-assistant-${paging_index}-${run_stamp}","content":[{"type":"text","text":"${paging_keyword} filler reply ${paging_index}"}],"phase":"final_answer"}}
+EOF
+  done
 
   cat > "$codex_fixture_file" <<EOF
 {"timestamp":"2026-02-16T12:00:00.000Z","type":"session_meta","payload":{"id":"${codex_session_id}","cwd":"${codex_project_dir}","source":"vscode"}}
@@ -1358,6 +1507,16 @@ enabled = true
 glob = "${fixtures_root}/hermes/sessions/*.json"
 watch_root = "${fixtures_root}/hermes/sessions"
 
+# Filler sessions that push the corpus past one monitor page so
+# assert_monitor_session_feed_pages actually redeems a cursor. Own source name
+# and own cwd, so no other assertion sees them.
+[[ingest.sources]]
+name = "ci-paging"
+harness = "codex"
+enabled = true
+glob = "${paging_fixture_dir}/*.jsonl"
+watch_root = "${paging_fixture_dir}"
+
 [[ingest.sources]]
 name = "ci-nac"
 harness = "nac"
@@ -1372,6 +1531,9 @@ format = "nac_sqlite"
 # mcp_smoke.py must proxy through it until the explicit crash check below.
 
 use_central_server = true
+# Stated rather than inherited: it is the monitor session feed's effective page
+# size, and MONITOR_SESSIONS_MAX_RESULTS asserts the route reports exactly this.
+max_results = 25
 
 [runtime]
 root_dir = "${runtime_root}"
@@ -1478,6 +1640,10 @@ EOF
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_postings WHERE term = '${claude_keyword}'" 120
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${routed_clickhouse_database}.search_documents WHERE positionCaseInsensitiveUTF8(text_content, '${claude_keyword}') > 0" 120
   assert_clickhouse_count "$clickhouse_url" "named backend excludes default-only codex session" "SELECT count() FROM ${routed_clickhouse_database}.search_documents WHERE positionCaseInsensitiveUTF8(text_content, '${codex_keyword}') > 0" "0"
+  # Every filler session must be live before the feed is paged; a partially
+  # ingested corpus would leave page 1 short and fail the paging gate for the
+  # wrong reason.
+  wait_for_clickhouse_count "$clickhouse_url" "SELECT countDistinct(session_id) >= ${MONITOR_SESSIONS_PAGING_FIXTURES} FROM ${clickhouse_database}.events WHERE source_name = 'ci-paging'" 180
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_documents WHERE positionCaseInsensitiveUTF8(text_content, '${kimi_keyword}') > 0" 120
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_postings WHERE term = '${kimi_keyword}'" 120
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_documents WHERE positionCaseInsensitiveUTF8(text_content, '${qwen_keyword}') > 0" 120
@@ -1961,29 +2127,87 @@ if not valid:
 ' "$expected_server_version" "$applied_schema_level"
 
   local monitor_api_url="http://127.0.0.1:${monitor_port}"
-  echo "[e2e] checking one-release monitor API aliases"
-  assert_monitor_api_alias "$python_bin" "$monitor_api_url" "$tmp_root" \
-    "/api/v1/health" "/api/health"
-  assert_monitor_api_alias "$python_bin" "$monitor_api_url" "$tmp_root" \
-    "/api/v1/status" "/api/status"
-  assert_monitor_api_alias "$python_bin" "$monitor_api_url" "$tmp_root" \
-    "/api/v1/analytics?range=24h" "/api/analytics?range=24h"
-  assert_monitor_api_alias "$python_bin" "$monitor_api_url" "$tmp_root" \
-    "/api/v1/tables" "/api/tables"
-  assert_monitor_api_alias "$python_bin" "$monitor_api_url" "$tmp_root" \
-    "/api/v1/web-searches?limit=25" "/api/web-searches?limit=25"
-  assert_monitor_api_alias "$python_bin" "$monitor_api_url" "$tmp_root" \
-    "/api/v1/tables/v_conversation_trace?limit=500" \
-    "/api/tables/v_conversation_trace?limit=500"
-  assert_monitor_api_alias "$python_bin" "$monitor_api_url" "$tmp_root" \
-    "/api/v1/sessions?since=all&limit=200" \
-    "/api/sessions?since=all&limit=200"
+  echo "[e2e] checking the removed one-release monitor API aliases are gone"
+  local legacy_path
+  for legacy_path in \
+    "/api/health" \
+    "/api/status" \
+    "/api/analytics?range=24h" \
+    "/api/tables" \
+    "/api/web-searches?limit=25" \
+    "/api/tables/v_conversation_trace?limit=500" \
+    "/api/sessions?since=all&limit=200"; do
+    assert_monitor_api_path_gone "$python_bin" "$monitor_api_url" "$tmp_root" "$legacy_path"
+  done
 
-  local sessions_body
+  echo "[e2e] checking the monitor session feed pages against a real repository"
+  assert_monitor_session_feed_pages "$python_bin" "http://127.0.0.1:${monitor_port}"
+
+  # Membership runs over the PAGED traversal, not over page 1: the requested
+  # `limit=200` is clamped to the backend's `max_results`, and the paging
+  # fixtures deliberately occupy page 1, so every harness fixture session below
+  # is reachable only by redeeming a cursor.
+  local sessions_body sessions_all
   sessions_body="$(curl -fsS "http://127.0.0.1:${monitor_port}/api/v1/sessions?since=all&limit=200")"
-  printf '%s' "$sessions_body" | "$python_bin" -c 'import json,sys; data=json.load(sys.stdin); sid=sys.argv[1]; ok=any(s.get("id")==sid and s.get("harness",{}).get("id")=="cursor" for s in data.get("sessions", [])); sys.exit(0 if ok else 1)' "$cursor_session_id"
-  printf '%s' "$sessions_body" | "$python_bin" -c 'import json,sys; data=json.load(sys.stdin); sid=sys.argv[1]; ok=any(s.get("id")==sid and s.get("harness",{}).get("id")=="pi-coding-agent" for s in data.get("sessions", [])); sys.exit(0 if ok else 1)' "$pi_session_id"
-  printf '%s' "$sessions_body" | "$python_bin" -c 'import json,sys; data=json.load(sys.stdin); sid=sys.argv[1]; ok=any(s.get("id")==sid and s.get("harness",{}).get("id")=="kiro-cli" for s in data.get("sessions", [])); sys.exit(0 if ok else 1)' "$kiro_session_id"
+  sessions_all="$(monitor_sessions_all "$python_bin" "http://127.0.0.1:${monitor_port}")"
+  printf '%s' "$sessions_all" | "$python_bin" -c 'import json,sys; data=json.load(sys.stdin); sid=sys.argv[1]; ok=any(s.get("id")==sid and s.get("harness")=="cursor" for s in data.get("sessions", [])); sys.exit(0 if ok else 1)' "$cursor_session_id"
+  printf '%s' "$sessions_all" | "$python_bin" -c 'import json,sys; data=json.load(sys.stdin); sid=sys.argv[1]; ok=any(s.get("id")==sid and s.get("harness")=="pi-coding-agent" for s in data.get("sessions", [])); sys.exit(0 if ok else 1)' "$pi_session_id"
+  printf '%s' "$sessions_all" | "$python_bin" -c 'import json,sys; data=json.load(sys.stdin); sid=sys.argv[1]; ok=any(s.get("id")==sid and s.get("harness")=="kiro-cli" for s in data.get("sessions", [])); sys.exit(0 if ok else 1)' "$kiro_session_id"
+
+  # The feed is summaries only: no transcript key may appear at any depth, and
+  # the response must say whether more sessions exist.
+  printf '%s' "$sessions_body" | "$python_bin" -c '
+import json
+import sys
+
+data = json.load(sys.stdin)
+forbidden = {"turns", "steps", "text", "events", "payload_json"}
+
+
+def walk(node):
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key in forbidden:
+                print(f"monitor session feed carries transcript key {key!r}", file=sys.stderr)
+                raise SystemExit(1)
+            walk(value)
+    elif isinstance(node, list):
+        for value in node:
+            walk(value)
+
+
+walk(data)
+if not isinstance(data.get("has_more"), bool):
+    print(f"monitor session feed must report has_more; got {data.get('"'"'has_more'"'"')!r}", file=sys.stderr)
+    raise SystemExit(1)
+if data.get("has_more") != (data.get("next_cursor") is not None):
+    print("monitor session feed has_more must track next_cursor", file=sys.stderr)
+    raise SystemExit(1)
+'
+
+  # The lazy transcript load: turns arrive only from the per-session page route.
+  local session_page_body
+  session_page_body="$(curl -fsS "http://127.0.0.1:${monitor_port}/api/v1/sessions/${codex_session_id}/page?limit=5")"
+  printf '%s' "$session_page_body" | "$python_bin" -c '
+import json
+import sys
+
+data = json.load(sys.stdin)
+session_id = sys.argv[1]
+session = data.get("session") or {}
+turns = session.get("turns")
+valid = (
+    data.get("ok") is True
+    and data.get("read_model") == "live"
+    and session.get("id") == session_id
+    and isinstance(turns, list)
+    and len(turns) >= 1
+    and isinstance(data.get("has_more"), bool)
+)
+if not valid:
+    print(f"unexpected monitor session page payload: {data!r}", file=sys.stderr)
+    raise SystemExit(1)
+' "$codex_session_id"
 
   # Regression for #388: turn_seq is computed by a running user-message window
   # over the events ReplacingMergeTree. Re-ingestion can briefly leave a
@@ -2030,13 +2254,12 @@ if not valid:
   # production ingestion.
   "$moraine_bin" db migrate --config "$config_path" >/dev/null
 
-  # `/api/v1/sessions` intentionally keeps its dashboard shape without
-  # eventCount. Derive the monitor-side canonical count through the existing
-  # trace preview route, then compare both that count and sessions.endedAt with
-  # MCP below.
+  # `/api/v1/sessions` now serves the same shared discovery operation MCP
+  # `list_sessions` pages, so its summary carries eventCount directly. Compare
+  # it against the trace preview route and against MCP below.
   echo "[e2e] checking monitor/repository session count + last-activity parity"
-  sessions_body="$(curl -fsS "http://127.0.0.1:${monitor_port}/api/v1/sessions?since=all&limit=200")"
-  printf '%s' "$sessions_body" | "$python_bin" -c 'import json,sys; data=json.load(sys.stdin); sid=sys.argv[1]; expected=int(sys.argv[2]); session=next((s for s in data.get("sessions", []) if s.get("id")==sid), None); ok=session is not None and session.get("endedAt")==expected; sys.exit(0 if ok else 1)' "$codex_session_id" "1771243203900"
+  sessions_all="$(monitor_sessions_all "$python_bin" "http://127.0.0.1:${monitor_port}")"
+  printf '%s' "$sessions_all" | "$python_bin" -c 'import json,sys; data=json.load(sys.stdin); sid=sys.argv[1]; expected=int(sys.argv[2]); events=int(sys.argv[3]); session=next((s for s in data.get("sessions", []) if s.get("id")==sid), None); ok=session is not None and session.get("endedAt")==expected and session.get("eventCount")==events; sys.exit(0 if ok else 1)' "$codex_session_id" "1771243203900" "8"
   local trace_body
   trace_body="$(curl -fsS "http://127.0.0.1:${monitor_port}/api/v1/tables/v_conversation_trace?limit=500")"
   printf '%s' "$trace_body" | "$python_bin" -c 'import json,sys; data=json.load(sys.stdin); sid=sys.argv[1]; expected=int(sys.argv[2]); count=sum(1 for row in data.get("rows", []) if row.get("session_id")==sid); sys.exit(0 if count==expected else 1)' "$codex_session_id" "8"
@@ -2117,9 +2340,8 @@ PY
     --file-attention-path "Cargo.toml"
 
   echo "[e2e] checking named-backend HTTP route through shared daemon router"
-  routed_sessions_body="$(curl -fsS \
-    -H "X-Moraine-Project-Dir: ${claude_project_dir}" \
-    "http://127.0.0.1:${monitor_port}/api/v1/sessions?since=all&limit=200")"
+  routed_sessions_body="$(monitor_sessions_all "$python_bin" "http://127.0.0.1:${monitor_port}" \
+    -H "X-Moraine-Project-Dir: ${claude_project_dir}")"
   printf '%s' "$routed_sessions_body" | "$python_bin" -c 'import json,sys; data=json.load(sys.stdin); present=sys.argv[1]; absent=sys.argv[2]; ids={row.get("id") for row in data.get("sessions", [])}; sys.exit(0 if present in ids and absent not in ids else 1)' "$claude_session_id" "$codex_session_id"
   routed_health_body="$(curl -fsS \
     -H "X-Moraine-Project-Dir: ${claude_project_dir}" \

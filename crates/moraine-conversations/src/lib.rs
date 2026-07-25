@@ -5,6 +5,7 @@ mod domain;
 mod error;
 mod in_memory_repo;
 mod repo;
+mod session_label;
 
 pub use backend_router::{BackendRepository, BackendRepositoryRouter};
 pub use clickhouse_repo::{
@@ -37,7 +38,8 @@ pub use domain::{
 };
 pub use error::{RepoError, RepoResult};
 pub use in_memory_repo::{
-    InMemoryConversationCalls, InMemoryConversationRepository, InMemoryConversationResponses,
+    CanonicalSessionPageResponse, InMemoryConversationCalls, InMemoryConversationRepository,
+    InMemoryConversationResponses,
 };
 // Boundary crates (MCP dispatch, monitor handlers, CLI commands) hold only
 // `Arc<dyn ConversationRepository>` and do not depend on moraine-clickhouse;
@@ -49,6 +51,10 @@ pub use moraine_clickhouse::{
     EnvelopeStatsSnapshot, QueryClass, QueryEnvelope,
 };
 pub use repo::ConversationRepository;
+// The session summary label both boundary crates render (issue-599 §5.7 holds
+// MCP and the monitor to identical summary fields, synthesized labels
+// included), so it lives with the item it labels rather than in either caller.
+pub use session_label::{readable_harness, session_display_label};
 
 /// Build the production ClickHouse repository behind its backend-neutral read
 /// trait. The compatibility factory assigns the shared conversation-reader

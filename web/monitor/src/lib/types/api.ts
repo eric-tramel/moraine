@@ -53,6 +53,8 @@ export interface StatusResponse {
   ok: boolean;
   publication?: PublicationStatus;
   ingestor?: IngestorStatus;
+  /** The vocabulary the session feed's server-side `harness` filter accepts. */
+  known_harnesses?: string[];
   error?: string;
 }
 

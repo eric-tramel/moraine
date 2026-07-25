@@ -1,24 +1,30 @@
+use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard};
 
 use async_trait::async_trait;
 
 use crate::domain::{
-    AnalyticsRange, AnalyticsSnapshot, AnalyticsWindow, IngestHeartbeatRead, SessionAnalytics,
+    AnalyticsRange, AnalyticsSnapshot, AnalyticsWindow, CanonicalContinuation,
+    CanonicalReadOutcome, CanonicalSessionPage, IngestHeartbeatRead, SessionAnalytics,
     SessionAnalyticsQuery, StoreDiagnostics, StoreHealth, TablePreview, TablePreviewQuery,
     TableSummaries, WebSearchEvent,
 };
 use crate::domain::{
-    Conversation, ConversationDetailOptions, ConversationListFilter, ConversationSearchQuery,
-    ConversationSearchResults, ConversationSearchStats, ConversationSummary, FileAttentionQuery,
-    FileAttentionTouch, McpEventOpen, McpEventType, McpSessionListFilter, McpSessionListItem,
-    McpSessionOpen, McpTurnOpen, OpenContext, OpenEventRequest, Page, PageRequest, RepoConfig,
-    SearchEventsQuery, SearchEventsResult, SearchEventsStats, SearchMcpEventsQuery,
-    SearchMcpEventsResult, SearchMcpEventsStats, SessionEventsQuery, SessionMetadata,
-    SessionMetadataSearchQuery, SessionMetadataSearchResults, SessionMetadataSearchStats,
-    TraceEvent, Turn, TurnListFilter, TurnSummary,
+    Conversation, ConversationDetailOptions, ConversationListFilter, ConversationMode,
+    ConversationSearchQuery, ConversationSearchResults, ConversationSearchStats,
+    ConversationSummary, FileAttentionQuery, FileAttentionTouch, McpEventOpen, McpEventType,
+    McpSessionListFilter, McpSessionListItem, McpSessionOpen, McpTurnOpen, OpenContext,
+    OpenEventRequest, Page, PageRequest, RepoConfig, SearchEventsQuery, SearchEventsResult,
+    SearchEventsStats, SearchMcpEventsQuery, SearchMcpEventsResult, SearchMcpEventsStats,
+    SessionEventsQuery, SessionMetadata, SessionMetadataSearchQuery, SessionMetadataSearchResults,
+    SessionMetadataSearchStats, TraceEvent, Turn, TurnListFilter, TurnSummary,
 };
-use crate::error::RepoResult;
+use crate::error::{RepoError, RepoResult};
 use crate::repo::ConversationRepository;
+
+/// One programmed outcome of [`ConversationRepository::canonical_open_session_page`].
+pub type CanonicalSessionPageResponse =
+    RepoResult<Option<CanonicalReadOutcome<CanonicalSessionPage>>>;
 
 /// Configurable responses returned by [`InMemoryConversationRepository`].
 ///
@@ -32,6 +38,22 @@ pub struct InMemoryConversationResponses {
     pub get_session_metadata: Option<RepoResult<Option<SessionMetadata>>>,
     pub get_mcp_session: Option<RepoResult<Option<McpSessionOpen>>>,
     pub list_mcp_sessions: Option<RepoResult<Page<McpSessionListItem>>>,
+    /// A static keyset corpus: the page served for a given continuation token,
+    /// with `""` keying the uncursored first page. Takes precedence over
+    /// [`Self::list_mcp_sessions`], so a caller that drops the cursor is served
+    /// page 1 again and the overlap is visible to the test.
+    pub list_mcp_sessions_by_cursor: BTreeMap<String, RepoResult<Page<McpSessionListItem>>>,
+    pub canonical_open_session_page: Option<CanonicalSessionPageResponse>,
+    /// A static session traversal: the page served after a given
+    /// `after_turn_seq`, with `0` keying the uncursored first page. Takes
+    /// precedence over [`Self::canonical_open_session_page`].
+    pub canonical_open_session_page_after_turn: BTreeMap<u32, CanonicalSessionPageResponse>,
+    /// The `open_v2` verdict the fake reports to
+    /// [`ConversationRepository::canonical_reader_ready`]. Unset reads as
+    /// ready: the fake serves programmed canonical pages, so a consumer test
+    /// exercises the reader unless it deliberately asks for a not-ready
+    /// backend.
+    pub canonical_reader_ready: Option<bool>,
     pub list_turns: Option<RepoResult<Page<TurnSummary>>>,
     pub get_turn: Option<RepoResult<Option<Turn>>>,
     pub get_mcp_turn: Option<RepoResult<Option<McpTurnOpen>>>,
@@ -63,6 +85,7 @@ pub struct InMemoryConversationCalls {
     pub get_session_metadata: Vec<String>,
     pub get_mcp_session: Vec<String>,
     pub list_mcp_sessions: Vec<(McpSessionListFilter, PageRequest)>,
+    pub canonical_open_session_page: Vec<(String, u16, Option<CanonicalContinuation>)>,
     pub list_turns: Vec<(String, TurnListFilter, PageRequest)>,
     pub get_turn: Vec<(String, u32)>,
     pub get_mcp_turn: Vec<(String, u32)>,
@@ -95,6 +118,11 @@ pub struct InMemoryConversationRepository {
     config: RepoConfig,
     responses: InMemoryConversationResponses,
     calls: Mutex<InMemoryConversationCalls>,
+    /// `list_sessions` token -> the filter signature it was minted under. The
+    /// real repository carries this inside the token; the fake keeps it beside
+    /// the token so it can refuse the same way (see
+    /// [`session_list_filter_sig`]).
+    minted_session_cursors: Mutex<BTreeMap<String, String>>,
 }
 
 impl InMemoryConversationRepository {
@@ -107,6 +135,7 @@ impl InMemoryConversationRepository {
             config,
             responses,
             calls: Mutex::new(InMemoryConversationCalls::default()),
+            minted_session_cursors: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -348,15 +377,43 @@ impl ConversationRepository for InMemoryConversationRepository {
         filter: McpSessionListFilter,
         page: PageRequest,
     ) -> RepoResult<Page<McpSessionListItem>> {
+        let filter_sig = session_list_filter_sig(&filter);
+        let cursor = page.cursor.clone().unwrap_or_default();
         self.record(|calls| calls.list_mcp_sessions.push((filter, page)));
-        response_or!(
-            self,
-            list_mcp_sessions,
-            Page {
-                items: Vec::new(),
-                next_cursor: None,
-            }
-        )
+
+        // The real repository's cursor contract, modeled: a token is bound to
+        // the filter that minted it and is refused under any other. A fake that
+        // dispatched on the token string alone could not fail a caller that
+        // re-derives its filter between pages, so no unit test guarding that
+        // could ever be red.
+        let minted_sig = mutex_lock(&self.minted_session_cursors)
+            .get(&cursor)
+            .cloned();
+        if minted_sig.is_some_and(|minted| minted != filter_sig) {
+            return Err(RepoError::invalid_cursor(
+                "cursor does not match current list_sessions filter",
+            ));
+        }
+
+        let result = match self.responses.list_mcp_sessions_by_cursor.get(&cursor) {
+            Some(keyed) => keyed.clone(),
+            None => response_or!(
+                self,
+                list_mcp_sessions,
+                Page {
+                    items: Vec::new(),
+                    next_cursor: None,
+                }
+            ),
+        };
+        if let Ok(Page {
+            next_cursor: Some(next),
+            ..
+        }) = &result
+        {
+            mutex_lock(&self.minted_session_cursors).insert(next.clone(), filter_sig);
+        }
+        result
     }
 
     async fn list_turns(
@@ -486,6 +543,61 @@ impl ConversationRepository for InMemoryConversationRepository {
         self.record(|calls| calls.cancel_query.push(query_id.to_string()));
         response_or!(self, cancel_query, ())
     }
+
+    async fn canonical_reader_ready(&self) -> bool {
+        self.responses.canonical_reader_ready.unwrap_or(true)
+    }
+
+    async fn canonical_open_session_page(
+        &self,
+        session_id: &str,
+        limit: u16,
+        after: Option<CanonicalContinuation>,
+    ) -> CanonicalSessionPageResponse {
+        let after_turn_seq = after
+            .as_ref()
+            .map(|continuation| continuation.after_turn_seq)
+            .unwrap_or_default();
+        self.record(|calls| {
+            calls
+                .canonical_open_session_page
+                .push((session_id.to_string(), limit, after))
+        });
+        if let Some(keyed) = self
+            .responses
+            .canonical_open_session_page_after_turn
+            .get(&after_turn_seq)
+        {
+            return keyed.clone();
+        }
+        // Unprogrammed, the fake keeps the trait's typed failure instead of
+        // answering `Ok(None)`: a consumer wired to a repository with no v2
+        // reader must see that, not an empty session.
+        match &self.responses.canonical_open_session_page {
+            Some(result) => result.clone(),
+            None => Err(RepoError::backend(
+                "canonical v2 open reader is not available on this repository",
+            )),
+        }
+    }
+}
+
+/// The `list_sessions` filter dimensions a continuation token is bound to.
+///
+/// `ClickHouseConversationRepository::mcp_session_list_filter_sig` builds the
+/// same JSON tuple and embeds it in the token it mints. The fake reproduces the
+/// query dimensions; it has no configured `session_scope`, which is the one
+/// term it cannot mirror.
+fn session_list_filter_sig(filter: &McpSessionListFilter) -> String {
+    serde_json::to_string(&(
+        filter.start_unix_ms,
+        filter.end_unix_ms,
+        filter.mode.map(ConversationMode::as_str),
+        filter.harness.as_deref(),
+        filter.source_name.as_deref(),
+        filter.sort.as_str(),
+    ))
+    .expect("list_sessions filter contains only serializable primitives")
 }
 
 fn mutex_lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -511,6 +623,77 @@ mod tests {
     };
 
     #[tokio::test]
+    async fn a_list_sessions_cursor_is_refused_when_the_filter_that_minted_it_moved() {
+        use crate::domain::{ConversationListSort, McpSessionListFilter, Page, PageRequest};
+        use std::collections::BTreeMap;
+
+        // The real repository embeds the filter signature in the token and
+        // refuses a mismatch. The fake must be able to refuse the same way, or
+        // no consumer test could ever exhibit a caller that re-derives its
+        // filter between pages.
+        let filter = |start_unix_ms: i64| McpSessionListFilter {
+            start_unix_ms,
+            end_unix_ms: 1_771_243_203_901,
+            mode: None,
+            sort: ConversationListSort::Desc,
+            harness: None,
+            source_name: None,
+        };
+        let repo = InMemoryConversationRepository::with_responses(
+            crate::domain::RepoConfig::default(),
+            InMemoryConversationResponses {
+                list_mcp_sessions_by_cursor: BTreeMap::from([
+                    (
+                        String::new(),
+                        Ok(Page {
+                            items: Vec::new(),
+                            next_cursor: Some("page-2".to_string()),
+                        }),
+                    ),
+                    (
+                        "page-2".to_string(),
+                        Ok(Page {
+                            items: Vec::new(),
+                            next_cursor: None,
+                        }),
+                    ),
+                ]),
+                ..Default::default()
+            },
+        );
+
+        let page_one = repo
+            .list_mcp_sessions(filter(0), PageRequest::default())
+            .await
+            .expect("page 1");
+        let cursor = page_one.next_cursor.expect("page 1 mints a cursor");
+
+        let resumed = PageRequest {
+            cursor: Some(cursor.clone()),
+            ..PageRequest::default()
+        };
+        assert!(
+            repo.list_mcp_sessions(filter(0), resumed.clone())
+                .await
+                .is_ok(),
+            "the minting filter redeems its own token"
+        );
+
+        let error = repo
+            .list_mcp_sessions(filter(1), resumed)
+            .await
+            .expect_err("a moved filter must refuse the token");
+        assert!(
+            matches!(error, RepoError::InvalidCursor(ref message)
+                if message == "cursor does not match current list_sessions filter"),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    // `list_session_analytics` is deprecated pending projector retirement;
+    // these suites are the callers that keep it covered until it is deleted.
+    #[allow(deprecated)]
     async fn analytics_contract_defaults_and_calls_work_through_trait_object() {
         let fake = Arc::new(InMemoryConversationRepository::default());
         let repo: Arc<dyn ConversationRepository> = fake.clone();
@@ -588,6 +771,9 @@ mod tests {
     }
 
     #[tokio::test]
+    // `list_session_analytics` is deprecated pending projector retirement;
+    // these suites are the callers that keep it covered until it is deleted.
+    #[allow(deprecated)]
     async fn analytics_contract_returns_configured_successes_and_accumulates_calls() {
         let session = SessionAnalytics {
             summary: ConversationSummary {
@@ -763,6 +949,9 @@ mod tests {
     }
 
     #[tokio::test]
+    // `list_session_analytics` is deprecated pending projector retirement;
+    // these suites are the callers that keep it covered until it is deleted.
+    #[allow(deprecated)]
     async fn analytics_contract_returns_each_configured_error_through_trait_object() {
         let responses = InMemoryConversationResponses {
             list_session_analytics: Some(Err(RepoError::backend("sessions"))),

@@ -13,7 +13,7 @@ module.exports = defineConfig({
   workers: 1,
   reporter: [
     ['list'],
-    ['./e2e/expected-cases-reporter.cjs', { expectedCases: 2 }],
+    ['./e2e/expected-cases-reporter.cjs', { expectedCases: 3 }],
   ],
   use: {
     baseURL: 'http://127.0.0.1:4173',

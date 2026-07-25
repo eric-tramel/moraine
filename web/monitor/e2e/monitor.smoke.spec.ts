@@ -59,6 +59,30 @@ const CANONICAL_API_PATHNAMES = [
 ] as const;
 const STATIC_PATHNAMES = ['/', '/app.js', '/styles.css'] as const;
 
+const SESSION_FIXTURE_ID = 'session-monitor-fixture';
+const SESSIONS_PAGE_TWO_CURSOR = 'cursor-page-2';
+const SESSION_PAGE_PATHNAME = `/api/v1/sessions/${SESSION_FIXTURE_ID}/page`;
+
+function sessionSummaryFixture(id: string, title: string) {
+  return {
+    id,
+    title,
+    displayLabel: title,
+    harness: 'codex',
+    source: 'ci-codex',
+    inferenceProvider: 'openai',
+    mode: 'tool_calling',
+    startedAt: 1_700_000_000_000,
+    endedAt: 1_700_000_003_900,
+    status: 'completed',
+    turnCount: 1,
+    eventCount: 4,
+    toolCallCount: 1,
+    sessionSlug: title.toLowerCase().replace(/\s+/g, '-'),
+    sessionSummary: `${title} summary`,
+  };
+}
+
 interface RuntimeTraffic {
   apiPathnames: string[];
   responses: Array<{ origin: string; pathname: string; status: number }>;
@@ -146,6 +170,7 @@ async function setupMockMonitorApi(page: Page): Promise<void> {
     await route.fulfill({
       json: {
         ok: true,
+        known_harnesses: ['claude-code', 'codex', 'hermes'],
         ingestor: {
           present: true,
           alive: true,
@@ -160,49 +185,81 @@ async function setupMockMonitorApi(page: Page): Promise<void> {
     });
   });
 
-  await page.route('**/api/v1/sessions', async (route) => {
+  // Summaries only: no `turns` key, no message content. The dashboard renders
+  // a card from exactly these fields.
+  await page.route('**/api/v1/sessions?*', async (route) => {
+    const url = new URL(route.request().url());
+    const cursor = url.searchParams.get('cursor');
+    if (cursor === SESSIONS_PAGE_TWO_CURSOR) {
+      await route.fulfill({
+        json: {
+          ok: true,
+          read_model: 'live',
+          sessions: [sessionSummaryFixture('session-monitor-page-2', 'Second page session')],
+          limit: 1,
+          next_cursor: null,
+          has_more: false,
+          window: { start: 1_700_000_000_000, end: 1_700_000_100_000 },
+        },
+      });
+      return;
+    }
     await route.fulfill({
       json: {
         ok: true,
-        sessions: [
-          {
-            id: 'session-monitor-fixture',
-            title: 'Inspect the repository',
-            harness: { id: 'codex', label: 'codex', short: 'C', hue: 150 },
-            startedAt: 1_700_000_000_000,
-            endedAt: 1_700_000_003_900,
-            durationMs: 3_900,
-            status: 'completed',
-            models: ['gpt-5.3-codex'],
-            turns: [
-              {
-                idx: 0,
-                model: 'gpt-5.3-codex',
-                startedAt: 1_700_000_000_000,
-                endedAt: 1_700_000_003_900,
-                durationMs: 3_900,
-                promptTokens: 10,
-                completionTokens: 6,
-                totalTokens: 16,
-                toolCalls: 0,
-                steps: [
-                  { kind: 'user', at: 1_700_000_000_000, text: 'Inspect the repository' },
-                  {
-                    kind: 'assistant',
-                    at: 1_700_000_003_900,
-                    text: 'Repository inspection complete',
-                    tokens: 6,
-                    durationMs: 3_900,
-                  },
-                ],
-              },
-            ],
-            totalTokens: 16,
-            totalToolCalls: 0,
-            tags: [],
-            traceId: 'trace-monitor-fixture',
-          },
-        ],
+        read_model: 'live',
+        sessions: [sessionSummaryFixture(SESSION_FIXTURE_ID, 'Inspect the repository')],
+        limit: 1,
+        next_cursor: SESSIONS_PAGE_TWO_CURSOR,
+        has_more: true,
+        window: { start: 1_700_000_000_000, end: 1_700_000_100_000 },
+      },
+    });
+  });
+
+  await page.route('**/api/v1/sessions/*/page?*', async (route) => {
+    const url = new URL(route.request().url());
+    const sessionId = decodeURIComponent(url.pathname.split('/').slice(-2)[0]);
+    await route.fulfill({
+      json: {
+        ok: true,
+        read_model: 'live',
+        limit: 25,
+        session: {
+          id: sessionId,
+          title: 'Inspect the repository',
+          harness: 'codex',
+          source: 'ci-codex',
+          inferenceProvider: 'openai',
+          mode: 'tool_calling',
+          startedAt: 1_700_000_000_000,
+          endedAt: 1_700_000_003_900,
+          completed: true,
+          turnCount: 1,
+          eventCount: 4,
+          sessionSlug: 'inspect-the-repository',
+          sessionSummary: 'Repository inspection complete',
+          turns: [
+            {
+              turnSeq: 1,
+              turnId: 'turn-1',
+              startedAt: 1_700_000_000_000,
+              endedAt: 1_700_000_003_900,
+              eventCount: 4,
+              userMessages: 1,
+              assistantMessages: 1,
+              toolCalls: 1,
+              toolResults: 1,
+              reasoningItems: 0,
+              userInput: 'Inspect the repository',
+              finalResponse: 'Repository inspection complete',
+              toolsCalled: ['Read'],
+              completed: true,
+            },
+          ],
+        },
+        has_more: false,
+        next_cursor: null,
       },
     });
   });
@@ -257,35 +314,48 @@ test('loads dashboard and handles core interactions', async ({ page }) => {
   await page.locator('#analyticsRanges').getByRole('button', { name: '7d' }).click();
   await expect(page.locator('#analyticsMeta')).toContainText('Last 7d');
 
-  // Sessions panel consumes the monitor API response rather than mock fallback data.
+  // Sessions panel consumes the monitor API response. There is no fallback to
+  // generated data, so anything rendered here came from the feed.
   await expect(page.locator('#sessionsPanel')).toBeVisible();
   await expect(page.locator('.mv-card-title').first()).toHaveText('Inspect the repository');
   await expect(page.locator('.mv-card').first()).toBeVisible();
 
-  // Clicking a card opens the side panel with detail (transcript is default)
+  // The collapsed list renders from summaries alone: no transcript request has
+  // been made for any session.
+  expect(runtimeTraffic.apiPathnames.filter((p) => p.endsWith('/page'))).toEqual([]);
+
+  // Opening a card lazily loads exactly one page of turns.
   await page.locator('.mv-card').first().click();
   await expect(page.locator('.mv-sidepanel')).toBeVisible();
   await expect(page.locator('.mv-nodes')).toBeVisible();
-
-  // Toggle to flamegraph view
-  await page.locator('.mv-viz-toggle button', { hasText: 'flamegraph' }).click();
-  const flameTurn = page.locator('.mv-flame-turn').first();
-  await expect(flameTurn).toBeVisible();
-  await expect(flameTurn.locator('.mv-tr-row').first()).toBeVisible();
-
-  // Back to transcript
-  await page.locator('.mv-viz-toggle button', { hasText: 'transcript' }).click();
-  await expect(page.locator('.mv-nodes')).toBeVisible();
+  await expect(page.locator('.mv-node-user .mv-node-text')).toHaveText('Inspect the repository');
+  await expect(page.locator('.mv-node-assistant .mv-node-text')).toHaveText(
+    'Repository inspection complete',
+  );
+  await expect
+    .poll(() => runtimeTraffic.apiPathnames.filter((p) => p === SESSION_PAGE_PATHNAME).length)
+    .toBe(1);
 
   await page.locator('.mv-sidepanel .mv-iconbtn').click();
   await expect(page.locator('.mv-sidepanel')).toHaveCount(0);
 
-  // Filter bar: searching narrows results
+  // The count says what is loaded, never a ratio against a total the feed does
+  // not report.
   const counter = page.locator('.mv-filter-count');
-  const totalText = (await counter.textContent()) ?? '';
-  const totalMatch = totalText.match(/\d+\s*\/\s*(\d+)/);
-  expect(totalMatch).not.toBeNull();
+  await expect(counter).toHaveText('1 loaded');
 
+  // `has_more` surfaces as an affordance, so a page can never read as the whole
+  // corpus. Redeeming the cursor appends page 2.
+  await page.getByRole('button', { name: 'Load more sessions' }).click();
+  await expect(page.locator('.mv-card')).toHaveCount(2);
+  await expect(counter).toHaveText('2 loaded');
+  await expect(page.getByRole('button', { name: 'Load more sessions' })).toHaveCount(0);
+
+  // Filter bar: searching narrows the loaded sessions
+  await expect(page.locator('.mv-search-input')).toHaveAttribute(
+    'placeholder',
+    'Filter loaded sessions by title or id',
+  );
   await page.locator('.mv-search-input').fill('nothing-should-match-xyz');
   await expect(page.locator('.mv-empty')).toContainText('No sessions match');
   await page.locator('.mv-search-clear').click();
@@ -300,6 +370,27 @@ test('loads dashboard and handles core interactions', async ({ page }) => {
   await expectVersionedRuntimeTraffic(runtimeTraffic, pageOrigin);
 });
 
+test('surfaces a failed session feed as an error instead of fabricated sessions', async ({
+  page,
+}) => {
+  // The deleted mock fallback answered every failure with generated sessions
+  // and a null error store, which made an unreachable backend look like a live
+  // one serving unfamiliar work.
+  await page.route('**/api/v1/sessions?*', async (route) => {
+    await route.fulfill({
+      status: 504,
+      json: { ok: false, error: 'sessions query failed: deadline', code: 'deadline_exceeded' },
+    });
+  });
+
+  await page.goto('/');
+  await expect(page.locator('#sessionsPanel')).toBeVisible();
+  await expect(page.locator('#sessionsPanel .mv-empty').first()).toContainText(
+    'Sessions unavailable',
+  );
+  await expect(page.locator('.mv-card')).toHaveCount(0);
+});
+
 test('keeps dashboard and detail views inside the mobile viewport', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto('/');
@@ -310,10 +401,6 @@ test('keeps dashboard and detail views inside the mobile viewport', async ({ pag
 
   await page.locator('.mv-card').first().click();
   await expect(page.locator('.mv-sidepanel')).toBeVisible();
-  await expectNoPageOverflow(page);
-
-  await page.locator('.mv-viz-toggle button', { hasText: 'flamegraph' }).click();
-  await expect(page.locator('.mv-flame-turn').first()).toBeVisible();
-  await expect(page.locator('.mv-tr-row').first()).toBeVisible();
+  await expect(page.locator('.mv-nodes')).toBeVisible();
   await expectNoPageOverflow(page);
 });

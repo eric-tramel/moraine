@@ -1,37 +1,60 @@
 import { derived, writable } from 'svelte/store';
-import type { Session, SessionsFilter } from '../types/sessions';
+import type { SessionSummary, SessionsFilter } from '../types/sessions';
 
-export const sessionsStore = writable<Session[]>([]);
+export const sessionsStore = writable<SessionSummary[]>([]);
 export const sessionsLoadingStore = writable<boolean>(false);
+export const sessionsLoadingMoreStore = writable<boolean>(false);
 export const sessionsErrorStore = writable<string | null>(null);
+
+/**
+ * The continuation for the next page, and whether one exists.
+ *
+ * `hasMore` is the server's own answer, so the list can never present a loaded
+ * subset as the whole corpus. An empty page carrying a cursor is a legal "keep
+ * paging" signal, not "no results".
+ */
+export const sessionsCursorStore = writable<string | null>(null);
+export const sessionsHasMoreStore = writable<boolean>(false);
 
 export const sessionsFilterStore = writable<SessionsFilter>({
   query: '',
-  model: 'all',
   status: 'all',
   harness: 'all',
 });
 
 export const activeSessionIdStore = writable<string | null>(null);
 
-export function filterSessions(sessions: Session[], filter: SessionsFilter): Session[] {
+/**
+ * Narrow the sessions ALREADY LOADED.
+ *
+ * `query` matches labels and identifiers only. Message content is not in the
+ * feed and is not fetched to answer a keystroke, so this cannot search
+ * transcripts — the filter input says so. Whole-corpus search arrives with
+ * issue #597; until then this is page-local by construction.
+ *
+ * `harness` and `status` are applied here too so a filter change is instant on
+ * what is loaded; `harness` is additionally pushed to the server, which is what
+ * makes it correct across pages.
+ */
+export function filterSessions(
+  sessions: SessionSummary[],
+  filter: SessionsFilter,
+): SessionSummary[] {
   const q = filter.query.trim().toLowerCase();
-  return sessions.filter((s) => {
-    if (filter.model !== 'all' && !s.models.includes(filter.model)) return false;
-    if (filter.status !== 'all' && s.status !== filter.status) return false;
-    if (filter.harness !== 'all' && s.harness.id !== filter.harness) return false;
+  return sessions.filter((session) => {
+    if (filter.status !== 'all' && session.status !== filter.status) return false;
+    if (filter.harness !== 'all' && (session.harness ?? '') !== filter.harness) return false;
     if (!q) return true;
-    if (s.title.toLowerCase().includes(q)) return true;
-    if (s.id.toLowerCase().includes(q)) return true;
-    if (s.harness.label.toLowerCase().includes(q)) return true;
-    if (s.tags.some((tag) => tag.toLowerCase().includes(q))) return true;
-    for (const turn of s.turns) {
-      for (const step of turn.steps) {
-        if ('text' in step && step.text && step.text.toLowerCase().includes(q)) return true;
-        if (step.kind === 'tool_call' && step.tool.toLowerCase().includes(q)) return true;
-      }
-    }
-    return false;
+    return [
+      session.title,
+      session.displayLabel,
+      session.sessionSummary,
+      session.sessionSlug,
+      session.id,
+      session.harness,
+      session.source,
+      session.inferenceProvider,
+    ].some((field) => field?.toLowerCase().includes(q));
   });
 }
 

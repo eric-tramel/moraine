@@ -7,6 +7,7 @@ description = "Analytics and query logic for Moraine monitor service"
 [dependencies]
 anyhow = "1.0"
 axum = "0.7"
+base64 = "0.22"
 mime_guess = "2.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

@@ -22,6 +22,21 @@ pub trait ConversationRepository: Send + Sync {
     fn config(&self) -> &RepoConfig;
 
     async fn prewarm_mcp_search_state(&self) -> RepoResult<()>;
+
+    /// The projector-backed dashboard read. It has had no interactive caller
+    /// since issue-599 WI-04 moved the monitor session feed onto
+    /// [`Self::list_mcp_sessions`]; only live-fixture and repository tests
+    /// still reach it.
+    ///
+    /// Its implementation walks `v_session_summary` / `v_conversation_trace`
+    /// and returns full transcripts, which is exactly the corpus-shaped read
+    /// #599 removed from the interactive path. Deleting it belongs to the
+    /// projector-retirement PR, which also retires the views it reads and the
+    /// `mode_subquery_for_sessions` helper it shares with `list_conversations`
+    /// and `get_conversation`.
+    #[deprecated(
+        note = "no interactive caller since issue-599 WI-04; removal belongs to the projector-retirement PR"
+    )]
     async fn list_session_analytics(
         &self,
         query: SessionAnalyticsQuery,
@@ -57,10 +72,10 @@ pub trait ConversationRepository: Send + Sync {
 
     async fn get_mcp_session(&self, session_id: &str) -> RepoResult<Option<McpSessionOpen>>;
 
-    /// Session DISCOVERY, and the operation the monitor feed is being
-    /// consolidated onto (issue-599 WI-03; it still reads
-    /// [`Self::list_session_analytics`] today). The `mcp_` prefix is already
-    /// historical; renaming it is recorded as a post-epic cleanup.
+    /// Session DISCOVERY, and the single shared operation MCP `list_sessions`
+    /// and the monitor session feed both page through (issue-599 WI-04 moved
+    /// the feed here from [`Self::list_session_analytics`]). The `mcp_` prefix
+    /// is historical; renaming it is recorded as a post-epic cleanup.
     ///
     /// Whether more results exist is `Page::next_cursor.is_some()` — there is
     /// deliberately no `total`, because a corpus-wide count is exactly the
@@ -143,6 +158,23 @@ pub trait ConversationRepository: Send + Sync {
     // repository. The default here fails typed so a backend that has not
     // implemented the reader (in-memory, or an unwired router) never silently
     // returns an empty page.
+
+    /// Whether the canonical v2 reader below may serve reads on this
+    /// repository.
+    ///
+    /// This is the SAME `open_v2` readiness authority the MCP `open` cutover
+    /// and the issue-599 directory listing path gate on — one authority, one
+    /// verdict, so no consumer can read canonical indexes the others refuse.
+    /// Every caller of [`Self::canonical_open_session_page`] and its siblings
+    /// must consult it first: those readers do not gate themselves, and on a
+    /// backend whose indexes are unpublished they would answer from an
+    /// incomplete store.
+    ///
+    /// The default is `false`, matching the typed failure the default readers
+    /// below return: a repository with no v2 reader is never ready.
+    async fn canonical_reader_ready(&self) -> bool {
+        false
+    }
 
     /// One keyset page of an `open(session)` traversal from live canonical rows.
     async fn canonical_open_session_page(

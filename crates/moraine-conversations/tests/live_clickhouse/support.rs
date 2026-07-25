@@ -169,15 +169,28 @@ fn canonicalize_json(value: &Value) -> Value {
     }
 }
 
+/// The monitor session SUMMARY fields, which after issue-599 WI-04 are the
+/// same values MCP `list_sessions` reports for that session. Transcript-derived
+/// fields are deliberately absent from both sides: the feed no longer reads
+/// them.
 fn monitor_session_projection(session: &Value) -> Result<Value> {
     let session_id = session
         .get("id")
         .and_then(Value::as_str)
         .context("monitor session missing string id")?;
+    // `harness` is nullable on the wire — a session whose events carry no
+    // harness serves JSON null — so a hard error here would fail parity on
+    // legitimate data rather than on a divergence.
     let harness = session
-        .pointer("/harness/id")
-        .and_then(Value::as_str)
-        .context("monitor session missing harness.id")?;
+        .get("harness")
+        .map(|value| match value {
+            Value::Null => Ok(""),
+            other => other
+                .as_str()
+                .context("monitor session harness must be a string or null"),
+        })
+        .transpose()?
+        .unwrap_or_default();
     let started_at = session
         .get("startedAt")
         .and_then(Value::as_i64)
@@ -186,32 +199,32 @@ fn monitor_session_projection(session: &Value) -> Result<Value> {
         .get("endedAt")
         .and_then(Value::as_i64)
         .context("monitor session missing endedAt")?;
-    let models = session
-        .get("models")
-        .and_then(Value::as_array)
-        .context("monitor session missing models")?;
-    let trace_id = session
-        .get("traceId")
+    let mode = session
+        .get("mode")
         .and_then(Value::as_str)
-        .context("monitor session missing traceId")?;
-    let turns = session
-        .get("turns")
-        .and_then(Value::as_array)
-        .context("monitor session missing turns")?;
-    let tool_calls = session
-        .get("totalToolCalls")
+        .context("monitor session missing mode")?;
+    let turn_count = session
+        .get("turnCount")
         .and_then(Value::as_u64)
-        .context("monitor session missing totalToolCalls")?;
+        .context("monitor session missing turnCount")?;
+    let event_count = session
+        .get("eventCount")
+        .and_then(Value::as_u64)
+        .context("monitor session missing eventCount")?;
+    let tool_call_count = session
+        .get("toolCallCount")
+        .and_then(Value::as_u64)
+        .context("monitor session missing toolCallCount")?;
 
     Ok(json!({
         "session_id": session_id,
         "harness": harness,
         "started_at_unix_ms": started_at,
         "ended_at_unix_ms": ended_at,
-        "models": models,
-        "trace_id": trace_id,
-        "turns": turns.len(),
-        "tool_calls": tool_calls,
+        "mode": mode,
+        "turn_count": turn_count,
+        "event_count": event_count,
+        "tool_call_count": tool_call_count,
     }))
 }
 
@@ -246,23 +259,23 @@ mod tests {
     fn monitor_sessions_normalize_order_and_reject_incomplete_shapes() {
         let first = json!({
             "id": "session-a",
-            "harness": {"id": "claude"},
+            "harness": "claude-code",
             "startedAt": 1,
             "endedAt": 2,
-            "models": ["model-a"],
-            "traceId": "trace-a",
-            "turns": [{"id": 1}],
-            "totalToolCalls": 3
+            "mode": "chat",
+            "turnCount": 1,
+            "eventCount": 4,
+            "toolCallCount": 3
         });
         let second = json!({
             "id": "session-b",
-            "harness": {"id": "codex"},
+            "harness": "codex",
             "startedAt": 3,
             "endedAt": 4,
-            "models": ["model-b"],
-            "traceId": "trace-b",
-            "turns": [],
-            "totalToolCalls": 0
+            "mode": "tool_calling",
+            "turnCount": 0,
+            "eventCount": 0,
+            "toolCallCount": 0
         });
         let forward = MonitorSessionsResponse {
             ok: true,

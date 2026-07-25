@@ -8,10 +8,10 @@ use crate::contract::{
     ToolErrorEnvelope, LIST_SESSIONS_DEADLINE_MS, LIST_SESSIONS_TOOL,
 };
 use anyhow::{Context, Result};
-use chrono::{Datelike, TimeZone, Timelike, Utc};
 use moraine_conversations::{
-    ConversationListSort as RepoListSort, ConversationMode as RepoConversationMode,
-    McpSessionListFilter, McpSessionListItem, Page, PageRequest, QueryEnvelope,
+    session_display_label, ConversationListSort as RepoListSort,
+    ConversationMode as RepoConversationMode, McpSessionListFilter, McpSessionListItem, Page,
+    PageRequest, QueryEnvelope,
 };
 use serde_json::{json, Value};
 use tokio::time::{timeout, Duration};
@@ -218,82 +218,6 @@ fn session_json(rank: usize, session: &McpSessionListItem) -> Result<Value, Cont
     }))
 }
 
-fn session_display_label(session: &McpSessionListItem) -> String {
-    if let Some(label) = session
-        .title
-        .as_deref()
-        .filter(|label| !label.trim().is_empty())
-        .or(session.session_summary.as_deref())
-        .filter(|label| !label.trim().is_empty())
-        .or(session.session_slug.as_deref())
-        .filter(|label| !label.trim().is_empty())
-    {
-        return label.to_string();
-    }
-
-    let harness = readable_harness(session.harness.as_deref().unwrap_or("session"));
-    let mode = readable_mode(session.mode.as_str());
-    let updated_at = compact_utc_datetime(session.last_event_unix_ms);
-    let turns = pluralize(session.total_turns as u64, "turn", "turns");
-
-    format!("{harness}, {mode}, {updated_at}, {turns}")
-}
-
-fn readable_harness(harness: &str) -> &str {
-    match harness {
-        "codex" => "Codex",
-        "claude-code" => "Claude Code",
-        "cursor" => "Cursor",
-        "hermes" => "Hermes",
-        "kiro-cli" => "Kiro CLI",
-        "kimi-cli" => "Kimi CLI",
-        "nac" => "NAC",
-        "opencode" => "OpenCode",
-        "pi-coding-agent" => "Pi Coding Agent",
-        "qwen-code" => "Qwen Code",
-        _ => harness,
-    }
-}
-
-fn readable_mode(mode: &str) -> &'static str {
-    match mode {
-        "web_search" => "web search",
-        "tool_calling" => "tool session",
-        "mcp_internal" => "MCP session",
-        "chat" => "chat",
-        _ => "session",
-    }
-}
-
-fn compact_utc_datetime(unix_ms: i64) -> String {
-    const MONTHS: [&str; 12] = [
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    ];
-
-    let Some(datetime) = Utc.timestamp_millis_opt(unix_ms).single() else {
-        return format_rfc3339_utc_millis(unix_ms);
-    };
-    let month_name = MONTHS
-        .get(datetime.month0() as usize)
-        .copied()
-        .unwrap_or("Jan");
-
-    format!(
-        "{month_name} {} {:02}:{:02} UTC",
-        datetime.day(),
-        datetime.hour(),
-        datetime.minute()
-    )
-}
-
-fn pluralize(count: u64, singular: &str, plural: &str) -> String {
-    if count == 1 {
-        format!("1 {singular}")
-    } else {
-        format!("{count} {plural}")
-    }
-}
-
 fn mcp_session_id(session_id: &str) -> Result<String, ContractError> {
     McpSessionId::from_raw_session_id(session_id)
         .map(|id| id.to_string())
@@ -409,7 +333,6 @@ mod tests {
     use moraine_conversations::{
         ConversationMode, InMemoryConversationRepository, InMemoryConversationResponses, RepoConfig,
     };
-    use std::collections::BTreeSet;
     use std::sync::Arc;
 
     #[test]
@@ -744,38 +667,6 @@ mod tests {
         let text = format_list_sessions_text(&payload);
         assert!(text.contains("useful-slug"));
         assert!(!text.contains("chat     "));
-    }
-
-    #[test]
-    fn readable_harness_covers_canonical_harness_ids() {
-        let cases = [
-            ("codex", "Codex"),
-            ("claude-code", "Claude Code"),
-            ("cursor", "Cursor"),
-            ("hermes", "Hermes"),
-            ("kiro-cli", "Kiro CLI"),
-            ("kimi-cli", "Kimi CLI"),
-            ("nac", "NAC"),
-            ("opencode", "OpenCode"),
-            ("pi-coding-agent", "Pi Coding Agent"),
-            ("qwen-code", "Qwen Code"),
-            ("future-harness", "future-harness"),
-        ];
-
-        for (raw, expected) in cases {
-            assert_eq!(readable_harness(raw), expected);
-        }
-
-        let covered: BTreeSet<&str> = cases
-            .iter()
-            .map(|(raw, _)| *raw)
-            .filter(|raw| *raw != "future-harness")
-            .collect();
-        let known: BTreeSet<&str> = moraine_config::KNOWN_INGEST_HARNESSES
-            .iter()
-            .copied()
-            .collect();
-        assert_eq!(covered, known);
     }
 
     #[test]

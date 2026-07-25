@@ -1,6 +1,9 @@
 use super::*;
 
 #[tokio::test(flavor = "multi_thread")]
+// `list_session_analytics` is deprecated pending projector retirement;
+// these suites are the callers that keep it covered until it is deleted.
+#[allow(deprecated)]
 async fn session_analytics_assembles_canonical_views_and_public_steps() {
     scoped(async {
         let responses = vec![
@@ -148,6 +151,9 @@ async fn session_analytics_assembles_canonical_views_and_public_steps() {
     .await;
 }
 #[tokio::test(flavor = "multi_thread")]
+// `list_session_analytics` is deprecated pending projector retirement;
+// these suites are the callers that keep it covered until it is deleted.
+#[allow(deprecated)]
 async fn session_analytics_empty_and_timed_limit_sql_are_deterministic() {
     scoped(async {
         let (repo, state) = build_scripted_repo(vec![ScriptedResponse::rows(
@@ -175,6 +181,9 @@ async fn session_analytics_empty_and_timed_limit_sql_are_deterministic() {
     .await;
 }
 #[tokio::test(flavor = "multi_thread")]
+// `list_session_analytics` is deprecated pending projector retirement;
+// these suites are the callers that keep it covered until it is deleted.
+#[allow(deprecated)]
 async fn session_analytics_propagates_each_wire_stage_error() {
     scoped(async {
         let scenarios = vec![

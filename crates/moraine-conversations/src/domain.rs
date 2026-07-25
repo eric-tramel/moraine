@@ -22,6 +22,19 @@ impl ConversationMode {
             Self::Chat => "chat",
         }
     }
+
+    /// Parse a canonical wire mode. An unrecognized value yields `None` so the
+    /// caller rejects the request rather than dropping the filter and serving a
+    /// wider result set than was asked for.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "web_search" => Some(Self::WebSearch),
+            "mcp_internal" => Some(Self::McpInternal),
+            "tool_calling" => Some(Self::ToolCalling),
+            "chat" => Some(Self::Chat),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -1213,7 +1226,8 @@ pub enum SessionLookback {
 }
 
 impl SessionLookback {
-    pub(crate) const fn window_seconds(self) -> Option<u32> {
+    /// The window this lookback names, or `None` for `all` (no lower bound).
+    pub const fn window_seconds(self) -> Option<u32> {
         match self {
             Self::OneHour => Some(60 * 60),
             Self::SixHours => Some(6 * 60 * 60),

@@ -1250,6 +1250,9 @@ fn publication_attention_query() -> FileAttentionQuery {
     }
 }
 
+// `list_session_analytics` is deprecated pending projector retirement;
+// these suites are the callers that keep it covered until it is deleted.
+#[allow(deprecated)]
 async fn assert_live_repository_surfaces(
     repository: &ClickHouseConversationRepository,
     boundary: &str,
@@ -1616,17 +1619,35 @@ async fn assert_monitor_http_surfaces(
             );
         }
 
+        // Both sides read the shared discovery operation (issue-599 WI-04), so
+        // the window and limit here must match what the monitor derives from
+        // `since=all&limit=100`.
+        let now_unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .context("system clock before the unix epoch")?
+            .as_millis() as i64;
         let direct_sessions = direct_repository
-            .list_session_analytics(SessionAnalyticsQuery {
-                lookback: SessionLookback::All,
-                limit: 100,
-            })
-            .await?;
+            .list_mcp_sessions(
+                McpSessionListFilter {
+                    start_unix_ms: 0,
+                    end_unix_ms: now_unix_ms + 1,
+                    mode: None,
+                    sort: ConversationListSort::Desc,
+                    harness: None,
+                    source_name: None,
+                },
+                PageRequest {
+                    limit: RepoConfig::default().max_results,
+                    cursor: None,
+                },
+            )
+            .await?
+            .items;
         assert_session_id_set(
             &format!("{boundary}: direct monitor sessions"),
             direct_sessions
                 .iter()
-                .map(|session| session.summary.session_id.clone()),
+                .map(|session| session.session_id.clone()),
             &expected_live_session_ids(model),
         )?;
         let monitor_sessions = super::monitor_semantics::<super::MonitorSessionsResponse>(
