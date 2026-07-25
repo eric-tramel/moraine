@@ -518,6 +518,17 @@ class RunLiveTestTests(unittest.TestCase):
             "fsync-to-open-valid", "live_canonical_open_fsync_to_open_valid"
         )
 
+    def test_list_parity_mode_runs_only_exact_ignored_function(self) -> None:
+        self.assert_exact_invocation("list-parity", "live_session_list_directory_parity")
+
+    def test_list_query_log_mode_runs_only_exact_ignored_function(self) -> None:
+        self.assert_exact_invocation("list-query-log", "live_session_list_query_log_clean")
+
+    def test_list_bench_mode_runs_only_exact_ignored_function(self) -> None:
+        self.assert_exact_invocation(
+            "list-bench", "live_session_list_boundedness_benchmark"
+        )
+
     def test_missing_and_unknown_modes_fail_before_boot(self) -> None:
         missing = self.run_wrapper()
         unknown = self.run_wrapper("all-ignored")

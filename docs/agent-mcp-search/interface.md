@@ -188,6 +188,19 @@ timezone. `mode` can filter session mode: `web_search`, `mcp_internal`,
 case-sensitive semantics as `search_sessions`. `next_cursor` lets clients
 continue the same listing; changing any filter invalidates that cursor.
 
+Paging rules worth knowing before writing a loop:
+
+- **Stop on `next_cursor: null`, never on an empty page.** A page can come back
+  with no sessions and still carry a cursor — the server bounds how much it
+  resolves per request, and a selective filter can use that budget up without
+  producing a row. Redeem the cursor and keep going.
+- **The listing is a moving feed, not a snapshot.** A session that gains events
+  while you page moves ahead of your position and will not reappear on a later
+  page. To see the current top of the feed, start again from page 1. Activity in
+  sessions you already passed does not disturb your cursor.
+- **A rejected cursor means restart, not retry.** `invalid_request` on a cursor
+  means the filter, the sort, or the server's read path moved under you.
+
 Output data includes compact session records:
 
 ```json

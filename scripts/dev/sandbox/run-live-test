@@ -49,6 +49,10 @@ Modes:
                     Run live_canonical_open_append_to_visible exactly (WI-11).
   fsync-to-open-valid
                     Run live_canonical_open_fsync_to_open_valid exactly (WI-11).
+  list-parity       Run live_session_list_directory_parity exactly (#599 WI-07).
+  list-query-log    Run live_session_list_query_log_clean exactly (#599 WI-07).
+  list-bench        Run live_session_list_boundedness_benchmark exactly
+                    (#599 WI-07).
 
 Each invocation creates and owns a fresh sandbox, enables destructive tests
 only for the in-container Cargo process, retains a diagnostic log, and tears
@@ -107,6 +111,15 @@ case "$1" in
     fsync-to-open-valid)
         # WI-11 populates this test body; pre-declared mode arm.
         test_function="live_canonical_open_fsync_to_open_valid"
+        ;;
+    list-parity)
+        test_function="live_session_list_directory_parity"
+        ;;
+    list-query-log)
+        test_function="live_session_list_query_log_clean"
+        ;;
+    list-bench)
+        test_function="live_session_list_boundedness_benchmark"
         ;;
     -h|--help)
         usage
