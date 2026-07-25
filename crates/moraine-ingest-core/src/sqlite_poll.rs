@@ -304,7 +304,11 @@ fn project_exclusions_hash(config: &AppConfig) -> u64 {
 }
 
 fn sqlite_policy_fingerprint(format: &str, exclusions_hash: u64) -> String {
-    format!("sqlite-publication-v1:{format}:{exclusions_hash:016x}")
+    // Carries the normalization-rules version for the same reason the JSONL
+    // fingerprint does: an adapter change that alters attribution or row shape
+    // must replace the source rather than leave both interpretations live.
+    let rules = crate::dispatch::SOURCE_NORMALIZATION_RULES_VERSION;
+    format!("sqlite-publication-v1:{rules}:{format}:{exclusions_hash:016x}")
 }
 
 fn sqlite_data_version(connection: &Connection) -> Result<i64> {

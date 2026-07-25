@@ -44,6 +44,24 @@ const ERROR_KIND_SOURCE_LINE_TOO_LARGE: &str = "jsonl_source_line_too_large";
 const ERROR_KIND_NORMALIZED_ROW_TOO_LARGE: &str = "jsonl_normalized_row_too_large";
 const JSONL_PUBLICATION_PROTOCOL_VERSION: &str = "jsonl-publication-v1";
 
+/// Version of the source-adapter normalization rules, i.e. what a given source
+/// line is turned into — session attribution, row shape, derived links.
+///
+/// **Bump this whenever an adapter changes what rows or what attribution a
+/// source line produces.** It feeds the policy fingerprints, so a bump is a
+/// whole-source replacement replay: every source is re-read under a fresh
+/// generation and the atomic publication switches to it, leaving the old
+/// interpretation superseded rather than live alongside the new one. Without
+/// the bump, a corpus keeps rows that the current code would never write, and
+/// the two interpretations disagree forever — precisely the state that
+/// followed the sub-agent attribution fix.
+///
+/// v2: session attribution became deterministic and thread-truthful. A Codex
+/// sub-agent rollout embeds the parent thread's `session_meta`, which used to
+/// re-attribute the rest of the file to the parent, and attribution differed
+/// between a full read and a resumed read.
+pub(crate) const SOURCE_NORMALIZATION_RULES_VERSION: &str = "normalization-v2";
+
 /// Fingerprint the policy inputs that can change which logical rows a file
 /// produces. A changed value is a whole-source replacement, even when the
 /// inode and byte offset are unchanged: rows hidden by an old exclusion or
@@ -54,6 +72,7 @@ fn jsonl_policy_fingerprint(config: &AppConfig, work: &WorkItem) -> String {
     exclusions.sort();
     let payload = serde_json::to_vec(&json!({
         "protocol": JSONL_PUBLICATION_PROTOCOL_VERSION,
+        "normalization_rules": SOURCE_NORMALIZATION_RULES_VERSION,
         "source_format": work.format.to_string(),
         "harness": work.harness,
         "project_exclusions": exclusions,
@@ -2083,16 +2102,19 @@ fn truncate(input: &str, max_chars: usize) -> String {
 mod tests {
     use super::{
         complete_work, compose_hermes_model, enqueue_work, enrich_claude_model_latency,
-        jsonl_source_line_byte_limit, process_file, process_session_json_file, run_work_item,
-        source_inode_for_file, work_item_is_ingestable, work_path_is_canonical, SessionCursor,
-        CLICKHOUSE_JSON_OBJECT_BYTE_LIMIT, ERROR_KIND_NORMALIZED_ROW_TOO_LARGE,
-        ERROR_KIND_SOURCE_LINE_TOO_LARGE, SESSION_JSON_GENERATION, SESSION_JSON_INODE,
+        jsonl_policy_fingerprint, jsonl_source_line_byte_limit, process_file,
+        process_session_json_file, run_work_item, source_inode_for_file, work_item_is_ingestable,
+        work_path_is_canonical, SessionCursor, CLICKHOUSE_JSON_OBJECT_BYTE_LIMIT,
+        ERROR_KIND_NORMALIZED_ROW_TOO_LARGE, ERROR_KIND_SOURCE_LINE_TOO_LARGE,
+        JSONL_PUBLICATION_PROTOCOL_VERSION, SESSION_JSON_GENERATION, SESSION_JSON_INODE,
+        SOURCE_NORMALIZATION_RULES_VERSION,
     };
     use crate::model::{Checkpoint, CheckpointLifecycle};
     use crate::sqlite_poll::VolatilePollMap;
     use crate::{DispatchState, Metrics, SinkMessage, WorkItem};
     use moraine_config::SourceFormat;
     use serde_json::{json, Value};
+    use sha2::{Digest, Sha256};
     use std::collections::HashMap;
     use std::fs;
     use std::future::Future;
@@ -2725,6 +2747,64 @@ mod tests {
         assert_eq!(retried_batch.error_rows.len(), 1);
 
         let _ = fs::remove_file(&path);
+    }
+
+    /// The policy fingerprint must carry the normalization-rules version.
+    ///
+    /// A fingerprint change is what turns an adapter rule change into a
+    /// whole-source replacement replay; without this input, altering what a
+    /// source line normalizes to leaves the old rows live alongside the new
+    /// interpretation forever. Dropping the field from the payload is the
+    /// regression this pins.
+    #[test]
+    fn policy_fingerprints_carry_the_normalization_rules_version() {
+        let config = moraine_config::AppConfig::default();
+        let work = WorkItem {
+            source_name: "codex".to_string(),
+            harness: "codex".to_string(),
+            format: SourceFormat::Jsonl,
+            source_glob: String::new(),
+            path: "/tmp/rollout.jsonl".to_string(),
+        };
+
+        let mut exclusions = config.ingest.exclude_project_dirs.clone();
+        exclusions.sort();
+        let with_rules = serde_json::to_vec(&json!({
+            "protocol": JSONL_PUBLICATION_PROTOCOL_VERSION,
+            "normalization_rules": SOURCE_NORMALIZATION_RULES_VERSION,
+            "source_format": work.format.to_string(),
+            "harness": work.harness,
+            "project_exclusions": exclusions.clone(),
+        }))
+        .expect("policy payload serializes");
+        let expected: String = Sha256::digest(with_rules)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        assert_eq!(
+            jsonl_policy_fingerprint(&config, &work),
+            expected,
+            "the JSONL fingerprint must hash the normalization-rules version"
+        );
+
+        // A different rules version must be a different fingerprint, or a
+        // future bump would not trigger the replacement replay it exists for.
+        let without_rules = serde_json::to_vec(&json!({
+            "protocol": JSONL_PUBLICATION_PROTOCOL_VERSION,
+            "source_format": work.format.to_string(),
+            "harness": work.harness,
+            "project_exclusions": exclusions,
+        }))
+        .expect("policy payload serializes");
+        let legacy: String = Sha256::digest(without_rules)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        assert_ne!(
+            jsonl_policy_fingerprint(&config, &work),
+            legacy,
+            "a corpus normalized under the previous rules must not fingerprint equal"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
