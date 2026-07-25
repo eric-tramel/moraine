@@ -1385,9 +1385,24 @@ async fn internal_list_timeout_kills_abandoned_transport_statement() {
     };
     let hung = hung_query_ids.lock().expect("hung lock").clone();
     assert!(!hung.is_empty(), "mock never saw a data query");
+    // The KILL must COVER the abandoned statement, which it can do two ways:
+    // by naming the statement id outright (the transport drop guard), or by
+    // the request-scoped prefix `list_sessions` now issues explicitly, which
+    // matches every statement of that request. Requiring the literal id would
+    // reject the prefix form even though it kills strictly more.
+    let request_prefix = kill
+        .split("moraine-request-")
+        .nth(1)
+        .map(|tail| {
+            let end = tail.find("%27").unwrap_or(tail.len());
+            format!("moraine-request-{}", &tail[..end])
+        })
+        .expect("KILL names a request-scoped id");
     assert!(
-        hung.iter().any(|query_id| kill.contains(query_id.as_str())),
-        "KILL must target the abandoned statement: kill={kill}, hung={hung:?}"
+        hung.iter().any(|query_id| {
+            kill.contains(query_id.as_str()) || query_id.starts_with(&request_prefix)
+        }),
+        "KILL must cover the abandoned statement: kill={kill}, hung={hung:?}, prefix={request_prefix}"
     );
     assert!(
         kill.contains("moraine-request-"),

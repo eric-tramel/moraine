@@ -1,6 +1,6 @@
 use super::{
-    handled_tool_error_result, internal_id_error, repo_error_to_contract_error,
-    request_performance, tool_success_result, AppState,
+    backend_query_id, cancel_query_with_deadline, handled_tool_error_result, internal_id_error,
+    repo_error_to_contract_error, request_performance, tool_success_result, AppState,
 };
 use crate::contract::{
     format_rfc3339_utc_millis, CanonicalListSessionsArgs, ContractError, ListSessionsArgs,
@@ -42,6 +42,16 @@ impl AppState {
             cursor: args.cursor.clone(),
         };
 
+        // The request id the statements below run under, so a fired timeout
+        // can KILL them by prefix. Outside an envelope (direct unit-test
+        // calls) keep a bespoke id so unenveloped statements stay
+        // attributable — the same rule `file_attention` follows, which is what
+        // keeps the cancelled id on the `moraine-request-` prefix the
+        // concurrency tests assert.
+        let query_id = QueryEnvelope::current()
+            .map(|envelope| envelope.request_id().to_string())
+            .unwrap_or_else(|_| backend_query_id("list-sessions"));
+
         // The tool-level cap narrows the request envelope (never widens it),
         // so the server-side max_execution_time of every statement below
         // tracks this 3s bound. When the tokio timeout fires the dropped
@@ -66,6 +76,10 @@ impl AppState {
                 );
             }
             Err(_) => {
+                // Belt-and-suspenders alongside the transport drop guards: an
+                // explicit bounded prefix KILL on the request id, so a page
+                // that timed out cannot leave a server query running.
+                cancel_query_with_deadline(self, &query_id).await;
                 return encode_list_sessions_error(
                     canonical_request,
                     ContractError::new(
@@ -419,6 +433,46 @@ mod tests {
             result["structuredContent"]["error"]["code"],
             "deadline_exceeded"
         );
+    }
+
+    /// The repository's budget errors must surface as their own contract
+    /// codes. The silent regression this guards is either collapsing to
+    /// `internal_error`, which tells a caller nothing actionable and hides a
+    /// budget problem as a server fault.
+    #[test]
+    fn query_budget_errors_keep_their_contract_codes() {
+        for (repo_error, expected_code) in [
+            (
+                moraine_conversations::RepoError::DeadlineExceeded {
+                    budget_note: "interactive 3s".to_string(),
+                },
+                "deadline_exceeded",
+            ),
+            (
+                moraine_conversations::RepoError::ResourceExhausted {
+                    budget_note: "read rows".to_string(),
+                },
+                "resource_exhausted",
+            ),
+        ] {
+            let contract_error = repo_error_to_contract_error(repo_error);
+            let result = encode_list_sessions_error(
+                json!({}),
+                contract_error,
+                Performance::builder().finish(),
+            )
+            .expect("budget error response");
+
+            assert_eq!(result["isError"], true);
+            assert_eq!(
+                result["structuredContent"]["error"]["code"], expected_code,
+                "a query-budget failure must not be reported as an internal error"
+            );
+            assert_eq!(
+                result["structuredContent"]["error"]["details"]["reason"], "query_budget",
+                "the caller needs to know it hit a budget, not a bug"
+            );
+        }
     }
 
     #[test]
