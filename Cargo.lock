@@ -1323,6 +1323,7 @@ version = "0.7.1"
 dependencies = [
  "anyhow",
  "axum",
+ "base64",
  "mime_guess",
  "moraine-config",
  "moraine-conversations",

@@ -124,6 +124,9 @@ impl ConversationRepository for BlockingRepository {
         self.inner.prewarm_mcp_search_state().await
     }
 
+    // Pass-through for a method deprecated pending projector retirement; the
+    // wrapper must keep delegating it while the trait declares it.
+    #[allow(deprecated)]
     async fn list_session_analytics(
         &self,
         query: SessionAnalyticsQuery,

@@ -1,101 +1,118 @@
-export type SessionStatus = 'active' | 'completed' | 'cancelled' | 'error';
+/**
+ * The dashboard's view of `/api/v1/sessions` and `/api/v1/sessions/:id/page`.
+ *
+ * The session feed carries SUMMARIES ONLY — navigation scalars and labels, no
+ * message content — so its size stays flat as transcripts grow. Turns arrive
+ * only when a session is opened, one bounded page at a time. Nothing here has a
+ * `steps` shape: the server has no per-step read path, and inventing one on the
+ * client would mean fetching transcripts to render a list.
+ */
 
-export type HarnessId =
-  | 'claude-code'
-  | 'codex'
-  | 'hermes'
-  | 'pi-coding-agent'
-  | 'cursor'
-  | 'aider'
-  | 'cli'
-  | 'custom';
+/** The only two values the server derives (`completed` flag, else recency). */
+export type SessionStatus = 'active' | 'completed';
 
+/** A harness identity for display, derived from the summary's harness id. */
 export interface Harness {
-  id: HarnessId | string;
+  id: string;
   label: string;
   short: string;
   hue: number;
 }
 
-export interface UserStep {
-  kind: 'user';
-  at: number;
-  text: string;
-}
-
-export interface AssistantStep {
-  kind: 'assistant';
-  at: number;
-  text: string;
-  tokens?: number;
-  durationMs?: number;
-}
-
-export interface ThinkingStep {
-  kind: 'thinking';
-  at: number;
-  text: string;
-  durationMs?: number;
-}
-
-export interface ToolCallStep {
-  kind: 'tool_call';
-  at: number;
-  tool: string;
-  args: Record<string, unknown>;
-  latencyMs: number;
-  result: string;
-  resultAt: number;
-  status: 'ok' | 'error';
-  callId?: string;
-}
-
-export type Step = UserStep | AssistantStep | ThinkingStep | ToolCallStep;
-
-export interface Turn {
-  idx: number;
-  model: string;
-  startedAt: number;
-  endedAt: number;
-  durationMs: number;
-  promptTokens: number;
-  completionTokens: number;
-  totalTokens: number;
-  toolCalls: number;
-  steps: Step[];
-  finishReason?: string;
-}
-
-export interface Session {
+/** One row of `/api/v1/sessions`. */
+export interface SessionSummary {
   id: string;
-  title: string;
-  harness: Harness;
+  title: string | null;
+  displayLabel: string;
+  harness: string | null;
+  source: string | null;
+  inferenceProvider: string | null;
+  mode: string;
   startedAt: number;
   endedAt: number;
-  durationMs: number;
   status: SessionStatus;
-  models: string[];
-  turns: Turn[];
-  totalTokens: number;
-  totalToolCalls: number;
-  tags: string[];
-  traceId: string;
+  turnCount: number;
+  eventCount: number;
+  toolCallCount: number;
+  sessionSlug: string | null;
+  sessionSummary: string | null;
+}
+
+export interface SessionWindow {
+  start: number;
+  end: number;
 }
 
 export interface SessionsResponse {
   ok: boolean;
   read_model?: 'live';
-  sessions: Session[];
-  models?: string[];
-  harnesses?: Harness[];
+  sessions?: SessionSummary[];
+  limit?: number;
+  next_cursor?: string | null;
+  has_more?: boolean;
+  window?: SessionWindow;
   error?: string;
+  code?: string;
 }
 
-export type TurnVizVariant = 'chat' | 'timeline' | 'trace' | 'document';
+/** One turn from `/api/v1/sessions/:id/page`: counts, references, summaries. */
+export interface SessionTurn {
+  turnSeq: number;
+  turnId: string;
+  startedAt: number;
+  endedAt: number;
+  eventCount: number;
+  userMessages: number;
+  assistantMessages: number;
+  toolCalls: number;
+  toolResults: number;
+  reasoningItems: number;
+  userInput: string | null;
+  finalResponse: string | null;
+  toolsCalled: string[];
+  completed: boolean;
+}
 
+/** The opened session header plus the turns loaded so far. */
+export interface SessionTranscript {
+  id: string;
+  title: string | null;
+  harness: string | null;
+  source: string | null;
+  inferenceProvider: string | null;
+  mode: string;
+  startedAt: number;
+  endedAt: number;
+  completed: boolean;
+  turnCount: number;
+  eventCount: number;
+  sessionSlug: string | null;
+  sessionSummary: string | null;
+  turns: SessionTurn[];
+}
+
+export interface SessionPageResponse {
+  ok: boolean;
+  read_model?: 'live';
+  limit?: number;
+  session?: SessionTranscript;
+  /** The pinned view changed underneath the cursor; reload from page 1. */
+  reopen?: boolean;
+  has_more?: boolean;
+  next_cursor?: string | null;
+  error?: string;
+  code?: string;
+}
+
+/**
+ * Client-side narrowing of the sessions already loaded.
+ *
+ * `harness` and `status` are the two the server can answer; `query` is
+ * page-local by construction (see `filterSessions`) until issue #597 ships a
+ * server-side search.
+ */
 export interface SessionsFilter {
   query: string;
-  model: string;
   status: string;
   harness: string;
 }

@@ -207,7 +207,17 @@ impl ClickHouseConversationRepository {
         }
         match self.ch.open_v2_reader_ready().await {
             Ok(ready) => {
-                let _ = self.canonical_list_ready.set(ready);
+                // Latch ONLY the positive. Readiness is monotonic once
+                // published, so caching `true` is safe and keeps the flip
+                // one-way for the process. Caching `false` is not the same
+                // thing: readiness becomes true when the backfill publishes,
+                // and a latched negative would pin every reader to the
+                // fallback — and the monitor's page route to a hard 503 —
+                // until the daemon is restarted. While not ready this costs
+                // one point-read of `mcp_read_index_state` per call.
+                if ready {
+                    let _ = self.canonical_list_ready.set(true);
+                }
                 ready
             }
             Err(error) => {

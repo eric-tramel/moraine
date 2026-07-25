@@ -2,63 +2,41 @@
   import { createEventDispatcher } from 'svelte';
   import StatusDot from './StatusDot.svelte';
   import Chip from './Chip.svelte';
-  import TurnViz from './TurnViz.svelte';
   import SessionNodes from './SessionNodes.svelte';
-  import type { Session } from '../../types/sessions';
-  import { fmtDate, fmtDuration, fmtTokens } from '../../utils/sessionFormat';
+  import type { SessionSummary, SessionTranscript } from '../../types/sessions';
+  import { fmtDate, fmtDuration } from '../../utils/sessionFormat';
 
-  export let session: Session;
+  /**
+   * An opened session: the summary the list already had, progressively filled
+   * with turns from `/api/v1/sessions/:id/page`.
+   *
+   * `transcript` is null until the first page lands. Header facts come from the
+   * transcript once it does, and from the summary before that, so the panel is
+   * useful immediately rather than blank while a page is in flight.
+   */
+  export let summary: SessionSummary;
+  export let transcript: SessionTranscript | null = null;
+  export let loading = false;
+  export let loadingMore = false;
+  export let hasMore = false;
+  export let errorMessage: string | null = null;
   export let layout: 'sidepanel' | 'inline' | 'split' | 'drawer' = 'sidepanel';
   export let closable = false;
 
-  const dispatch = createEventDispatcher<{ close: void }>();
+  const dispatch = createEventDispatcher<{ close: void; loadMore: void }>();
 
-  type VizMode = 'transcript' | 'flamegraph';
-
-  let expandedTools = new Set<string>();
-  let vizMode: VizMode = 'transcript';
-
-  let currentSessionId: string | null = null;
-  $: if (session.id !== currentSessionId) {
-    currentSessionId = session.id;
-    expandedTools = new Set();
-  }
-
-  function toggleTool(key: string): void {
-    const next = new Set(expandedTools);
-    if (next.has(key)) next.delete(key);
-    else next.add(key);
-    expandedTools = next;
-  }
-
-  function setMode(mode: VizMode): void {
-    vizMode = mode;
-  }
+  $: turns = transcript?.turns ?? [];
+  $: startedAt = transcript?.startedAt ?? summary.startedAt;
+  $: endedAt = transcript?.endedAt ?? summary.endedAt;
+  $: turnCount = transcript?.turnCount ?? summary.turnCount;
+  $: eventCount = transcript?.eventCount ?? summary.eventCount;
 </script>
 
 <div class="mv-detail mv-detail-{layout}">
   <div class="mv-detail-head">
     <div class="mv-detail-titlerow">
-      <StatusDot endedAt={session.endedAt} />
-      <h3 class="mv-detail-title">{session.title}</h3>
-      <div class="mv-viz-toggle" role="group" aria-label="Detail view">
-        <button
-          type="button"
-          class:is-active={vizMode === 'transcript'}
-          aria-pressed={vizMode === 'transcript'}
-          on:click={() => setMode('transcript')}
-        >
-          transcript
-        </button>
-        <button
-          type="button"
-          class:is-active={vizMode === 'flamegraph'}
-          aria-pressed={vizMode === 'flamegraph'}
-          on:click={() => setMode('flamegraph')}
-        >
-          flamegraph
-        </button>
-      </div>
+      <StatusDot {endedAt} />
+      <h3 class="mv-detail-title">{summary.displayLabel}</h3>
       {#if closable}
         <button class="mv-iconbtn" type="button" aria-label="Close session detail" on:click={() => dispatch('close')}>✕</button>
       {/if}
@@ -66,71 +44,65 @@
     <div class="mv-detail-metagrid">
       <div>
         <div class="mv-meta-k">session id</div>
-        <div class="mono mv-meta-v">{session.id}</div>
+        <div class="mono mv-meta-v">{summary.id}</div>
       </div>
       <div>
-        <div class="mv-meta-k">trace id</div>
-        <div class="mono mv-meta-v">{session.traceId}</div>
+        <div class="mv-meta-k">harness</div>
+        <div class="mv-meta-v">{summary.harness ?? '—'}</div>
+      </div>
+      <div>
+        <div class="mv-meta-k">source</div>
+        <div class="mv-meta-v">{summary.source ?? '—'}</div>
       </div>
       <div>
         <div class="mv-meta-k">started</div>
-        <div class="mv-meta-v">{fmtDate(session.startedAt)}</div>
+        <div class="mv-meta-v">{fmtDate(startedAt)}</div>
       </div>
       <div>
         <div class="mv-meta-k">duration</div>
-        <div class="mono mv-meta-v">{fmtDuration(session.durationMs)}</div>
+        <div class="mono mv-meta-v">{fmtDuration(Math.max(0, endedAt - startedAt))}</div>
       </div>
       <div>
         <div class="mv-meta-k">turns</div>
-        <div class="mono mv-meta-v">{session.turns.length}</div>
+        <div class="mono mv-meta-v">{turnCount}</div>
       </div>
       <div>
-        <div class="mv-meta-k">tokens</div>
-        <div class="mono mv-meta-v">{session.totalTokens.toLocaleString()}</div>
+        <div class="mv-meta-k">events</div>
+        <div class="mono mv-meta-v">{eventCount}</div>
       </div>
       <div>
-        <div class="mv-meta-k">tool calls</div>
-        <div class="mono mv-meta-v">{session.totalToolCalls}</div>
-      </div>
-      <div>
-        <div class="mv-meta-k">models</div>
+        <div class="mv-meta-k">mode</div>
         <div class="mv-meta-v">
-          {#each session.models as model (model)}
-            <Chip>{model}</Chip>
-          {/each}
+          <Chip>{summary.mode}</Chip>
+          {#if summary.inferenceProvider}
+            <Chip>{summary.inferenceProvider}</Chip>
+          {/if}
         </div>
       </div>
     </div>
   </div>
 
   <div class="mv-turns">
-    {#if vizMode === 'transcript'}
-      <SessionNodes {session} {expandedTools} on:toggleTool={(e) => toggleTool(e.detail)} />
+    {#if errorMessage}
+      <div class="mv-empty" role="status" aria-live="polite">{errorMessage}</div>
+    {:else if loading && turns.length === 0}
+      <div class="mv-empty">Loading turns…</div>
+    {:else if turns.length === 0}
+      <div class="mv-empty">This session has no turns to show.</div>
     {:else}
-      <div class="mv-flame">
-        {#each session.turns as turn, i (turn.idx)}
-          {@const userStep = turn.steps.find((s) => s.kind === 'user')}
-          <section class="mv-flame-turn">
-            {#if userStep && userStep.kind === 'user'}
-              <div class="mv-flame-prompt">
-                <div class="mv-flame-prompt-head mono">
-                  <span class="mv-flame-prompt-label">user</span>
-                  <span class="mv-flame-prompt-meta">
-                    turn {String(i + 1).padStart(2, '0')} · {turn.model || '—'} · {fmtDuration(turn.durationMs)} · {fmtTokens(turn.totalTokens)} tok · {turn.toolCalls} tool{turn.toolCalls === 1 ? '' : 's'}
-                  </span>
-                </div>
-                <div class="mv-flame-prompt-text">{userStep.text}</div>
-              </div>
-            {/if}
-            <TurnViz
-              {turn}
-              variant="trace"
-              hideUserSteps
-              {expandedTools}
-              on:toggleTool={(e) => toggleTool(e.detail)}
-            />
-          </section>
-        {/each}
+      <SessionNodes {turns} />
+      <div class="mv-loadmore">
+        <span class="mv-loadmore-count mono">{turns.length} of {turnCount} turns loaded</span>
+        {#if hasMore}
+          <button
+            class="mv-loadmore-btn"
+            type="button"
+            disabled={loadingMore}
+            on:click={() => dispatch('loadMore')}
+          >
+            {loadingMore ? 'Loading…' : 'Load more turns'}
+          </button>
+        {/if}
       </div>
     {/if}
   </div>

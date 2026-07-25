@@ -17,7 +17,7 @@ use std::env;
 use std::fs;
 use std::io::{self, Write};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
@@ -1059,6 +1059,9 @@ async fn live_schema_semantics_and_teardown() -> Result<()> {
     with_live_fixture_envelope(live_schema_semantics_and_teardown_body()).await
 }
 
+// `list_session_analytics` is deprecated pending projector retirement;
+// these suites are the callers that keep it covered until it is deleted.
+#[allow(deprecated)]
 async fn live_schema_semantics_and_teardown_body() -> Result<()> {
     let prerequisites = LivePrerequisites::load()?;
     let database = prepare_owned_database_identity(&prerequisites.sandbox_id)?;
@@ -2185,22 +2188,25 @@ fn direct_analytics_semantics(
     )
 }
 
+/// The repository side of the session-feed parity gate. Both sides now read
+/// `list_mcp_sessions`, so this observation is over the shared operation's own
+/// item rather than the projector's analytics row (issue-599 §5.7).
 fn direct_sessions_semantics(
-    sessions: &[moraine_conversations::SessionAnalytics],
+    sessions: &[moraine_conversations::McpSessionListItem],
 ) -> Result<SemanticObservation> {
     let payload = Value::Array(
         sessions
             .iter()
             .map(|session| {
                 json!({
-                    "session_id": session.summary.session_id,
-                    "harness": session.harness,
-                    "started_at_unix_ms": session.summary.first_event_unix_ms,
-                    "ended_at_unix_ms": session.summary.last_event_unix_ms,
-                    "models": session.models,
-                    "trace_id": session.trace_id,
-                    "turns": session.turns.len(),
-                    "tool_calls": session.summary.tool_calls,
+                    "session_id": session.session_id,
+                    "harness": session.harness.clone().unwrap_or_default(),
+                    "started_at_unix_ms": session.first_event_unix_ms,
+                    "ended_at_unix_ms": session.last_event_unix_ms,
+                    "mode": session.mode.as_str(),
+                    "turn_count": session.total_turns,
+                    "event_count": session.total_events,
+                    "tool_call_count": session.tool_calls,
                 })
             })
             .collect(),
@@ -2337,6 +2343,17 @@ async fn live_monitor_repository_semantic_parity_body() -> Result<()> {
                 bail!("monitor/repository analytics semantic mismatch: {analytics_comparison:?}");
             }
 
+            // The same window the monitor derives from `since=30d`, and the
+            // same effective limit its second clamp applies.
+            let now_unix_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .context("system clock before the unix epoch")?
+                .as_millis() as i64;
+            let lookback_ms = i64::from(
+                SessionLookback::ThirtyDays
+                    .window_seconds()
+                    .context("30d lookback has a window")?,
+            ) * 1_000;
             let monitor_sessions = monitor_semantics::<MonitorSessionsResponse>(
                 &client,
                 &base.join("sessions?since=30d&limit=50")?,
@@ -2344,11 +2361,22 @@ async fn live_monitor_repository_semantic_parity_body() -> Result<()> {
             .await?;
             let direct_sessions = direct_sessions_semantics(
                 &direct_repository
-                    .list_session_analytics(SessionAnalyticsQuery {
-                        lookback: SessionLookback::ThirtyDays,
-                        limit: 50,
-                    })
-                    .await?,
+                    .list_mcp_sessions(
+                        McpSessionListFilter {
+                            start_unix_ms: (now_unix_ms - lookback_ms).max(0),
+                            end_unix_ms: now_unix_ms + 1,
+                            mode: None,
+                            sort: ConversationListSort::Desc,
+                            harness: None,
+                            source_name: None,
+                        },
+                        PageRequest {
+                            limit: RepoConfig::default().max_results,
+                            cursor: None,
+                        },
+                    )
+                    .await?
+                    .items,
             )?;
             let sessions_comparison =
                 SemanticComparison::compare(&monitor_sessions, &direct_sessions);

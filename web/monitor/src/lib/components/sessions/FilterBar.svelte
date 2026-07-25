@@ -1,29 +1,33 @@
 <script lang="ts">
   import { createEventDispatcher } from 'svelte';
-  import type { Harness, SessionsFilter } from '../../types/sessions';
+  import type { SessionsFilter } from '../../types/sessions';
 
   export let filter: SessionsFilter;
-  export let models: string[] = [];
-  export let harnesses: Harness[] = [];
+  /** The harness vocabulary served by `/api/v1/status`, not scraped from the loaded page. */
+  export let harnesses: string[] = [];
   export let count = 0;
-  export let total = 0;
 
-  const statuses = ['all', 'completed', 'active', 'cancelled', 'error'];
+  // The server derives exactly these two (`completed` flag, else the activity
+  // window). `cancelled` and `error` were offered here and have never been
+  // producible, so selecting them queried for nothing.
+  const statuses = ['all', 'active', 'completed'];
 
   const dispatch = createEventDispatcher<{ change: SessionsFilter }>();
 
   function update(next: Partial<SessionsFilter>): void {
-    const merged = { ...filter, ...next };
-    dispatch('change', merged);
+    dispatch('change', { ...filter, ...next });
   }
 </script>
 
 <div class="mv-filterbar">
   <div class="mv-search">
     <span class="mv-search-icon" aria-hidden="true">⌕</span>
+    <!-- Honest label: the feed carries no message content, so this narrows the
+         loaded pages by label and id. Whole-corpus search arrives with #597. -->
     <input
       class="mv-search-input"
-      placeholder="Search prompts and responses…"
+      placeholder="Filter loaded sessions by title or id"
+      aria-label="Filter loaded sessions by title or id"
       value={filter.query}
       on:input={(e) => update({ query: e.currentTarget.value })}
     />
@@ -34,15 +38,6 @@
     {/if}
   </div>
   <div class="mv-filters">
-    <label class="mv-filter">
-      <span class="mv-filter-k">model</span>
-      <select class="mv-select" value={filter.model} on:change={(e) => update({ model: e.currentTarget.value })}>
-        <option value="all">all</option>
-        {#each models as model (model)}
-          <option value={model}>{model}</option>
-        {/each}
-      </select>
-    </label>
     <label class="mv-filter">
       <span class="mv-filter-k">status</span>
       <select class="mv-select" value={filter.status} on:change={(e) => update({ status: e.currentTarget.value })}>
@@ -60,12 +55,14 @@
           on:change={(e) => update({ harness: e.currentTarget.value })}
         >
           <option value="all">all</option>
-          {#each harnesses as h (h.id)}
-            <option value={h.id}>{h.label}</option>
+          {#each harnesses as harness (harness)}
+            <option value={harness}>{harness}</option>
           {/each}
         </select>
       </label>
     {/if}
-    <span class="mv-filter-count mono">{count} / {total}</span>
+    <!-- "loaded", never "{count} / {total}": the feed is paged and reports no
+         corpus total, so a ratio here would invent a denominator. -->
+    <span class="mv-filter-count mono">{count} loaded</span>
   </div>
 </div>

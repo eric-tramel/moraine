@@ -1241,6 +1241,44 @@ async fn list_sessions_gates_on_the_same_readiness_key_as_the_open_cutover() {
     .await;
 }
 
+/// A NEGATIVE readiness verdict must not be latched.
+///
+/// Readiness is monotonic once published, so caching `true` keeps the flip
+/// one-way for the process. Caching `false` is a different claim: the backfill
+/// publishes readiness later, and a pinned negative would hold every reader on
+/// the fallback — and the monitor's page route on a hard 503 — until the daemon
+/// is restarted.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unready_backend_reprobes_rather_than_pinning_itself_to_the_fallback() {
+    scoped(async {
+        let (repo, state) = build_repo().await;
+
+        for _ in 0..2 {
+            repo.list_mcp_sessions(
+                directory_filter(),
+                PageRequest {
+                    limit: 2,
+                    cursor: None,
+                },
+            )
+            .await
+            .expect("header-path page");
+        }
+
+        let probes = state
+            .readiness_probe_queries
+            .lock()
+            .expect("readiness probe lock")
+            .len();
+        assert!(
+            probes >= 2,
+            "a not-ready backend must re-probe so it can adopt readiness without a restart, \
+             saw {probes} probe(s)"
+        );
+    })
+    .await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn list_mcp_sessions_rejects_cursor_filter_mismatch() {
     scoped(async {

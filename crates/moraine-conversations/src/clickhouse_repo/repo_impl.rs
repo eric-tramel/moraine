@@ -200,6 +200,13 @@ impl ConversationRepository for ClickHouseConversationRepository {
         .await
     }
 
+    async fn canonical_reader_ready(&self) -> bool {
+        // Same latch the directory listing path gates on, so `open` and `list`
+        // cannot disagree about whether this backend's canonical indexes are
+        // published.
+        self.canonical_list_path_ready().await
+    }
+
     async fn canonical_open_session_page(
         &self,
         session_id: &str,

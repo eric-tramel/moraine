@@ -8,16 +8,20 @@ use axum::{
     routing::get,
     Json, Router,
 };
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine as _;
 #[cfg(test)]
 use moraine_config::AppConfig;
 use moraine_config::{QueryBudgetsConfig, ValidatedQueryBudgets};
 use moraine_conversations::{
-    budget_telemetry, record_budget_rejection, record_budget_request, AnalyticsRange,
-    BackendRepository, BackendRepositoryRouter, CoreIndexHealth, IngestHeartbeat,
-    IngestHeartbeatRead, PublicationDiagnostics, QueryClass, QueryEnvelope, RepoError,
-    SessionAnalytics, SessionAnalyticsQuery, SessionLookback, SessionStep, SessionTurn,
+    budget_telemetry, record_budget_rejection, record_budget_request, session_display_label,
+    AnalyticsRange, BackendRepository, BackendRepositoryRouter, CanonicalContinuation,
+    CanonicalReadOutcome, ConversationListSort, ConversationMode, CoreIndexHealth, IngestHeartbeat,
+    IngestHeartbeatRead, McpSessionListFilter, McpSessionListItem, McpSessionOpen, McpTurnCompact,
+    PageRequest, PublicationDiagnostics, QueryClass, QueryEnvelope, RepoError, SessionLookback,
     StoreConnectionMetrics, StoreHealth, StoreProbe, TablePreviewQuery, TableSummaries,
 };
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::future::Future;
@@ -81,6 +85,17 @@ struct AnalyticsQuery {
 struct SessionsQuery {
     limit: Option<u32>,
     since: Option<String>,
+    cursor: Option<String>,
+    harness: Option<String>,
+    source: Option<String>,
+    mode: Option<String>,
+    sort: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SessionPageQuery {
+    limit: Option<u32>,
+    cursor: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -199,16 +214,14 @@ fn monitor_router(state: Arc<AppState>) -> Router {
         ));
     // Capabilities is daemon/default-global metadata, not a project-routed data
     // endpoint. It intentionally remains outside project selection middleware.
-    let versioned_routes = data_routes
-        .clone()
-        .route("/capabilities", get(api_capabilities));
+    let versioned_routes = data_routes.route("/capabilities", get(api_capabilities));
 
+    // The `/api/*` legacy aliases are gone: their documented one-release
+    // compatibility window opened with `/api/v1` in v0.7.0 and closed with
+    // v0.7.1. An unversioned path now falls through to static handling and
+    // returns the JSON 404, which is what an unknown API path has always done.
     Router::new()
         .nest("/api/v1", versioned_routes)
-        // One-release compatibility surface. These are direct aliases so
-        // status codes, query handling, response payloads, and backend
-        // selection remain identical.
-        .nest("/api", data_routes)
         .fallback(get(static_fallback))
         .with_state(state)
 }
@@ -223,6 +236,7 @@ fn dashboard_routes(read_limits: Arc<MonitorReadLimits>) -> Router<Arc<AppState>
         .route("/web-searches", get(api_web_searches))
         .route("/tables/:table", get(api_table_rows))
         .route("/sessions", get(api_sessions))
+        .route("/sessions/:id/page", get(api_session_page))
         .route_layer(middleware::from_fn_with_state(
             read_limits,
             monitor_read_admission,
@@ -290,6 +304,13 @@ async fn monitor_read_admission(
 /// else keeps the pre-envelope 503 with no code. Scope/auth and not-found
 /// outcomes never reach this mapping: they travel as `Ok(None)`/empty
 /// results, not as `RepoError`.
+///
+/// A rejected continuation token is the one repository failure caused by the
+/// request rather than the backend, so it is a 400. Paging must be able to tell
+/// "your cursor is stale, restart the feed" apart from "the store is down":
+/// `list_mcp_sessions` refuses a cursor minted by the other read path, and a
+/// caller that reads that as a transient 503 and retries would page a silent
+/// gap instead of restarting (issue-599 §1.2).
 fn repo_error_status(error: &RepoError) -> (StatusCode, Option<&'static str>) {
     match error {
         RepoError::DeadlineExceeded { .. } => {
@@ -298,6 +319,7 @@ fn repo_error_status(error: &RepoError) -> (StatusCode, Option<&'static str>) {
         RepoError::ResourceExhausted { .. } => {
             (StatusCode::TOO_MANY_REQUESTS, Some("resource_exhausted"))
         }
+        RepoError::InvalidCursor(_) => (StatusCode::BAD_REQUEST, Some("invalid_cursor")),
         _ => (StatusCode::SERVICE_UNAVAILABLE, None),
     }
 }
@@ -669,6 +691,12 @@ async fn api_status(Extension(backend): Extension<Arc<BackendRepository>>) -> Re
             "clickhouse": clickhouse,
             "publication": publication,
             "core_index": core_index,
+            // The vocabulary the session feed's `harness` filter accepts.
+            // Served rather than inferred: `harness` narrows a keyset-paged
+            // feed server-side, so a client deriving the menu from the sessions
+            // it happens to have loaded would offer options that change as it
+            // pages, and could never select a harness absent from page 1.
+            "known_harnesses": moraine_config::KNOWN_INGEST_HARNESSES,
             "query_budgets": query_budgets_payload(),
             "database": {
                 "exists": database_exists,
@@ -910,30 +938,200 @@ fn resolve_analytics_range(value: Option<&str>) -> AnalyticsRange {
     }
 }
 
+/// A session with no event newer than this reads as `completed` even without a
+/// terminal event, so a feed poll can distinguish live work from a session that
+/// simply stopped without one.
+const SESSION_ACTIVE_WINDOW_MS: i64 = 60_000;
+
+/// The session feed: SUMMARIES ONLY, one keyset page at a time.
+///
+/// It serves from [`moraine_conversations::ConversationRepository::list_mcp_sessions`]
+/// — the same
+/// operation MCP `list_sessions` pages through (issue-599 §1.1) — so the two
+/// surfaces cannot drift, and no transcript content is read to render a card.
+/// Turns arrive only when a client opens a session, through
+/// [`api_session_page`].
+///
+/// `has_more` is `next_cursor.is_some()` and nothing else. There is
+/// deliberately no total: a corpus-wide count is exactly the corpus-sized work
+/// this route exists to stop doing. An empty `sessions` with `has_more: true`
+/// is a legal "keep going" signal, not "no results".
 async fn api_sessions(
     Query(params): Query<SessionsQuery>,
     Extension(backend): Extension<Arc<BackendRepository>>,
 ) -> Response {
-    let query = SessionAnalyticsQuery {
-        lookback: resolve_session_lookback(params.since.as_deref()),
-        limit: params.limit.unwrap_or(50).clamp(1, 200) as u16,
+    let repository = backend.repository();
+    let now_ms = unix_now_ms();
+    let lookback = resolve_session_lookback(params.since.as_deref());
+
+    let sort = match params.sort.as_deref() {
+        None | Some("desc") => ConversationListSort::Desc,
+        Some("asc") => ConversationListSort::Asc,
+        Some(other) => return bad_request(format!("sort must be desc or asc, got {other:?}")),
     };
-    let sessions = match backend.repository().list_session_analytics(query).await {
-        Ok(sessions) => sessions,
+    // An unrecognized mode is rejected rather than ignored: silently dropping
+    // it would answer a narrow question with a wide result set.
+    let mode = match params
+        .mode
+        .as_deref()
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+    {
+        None => None,
+        Some(value) => match ConversationMode::parse(value) {
+            Some(mode) => Some(mode),
+            None => return bad_request(format!("unknown mode {value:?}")),
+        },
+    };
+    let token = match optional_cursor(params.cursor.as_deref()) {
+        Ok(token) => token,
+        Err(message) => return invalid_cursor_response(message),
+    };
+    // A continuation REPLAYS the window its feed was opened under. The
+    // repository binds a cursor to the filter that minted it, so a window
+    // re-derived from the current clock would present a different filter and
+    // the token this handler issued one request ago would be refused.
+    let (window, cursor) = match token.as_deref() {
+        None => (resolve_session_window(lookback, now_ms), None),
+        Some(token) => match decode_sessions_cursor(token, lookback) {
+            Ok(cursor) => (cursor.window, Some(cursor.inner)),
+            Err(message) => return invalid_cursor_response(message),
+        },
+    };
+
+    // Two clamps, both real: the route's documented 1..=200 bound, then the
+    // backend's own `max_results`. Reporting the second is what keeps `limit`
+    // honest — the repository would otherwise serve fewer rows than the
+    // response claims to have asked for.
+    let requested = params.limit.unwrap_or(50).clamp(1, 200) as u16;
+    let limit = requested.min(repository.config().max_results.max(1));
+
+    let filter = McpSessionListFilter {
+        start_unix_ms: window.start_unix_ms,
+        end_unix_ms: window.end_unix_ms,
+        mode,
+        sort,
+        // A cleared dashboard filter arrives as an empty value; treat it as
+        // absent rather than as a filter that matches nothing.
+        harness: optional_filter_value(params.harness.as_deref()),
+        source_name: optional_filter_value(params.source.as_deref()),
+    };
+    let page = match repository
+        .list_mcp_sessions(filter, PageRequest { limit, cursor })
+        .await
+    {
+        Ok(page) => page,
         Err(error) => {
             return repo_error_response(format!("sessions query failed: {error}"), &error);
         }
     };
-    let now_ms = unix_now_ms();
-    let sessions = sessions
-        .into_iter()
+
+    let sessions = page
+        .items
+        .iter()
         .map(|session| monitor_session_json(session, now_ms))
         .collect::<Vec<_>>();
 
+    let next_cursor = match page.next_cursor {
+        None => None,
+        Some(inner) => match encode_sessions_cursor(lookback, window, inner) {
+            Ok(token) => Some(token),
+            Err(message) => {
+                return json_response(
+                    json!({"ok": false, "error": message}),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                );
+            }
+        },
+    };
+
+    let has_more = next_cursor.is_some();
     json_response(
-        json!({"ok": true, "read_model": "live", "sessions": sessions}),
+        json!({
+            "ok": true,
+            "read_model": "live",
+            "sessions": sessions,
+            "limit": limit,
+            "next_cursor": next_cursor,
+            "has_more": has_more,
+            "window": {"start": window.start_unix_ms, "end": window.end_unix_ms},
+        }),
         StatusCode::OK,
     )
+}
+
+fn bad_request(message: String) -> Response {
+    json_response(
+        json!({"ok": false, "error": message}),
+        StatusCode::BAD_REQUEST,
+    )
+}
+
+/// A refused continuation token, from this handler's own envelope or from the
+/// repository, carries the same `400` + `invalid_cursor` pair. The caller
+/// recovers by restarting the feed, and reporting it as an error rather than a
+/// short page is what stops a stale cursor from presenting as a gap.
+fn invalid_cursor_response(message: String) -> Response {
+    json_response(
+        json!({"ok": false, "error": message, "code": "invalid_cursor"}),
+        StatusCode::BAD_REQUEST,
+    )
+}
+
+/// Ceiling on a monitor continuation token, enforced when minting and again
+/// when decoding. Tokens are this server's own mints, so an oversized one is
+/// fabricated, and parsing it is unbounded work on unvalidated input. Minting
+/// stays under the cap by dropping optional carried state (see
+/// [`encode_session_page_cursor`]), which keeps token size O(1) in transcript
+/// and session-header size.
+const MONITOR_CURSOR_MAX_CHARS: usize = 4096;
+
+/// The mint-side half of [`MONITOR_CURSOR_MAX_CHARS`]. Every token this service
+/// hands back passes through here, so the cap cannot be asymmetric: a token a
+/// client receives is always one [`decode_monitor_cursor`] accepts. Failing the
+/// mint is the only correct outcome — returning the token anyway hands out a
+/// continuation that cannot be redeemed, and dropping it silently would present
+/// a partial feed as complete.
+fn checked_monitor_cursor(token: String) -> Result<String, String> {
+    if token.len() > MONITOR_CURSOR_MAX_CHARS {
+        return Err(format!(
+            "minted cursor exceeds the {MONITOR_CURSOR_MAX_CHARS} character cursor limit"
+        ));
+    }
+    Ok(token)
+}
+
+fn decode_monitor_cursor<T: DeserializeOwned>(token: &str) -> Result<T, String> {
+    if token.len() > MONITOR_CURSOR_MAX_CHARS {
+        return Err(format!(
+            "cursor must be at most {MONITOR_CURSOR_MAX_CHARS} characters"
+        ));
+    }
+    let raw = URL_SAFE_NO_PAD
+        .decode(token)
+        .map_err(|error| format!("invalid base64 cursor: {error}"))?;
+    serde_json::from_slice(&raw).map_err(|error| format!("invalid cursor payload: {error}"))
+}
+
+/// A present-but-blank filter value is a cleared filter, not a filter for the
+/// empty string.
+fn optional_filter_value(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+/// A present `cursor` must carry a token. An empty one is a client bug that
+/// would otherwise silently restart the feed from page 1.
+fn optional_cursor(value: Option<&str>) -> Result<Option<String>, String> {
+    match value {
+        None => Ok(None),
+        Some(token) if token.trim().is_empty() => {
+            Err("cursor must be a non-empty string when provided".to_string())
+        }
+        Some(token) => Ok(Some(token.to_string())),
+    }
 }
 
 fn resolve_session_lookback(value: Option<&str>) -> SessionLookback {
@@ -949,248 +1147,379 @@ fn resolve_session_lookback(value: Option<&str>) -> SessionLookback {
     }
 }
 
-fn monitor_session_json(session: SessionAnalytics, now_ms: i64) -> Value {
-    let mut total_tokens = 0_u64;
-    let mut total_tool_calls = 0_u64;
-    let turns = session
-        .turns
-        .into_iter()
-        .enumerate()
-        .map(|(idx, turn)| {
-            let (value, tokens, tool_calls) = monitor_turn_json(idx, turn);
-            total_tokens = total_tokens.saturating_add(tokens);
-            total_tool_calls = total_tool_calls.saturating_add(tool_calls);
-            value
-        })
-        .collect::<Vec<_>>();
-    let duration_ms = session
-        .summary
-        .last_event_unix_ms
-        .saturating_sub(session.summary.first_event_unix_ms)
-        .max(0);
-    let status = if now_ms.saturating_sub(session.summary.last_event_unix_ms) < 60_000 {
-        "active"
-    } else {
+/// The inverse of [`resolve_session_lookback`]: the `since` value a resolved
+/// lookback is named by on the wire.
+fn session_lookback_key(lookback: SessionLookback) -> &'static str {
+    match lookback {
+        SessionLookback::OneHour => "1h",
+        SessionLookback::SixHours => "6h",
+        SessionLookback::TwentyFourHours => "24h",
+        SessionLookback::SevenDays => "7d",
+        SessionLookback::ThirtyDays => "30d",
+        SessionLookback::NinetyDays => "90d",
+        SessionLookback::All => "all",
+    }
+}
+
+/// The `[start, end)` millisecond window one session-feed page was computed
+/// under, and the part of the repository filter this route derives rather than
+/// receives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct SessionWindow {
+    start_unix_ms: i64,
+    end_unix_ms: i64,
+}
+
+/// `since` is a lookback from now; `all` drops the lower bound. The upper bound
+/// is exclusive and the repository requires `start < end`, so a zero-width
+/// window at the epoch is not representable.
+fn resolve_session_window(lookback: SessionLookback, now_ms: i64) -> SessionWindow {
+    SessionWindow {
+        start_unix_ms: match lookback.window_seconds() {
+            Some(seconds) => now_ms.saturating_sub(i64::from(seconds) * 1_000).max(0),
+            None => 0,
+        },
+        end_unix_ms: now_ms.saturating_add(1),
+    }
+}
+
+/// Wire version of the monitor's session-feed continuation token. A bump
+/// invalidates outstanding tokens rather than reinterpreting them.
+const SESSIONS_CURSOR_VERSION: u8 = 1;
+
+/// The monitor's envelope around a repository `list_sessions` token.
+///
+/// The repository binds its token to the filter that minted it, and this route
+/// derives the filter's time window from the wall clock. The window therefore
+/// travels inside the token and is replayed verbatim on every continuation, so
+/// page 2 presents exactly the filter page 1 was computed under. Without it a
+/// freshly minted cursor could not be redeemed at all: the clock moves between
+/// requests, and the repository refuses a cursor whose filter moved.
+///
+/// The remaining filter dimensions (`mode`, `harness`, `source`, `sort`) are
+/// client-supplied and are NOT pinned here — the repository already refuses a
+/// token presented under different ones, with a message naming the mismatch.
+#[derive(Serialize, Deserialize)]
+struct SessionsCursor {
+    version: u8,
+    /// The lookback the window was resolved from. A continuation that asks for
+    /// a different one is refused rather than silently served the pinned
+    /// window, which would make the `since` control look inert.
+    since: SessionLookback,
+    #[serde(flatten)]
+    window: SessionWindow,
+    /// The repository's own token, carried through untouched.
+    inner: String,
+}
+
+fn encode_sessions_cursor(
+    lookback: SessionLookback,
+    window: SessionWindow,
+    inner: String,
+) -> Result<String, String> {
+    let cursor = SessionsCursor {
+        version: SESSIONS_CURSOR_VERSION,
+        since: lookback,
+        window,
+        inner,
+    };
+    // Nothing in this envelope is droppable — the repository token is the
+    // continuation — so an oversized mint is a hard failure rather than a
+    // shrink. It is unreachable for a well-formed repository token; the check
+    // exists so a repository that grew its own token cannot silently start
+    // issuing unredeemable monitor cursors.
+    serde_json::to_vec(&cursor)
+        .map(|bytes| URL_SAFE_NO_PAD.encode(bytes))
+        .map_err(|error| format!("failed to encode sessions cursor: {error}"))
+        .and_then(checked_monitor_cursor)
+}
+
+fn decode_sessions_cursor(
+    token: &str,
+    lookback: SessionLookback,
+) -> Result<SessionsCursor, String> {
+    let cursor: SessionsCursor = decode_monitor_cursor(token)?;
+    if cursor.version != SESSIONS_CURSOR_VERSION {
+        return Err(format!(
+            "unsupported sessions cursor version {}",
+            cursor.version
+        ));
+    }
+    if cursor.since != lookback {
+        return Err(format!(
+            "cursor was minted for since={}; restart the feed to change the window",
+            session_lookback_key(cursor.since)
+        ));
+    }
+    // The window is the one part of the repository filter this route takes
+    // from the token rather than from the request, so it is unvalidated client
+    // input on the way into `McpSessionListFilter`. Two checks, both required.
+    //
+    // The range must be a valid half-open interval: the repository rejects
+    // `start >= end` as an invalid argument, which is a 503 here, not the 400
+    // a refused token is documented to produce.
+    if cursor.window.start_unix_ms < 0 || cursor.window.end_unix_ms <= cursor.window.start_unix_ms {
+        return Err("cursor window is not a valid time range".to_string());
+    }
+    // And the range must be the one `since` names. `resolve_session_window`
+    // derives the lower bound entirely from the lookback and the upper bound,
+    // so re-deriving it from the token's own `end` reproduces any window this
+    // route ever minted and no other. Without this, tampering the lower bound
+    // widens the query past what `since` permits — the `since` check above
+    // would still pass, because it only compares the label.
+    if cursor.window
+        != resolve_session_window(cursor.since, cursor.window.end_unix_ms.saturating_sub(1))
+    {
+        return Err(format!(
+            "cursor window does not match since={}",
+            session_lookback_key(cursor.since)
+        ));
+    }
+    Ok(cursor)
+}
+
+/// One session SUMMARY. No `turns` key, and nothing under it: the feed carries
+/// navigation scalars and labels only, so its response size stays flat as
+/// transcripts grow (issue-599 §5.3).
+///
+/// `displayLabel` comes from the shared ladder MCP renders, so the same session
+/// reads identically on both surfaces.
+fn monitor_session_json(session: &McpSessionListItem, now_ms: i64) -> Value {
+    // A recorded terminal event is authoritative; otherwise recency stands in
+    // for it. Same rule as before the cutover, so status keeps its meaning.
+    let status = if session.completed
+        || now_ms.saturating_sub(session.last_event_unix_ms) >= SESSION_ACTIVE_WINDOW_MS
+    {
         "completed"
+    } else {
+        "active"
     };
 
     json!({
-        "id": session.summary.session_id,
-        "title": derive_title(&session.first_user_text),
-        "harness": harness_descriptor(&session.harness, &session.source_name),
-        "startedAt": session.summary.first_event_unix_ms,
-        "endedAt": session.summary.last_event_unix_ms,
-        "durationMs": duration_ms,
+        "id": session.session_id,
+        "title": session.title.as_deref(),
+        "displayLabel": session_display_label(session),
+        "harness": session.harness.as_deref(),
+        "source": session.source.as_deref(),
+        "inferenceProvider": session.inference_provider.as_deref(),
+        "mode": session.mode.as_str(),
+        "startedAt": session.first_event_unix_ms,
+        "endedAt": session.last_event_unix_ms,
         "status": status,
-        "models": session.models,
-        "turns": turns,
-        "totalTokens": total_tokens,
-        "totalToolCalls": total_tool_calls,
-        "tags": Vec::<String>::new(),
-        "traceId": session.trace_id,
+        "turnCount": session.total_turns,
+        "eventCount": session.total_events,
+        "toolCallCount": session.tool_calls,
+        "sessionSlug": session.session_slug.as_deref(),
+        "sessionSummary": session.session_summary.as_deref(),
     })
 }
 
-fn monitor_turn_json(idx: usize, turn: SessionTurn) -> (Value, u64, u64) {
-    let prompt_tokens = sum_buckets(
-        &turn.token_usage_buckets,
-        &[
-            "input_text",
-            "input_cache_read",
-            "input_cache_write",
-            "input_image",
-            "input_audio",
-            "embedding_input_text",
-            "embedding_input_image",
-        ],
-    );
-    let total_tokens = turn
-        .token_usage_buckets
-        .values()
-        .copied()
-        .fold(0_u64, u64::saturating_add);
-    let completion_tokens = total_tokens.saturating_sub(prompt_tokens);
-    let tool_calls = turn.summary.tool_calls;
-    let steps = turn
-        .steps
-        .into_iter()
-        .map(monitor_step_json)
-        .collect::<Vec<_>>();
-    let duration_ms = turn
-        .summary
-        .ended_at_unix_ms
-        .saturating_sub(turn.summary.started_at_unix_ms)
-        .max(0);
+/// The lazy transcript load (issue-599 WI-05): one bounded page of a session's
+/// turns, read through [`moraine_conversations::ConversationRepository::canonical_open_session_page`]
+/// — the same canonical `open(session)` reader MCP's `open` tool uses. This
+/// handler performs no other repository read.
+///
+/// `Ok(None)` covers both "no such session" and "outside this backend's
+/// configured scope" and answers `404` for either, so the route cannot be used
+/// to probe for sessions the caller may not read.
+///
+/// The canonical reader is gated on `open_v2` readiness — the same authority
+/// MCP `open` and the directory listing path consult — because it reads
+/// `mcp_session_directory` / `mcp_event_navigation` directly and a backend
+/// whose backfill or overlap audit has not published them would answer from an
+/// incomplete store. A not-ready backend gets `503 canonical_reader_unavailable`
+/// rather than a plausible-looking partial transcript.
+async fn api_session_page(
+    Path(session_id): Path<String>,
+    Query(params): Query<SessionPageQuery>,
+    Extension(backend): Extension<Arc<BackendRepository>>,
+) -> Response {
+    if !backend.repository().canonical_reader_ready().await {
+        return json_response(
+            json!({
+                "ok": false,
+                "error": "session transcripts are unavailable until this backend publishes its canonical read indexes",
+                "code": "canonical_reader_unavailable",
+            }),
+            StatusCode::SERVICE_UNAVAILABLE,
+        );
+    }
 
-    (
+    let after = match params.cursor.as_deref() {
+        None => None,
+        Some(token) => match decode_session_page_cursor(token, &session_id) {
+            Ok(continuation) => Some(continuation),
+            Err(message) => return invalid_cursor_response(message),
+        },
+    };
+    let limit = params.limit.unwrap_or(50).clamp(1, 200) as u16;
+
+    let outcome = backend
+        .repository()
+        .canonical_open_session_page(&session_id, limit, after)
+        .await;
+    let page = match outcome {
+        Ok(Some(CanonicalReadOutcome::Page(page))) => page,
+        Ok(Some(CanonicalReadOutcome::Reopen)) => {
+            // The pinned view no longer describes this session (a replay
+            // flipped its generations). Reopening from page 1 is the caller's
+            // recovery; it is not a failure of this request.
+            return json_response(
+                json!({"ok": true, "read_model": "live", "reopen": true}),
+                StatusCode::OK,
+            );
+        }
+        Ok(None) => {
+            return json_response(
+                json!({"ok": false, "error": "session not found"}),
+                StatusCode::NOT_FOUND,
+            );
+        }
+        Err(error) => {
+            return repo_error_response(format!("session page query failed: {error}"), &error);
+        }
+    };
+
+    let next_cursor = match page.continuation.as_ref() {
+        None => None,
+        Some(continuation) => match encode_session_page_cursor(&session_id, continuation) {
+            Ok(token) => Some(token),
+            Err(message) => {
+                return json_response(
+                    json!({"ok": false, "error": message}),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                );
+            }
+        },
+    };
+
+    json_response(
         json!({
-            "idx": idx,
-            "model": turn.model,
-            "startedAt": turn.summary.started_at_unix_ms,
-            "endedAt": turn.summary.ended_at_unix_ms,
-            "durationMs": duration_ms,
-            "promptTokens": prompt_tokens,
-            "completionTokens": completion_tokens,
-            "totalTokens": total_tokens,
-            "toolCalls": tool_calls,
-            "steps": steps,
+            "ok": true,
+            "read_model": "live",
+            "limit": limit,
+            "session": monitor_session_page_json(&page.session),
+            "has_more": next_cursor.is_some(),
+            "next_cursor": next_cursor,
         }),
-        total_tokens,
-        tool_calls,
+        StatusCode::OK,
     )
 }
 
-fn monitor_step_json(step: SessionStep) -> Value {
-    match step {
-        SessionStep::User {
-            event_unix_ms,
-            text,
-        } => json!({"kind": "user", "at": event_unix_ms, "text": text}),
-        SessionStep::Assistant {
-            event_unix_ms,
-            text,
-            endpoint_kind,
-            latency_ms,
-            token_usage_buckets,
-            token_usage_native_units,
-        } => {
-            let tokens = sum_buckets(
-                &token_usage_buckets,
-                &[
-                    "output_text",
-                    "output_image",
-                    "output_audio",
-                    "reasoning",
-                    "server_tool_use",
-                ],
-            );
-            let mut value = json!({
-                "kind": "assistant",
-                "at": event_unix_ms,
-                "text": text,
-                "tokens": tokens,
-                "endpointKind": endpoint_kind,
-                "nativeTokenUnits": token_usage_native_units,
-            });
-            if let Some(latency_ms) = latency_ms {
-                value["durationMs"] = json!(latency_ms);
-            }
-            value
-        }
-        SessionStep::Thinking {
-            event_unix_ms,
-            text,
-        } => json!({"kind": "thinking", "at": event_unix_ms, "text": text}),
-        SessionStep::ToolCall {
-            event_unix_ms,
-            tool_name,
-            call_id,
-            arguments,
-            latency_ms: call_latency_ms,
-            is_error: call_is_error,
-            result,
-        } => {
-            let (latency_ms, result_text, result_at, status) = match result {
-                Some(result) => (
-                    result.latency_ms,
-                    result.text,
-                    result.event_unix_ms,
-                    if call_is_error || result.is_error {
-                        "error"
-                    } else {
-                        "ok"
-                    },
-                ),
-                None => (
-                    call_latency_ms.unwrap_or_default(),
-                    String::new(),
-                    event_unix_ms,
-                    if call_is_error { "error" } else { "ok" },
-                ),
-            };
-            json!({
-                "kind": "tool_call",
-                "at": event_unix_ms,
-                "tool": tool_name,
-                "args": arguments,
-                "latencyMs": latency_ms,
-                "result": result_text,
-                "resultAt": result_at,
-                "status": status,
-                "callId": call_id,
-            })
-        }
-    }
+/// Wire version of the monitor's session-page continuation token. The token is
+/// this route's own envelope around the repository continuation — the monitor
+/// neither accepts nor mints MCP `open` cursors, and a version bump invalidates
+/// outstanding tokens rather than reinterpreting them.
+const SESSION_PAGE_CURSOR_VERSION: u8 = 1;
+
+#[derive(Serialize, Deserialize)]
+struct SessionPageCursor {
+    version: u8,
+    session_id: String,
+    continuation: CanonicalContinuation,
 }
 
-fn sum_buckets(buckets: &std::collections::BTreeMap<String, u64>, names: &[&str]) -> u64 {
-    names
-        .iter()
-        .filter_map(|name| buckets.get(*name))
-        .copied()
-        .fold(0_u64, u64::saturating_add)
-}
-
-fn derive_title(first_user_text: &str) -> String {
-    let trimmed = first_user_text.trim();
-    if trimmed.is_empty() {
-        return "(untitled session)".to_string();
-    }
-
-    let first_line = trimmed.lines().next().unwrap_or(trimmed).trim();
-    if first_line.chars().count() <= 120 {
-        first_line.to_string()
-    } else {
-        format!(
-            "{}\u{2026}",
-            first_line.chars().take(120).collect::<String>()
-        )
-    }
-}
-
-fn harness_descriptor(harness_id: &str, source_name: &str) -> Value {
-    let id = if harness_id.trim().is_empty() {
-        source_name.trim()
-    } else {
-        harness_id.trim()
+/// Mint a continuation token for `session_id`, bounded by
+/// [`MONITOR_CURSOR_MAX_CHARS`].
+///
+/// `CanonicalContinuation::session_carry` is a JSON-encoded session header, so
+/// carrying it verbatim would size the token by header content rather than by
+/// the anchor. It is dropped whenever the encoded token would exceed the cap;
+/// the reader then recomputes the header on the next page (design §6
+/// carry-drop, the same trade the MCP `open` cursor makes). Everything that
+/// remains is fixed-shape, so token size is O(1) in transcript and header size.
+fn encode_session_page_cursor(
+    session_id: &str,
+    continuation: &CanonicalContinuation,
+) -> Result<String, String> {
+    let mut cursor = SessionPageCursor {
+        version: SESSION_PAGE_CURSOR_VERSION,
+        session_id: session_id.to_string(),
+        continuation: continuation.clone(),
     };
-    let id = if id.is_empty() { "unknown" } else { id };
-    let short = id
-        .split(|character: char| !character.is_ascii_alphanumeric())
-        .filter(|part| !part.is_empty())
-        .take(2)
-        .filter_map(|part| part.chars().next())
-        .collect::<String>()
-        .to_uppercase();
-    let short = if short.is_empty() {
-        id.chars().take(2).collect::<String>().to_uppercase()
-    } else {
-        short
-    };
+    let token = encode_session_page_cursor_token(&cursor)?;
+    if token.len() <= MONITOR_CURSOR_MAX_CHARS || cursor.continuation.session_carry.is_none() {
+        return checked_monitor_cursor(token);
+    }
+    cursor.continuation.session_carry = None;
+    // Re-checked after the drop: the carry is the only oversized part, but
+    // "dropped the carry" is not the same claim as "now fits", and a token that
+    // still exceeds the cap must not be handed back.
+    encode_session_page_cursor_token(&cursor).and_then(checked_monitor_cursor)
+}
 
+fn encode_session_page_cursor_token(cursor: &SessionPageCursor) -> Result<String, String> {
+    serde_json::to_vec(cursor)
+        .map(|bytes| URL_SAFE_NO_PAD.encode(bytes))
+        .map_err(|error| format!("failed to encode session page cursor: {error}"))
+}
+
+/// Decode a continuation token for `session_id`.
+///
+/// The token carries the session it was minted for and is refused for any
+/// other: the anchor it holds is meaningless outside its own traversal, so
+/// honoring it on another path would serve an arbitrary slice of that session
+/// rather than its first page.
+fn decode_session_page_cursor(
+    token: &str,
+    session_id: &str,
+) -> Result<CanonicalContinuation, String> {
+    let token = optional_cursor(Some(token))?.unwrap_or_default();
+    let cursor: SessionPageCursor = decode_monitor_cursor(&token)?;
+    if cursor.version != SESSION_PAGE_CURSOR_VERSION {
+        return Err(format!(
+            "unsupported session page cursor version {}",
+            cursor.version
+        ));
+    }
+    if cursor.session_id != session_id {
+        return Err("cursor was minted for a different session".to_string());
+    }
+    Ok(cursor.continuation)
+}
+
+/// The opened session header plus this page's turns. Turn bodies are the
+/// summaries and references the canonical reader returns.
+fn monitor_session_page_json(session: &McpSessionOpen) -> Value {
     json!({
-        "id": id,
-        "label": id,
-        "short": short,
-        "hue": hue_for_label(id),
+        "id": session.metadata.session_id,
+        "title": session.title.as_deref(),
+        "harness": session.harness.as_deref(),
+        "source": session.source.as_deref(),
+        "inferenceProvider": session.inference_provider.as_deref(),
+        "mode": session.metadata.mode.as_str(),
+        "startedAt": session.metadata.first_event_unix_ms,
+        "endedAt": session.metadata.last_event_unix_ms,
+        "completed": session.completed,
+        "turnCount": session.metadata.total_turns,
+        "eventCount": session.metadata.total_events,
+        "sessionSlug": session.session_slug.as_deref(),
+        "sessionSummary": session.session_summary.as_deref(),
+        "turns": session
+            .turns
+            .iter()
+            .map(monitor_session_turn_json)
+            .collect::<Vec<_>>(),
     })
 }
 
-fn hue_for_label(label: &str) -> u32 {
-    match label {
-        "claude-code" => 25,
-        "codex" => 150,
-        "hermes" => 265,
-        "cursor" => 200,
-        "aider" => 340,
-        "continue" => 100,
-        "cli" => 60,
-        _ => {
-            label.bytes().fold(0_u32, |hash, byte| {
-                hash.wrapping_mul(31).wrapping_add(u32::from(byte))
-            }) % 360
-        }
-    }
+fn monitor_session_turn_json(turn: &McpTurnCompact) -> Value {
+    json!({
+        "turnSeq": turn.metadata.turn_seq,
+        "turnId": turn.metadata.turn_id,
+        "startedAt": turn.metadata.started_at_unix_ms,
+        "endedAt": turn.metadata.ended_at_unix_ms,
+        "eventCount": turn.metadata.total_events,
+        "userMessages": turn.metadata.user_messages,
+        "assistantMessages": turn.metadata.assistant_messages,
+        "toolCalls": turn.metadata.tool_calls,
+        "toolResults": turn.metadata.tool_results,
+        "reasoningItems": turn.metadata.reasoning_items,
+        "userInput": turn.user_input_summary.as_deref(),
+        "finalResponse": turn.final_response_summary.as_deref(),
+        "toolsCalled": turn.tools_called,
+        "completed": turn.completed,
+    })
 }
 
 #[derive(Default)]
@@ -1389,13 +1718,15 @@ mod tests {
     use moraine_config::{ClickHouseConfig, RouteConfig, DEFAULT_BACKEND_NAME, ROUTE_MODE_MIRROR};
     use moraine_conversations::{
         AnalyticsConcurrencyPoint, AnalyticsSnapshot, AnalyticsTokenPoint, AnalyticsTurnPoint,
-        AnalyticsWindow, ConversationMode, ConversationRepository, ConversationSummary,
-        InMemoryConversationRepository, InMemoryConversationResponses, IngestHeartbeat, RepoConfig,
-        SessionStep, StoreDiagnostics, TableColumn, TablePreview, TableSummary, ToolResult,
-        TurnSummary, WebSearchEvent,
+        AnalyticsWindow, CanonicalReadAnchor, CanonicalSessionPage, CanonicalSessionSignals,
+        ConversationMode, ConversationRepository, InMemoryConversationRepository,
+        InMemoryConversationResponses, IngestHeartbeat, McpTurnCompact, Page, RepoConfig,
+        SessionMetadata, StoreDiagnostics, TableColumn, TablePreview, TableSummary, TurnSummary,
+        WebSearchEvent,
     };
     use std::collections::BTreeMap;
     use std::fs;
+    use std::time::Duration;
     use tower::ServiceExt;
 
     fn temp_path(suffix: &str) -> PathBuf {
@@ -1598,88 +1929,69 @@ mod tests {
         }
     }
 
-    fn sample_session() -> SessionAnalytics {
-        let assistant_buckets =
-            BTreeMap::from([("output_text".to_string(), 4), ("reasoning".to_string(), 2)]);
-        SessionAnalytics {
-            summary: ConversationSummary {
-                session_id: "session-1".to_string(),
-                first_event_time: "2026-02-16T12:00:00.000Z".to_string(),
-                first_event_unix_ms: 1_771_243_200_000,
-                last_event_time: "2026-02-16T12:00:03.900Z".to_string(),
-                last_event_unix_ms: 1_771_243_203_900,
-                total_turns: 1,
-                total_events: 7,
-                user_messages: 1,
-                assistant_messages: 1,
-                tool_calls: 1,
-                tool_results: 1,
-                mode: ConversationMode::ToolCalling,
-                session_slug: None,
-                session_summary: None,
-            },
-            harness: "codex".to_string(),
-            source_name: "ci-codex".to_string(),
-            models: vec!["gpt-5.3-codex".to_string()],
-            trace_id: "trace-1".to_string(),
-            first_user_text: "Inspect the repository".to_string(),
-            turns: vec![SessionTurn {
-                summary: TurnSummary {
-                    session_id: "session-1".to_string(),
-                    turn_seq: 1,
-                    turn_id: "turn-1".to_string(),
-                    started_at: "2026-02-16T12:00:00.000Z".to_string(),
-                    started_at_unix_ms: 1_771_243_200_000,
-                    ended_at: "2026-02-16T12:00:03.900Z".to_string(),
-                    ended_at_unix_ms: 1_771_243_203_900,
-                    total_events: 7,
-                    user_messages: 1,
-                    assistant_messages: 1,
-                    tool_calls: 1,
-                    tool_results: 1,
-                    reasoning_items: 1,
-                },
-                model: "gpt-5.3-codex".to_string(),
-                token_usage_buckets: BTreeMap::from([
-                    ("input_text".to_string(), 10),
-                    ("output_text".to_string(), 4),
-                    ("reasoning".to_string(), 2),
-                ]),
-                steps: vec![
-                    SessionStep::User {
-                        event_unix_ms: 1_771_243_200_000,
-                        text: "Inspect the repository".to_string(),
-                    },
-                    SessionStep::Assistant {
-                        event_unix_ms: 1_771_243_201_000,
-                        text: "I will inspect it".to_string(),
-                        endpoint_kind: "responses".to_string(),
-                        latency_ms: Some(900),
-                        token_usage_buckets: assistant_buckets,
-                        token_usage_native_units: BTreeMap::new(),
-                    },
-                    SessionStep::ToolCall {
-                        event_unix_ms: 1_771_243_202_000,
-                        tool_name: "Read".to_string(),
-                        call_id: "call-1".to_string(),
-                        arguments: json!({"path": "Cargo.toml"}),
-                        latency_ms: Some(250),
-                        is_error: false,
-                        result: Some(ToolResult {
-                            event_unix_ms: 1_771_243_203_000,
-                            text: "workspace".to_string(),
-                            latency_ms: 1_000,
-                            is_error: false,
-                        }),
-                    },
-                ],
-            }],
+    fn sample_session() -> McpSessionListItem {
+        McpSessionListItem {
+            session_id: "session-1".to_string(),
+            first_event_time: "2026-02-16T12:00:00.000Z".to_string(),
+            first_event_unix_ms: 1_771_243_200_000,
+            last_event_time: "2026-02-16T12:00:03.900Z".to_string(),
+            last_event_unix_ms: 1_771_243_203_900,
+            total_turns: 1,
+            total_events: 7,
+            mode: ConversationMode::ToolCalling,
+            completed: false,
+            title: Some("Inspect the repository".to_string()),
+            source: Some("ci-codex".to_string()),
+            harness: Some("codex".to_string()),
+            inference_provider: Some("openai".to_string()),
+            session_slug: Some("inspect-repo".to_string()),
+            session_summary: Some("Repository inspection".to_string()),
+            tool_calls: 1,
+        }
+    }
+
+    /// A page of `count` sessions descending by `last_event_unix_ms`, ids
+    /// `feed-00..`, so a paging test can assert exactly which slice it got.
+    fn session_feed(start_index: usize, count: usize) -> Vec<McpSessionListItem> {
+        (0..count)
+            .map(|offset| {
+                let index = start_index + offset;
+                McpSessionListItem {
+                    session_id: format!("feed-{index:02}"),
+                    last_event_unix_ms: 1_771_243_203_900 - (index as i64) * 1_000,
+                    ..sample_session()
+                }
+            })
+            .collect()
+    }
+
+    fn session_ids(payload: &Value) -> Vec<String> {
+        payload["sessions"]
+            .as_array()
+            .expect("sessions array")
+            .iter()
+            .map(|session| session["id"].as_str().expect("session id").to_string())
+            .collect()
+    }
+
+    fn sessions_query() -> SessionsQuery {
+        SessionsQuery {
+            limit: None,
+            since: None,
+            cursor: None,
+            harness: None,
+            source: None,
+            mode: None,
+            sort: None,
         }
     }
 
     fn successful_responses() -> InMemoryConversationResponses {
         InMemoryConversationResponses {
-            list_session_analytics: Some(Ok(vec![sample_session()])),
+            list_mcp_sessions: Some(Ok(Page {
+                items: vec![sample_session()],
+                next_cursor: None,
+            })),
             analytics_series: Some(Ok(AnalyticsSnapshot {
                 window: AnalyticsWindow {
                     range: AnalyticsRange::SevenDays,
@@ -1803,8 +2115,6 @@ mod tests {
         let app = monitor_router(state);
 
         let canonical = router_json(&app, "/api/v1/analytics?range=24h").await;
-        let legacy = router_json(&app, "/api/analytics?range=24h").await;
-        assert_eq!(canonical, legacy);
         assert_eq!(canonical.0, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(canonical.1["ok"], json!(false));
         assert_eq!(
@@ -1893,6 +2203,7 @@ mod tests {
             Query(SessionsQuery {
                 limit: Some(0),
                 since: Some("not-a-window".to_string()),
+                ..sessions_query()
             }),
             Extension(backend.clone()),
         )
@@ -1900,18 +2211,20 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let sessions = response_json(response).await;
         assert_eq!(sessions["read_model"], json!("live"));
+        assert_eq!(sessions["limit"], json!(1));
+        assert_eq!(sessions["has_more"], json!(false));
+        assert_eq!(sessions["next_cursor"], Value::Null);
         let session = &sessions["sessions"][0];
         assert_eq!(session["id"], json!("session-1"));
         assert_eq!(session["endedAt"], json!(1_771_243_203_900_i64));
-        assert_eq!(session["turns"][0]["idx"], json!(0));
-        assert_eq!(session["turns"][0]["promptTokens"], json!(10));
-        assert_eq!(session["turns"][0]["completionTokens"], json!(6));
-        assert_eq!(session["turns"][0]["steps"][1]["durationMs"], json!(900));
-        assert_eq!(session["turns"][0]["steps"][2]["latencyMs"], json!(1_000));
-        assert!(
-            session.get("eventCount").is_none(),
-            "session response shape must remain unchanged"
-        );
+        assert_eq!(session["eventCount"], json!(7));
+        assert_eq!(session["turnCount"], json!(1));
+        assert_eq!(session["toolCallCount"], json!(1));
+        assert_eq!(session["harness"], json!("codex"));
+        assert_eq!(session["source"], json!("ci-codex"));
+        assert_eq!(session["inferenceProvider"], json!("openai"));
+        assert_eq!(session["mode"], json!("tool_calling"));
+        assert_eq!(session["displayLabel"], json!("Inspect the repository"));
 
         let response = api_table_rows(
             Path("events".to_string()),
@@ -1932,13 +2245,16 @@ mod tests {
         assert_eq!(calls.list_table_summaries, 2);
         assert_eq!(calls.list_web_searches, vec![1_000]);
         assert_eq!(calls.analytics_series, vec![AnalyticsRange::SevenDays]);
-        assert_eq!(
-            calls.list_session_analytics,
-            vec![SessionAnalyticsQuery {
-                lookback: SessionLookback::ThirtyDays,
-                limit: 1,
-            }]
-        );
+        // The feed reads the shared discovery operation, never the projector.
+        assert!(calls.list_session_analytics.is_empty());
+        let (filter, page) = calls
+            .list_mcp_sessions
+            .first()
+            .expect("session feed reads list_mcp_sessions");
+        assert_eq!(page.limit, 1);
+        assert_eq!(page.cursor, None);
+        assert_eq!(filter.sort, ConversationListSort::Desc);
+        assert_eq!(filter.mode, None);
         assert_eq!(
             calls.preview_table,
             vec![TablePreviewQuery {
@@ -1951,7 +2267,7 @@ mod tests {
     #[tokio::test]
     async fn repository_failures_keep_existing_http_status_envelopes() {
         let (backend, _) = fake_backend(InMemoryConversationResponses {
-            list_session_analytics: Some(Err(RepoError::backend("sessions unavailable"))),
+            list_mcp_sessions: Some(Err(RepoError::backend("sessions unavailable"))),
             analytics_series: Some(Err(RepoError::backend("analytics unavailable"))),
             list_web_searches: Some(Err(RepoError::backend("web unavailable"))),
             list_table_summaries: Some(Err(RepoError::backend("tables unavailable"))),
@@ -1981,14 +2297,7 @@ mod tests {
         assert_eq!(analytics.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response_json(analytics).await["ok"], json!(false));
 
-        let sessions = api_sessions(
-            Query(SessionsQuery {
-                limit: None,
-                since: None,
-            }),
-            Extension(backend.clone()),
-        )
-        .await;
+        let sessions = api_sessions(Query(sessions_query()), Extension(backend.clone())).await;
         assert_eq!(sessions.status(), StatusCode::SERVICE_UNAVAILABLE);
 
         let web = api_web_searches(
@@ -2032,22 +2341,1039 @@ mod tests {
         assert_eq!(resolve_session_lookback(Some("all")), SessionLookback::All);
     }
 
-    #[test]
-    fn unmatched_tool_call_preserves_call_latency_and_error() {
-        let step = monitor_step_json(SessionStep::ToolCall {
-            event_unix_ms: 1_000,
-            tool_name: "Read".to_string(),
-            call_id: "call-unmatched".to_string(),
-            arguments: json!({"path": "Cargo.toml"}),
-            latency_ms: Some(321),
-            is_error: true,
-            result: None,
-        });
+    // --- issue-599 WI-04: `/api/v1/sessions` is summaries + a cursor --------
 
-        assert_eq!(step["latencyMs"], json!(321));
-        assert_eq!(step["status"], json!("error"));
-        assert_eq!(step["result"], json!(""));
-        assert_eq!(step["resultAt"], json!(1_000));
+    /// Every string anywhere in `value`, so an assertion about transcript
+    /// content cannot be satisfied by checking only the keys it expects.
+    fn all_strings(value: &Value, out: &mut Vec<String>) {
+        match value {
+            Value::String(text) => out.push(text.clone()),
+            Value::Array(items) => items.iter().for_each(|item| all_strings(item, out)),
+            Value::Object(fields) => fields.values().for_each(|item| all_strings(item, out)),
+            _ => {}
+        }
+    }
+
+    fn all_keys(value: &Value, out: &mut Vec<String>) {
+        match value {
+            Value::Array(items) => items.iter().for_each(|item| all_keys(item, out)),
+            Value::Object(fields) => {
+                for (key, item) in fields {
+                    out.push(key.clone());
+                    all_keys(item, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[tokio::test]
+    async fn session_feed_carries_summaries_and_no_transcript_content() {
+        let (backend, _) = fake_backend(successful_responses()).await;
+
+        let response = api_sessions(Query(sessions_query()), Extension(backend)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_json(response).await;
+
+        let mut keys = Vec::new();
+        all_keys(&payload, &mut keys);
+        for forbidden in ["turns", "steps", "text", "events", "payload_json", "models"] {
+            assert!(
+                !keys.iter().any(|key| key == forbidden),
+                "session feed must not carry {forbidden:?}: {payload}"
+            );
+        }
+
+        let session = &payload["sessions"][0];
+        let mut fields = session
+            .as_object()
+            .expect("session object")
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        fields.sort();
+        assert_eq!(
+            fields,
+            vec![
+                "displayLabel",
+                "endedAt",
+                "eventCount",
+                "harness",
+                "id",
+                "inferenceProvider",
+                "mode",
+                "sessionSlug",
+                "sessionSummary",
+                "source",
+                "startedAt",
+                "status",
+                "title",
+                "toolCallCount",
+                "turnCount",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn session_summary_never_carries_the_body_of_a_message() {
+        // A session whose only content-bearing fields are its title and summary
+        // still cannot leak an assistant reply, because the feed reads no
+        // message text at all.
+        let mut session = sample_session();
+        session.title = Some("Inspect the repository".to_string());
+        session.session_summary = Some("Repository inspection".to_string());
+        let (backend, _) = fake_backend(InMemoryConversationResponses {
+            list_mcp_sessions: Some(Ok(Page {
+                items: vec![session],
+                next_cursor: None,
+            })),
+            ..Default::default()
+        })
+        .await;
+
+        let payload =
+            response_json(api_sessions(Query(sessions_query()), Extension(backend)).await).await;
+        let mut strings = Vec::new();
+        all_strings(&payload, &mut strings);
+        assert!(
+            strings.iter().all(|text| text.len() <= 200),
+            "no feed string may be transcript-sized: {strings:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn has_more_is_true_exactly_when_the_repository_returns_a_cursor() {
+        for next_cursor in [None, Some("cursor-page-2".to_string())] {
+            let (backend, _) = fake_backend(InMemoryConversationResponses {
+                list_mcp_sessions: Some(Ok(Page {
+                    items: vec![sample_session()],
+                    next_cursor: next_cursor.clone(),
+                })),
+                ..Default::default()
+            })
+            .await;
+
+            let payload =
+                response_json(api_sessions(Query(sessions_query()), Extension(backend)).await)
+                    .await;
+            assert_eq!(
+                payload["has_more"],
+                json!(next_cursor.is_some()),
+                "has_more must track next_cursor, got {payload}"
+            );
+            // The wire token is this route's envelope, not the repository's
+            // token; it must carry that token through unchanged.
+            assert_eq!(
+                payload["next_cursor"]
+                    .as_str()
+                    .map(
+                        |token| decode_sessions_cursor(token, SessionLookback::ThirtyDays)
+                            .expect("minted cursor decodes")
+                            .inner
+                    ),
+                next_cursor,
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_empty_page_with_a_cursor_still_reports_more() {
+        // The repository's legal "keep going" signal: the candidate budget ran
+        // out before anything survived. Rendering that as "no sessions" would
+        // present a subset as complete.
+        let (backend, _) = fake_backend(InMemoryConversationResponses {
+            list_mcp_sessions: Some(Ok(Page {
+                items: Vec::new(),
+                next_cursor: Some("keep-going".to_string()),
+            })),
+            ..Default::default()
+        })
+        .await;
+
+        let payload =
+            response_json(api_sessions(Query(sessions_query()), Extension(backend)).await).await;
+        assert_eq!(payload["sessions"], json!([]));
+        assert_eq!(payload["has_more"], json!(true));
+        assert_eq!(
+            decode_sessions_cursor(
+                payload["next_cursor"].as_str().expect("keep-going cursor"),
+                SessionLookback::ThirtyDays,
+            )
+            .expect("minted cursor decodes")
+            .inner,
+            "keep-going",
+        );
+    }
+
+    #[tokio::test]
+    async fn session_cursor_round_trips_to_page_two_with_no_overlap_and_no_gap() {
+        // A static six-session corpus split into two pages of three. Page 2 is
+        // reachable only by presenting page 1's cursor, so a handler that
+        // dropped it would be served page 1 again and overlap.
+        //
+        // The fake binds each token it mints to that request's filter, exactly
+        // as the repository does, so this also fails when page 2 presents a
+        // window the handler re-derived from the clock instead of replaying the
+        // one page 1 was computed under.
+        let page_one = session_feed(0, 3);
+        let page_two = session_feed(3, 3);
+        let corpus: Vec<String> = page_one
+            .iter()
+            .chain(page_two.iter())
+            .map(|session| session.session_id.clone())
+            .collect();
+        let (backend, repository) = fake_backend(InMemoryConversationResponses {
+            list_mcp_sessions_by_cursor: BTreeMap::from([
+                (
+                    String::new(),
+                    Ok(Page {
+                        items: page_one,
+                        next_cursor: Some("page-2".to_string()),
+                    }),
+                ),
+                (
+                    "page-2".to_string(),
+                    Ok(Page {
+                        items: page_two,
+                        next_cursor: None,
+                    }),
+                ),
+            ]),
+            ..Default::default()
+        })
+        .await;
+
+        let first = response_json(
+            api_sessions(
+                Query(SessionsQuery {
+                    limit: Some(3),
+                    ..sessions_query()
+                }),
+                Extension(backend.clone()),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(first["has_more"], json!(true));
+        let cursor = first["next_cursor"]
+            .as_str()
+            .expect("page 1 mints a cursor")
+            .to_string();
+
+        // The feed window is derived from the wall clock. Let the clock move,
+        // which is the production condition: page 2 arrives at a later instant
+        // than the page-1 mint.
+        tokio::time::sleep(Duration::from_millis(2)).await;
+
+        let second_response = api_sessions(
+            Query(SessionsQuery {
+                limit: Some(3),
+                cursor: Some(cursor.clone()),
+                ..sessions_query()
+            }),
+            Extension(backend),
+        )
+        .await;
+        assert_eq!(
+            second_response.status(),
+            StatusCode::OK,
+            "a freshly minted cursor must be redeemable"
+        );
+        let second = response_json(second_response).await;
+        assert_eq!(second["has_more"], json!(false));
+        assert_eq!(
+            second["window"], first["window"],
+            "a continuation reports the window it replayed"
+        );
+
+        let first_ids = session_ids(&first);
+        let second_ids = session_ids(&second);
+        assert!(
+            first_ids.iter().all(|id| !second_ids.contains(id)),
+            "pages must not overlap: {first_ids:?} then {second_ids:?}"
+        );
+        let traversed: Vec<String> = first_ids.into_iter().chain(second_ids).collect();
+        assert_eq!(
+            traversed, corpus,
+            "traversal must cover the corpus in order"
+        );
+
+        // The repository's own token reached it verbatim; a dropped or
+        // rewritten cursor is what produces the gap this test exists to catch.
+        let calls = repository.calls();
+        assert_eq!(calls.list_mcp_sessions.len(), 2);
+        assert_eq!(calls.list_mcp_sessions[0].1.cursor, None);
+        assert_eq!(
+            calls.list_mcp_sessions[1].1.cursor.as_deref(),
+            Some("page-2")
+        );
+        // Page 2 presented the identical window, which is what makes the token
+        // redeemable at all.
+        assert_eq!(
+            (
+                calls.list_mcp_sessions[1].0.start_unix_ms,
+                calls.list_mcp_sessions[1].0.end_unix_ms
+            ),
+            (
+                calls.list_mcp_sessions[0].0.start_unix_ms,
+                calls.list_mcp_sessions[0].0.end_unix_ms
+            ),
+        );
+    }
+
+    #[tokio::test]
+    async fn a_continuation_replays_the_pinned_window_rather_than_the_current_clock() {
+        // Clock-independent statement of the same contract: the window the
+        // repository sees on a continuation comes from the token, so a page
+        // minted at any instant resolves to the same filter when it is redeemed.
+        let pinned = SessionWindow {
+            start_unix_ms: 1_768_651_203_900,
+            end_unix_ms: 1_771_243_203_901,
+        };
+        let token =
+            encode_sessions_cursor(SessionLookback::ThirtyDays, pinned, "page-2".to_string())
+                .expect("cursor encodes");
+        let (backend, repository) = fake_backend(successful_responses()).await;
+
+        let response = api_sessions(
+            Query(SessionsQuery {
+                cursor: Some(token),
+                ..sessions_query()
+            }),
+            Extension(backend),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_json(response).await;
+        assert_eq!(payload["window"]["start"], json!(pinned.start_unix_ms));
+        assert_eq!(payload["window"]["end"], json!(pinned.end_unix_ms));
+
+        let calls = repository.calls();
+        let (filter, page) = calls.list_mcp_sessions.first().expect("one page read");
+        assert_eq!(filter.start_unix_ms, pinned.start_unix_ms);
+        assert_eq!(filter.end_unix_ms, pinned.end_unix_ms);
+        assert_eq!(page.cursor.as_deref(), Some("page-2"));
+    }
+
+    #[tokio::test]
+    async fn a_continuation_may_not_silently_change_the_window_it_pinned() {
+        // Serving the pinned window under a different `since` would make the
+        // control look inert; the caller is told to restart the feed instead.
+        let token = encode_sessions_cursor(
+            SessionLookback::ThirtyDays,
+            resolve_session_window(SessionLookback::ThirtyDays, unix_now_ms()),
+            "page-2".to_string(),
+        )
+        .expect("cursor encodes");
+        let (backend, repository) = fake_backend(successful_responses()).await;
+
+        let response = api_sessions(
+            Query(SessionsQuery {
+                since: Some("6h".to_string()),
+                cursor: Some(token),
+                ..sessions_query()
+            }),
+            Extension(backend),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let payload = response_json(response).await;
+        assert_eq!(payload["code"], json!("invalid_cursor"));
+        assert!(payload["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("since=30d")));
+        assert!(
+            repository.calls().list_mcp_sessions.is_empty(),
+            "a refused cursor must not reach the repository"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_continuation_whose_window_was_tampered_with_is_refused_as_an_invalid_cursor() {
+        // The window is the one filter dimension this route takes from the
+        // token instead of the request, so it is client input on the way into
+        // `McpSessionListFilter`. A widened lower bound queries outside the
+        // `since` the token still names, and a reversed range reaches the
+        // repository as an invalid argument — which is a 503, not the 400 a
+        // refused token is documented to produce.
+        let honest = resolve_session_window(SessionLookback::ThirtyDays, unix_now_ms());
+        let tampered = [
+            SessionWindow {
+                start_unix_ms: 0,
+                ..honest
+            },
+            SessionWindow {
+                start_unix_ms: honest.end_unix_ms,
+                end_unix_ms: honest.start_unix_ms,
+            },
+            SessionWindow {
+                start_unix_ms: -1,
+                ..honest
+            },
+        ];
+
+        for window in tampered {
+            let token =
+                encode_sessions_cursor(SessionLookback::ThirtyDays, window, "page-2".to_string())
+                    .expect("cursor encodes");
+            let (backend, repository) = fake_backend(successful_responses()).await;
+
+            let response = api_sessions(
+                Query(SessionsQuery {
+                    cursor: Some(token),
+                    ..sessions_query()
+                }),
+                Extension(backend),
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "tampered window {window:?} must be a client error"
+            );
+            assert_eq!(
+                response_json(response).await["code"],
+                json!("invalid_cursor"),
+                "tampered window {window:?} must be classified as a refused cursor"
+            );
+            assert!(
+                repository.calls().list_mcp_sessions.is_empty(),
+                "a tampered window must not reach the repository filter"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_sessions_cursor_this_service_would_refuse_is_never_minted() {
+        // Mint and decode share one cap. A token longer than the decoder
+        // accepts would be a continuation the very next request rejects,
+        // stranding the caller mid-feed with no way forward.
+        let window = resolve_session_window(SessionLookback::ThirtyDays, unix_now_ms());
+
+        for inner_len in [
+            0,
+            16,
+            MONITOR_CURSOR_MAX_CHARS / 2,
+            MONITOR_CURSOR_MAX_CHARS,
+            MONITOR_CURSOR_MAX_CHARS * 2,
+        ] {
+            let inner = "r".repeat(inner_len);
+            let Ok(token) =
+                encode_sessions_cursor(SessionLookback::ThirtyDays, window, inner.clone())
+            else {
+                continue;
+            };
+            assert_eq!(
+                decode_sessions_cursor(&token, SessionLookback::ThirtyDays)
+                    .unwrap_or_else(|error| panic!(
+                        "a minted token must decode, inner {inner_len} chars: {error}"
+                    ))
+                    .inner,
+                inner,
+            );
+        }
+
+        // Not vacuous: the largest case above is genuinely refused at mint
+        // rather than quietly fitting.
+        let message = encode_sessions_cursor(
+            SessionLookback::ThirtyDays,
+            window,
+            "r".repeat(MONITOR_CURSOR_MAX_CHARS * 2),
+        )
+        .expect_err("an oversized mint must fail");
+        assert!(message.contains("cursor limit"), "got {message}");
+    }
+
+    #[tokio::test]
+    async fn session_deadline_surfaces_as_a_budget_classified_error() {
+        let (backend, _) = fake_backend(InMemoryConversationResponses {
+            list_mcp_sessions: Some(Err(RepoError::deadline_exceeded(
+                "query budget deadline expired (budget 15.000s)",
+            ))),
+            ..Default::default()
+        })
+        .await;
+
+        let response = api_sessions(Query(sessions_query()), Extension(backend)).await;
+        // 504 is this daemon's deadline status (issue #600 amendment A11); the
+        // machine-readable code is what a client branches on.
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        let payload = response_json(response).await;
+        assert_eq!(payload["ok"], json!(false));
+        assert_eq!(payload["code"], json!("deadline_exceeded"));
+
+        let (backend, _) = fake_backend(InMemoryConversationResponses {
+            list_mcp_sessions: Some(Err(RepoError::resource_exhausted(
+                "read_rows allowance exhausted (budget 500000000)",
+            ))),
+            ..Default::default()
+        })
+        .await;
+        let response = api_sessions(Query(sessions_query()), Extension(backend)).await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response_json(response).await["code"],
+            json!("resource_exhausted")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_cursor_is_a_recoverable_client_error_not_a_backend_failure() {
+        // `list_mcp_sessions` refuses a token minted by the other read path. A
+        // 503 would read as transient and invite a retry that pages a silent
+        // gap; the caller must be told to restart the feed instead.
+        let (backend, repository) = fake_backend(InMemoryConversationResponses {
+            list_mcp_sessions: Some(Err(RepoError::invalid_cursor(
+                "cursor was minted by a different list_sessions read path",
+            ))),
+            ..Default::default()
+        })
+        .await;
+
+        // A well-formed monitor envelope, so the refusal under test is the
+        // repository's and not this route's own decode.
+        let token = encode_sessions_cursor(
+            SessionLookback::ThirtyDays,
+            resolve_session_window(SessionLookback::ThirtyDays, unix_now_ms()),
+            "stale-repository-token".to_string(),
+        )
+        .expect("cursor encodes");
+        let response = api_sessions(
+            Query(SessionsQuery {
+                cursor: Some(token),
+                ..sessions_query()
+            }),
+            Extension(backend),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let payload = response_json(response).await;
+        assert_eq!(payload["ok"], json!(false));
+        assert_eq!(payload["code"], json!("invalid_cursor"));
+        assert_eq!(
+            repository.calls().list_mcp_sessions.len(),
+            1,
+            "the repository is what refused this token"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_malformed_or_oversized_cursor_is_refused_before_the_repository() {
+        let (backend, repository) = fake_backend(successful_responses()).await;
+
+        for token in [
+            "not base64!!".to_string(),
+            URL_SAFE_NO_PAD.encode(b"not json"),
+            "A".repeat(MONITOR_CURSOR_MAX_CHARS + 1),
+        ] {
+            let response = api_sessions(
+                Query(SessionsQuery {
+                    cursor: Some(token),
+                    ..sessions_query()
+                }),
+                Extension(backend.clone()),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                response_json(response).await["code"],
+                json!("invalid_cursor")
+            );
+        }
+        assert!(repository.calls().list_mcp_sessions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_query_parameters_reach_the_shared_repository_filter() {
+        let (backend, repository) = fake_backend(successful_responses()).await;
+
+        let response = api_sessions(
+            Query(SessionsQuery {
+                limit: Some(200),
+                since: Some("all".to_string()),
+                cursor: None,
+                harness: Some("  codex  ".to_string()),
+                source: Some(String::new()),
+                mode: Some("mcp_internal".to_string()),
+                sort: Some("asc".to_string()),
+            }),
+            Extension(backend),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_json(response).await;
+        // `all` drops the lower bound; the upper bound is exclusive of now.
+        assert_eq!(payload["window"]["start"], json!(0));
+        assert!(payload["window"]["end"].as_i64().expect("window end") > 0);
+        // 200 is inside the route's clamp but above the backend's max_results,
+        // so the reported limit is the one actually served.
+        assert_eq!(payload["limit"], json!(RepoConfig::default().max_results));
+
+        let calls = repository.calls();
+        let (filter, page) = calls.list_mcp_sessions.first().expect("one page read");
+        assert_eq!(page.limit, RepoConfig::default().max_results);
+        assert_eq!(filter.start_unix_ms, 0);
+        assert_eq!(filter.harness.as_deref(), Some("codex"));
+        assert_eq!(filter.source_name, None, "a cleared filter is absent");
+        assert_eq!(filter.mode, Some(ConversationMode::McpInternal));
+        assert_eq!(filter.sort, ConversationListSort::Asc);
+    }
+
+    #[tokio::test]
+    async fn since_window_bounds_the_filter_the_repository_receives() {
+        let (backend, repository) = fake_backend(successful_responses()).await;
+
+        let response = api_sessions(
+            Query(SessionsQuery {
+                since: Some("6h".to_string()),
+                ..sessions_query()
+            }),
+            Extension(backend),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_json(response).await;
+        let start = payload["window"]["start"].as_i64().expect("window start");
+        let end = payload["window"]["end"].as_i64().expect("window end");
+        assert_eq!(end - start, 6 * 60 * 60 * 1_000 + 1);
+
+        let calls = repository.calls();
+        let (filter, _) = calls.list_mcp_sessions.first().expect("one page read");
+        assert_eq!(filter.start_unix_ms, start);
+        assert_eq!(filter.end_unix_ms, end);
+    }
+
+    #[tokio::test]
+    async fn unusable_session_filters_are_rejected_rather_than_widened() {
+        let (backend, repository) = fake_backend(successful_responses()).await;
+
+        for query in [
+            SessionsQuery {
+                mode: Some("not-a-mode".to_string()),
+                ..sessions_query()
+            },
+            SessionsQuery {
+                sort: Some("sideways".to_string()),
+                ..sessions_query()
+            },
+            SessionsQuery {
+                cursor: Some("   ".to_string()),
+                ..sessions_query()
+            },
+        ] {
+            let response = api_sessions(Query(query), Extension(backend.clone())).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(response_json(response).await["ok"], json!(false));
+        }
+        assert!(
+            repository.calls().list_mcp_sessions.is_empty(),
+            "a rejected request must not reach the repository"
+        );
+    }
+
+    // --- issue-599 WI-05: `/api/v1/sessions/:id/page` lazy transcript ------
+
+    fn sample_session_metadata() -> SessionMetadata {
+        SessionMetadata {
+            session_id: "session-1".to_string(),
+            first_event_time: "2026-02-16T12:00:00.000Z".to_string(),
+            first_event_unix_ms: 1_771_243_200_000,
+            last_event_time: "2026-02-16T12:00:03.900Z".to_string(),
+            last_event_unix_ms: 1_771_243_203_900,
+            total_turns: 4,
+            total_events: 12,
+            user_messages: 4,
+            assistant_messages: 4,
+            tool_calls: 2,
+            tool_results: 2,
+            mode: ConversationMode::ToolCalling,
+            first_event_uid: "uid-first".to_string(),
+            last_event_uid: "uid-last".to_string(),
+            last_actor_role: "assistant".to_string(),
+        }
+    }
+
+    fn sample_turn(turn_seq: u32) -> McpTurnCompact {
+        McpTurnCompact {
+            metadata: TurnSummary {
+                session_id: "session-1".to_string(),
+                turn_seq,
+                turn_id: format!("turn-{turn_seq}"),
+                started_at: "2026-02-16T12:00:00.000Z".to_string(),
+                started_at_unix_ms: 1_771_243_200_000,
+                ended_at: "2026-02-16T12:00:03.900Z".to_string(),
+                ended_at_unix_ms: 1_771_243_203_900,
+                total_events: 3,
+                user_messages: 1,
+                assistant_messages: 1,
+                tool_calls: 1,
+                tool_results: 0,
+                reasoning_items: 0,
+            },
+            user_input_summary: Some(format!("prompt {turn_seq}")),
+            final_response_summary: Some(format!("reply {turn_seq}")),
+            user_input_event: None,
+            final_response_event: None,
+            tools_called: vec!["Read".to_string()],
+            normalized_event_types: vec!["message".to_string()],
+            completed: true,
+            terminal_event_uid: None,
+            first_event: None,
+            last_event: None,
+        }
+    }
+
+    fn sample_continuation(after_turn_seq: u32) -> CanonicalContinuation {
+        CanonicalContinuation {
+            signals: CanonicalSessionSignals {
+                pinned_revision: 7,
+                heads_fingerprint: "fingerprint".to_string(),
+                observed_sum: 12,
+                min_bound_ms: 1_771_243_200_000,
+                max_bound_ms: 1_771_243_203_900,
+            },
+            after: CanonicalReadAnchor {
+                sort_time_ms: 1_771_243_203_900,
+                source_host: "host-a".to_string(),
+                source_file: "session.jsonl".to_string(),
+                source_generation: 1,
+                source_offset: 42,
+                source_line_no: 9,
+                event_uid: format!("uid-{after_turn_seq}"),
+                event_order: u64::from(after_turn_seq) * 3,
+                turn_seq: after_turn_seq,
+                prefix_user_message_count: u64::from(after_turn_seq),
+                event_ordinal: 3,
+            },
+            after_turn_seq,
+            session_carry: None,
+        }
+    }
+
+    fn sample_session_page(
+        turns: Vec<McpTurnCompact>,
+        continuation: Option<CanonicalContinuation>,
+    ) -> CanonicalSessionPage {
+        CanonicalSessionPage {
+            session: McpSessionOpen {
+                metadata: sample_session_metadata(),
+                title: Some("Inspect the repository".to_string()),
+                source: Some("ci-codex".to_string()),
+                harness: Some("codex".to_string()),
+                inference_provider: Some("openai".to_string()),
+                session_slug: Some("inspect-repo".to_string()),
+                session_summary: Some("Repository inspection".to_string()),
+                turns,
+                completed: false,
+                terminal_event_uid: None,
+                snapshot: None,
+            },
+            continuation,
+        }
+    }
+
+    #[tokio::test]
+    async fn session_page_lazily_loads_turns_through_the_canonical_open_reader() {
+        let (backend, repository) = fake_backend(InMemoryConversationResponses {
+            canonical_open_session_page_after_turn: BTreeMap::from([
+                (
+                    0,
+                    Ok(Some(CanonicalReadOutcome::Page(sample_session_page(
+                        vec![sample_turn(1), sample_turn(2)],
+                        Some(sample_continuation(2)),
+                    )))),
+                ),
+                (
+                    2,
+                    Ok(Some(CanonicalReadOutcome::Page(sample_session_page(
+                        vec![sample_turn(3), sample_turn(4)],
+                        None,
+                    )))),
+                ),
+            ]),
+            ..Default::default()
+        })
+        .await;
+
+        let first = response_json(
+            api_session_page(
+                Path("session-1".to_string()),
+                Query(SessionPageQuery {
+                    limit: Some(2),
+                    cursor: None,
+                }),
+                Extension(backend.clone()),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(first["ok"], json!(true));
+        assert_eq!(first["read_model"], json!("live"));
+        assert_eq!(first["session"]["id"], json!("session-1"));
+        assert_eq!(first["session"]["turnCount"], json!(4));
+        let first_turns = first["session"]["turns"].as_array().expect("page 1 turns");
+        assert_eq!(first_turns.len(), 2, "the page is bounded by limit");
+        assert_eq!(first_turns[0]["turnSeq"], json!(1));
+        assert_eq!(first_turns[0]["userInput"], json!("prompt 1"));
+        assert_eq!(first["has_more"], json!(true));
+        let cursor = first["next_cursor"]
+            .as_str()
+            .expect("a non-terminal page mints a cursor")
+            .to_string();
+
+        let second = response_json(
+            api_session_page(
+                Path("session-1".to_string()),
+                Query(SessionPageQuery {
+                    limit: Some(2),
+                    cursor: Some(cursor),
+                }),
+                Extension(backend),
+            )
+            .await,
+        )
+        .await;
+        let second_turns = second["session"]["turns"].as_array().expect("page 2 turns");
+        assert_eq!(second_turns[0]["turnSeq"], json!(3));
+        assert_eq!(second_turns[1]["turnSeq"], json!(4));
+        assert_eq!(second["has_more"], json!(false));
+        assert_eq!(second["next_cursor"], Value::Null);
+
+        let calls = repository.calls();
+        assert_eq!(calls.canonical_open_session_page.len(), 2);
+        assert_eq!(calls.canonical_open_session_page[0].0, "session-1");
+        assert_eq!(calls.canonical_open_session_page[0].1, 2);
+        assert_eq!(calls.canonical_open_session_page[0].2, None);
+        // Page 2 handed the repository back its own continuation, unmodified.
+        assert_eq!(
+            calls.canonical_open_session_page[1].2.as_ref(),
+            Some(&sample_continuation(2))
+        );
+        // The canonical reader, and nothing else.
+        assert!(calls.get_mcp_session.is_empty());
+        assert!(calls.get_conversation.is_empty());
+        assert!(calls.list_turns.is_empty());
+        assert!(calls.list_session_events.is_empty());
+        assert!(calls.list_mcp_sessions.is_empty());
+        assert!(calls.list_session_analytics.is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_page_reopen_is_surfaced_as_a_reopen_signal() {
+        let (backend, _) = fake_backend(InMemoryConversationResponses {
+            canonical_open_session_page: Some(Ok(Some(CanonicalReadOutcome::Reopen))),
+            ..Default::default()
+        })
+        .await;
+
+        let response = api_session_page(
+            Path("session-1".to_string()),
+            Query(SessionPageQuery {
+                limit: None,
+                cursor: None,
+            }),
+            Extension(backend),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response_json(response).await;
+        assert_eq!(payload["ok"], json!(true));
+        assert_eq!(payload["reopen"], json!(true));
+        assert!(payload.get("session").is_none());
+    }
+
+    #[tokio::test]
+    async fn session_page_cursor_is_refused_for_another_session() {
+        let (backend, repository) = fake_backend(InMemoryConversationResponses {
+            canonical_open_session_page_after_turn: BTreeMap::from([(
+                0,
+                Ok(Some(CanonicalReadOutcome::Page(sample_session_page(
+                    vec![sample_turn(1)],
+                    Some(sample_continuation(1)),
+                )))),
+            )]),
+            ..Default::default()
+        })
+        .await;
+
+        let first = response_json(
+            api_session_page(
+                Path("session-1".to_string()),
+                Query(SessionPageQuery {
+                    limit: Some(1),
+                    cursor: None,
+                }),
+                Extension(backend.clone()),
+            )
+            .await,
+        )
+        .await;
+        let cursor = first["next_cursor"].as_str().expect("cursor").to_string();
+
+        let before = repository.calls().canonical_open_session_page.len();
+        for (session_id, token) in [
+            ("session-2", cursor),
+            ("session-1", "not-base64!!".to_string()),
+            ("session-1", String::new()),
+            ("session-1", "A".repeat(MONITOR_CURSOR_MAX_CHARS + 1)),
+        ] {
+            let response = api_session_page(
+                Path(session_id.to_string()),
+                Query(SessionPageQuery {
+                    limit: None,
+                    cursor: Some(token),
+                }),
+                Extension(backend.clone()),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let payload = response_json(response).await;
+            assert_eq!(payload["ok"], json!(false));
+            assert_eq!(payload["code"], json!("invalid_cursor"));
+        }
+        assert_eq!(
+            repository.calls().canonical_open_session_page.len(),
+            before,
+            "a refused cursor must not reach the reader"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_page_cursor_size_is_bounded_by_the_anchor_not_the_session_header() {
+        // `session_carry` is a JSON session header, so a token that embedded it
+        // verbatim would grow with header content. Two continuations whose only
+        // difference is carry size must mint tokens of the same bounded size.
+        let mut carried = sample_continuation(2);
+        carried.session_carry = Some("x".repeat(MONITOR_CURSOR_MAX_CHARS * 4));
+        let bare = sample_continuation(2);
+
+        let carried_token =
+            encode_session_page_cursor("session-1", &carried).expect("carried cursor encodes");
+        let bare_token =
+            encode_session_page_cursor("session-1", &bare).expect("bare cursor encodes");
+        assert!(
+            carried_token.len() <= MONITOR_CURSOR_MAX_CHARS,
+            "token must stay under the cap, got {}",
+            carried_token.len()
+        );
+        assert_eq!(
+            carried_token, bare_token,
+            "an oversized carry is dropped, not encoded"
+        );
+        assert_eq!(
+            decode_session_page_cursor(&carried_token, "session-1").expect("token decodes"),
+            bare,
+        );
+
+        // A carry that fits is kept, so the next page still skips the
+        // session-wide header pass.
+        let mut small = sample_continuation(2);
+        small.session_carry = Some("x".repeat(64));
+        let small_token =
+            encode_session_page_cursor("session-1", &small).expect("small cursor encodes");
+        assert_eq!(
+            decode_session_page_cursor(&small_token, "session-1").expect("token decodes"),
+            small,
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_page_cursor_that_still_exceeds_the_cap_after_the_carry_drop_is_not_minted() {
+        // Dropping the carry is a shrink, not a proof. An anchor that is itself
+        // over the cap must fail the mint rather than be handed back as a
+        // continuation the next request refuses.
+        let mut oversized_anchor = sample_continuation(2);
+        oversized_anchor.after.source_file = "f".repeat(MONITOR_CURSOR_MAX_CHARS * 2);
+        oversized_anchor.session_carry = Some("x".repeat(MONITOR_CURSOR_MAX_CHARS));
+        let message = encode_session_page_cursor("session-1", &oversized_anchor)
+            .expect_err("an anchor over the cap must fail the mint");
+        assert!(message.contains("cursor limit"), "got {message}");
+
+        // Same verdict with no carry to drop, which is the branch that returns
+        // the first encoding directly.
+        let mut carryless = sample_continuation(2);
+        carryless.after.source_file = "f".repeat(MONITOR_CURSOR_MAX_CHARS * 2);
+        assert!(encode_session_page_cursor("session-1", &carryless).is_err());
+
+        // The ordinary oversized-carry case still mints, and what mints decodes.
+        let mut carried = sample_continuation(2);
+        carried.session_carry = Some("x".repeat(MONITOR_CURSOR_MAX_CHARS * 4));
+        let token = encode_session_page_cursor("session-1", &carried)
+            .expect("dropping the carry keeps the mint");
+        decode_session_page_cursor(&token, "session-1").expect("a minted token must decode");
+    }
+
+    #[tokio::test]
+    async fn session_page_is_refused_until_the_canonical_reader_is_ready() {
+        // The canonical reader does not gate itself. Every other consumer
+        // checks `open_v2` readiness first; a route that skipped it would serve
+        // transcripts off indexes whose backfill or overlap audit has not
+        // published — precisely the backends where reading them is wrong.
+        let (backend, repository) = fake_backend(InMemoryConversationResponses {
+            canonical_reader_ready: Some(false),
+            canonical_open_session_page: Some(Ok(Some(CanonicalReadOutcome::Page(
+                sample_session_page(vec![sample_turn(1)], None),
+            )))),
+            ..Default::default()
+        })
+        .await;
+
+        let response = api_session_page(
+            Path("session-1".to_string()),
+            Query(SessionPageQuery {
+                limit: None,
+                cursor: None,
+            }),
+            Extension(backend),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let payload = response_json(response).await;
+        assert_eq!(payload["ok"], json!(false));
+        assert_eq!(payload["code"], json!("canonical_reader_unavailable"));
+        assert!(
+            repository.calls().canonical_open_session_page.is_empty(),
+            "a not-ready backend must not be read through the v2 reader"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_page_answers_404_for_an_unknown_or_out_of_scope_session() {
+        let (backend, _) = fake_backend(InMemoryConversationResponses {
+            canonical_open_session_page: Some(Ok(None)),
+            ..Default::default()
+        })
+        .await;
+
+        let response = api_session_page(
+            Path("nope".to_string()),
+            Query(SessionPageQuery {
+                limit: None,
+                cursor: None,
+            }),
+            Extension(backend),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            response_json(response).await,
+            json!({"ok": false, "error": "session not found"})
+        );
+    }
+
+    #[tokio::test]
+    async fn session_page_route_is_reachable_and_versioned_only() {
+        let (state, _) = fake_state(InMemoryConversationResponses {
+            canonical_open_session_page: Some(Ok(Some(CanonicalReadOutcome::Page(
+                sample_session_page(vec![sample_turn(1)], None),
+            )))),
+            ..Default::default()
+        });
+        let app = monitor_router(state);
+
+        let (status, payload) = router_json(&app, "/api/v1/sessions/session-1/page?limit=1").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(payload["session"]["turns"][0]["turnSeq"], json!(1));
     }
 
     #[tokio::test]
@@ -2144,6 +3470,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn status_serves_the_harness_filter_vocabulary() {
+        // `harness` narrows the session feed server-side, so the dashboard's
+        // menu cannot be derived from the page it happens to have loaded — a
+        // harness with no session on page 1 would be unselectable.
+        let (backend, _) = fake_backend(InMemoryConversationResponses {
+            read_store_health: Some(Ok(sample_health())),
+            latest_ingest_heartbeat: Some(Ok(sample_heartbeat())),
+            list_table_summaries: Some(Ok(TableSummaries::default())),
+            ..Default::default()
+        })
+        .await;
+
+        let status = response_json(api_status(Extension(backend)).await).await;
+        assert_eq!(
+            status["known_harnesses"],
+            json!(moraine_config::KNOWN_INGEST_HARNESSES),
+        );
+    }
+
+    #[tokio::test]
     async fn core_index_probe_failure_is_diagnostic_without_hiding_store_liveness() {
         let (backend, _) = fake_backend(InMemoryConversationResponses {
             read_store_health: Some(Ok(StoreHealth {
@@ -2216,7 +3562,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn versioned_routes_alias_legacy_payloads_and_preserve_static_assets() {
+    async fn versioned_routes_serve_the_api_and_legacy_aliases_are_gone() {
         const INDEX_BYTES: &[u8] = b"<!doctype html><title>shared-backend</title>\n";
         let root = temp_path("versioned-router");
         fs::create_dir_all(&root).expect("create static root");
@@ -2262,6 +3608,9 @@ mod tests {
             .expect("static body");
         assert_eq!(&static_body[..], INDEX_BYTES);
 
+        // The one-release `/api/*` compatibility window opened with `/api/v1`
+        // in v0.7.0 and closed with v0.7.1. Every legacy path is now an unknown
+        // path, which falls through to static handling and 404s.
         let route_matrix = [
             ("/api/v1/health", "/api/health"),
             ("/api/v1/status", "/api/status"),
@@ -2281,31 +3630,16 @@ mod tests {
             ),
         ];
         for (canonical_path, legacy_path) in route_matrix {
-            let (canonical_status, mut canonical) = router_json(&app, canonical_path).await;
-            let (legacy_status, mut legacy) = router_json(&app, legacy_path).await;
-            assert_eq!(canonical_status, legacy_status);
-            // `query_budgets` is live process telemetry: the two sequential
-            // requests observe different `requests` totals through the same
-            // handler. Assert the block travels on both shapes, then compare
-            // the rest of the payloads byte-for-byte.
-            let canonical_budgets = canonical
-                .as_object_mut()
-                .expect("canonical payload object")
-                .remove("query_budgets");
-            let legacy_budgets = legacy
-                .as_object_mut()
-                .expect("legacy payload object")
-                .remove("query_budgets");
+            let (canonical_status, _) = router_json(&app, canonical_path).await;
+            assert_eq!(canonical_status, StatusCode::OK, "{canonical_path}");
+
+            let (legacy_status, legacy) = router_json(&app, legacy_path).await;
             assert_eq!(
-                canonical_budgets.is_some(),
-                legacy_budgets.is_some(),
-                "{legacy_path} must carry query_budgets iff {canonical_path} does"
+                legacy_status,
+                StatusCode::NOT_FOUND,
+                "{legacy_path} must no longer be served"
             );
-            assert_eq!(
-                canonical, legacy,
-                "{legacy_path} must directly alias {canonical_path}"
-            );
-            assert_eq!(canonical_status, StatusCode::OK);
+            assert_eq!(legacy, json!({"ok": false, "error": "not found"}));
         }
 
         let (status, capabilities) = router_json(&app, "/api/v1/capabilities").await;
@@ -2325,41 +3659,22 @@ mod tests {
         let (status, missing) = router_json(&app, "/api/v1/not-a-route").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(missing, json!({"ok": false, "error": "not found"}));
+        // Each canonical route was served exactly once; the dead alias reached
+        // no handler at all.
         let calls = repository.calls();
-        assert_eq!(calls.read_store_health, 4);
+        assert_eq!(calls.read_store_health, 2);
         assert_eq!(calls.read_store_diagnostics, 1);
-        assert_eq!(calls.latest_ingest_heartbeat, 4);
-        assert_eq!(calls.list_table_summaries, 4);
-        assert_eq!(calls.list_web_searches, vec![1_000, 1_000]);
-        assert_eq!(
-            calls.analytics_series,
-            vec![AnalyticsRange::SevenDays, AnalyticsRange::SevenDays]
-        );
-        assert_eq!(
-            calls.list_session_analytics,
-            vec![
-                SessionAnalyticsQuery {
-                    lookback: SessionLookback::ThirtyDays,
-                    limit: 1,
-                },
-                SessionAnalyticsQuery {
-                    lookback: SessionLookback::ThirtyDays,
-                    limit: 1,
-                },
-            ]
-        );
+        assert_eq!(calls.latest_ingest_heartbeat, 2);
+        assert_eq!(calls.list_table_summaries, 2);
+        assert_eq!(calls.list_web_searches, vec![1_000]);
+        assert_eq!(calls.analytics_series, vec![AnalyticsRange::SevenDays]);
+        assert_eq!(calls.list_mcp_sessions.len(), 1);
         assert_eq!(
             calls.preview_table,
-            vec![
-                TablePreviewQuery {
-                    table: "events".to_string(),
-                    limit: 500,
-                },
-                TablePreviewQuery {
-                    table: "events".to_string(),
-                    limit: 500,
-                },
-            ]
+            vec![TablePreviewQuery {
+                table: "events".to_string(),
+                limit: 500,
+            }]
         );
 
         let _ = fs::remove_dir_all(root);
@@ -2400,7 +3715,7 @@ mod tests {
         let unknown = response_json(
             get_with_project_dir(
                 &app,
-                "/api/tables",
+                "/api/v1/tables",
                 Some(HeaderValue::from_static("/work/ghost/project")),
             )
             .await,
@@ -2409,7 +3724,7 @@ mod tests {
         let named_again = response_json(
             get_with_project_dir(
                 &app,
-                "/api/tables",
+                "/api/v1/tables",
                 Some(HeaderValue::from_static("/work/team/other")),
             )
             .await,
@@ -2492,20 +3807,20 @@ mod tests {
             .expect("metadata test app");
 
         let default_health =
-            response_json(get_with_project_dir(&app, "/api/health", None).await).await;
+            response_json(get_with_project_dir(&app, "/api/v1/health", None).await).await;
         assert_eq!(default_health["url"], json!("http://default.example:8123"));
         assert_eq!(default_health["database"], json!("moraine_default"));
 
         let named_header = HeaderValue::from_static("/work/team/project");
         let named_health = response_json(
-            get_with_project_dir(&app, "/api/health", Some(named_header.clone())).await,
+            get_with_project_dir(&app, "/api/v1/health", Some(named_header.clone())).await,
         )
         .await;
         assert_eq!(named_health["url"], json!("http://team.example:8123"));
         assert_eq!(named_health["database"], json!("moraine_team"));
 
         let named_status =
-            response_json(get_with_project_dir(&app, "/api/status", Some(named_header)).await)
+            response_json(get_with_project_dir(&app, "/api/v1/status", Some(named_header)).await)
                 .await;
         assert_eq!(
             named_status["clickhouse"]["url"],
@@ -2534,7 +3849,7 @@ mod tests {
             .expect("validation test app");
 
         let mut repeated = Request::builder()
-            .uri("/api/health")
+            .uri("/api/v1/health")
             .body(Body::empty())
             .expect("repeated header request");
         repeated.headers_mut().append(
@@ -2548,12 +3863,12 @@ mod tests {
         let requests = vec![
             repeated,
             Request::builder()
-                .uri("/api/health")
+                .uri("/api/v1/health")
                 .header(PROJECT_DIR_HEADER, HeaderValue::from_static("   "))
                 .body(Body::empty())
                 .expect("empty header request"),
             Request::builder()
-                .uri("/api/health")
+                .uri("/api/v1/health")
                 .header(
                     PROJECT_DIR_HEADER,
                     HeaderValue::from_static("relative/project"),
@@ -2561,7 +3876,7 @@ mod tests {
                 .body(Body::empty())
                 .expect("relative header request"),
             Request::builder()
-                .uri("/api/health")
+                .uri("/api/v1/health")
                 .header(
                     PROJECT_DIR_HEADER,
                     HeaderValue::from_bytes(&[0xff]).expect("opaque header"),
@@ -2607,7 +3922,7 @@ mod tests {
 
         let response = get_with_project_dir(
             &app,
-            "/api/health",
+            "/api/v1/health",
             Some(HeaderValue::from_static("/work/team/project")),
         )
         .await;

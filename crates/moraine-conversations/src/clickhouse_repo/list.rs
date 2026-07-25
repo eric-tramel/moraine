@@ -157,9 +157,8 @@ FORMAT JSONEachRow",
         })
     }
 
-    /// Session DISCOVERY. MCP `list_sessions` pages through it today; the
-    /// monitor feed still reads `list_session_analytics` and moves here in
-    /// WI-03 (issue-599 §1.1), which is why the `mcp_` prefix is already
+    /// Session DISCOVERY. MCP `list_sessions` and the monitor session feed both
+    /// page through it (issue-599 §1.1), which is why the `mcp_` prefix is
     /// historical and the operation carries no MCP-specific behavior.
     ///
     /// **Cursor contract (issue-599 §1.2).** The token is a VALUE anchor over
