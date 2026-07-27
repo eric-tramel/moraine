@@ -8,6 +8,18 @@ import pytest
 from moraine_conversations import ConversationClient
 
 
+def _conversation_hit_rows() -> list[dict]:
+    """Session-grained hits for #597's conversation ranking.
+
+    The statement selects only `(session_id, score, matched_terms)`; the
+    session detail is hydrated separately from the session-summary arm.
+    """
+    return [
+        {"session_id": "sess_c", "score": 12.5, "matched_terms": 2},
+        {"session_id": "sess_a", "score": 4.25, "matched_terms": 1},
+    ]
+
+
 def _session_rows() -> list[dict]:
     return [
         {
@@ -94,11 +106,23 @@ def _rows_for_query(query: str) -> list[dict]:
             },
         ]
 
-    if "GROUP BY p.doc_id" in query and "ORDER BY score DESC, event_uid ASC" in query:
+    # #597 routes conversation search through the bounded ranking CTEs, so the
+    # candidate and scoring statements are now `WITH live_locator …` shapes
+    # ordered by session score. Matched on that ordering, which identifies the
+    # statement without depending on the CTE body.
+    if "ORDER BY c.score DESC, c.session_id ASC" in query:
+        return _conversation_hit_rows()
+
+    # Event ranking is identified by its ordering alone. #597 rewrote the
+    # aggregation into the bounded postings CTEs, so a matcher additionally
+    # keyed on `GROUP BY p.doc_id` stopped firing and the smoke test reported
+    # "0 hits" for what was a fixture that no longer recognised the statement.
+    if "ORDER BY score DESC, event_uid ASC" in query:
         return [
             {
                 "event_uid": "evt-c-42",
                 "session_id": "sess_c",
+                "source_host": "host-a",
                 "source_name": "codex",
                 "harness": "codex",
                 "event_class": "message",
@@ -115,6 +139,7 @@ def _rows_for_query(query: str) -> list[dict]:
             {
                 "event_uid": "evt-a-11",
                 "session_id": "sess_a",
+                "source_host": "host-a",
                 "source_name": "codex",
                 "harness": "codex",
                 "event_class": "message",
