@@ -6,9 +6,9 @@ use moraine_conversations::{
     McpSessionListFilter, McpSessionListItem, McpSessionOpen, McpTurnOpen, OpenContext,
     OpenEventRequest, Page, PageRequest, RepoConfig, RepoResult, SearchEventsQuery,
     SearchEventsResult, SearchMcpEventsQuery, SearchMcpEventsResult, SessionAnalytics,
-    SessionAnalyticsQuery, SessionEventsQuery, SessionMetadata, SessionMetadataSearchQuery,
-    SessionMetadataSearchResults, StoreDiagnostics, StoreHealth, TablePreview, TablePreviewQuery,
-    TableSummaries, TraceEvent, Turn, TurnListFilter, TurnSummary, WebSearchEvent,
+    SessionAnalyticsQuery, SessionEventsQuery, SessionMetadata, StoreDiagnostics, StoreHealth,
+    TablePreview, TablePreviewQuery, TableSummaries, TraceEvent, Turn, TurnListFilter, TurnSummary,
+    WebSearchEvent,
 };
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use tokio::io::{AsyncWriteExt, ReadHalf, WriteHalf};
@@ -261,13 +261,6 @@ impl ConversationRepository for BlockingRepository {
         query: ConversationSearchQuery,
     ) -> RepoResult<ConversationSearchResults> {
         self.inner.search_conversations(query).await
-    }
-
-    async fn search_session_metadata(
-        &self,
-        query: SessionMetadataSearchQuery,
-    ) -> RepoResult<SessionMetadataSearchResults> {
-        self.inner.search_session_metadata(query).await
     }
 
     async fn file_attention(

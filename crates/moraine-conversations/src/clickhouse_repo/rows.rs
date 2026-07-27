@@ -70,49 +70,6 @@ pub(super) struct McpSessionListRow {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub(super) struct SessionMetadataSearchRow {
-    pub(super) session_id: String,
-    #[serde(default)]
-    pub(super) first_event_time: String,
-    #[serde(default)]
-    pub(super) first_event_unix_ms: i64,
-    #[serde(default)]
-    pub(super) last_event_time: String,
-    #[serde(default)]
-    pub(super) last_event_unix_ms: i64,
-    #[serde(default)]
-    pub(super) total_turns: u32,
-    #[serde(default)]
-    pub(super) total_events: u64,
-    #[serde(default)]
-    pub(super) user_messages: u64,
-    #[serde(default)]
-    pub(super) assistant_messages: u64,
-    #[serde(default)]
-    pub(super) tool_calls: u64,
-    #[serde(default)]
-    pub(super) tool_results: u64,
-    #[serde(default)]
-    pub(super) mode: String,
-    #[serde(default)]
-    pub(super) harness: String,
-    #[serde(default)]
-    pub(super) inference_provider: String,
-    #[serde(default)]
-    pub(super) session_slug: String,
-    #[serde(default)]
-    pub(super) session_summary: String,
-    #[serde(default)]
-    pub(super) meta_event_uid: String,
-    #[serde(default)]
-    pub(super) score: f64,
-    #[serde(default)]
-    pub(super) matched_terms: u16,
-    #[serde(default)]
-    pub(super) metadata_text: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
 pub(super) struct TurnSummaryRow {
     pub(super) session_id: String,
     pub(super) turn_seq: u32,
@@ -368,8 +325,6 @@ pub(super) struct SearchMcpCandidateRow {
     pub(super) scope_exists: u8,
     pub(super) projection_ready: u8,
     pub(super) projection_clean: u8,
-    #[serde(default)]
-    pub(super) projection_revision: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -434,6 +389,25 @@ pub(super) struct SearchMcpEventRow {
     pub(super) session_summary: String,
     #[serde(default)]
     pub(super) session_completed: u8,
+    /// Canonical `event_ts` in milliseconds, carried by the issue-597 v2
+    /// candidate derivation so winner hydration can bound the `events` scan by
+    /// the winners' OWN timestamps. Never deserialized from a statement and
+    /// never reported; the v1 detail statement leaves it at zero.
+    #[serde(skip)]
+    pub(super) hydration_event_ts_ms: i64,
+    /// The v2 ranking tiebreak key: the locator's deterministic `sort_time`,
+    /// which is what the ranking statement's `ORDER BY` uses.
+    ///
+    /// It is NOT `event_unix_ms`. The reported timestamp is `display_time`
+    /// (`ifNull(parse(record_ts), ingested_at)`) so search stays byte-identical
+    /// with `open`, while ordering uses `sort_time`
+    /// (`ifNull(parse(record_ts), epoch sentinel)`). The two differ for an event
+    /// with a malformed `record_ts`, and that difference is visible only when
+    /// `raw_score` ties exactly — which is precisely when the tiebreak decides
+    /// the answer. Sorting v2 rows by `event_unix_ms` would silently re-order
+    /// the SQL ranking.
+    #[serde(skip)]
+    pub(super) ranking_sort_time_ms: i64,
 }
 
 #[derive(Debug, Clone, Eq, Hash, PartialEq)]
@@ -449,25 +423,6 @@ impl SearchDocumentIdentity {
             event_uid: event_uid.into(),
         }
     }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub(super) struct CachedPostingRow {
-    #[serde(default)]
-    pub(super) source_host: String,
-    pub(super) event_uid: String,
-    pub(super) doc_len: u32,
-    pub(super) tf: u16,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub(super) struct FetchedPostingRow {
-    pub(super) term: String,
-    #[serde(default)]
-    pub(super) source_host: String,
-    pub(super) event_uid: String,
-    pub(super) doc_len: u32,
-    pub(super) tf: u16,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -501,12 +456,6 @@ pub(super) struct SearchDocExtraRow {
 pub(super) struct CorpusStatsRow {
     pub(super) docs: u64,
     pub(super) total_doc_len: u64,
-}
-
-#[derive(Debug, Deserialize)]
-pub(super) struct DfRow {
-    pub(super) term: String,
-    pub(super) df: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -592,18 +541,12 @@ pub(super) struct ConversationCandidateRow {
 #[derive(Debug, Default)]
 pub(super) struct ConversationCandidateSet {
     pub(super) rows: Vec<ConversationCandidateRow>,
-    pub(super) truncated: bool,
 }
 
 #[derive(Debug, Clone, Default)]
 pub(super) struct SessionTimeBounds {
     pub(super) first_event_time: String,
     pub(super) last_event_time: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub(super) struct ColumnExistsRow {
-    pub(super) exists: u8,
 }
 
 impl ClickHouseConversationRepository {
@@ -664,45 +607,6 @@ impl ClickHouseConversationRepository {
             first_event_uid: row.first_event_uid,
             last_event_uid: row.last_event_uid,
             last_actor_role: row.last_actor_role,
-        }
-    }
-
-    pub(super) fn map_session_metadata_search_row(
-        &self,
-        rank: usize,
-        row: SessionMetadataSearchRow,
-        terms: &[String],
-    ) -> SessionMetadataSearchHit {
-        let has_session_summary = !row.first_event_time.is_empty();
-        let snippet = evidence_snippet(
-            &row.session_summary,
-            &row.metadata_text,
-            terms,
-            self.cfg.preview_chars,
-        );
-
-        SessionMetadataSearchHit {
-            rank,
-            session_id: row.session_id,
-            first_event_time: has_session_summary.then_some(row.first_event_time),
-            first_event_unix_ms: has_session_summary.then_some(row.first_event_unix_ms),
-            last_event_time: has_session_summary.then_some(row.last_event_time),
-            last_event_unix_ms: has_session_summary.then_some(row.last_event_unix_ms),
-            total_turns: has_session_summary.then_some(row.total_turns),
-            total_events: has_session_summary.then_some(row.total_events),
-            user_messages: has_session_summary.then_some(row.user_messages),
-            assistant_messages: has_session_summary.then_some(row.assistant_messages),
-            tool_calls: has_session_summary.then_some(row.tool_calls),
-            tool_results: has_session_summary.then_some(row.tool_results),
-            mode: (!row.mode.is_empty()).then(|| Self::parse_mode(&row.mode)),
-            harness: non_empty_string(row.harness),
-            inference_provider: non_empty_string(row.inference_provider),
-            session_slug: non_empty_string(row.session_slug),
-            session_summary: non_empty_string(row.session_summary),
-            meta_event_uid: non_empty_string(row.meta_event_uid),
-            score: row.score,
-            matched_terms: row.matched_terms,
-            snippet,
         }
     }
 

@@ -1,3 +1,11 @@
+use super::canonical_list::{SessionMetaBatchRow, SessionTotalsBatchRow};
+use super::canonical_open::{list_title_and_summary, metadata_precedence, MetaRow};
+use super::consistency::EventTsBounds;
+use super::search_canonical::{
+    mcp_candidate_fetch_size, ScopeExistsRow, SearchCandidateDerivationRow, SearchCandidateRow,
+    SearchDedupKeyRow, SearchEventsCandidateRow, SearchRankingParams, SearchTurnAggregateRow,
+    SearchWideRow, TurnEventUidRow, MAX_TURN_SCOPE_UIDS,
+};
 use super::*;
 
 pub(super) const CONVERSATION_CANDIDATE_MIN: usize = 512;
@@ -5,22 +13,40 @@ pub(super) const CONVERSATION_CANDIDATE_MULTIPLIER: usize = 80;
 pub(super) const CONVERSATION_CANDIDATE_MAX: usize = 20_000;
 pub(super) const CONVERSATION_RECENT_WINDOW_MS: i64 = 45_000;
 pub(super) const CONVERSATION_RECENT_CANDIDATE_LIMIT: usize = 1024;
-pub(super) const MCP_SEARCH_MAX_CANDIDATE_PAGES: u16 = 16;
 pub(super) const CODEX_FINAL_ANSWER_MIRROR_MAX_TIMESTAMP_DELTA_MS: u64 = 10;
 
+/// Which sessions a conversation-search postings statement may read (issue
+/// #597 §1.5/F5).
+///
+/// The retired shape was `Option<&[String]>`, and `None` meant "emit no session
+/// predicate at all" — a whole-corpus postings scan. THREE distinct conditions
+/// produced it: a candidate-stage error (swallowed by a `warn!`), zero
+/// candidates, and candidate saturation. Two of those are ordinary outcomes, so
+/// the unbounded branch was the common case, not the exception.
+///
+/// This enum has no variant that means "no predicate on a scoring statement".
+/// [`Self::Discovery`] is only constructible by the candidate stage, which has
+/// no session set by construction and is bounded by its own `LIMIT`; the
+/// scoring stage can only pass [`Self::Sessions`], and
+/// `search_conversations_impl` returns zero results before building SQL when
+/// that list is empty.
 #[derive(Debug, Clone, Copy)]
-pub(super) struct SearchScoreAccum<'a> {
-    pub(super) row: &'a CachedPostingRow,
-    pub(super) score: f64,
-    pub(super) matched_mask: u64,
+pub(super) enum ConversationSessionFilter<'a> {
+    /// Candidate DISCOVERY. Bounded by `LIMIT`, not by a session predicate.
+    Discovery,
+    /// Candidate SCORING, restricted to the sessions the discovery stage found.
+    Sessions(&'a [String]),
 }
 
-#[derive(Debug, Clone, Copy)]
-#[cfg(test)]
-pub(super) struct RankedPosting<'a> {
-    pub(super) row: &'a CachedPostingRow,
-    pub(super) score: f64,
-    pub(super) matched_terms: u64,
+/// One bounded ranking pass's result, shared by the v1 (projected-header) and
+/// v2 (canonical-index) engines.
+pub(super) struct McpSearchPage {
+    pub(super) rows: Vec<SearchMcpEventRow>,
+    pub(super) docs: u64,
+    pub(super) total_doc_len: u64,
+    pub(super) scope_exists: bool,
+    /// See [`crate::domain::SearchMcpEventsResult::incomplete_due_to_candidate_budget`].
+    pub(super) incomplete_due_to_candidate_budget: bool,
 }
 
 impl ClickHouseConversationRepository {
@@ -110,237 +136,26 @@ LIMIT 1 BY h.session_id)"
         )
     }
 
-    pub async fn search_session_metadata(
-        &self,
-        query: SessionMetadataSearchQuery,
-    ) -> RepoResult<SessionMetadataSearchResults> {
-        self.run_publication_consistent(PublicationReadClass::MovingFeed, || {
-            self.search_session_metadata_impl(query.clone())
-        })
-        .await
-    }
-
-    async fn search_session_metadata_impl(
-        &self,
-        query: SessionMetadataSearchQuery,
-    ) -> RepoResult<SessionMetadataSearchResults> {
-        let query_text = query.query.trim();
-        if query_text.is_empty() {
-            return Err(RepoError::invalid_argument("query cannot be empty"));
-        }
-
-        Self::validate_time_bounds(query.from_unix_ms, query.to_unix_ms)?;
-        if let Some(session_id) = query.session_id.as_deref() {
-            Self::validate_session_id(session_id)?;
-        }
-
-        let query_id = Uuid::new_v4().to_string();
-        let started = Instant::now();
-
-        let terms_with_qf = tokenize_query(query_text, self.cfg.bm25_max_query_terms);
-        if terms_with_qf.is_empty() {
-            return Err(RepoError::invalid_argument(
-                "query has no searchable terms (tokens shorter than 2 characters are excluded)",
-            ));
-        }
-        let terms: Vec<String> = terms_with_qf.iter().map(|(term, _)| term.clone()).collect();
-
-        let requested_limit = query.limit.unwrap_or(self.cfg.max_results).max(1);
-        let limit = requested_limit.min(self.cfg.max_results);
-        let limit_capped = requested_limit > limit;
-
-        let min_should_match = query
-            .min_should_match
-            .unwrap_or(self.cfg.bm25_default_min_should_match)
-            .max(1)
-            .min(terms.len() as u16);
-        let min_score = query.min_score.unwrap_or(0.0);
-
-        let sql = self.build_search_session_metadata_sql(
-            &terms,
-            min_should_match,
-            min_score,
-            limit,
-            query.from_unix_ms,
-            query.to_unix_ms,
-            query.mode,
-            query.session_id.as_deref(),
-        )?;
-
-        let rows: Vec<SessionMetadataSearchRow> =
-            self.map_backend(self.query_rows(&sql, None).await)?;
-        let hits = rows
-            .into_iter()
-            .enumerate()
-            .map(|(idx, row)| self.map_session_metadata_search_row(idx + 1, row, &terms))
-            .collect::<Vec<_>>();
-        let took_ms = started.elapsed().as_millis() as u32;
-
-        Ok(SessionMetadataSearchResults {
-            query_id,
-            query: query_text.to_string(),
-            terms,
-            stats: SessionMetadataSearchStats {
-                requested_limit,
-                effective_limit: limit,
-                limit_capped,
-                result_count: hits.len(),
-                took_ms,
-            },
-            hits,
-        })
-    }
-
+    /// The retired exact oracle (issue #597 §1.5/F1, F3).
+    ///
+    /// This is the unbounded shape the issue exists to remove: an unfiltered
+    /// `GROUP BY t.source_host, t.event_uid` over `v_live_search_documents`
+    /// holding `any(t.text_content)` and `any(t.payload_json)` in aggregate
+    /// state — `O(D × doc_bytes)` — reached from three live triggers (an empty
+    /// fast pass, any broad term, and the public `oracle_exact` strategy).
+    ///
+    /// It is retained ONLY under `cfg(test)` and has no live caller: it is the
+    /// independent reference the relevance oracle compares bounded ranking
+    /// against, which is worth more than deleting it (the deleted
+    /// `rank_cached_postings` tests compared a test-only scorer against a
+    /// reference re-implemented inline in the same test, so they could stay
+    /// green through any regression in the shipped path). Anything that reaches
+    /// it from a non-test path is a bug;
+    /// `search_events_ranks_once_from_postings_and_reads_no_content` is what
+    /// proves the interactive path does not.
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn build_search_session_metadata_sql(
-        &self,
-        terms: &[String],
-        min_should_match: u16,
-        min_score: f64,
-        limit: u16,
-        from_unix_ms: Option<i64>,
-        to_unix_ms: Option<i64>,
-        mode: Option<ConversationMode>,
-        session_id: Option<&str>,
-    ) -> RepoResult<String> {
-        if terms.is_empty() {
-            return Err(RepoError::invalid_argument(
-                "cannot build session metadata search query with empty terms",
-            ));
-        }
-
-        let events_source = self.live_events_source();
-        let session_summary_table = self.table_ref("v_session_summary");
-        let mode_subquery = self.mode_subquery();
-        let terms_array_sql = sql_array_strings(terms);
-
-        let mut where_clauses = vec![
-            format!("meta.matched_terms >= {min_should_match}"),
-            format!("meta.score >= {min_score:.6}"),
-        ];
-        if let Some(from_unix_ms) = from_unix_ms {
-            where_clauses.push(format!(
-                "toUnixTimestamp64Milli(s.last_event_time) >= {from_unix_ms}"
-            ));
-        }
-        if let Some(to_unix_ms) = to_unix_ms {
-            where_clauses.push(format!(
-                "toUnixTimestamp64Milli(s.last_event_time) < {to_unix_ms}"
-            ));
-        }
-        if let Some(mode_clause) = Self::mode_filter_clause(mode) {
-            where_clauses.push(mode_clause);
-        }
-        if let Some(session_id) = session_id {
-            where_clauses.push(format!("meta.session_id = {}", sql_quote(session_id)));
-        }
-        let where_sql = where_clauses.join("\n  AND ");
-
-        Ok(format!(
-            "WITH
-  {terms_array_sql} AS q_terms
-SELECT
-  meta.session_id AS session_id,
-  if(s.session_id = '', '', toString(s.first_event_time)) AS first_event_time,
-  if(
-    s.session_id = '',
-    toInt64(0),
-    toInt64(toUnixTimestamp64Milli(s.first_event_time))
-  ) AS first_event_unix_ms,
-  if(s.session_id = '', '', toString(s.last_event_time)) AS last_event_time,
-  if(
-    s.session_id = '',
-    toInt64(0),
-    toInt64(toUnixTimestamp64Milli(s.last_event_time))
-  ) AS last_event_unix_ms,
-  if(s.session_id = '', toUInt32(0), toUInt32(s.total_turns)) AS total_turns,
-  if(s.session_id = '', toUInt64(0), toUInt64(s.total_events)) AS total_events,
-  if(s.session_id = '', toUInt64(0), toUInt64(s.user_messages)) AS user_messages,
-  if(s.session_id = '', toUInt64(0), toUInt64(s.assistant_messages)) AS assistant_messages,
-  if(s.session_id = '', toUInt64(0), toUInt64(s.tool_calls)) AS tool_calls,
-  if(s.session_id = '', toUInt64(0), toUInt64(s.tool_results)) AS tool_results,
-  ifNull(m.mode, 'chat') AS mode,
-  meta.harness AS harness,
-  meta.inference_provider AS inference_provider,
-  meta.session_slug AS session_slug,
-  meta.session_summary AS session_summary,
-  meta.meta_event_uid AS meta_event_uid,
-  meta.score AS score,
-  meta.matched_terms AS matched_terms,
-  leftUTF8(meta.metadata_text, {metadata_limit}) AS metadata_text
-FROM (
-  SELECT
-    searchable.session_id AS session_id,
-    searchable.meta_event_uid AS meta_event_uid,
-    searchable.harness AS harness,
-    searchable.inference_provider AS inference_provider,
-    searchable.session_slug AS session_slug,
-    searchable.session_summary AS session_summary,
-    searchable.metadata_text AS metadata_text,
-    toUInt16(arraySum(arrayMap(
-      term -> if(positionCaseInsensitiveUTF8(searchable.search_text, term) > 0, 1, 0),
-      q_terms
-    ))) AS matched_terms,
-    arraySum(arrayMap(
-      term ->
-        if(positionCaseInsensitiveUTF8(searchable.session_summary, term) > 0, 2.0, 0.0)
-        + if(positionCaseInsensitiveUTF8(searchable.session_slug, term) > 0, 1.5, 0.0)
-        + if(positionCaseInsensitiveUTF8(searchable.metadata_text, term) > 0, 1.0, 0.0),
-      q_terms
-    )) AS score
-  FROM (
-    SELECT
-      base.session_id AS session_id,
-      base.meta_event_uid AS meta_event_uid,
-      base.harness AS harness,
-      base.inference_provider AS inference_provider,
-      base.session_slug AS session_slug,
-      base.session_summary AS session_summary,
-      base.metadata_text AS metadata_text,
-      concat(base.session_summary, '\n', base.session_slug, '\n', base.metadata_text) AS search_text
-    FROM (
-      SELECT
-        e.session_id AS session_id,
-        argMax(e.event_uid, tuple(e.event_ts, e.event_uid)) AS meta_event_uid,
-        argMax(e.harness, tuple(e.event_ts, e.event_uid)) AS harness,
-        argMax(e.inference_provider, tuple(e.event_ts, e.event_uid)) AS inference_provider,
-        ifNull(argMax(nullIf(JSONExtractString(e.payload_json, 'slug'), ''), tuple(e.event_ts, e.event_uid)), '') AS session_slug,
-        ifNull(
-          argMax(
-            coalesce(
-              nullIf(JSONExtractString(e.payload_json, 'summary'), ''),
-              nullIf(JSONExtractString(e.payload_json, 'title'), ''),
-              nullIf(JSONExtractString(e.payload_json, 'name'), '')
-            ),
-            tuple(e.event_ts, e.event_uid)
-          ),
-          ''
-        ) AS session_summary,
-        argMax(e.payload_json, tuple(e.event_ts, e.event_uid)) AS metadata_text
-      FROM {events_source} AS e
-      WHERE e.event_kind = 'session_meta'
-      GROUP BY e.session_id
-    ) AS base
-  ) AS searchable
-) AS meta
-LEFT JOIN {session_summary_table} AS s ON s.session_id = meta.session_id
-ANY LEFT JOIN ({mode_subquery}) AS m ON m.session_id = meta.session_id
-WHERE {where_sql}
-ORDER BY meta.score DESC, meta.session_id ASC
-LIMIT {limit}
-FORMAT JSONEachRow",
-            terms_array_sql = terms_array_sql,
-            events_source = events_source,
-            session_summary_table = session_summary_table,
-            mode_subquery = mode_subquery,
-            where_sql = where_sql,
-            limit = limit,
-            metadata_limit = usize::from(self.cfg.preview_chars).saturating_mul(8),
-        ))
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn build_search_events_sql(
+    #[cfg(test)]
+    pub(super) fn build_search_events_exact_oracle_sql(
         &self,
         terms: &[String],
         idf_by_term: &HashMap<String, f64>,
@@ -533,8 +348,7 @@ FORMAT JSONEachRow",
         min_should_match: u16,
         min_score: f64,
         corpus_stats: Option<(u64, u64)>,
-        limit: u16,
-        offset: u64,
+        limit: u32,
     ) -> RepoResult<String> {
         if terms.is_empty() {
             return Err(RepoError::invalid_argument(
@@ -736,7 +550,7 @@ WHERE scope_s.session_id = {session_id}{scope_origin_filter}",
     GROUP BY p.doc_id, p.source_host
     HAVING matched_terms >= {min_should_match} AND raw_score >= {min_score:.6}
     ORDER BY raw_score DESC, event_unix_ms DESC, event_uid ASC, source_host ASC
-    LIMIT {limit} OFFSET {offset}
+    LIMIT {limit}
   )
 SELECT *
 FROM (
@@ -953,10 +767,21 @@ FORMAT JSONEachRow",
         ))
     }
 
+    /// Bounded winner hydration for `search_events`: the document row for
+    /// exactly the requested identities, with the wide columns truncated inside
+    /// the aggregate.
+    ///
+    /// Issue #597/F8 removed the `use_document_codex_flag` branch. When the
+    /// probe reported the column absent this statement fell back to
+    /// `positionCaseInsensitiveUTF8(t.payload_json, 'codex-mcp')`, which scans
+    /// every full payload value in the requested set. `has_codex_mcp` is a
+    /// MATERIALIZED column installed by migration 009 and listed in
+    /// `REQUIRED_SCHEMA_OBJECTS`, so a backend that lacks it has not been
+    /// migrated and must fail loudly rather than silently switch to a
+    /// content scan.
     pub(super) fn build_search_events_hydrate_sql(
         &self,
         document_identities: &[SearchDocumentIdentity],
-        use_document_codex_flag: bool,
     ) -> RepoResult<String> {
         if document_identities.is_empty() {
             return Err(RepoError::invalid_argument(
@@ -984,14 +809,8 @@ FORMAT JSONEachRow",
         let payload_json_limit = usize::from(self.cfg.preview_chars).saturating_mul(8);
         // Truncate the fat columns inside the aggregation (issue #443): the
         // GROUP BY state then holds at most `*_limit` characters per uid
-        // instead of full multi-MB payload blobs. The codex fallback still
-        // scans every full payload value, but as a boolean aggregate rather
-        // than a held string.
-        let codex_inner_expr = if use_document_codex_flag {
-            "toUInt8(any(t.has_codex_mcp))"
-        } else {
-            "toUInt8(max(toUInt8(positionCaseInsensitiveUTF8(t.payload_json, 'codex-mcp') > 0)))"
-        };
+        // instead of full multi-MB payload blobs.
+        let codex_inner_expr = "toUInt8(any(t.has_codex_mcp))";
         let documents_source_sql = format!(
             "(SELECT
   t.source_host AS source_host,
@@ -1050,35 +869,6 @@ FORMAT JSONEachRow",
             preview = self.cfg.preview_chars,
             documents_source_sql = documents_source_sql,
         ))
-    }
-
-    pub(super) async fn search_documents_has_codex_flag(&self) -> RepoResult<bool> {
-        let now = Instant::now();
-        {
-            let cache = self.stats_cache.read().await;
-            if let Some((value, fetched_at)) = cache.has_codex_flag_column {
-                if now.duration_since(fetched_at) <= SEARCH_SCHEMA_CACHE_TTL {
-                    return Ok(value);
-                }
-            }
-        }
-
-        let query = format!(
-            "SELECT
-  toUInt8(count() > 0) AS exists
-FROM system.columns
-WHERE database = {}
-  AND table = 'search_documents'
-  AND name = 'has_codex_mcp'
-FORMAT JSONEachRow",
-            sql_quote(&self.ch.config().database)
-        );
-        let rows: Vec<ColumnExistsRow> = self.map_backend(self.query_rows(&query, None).await)?;
-        let exists = rows.first().map(|row| row.exists != 0).unwrap_or(false);
-
-        let mut cache = self.stats_cache.write().await;
-        cache.has_codex_flag_column = Some((exists, now));
-        Ok(exists)
     }
 
     pub(super) fn passes_search_doc_filters(
@@ -1141,16 +931,6 @@ FORMAT JSONEachRow",
         true
     }
 
-    pub(super) fn bm25_term_score(tf: u16, doc_len: u32, avgdl: f64, k1: f64, b: f64) -> f64 {
-        let tf = tf as f64;
-        let norm = tf + k1 * (1.0 - b + b * (doc_len as f64 / avgdl.max(1.0)));
-        if norm <= 0.0 {
-            0.0
-        } else {
-            tf * (k1 + 1.0) / norm
-        }
-    }
-
     pub(super) fn bm25_idf(docs: u64, df: u64) -> f64 {
         let idf = if df == 0 {
             (1.0 + ((docs as f64 + 0.5) / 0.5)).ln()
@@ -1161,215 +941,9 @@ FORMAT JSONEachRow",
         idf.max(0.0)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    #[cfg(test)]
-    pub(super) fn rank_cached_postings<'a>(
-        terms: &[String],
-        postings_by_term: &'a HashMap<String, Arc<[CachedPostingRow]>>,
-        df_by_term: &HashMap<String, u64>,
-        docs: u64,
-        avgdl: f64,
-        k1: f64,
-        b: f64,
-        min_should_match: u16,
-        min_score: f64,
-    ) -> Vec<RankedPosting<'a>> {
-        let posting_count = terms
-            .iter()
-            .take(64)
-            .filter_map(|term| postings_by_term.get(term))
-            .map(|rows| rows.len())
-            .sum::<usize>();
-        let initial_capacity = usize::try_from(docs)
-            .unwrap_or(usize::MAX)
-            .min(posting_count)
-            .min(TERM_POSTINGS_CACHE_MAX_ROWS_TOTAL);
-        let mut index_by_identity = HashMap::<(&str, &str), usize>::with_capacity(initial_capacity);
-        let mut candidates = Vec::<RankedPosting<'a>>::with_capacity(initial_capacity);
-        let bm25_base = k1 * (1.0 - b);
-        let bm25_length_scale = k1 * b / avgdl.max(1.0);
-        for (idx, term) in terms.iter().take(64).enumerate() {
-            let df = *df_by_term.get(term).unwrap_or(&0);
-            let idf = Self::bm25_idf(docs, df);
-            if idf <= 0.0 {
-                continue;
-            }
-
-            if let Some(rows) = postings_by_term.get(term) {
-                for row in rows.iter() {
-                    let entry_index = *index_by_identity
-                        .entry((row.source_host.as_str(), row.event_uid.as_str()))
-                        .or_insert_with(|| {
-                            let index = candidates.len();
-                            candidates.push(RankedPosting {
-                                row,
-                                score: 0.0,
-                                matched_terms: 0,
-                            });
-                            index
-                        });
-                    let entry = &mut candidates[entry_index];
-                    let tf = f64::from(row.tf);
-                    let norm = tf + bm25_base + bm25_length_scale * f64::from(row.doc_len);
-                    entry.score += idf * tf * (k1 + 1.0) / norm;
-                    entry.matched_terms |= 1u64 << idx;
-                }
-            }
-        }
-
-        let mut candidate_index = 0;
-        while candidate_index < candidates.len() {
-            let candidate = &mut candidates[candidate_index];
-            let matched_terms = u64::from(candidate.matched_terms.count_ones());
-            candidate.matched_terms = matched_terms;
-            if matched_terms < u64::from(min_should_match) || candidate.score < min_score {
-                candidates.swap_remove(candidate_index);
-            } else {
-                candidate_index += 1;
-            }
-        }
-        Self::order_ranked_posting_prefix(&mut candidates, 256);
-        candidates
-    }
-
-    #[cfg(test)]
-    fn compare_ranked_postings(a: &RankedPosting<'_>, b: &RankedPosting<'_>) -> std::cmp::Ordering {
-        b.score
-            .total_cmp(&a.score)
-            .then_with(|| a.row.event_uid.cmp(&b.row.event_uid))
-            .then_with(|| a.row.source_host.cmp(&b.row.source_host))
-    }
-
-    #[cfg(test)]
-    fn order_ranked_posting_prefix(candidates: &mut [RankedPosting<'_>], prefix_len: usize) {
-        let prefix_len = prefix_len.min(candidates.len());
-        if prefix_len < candidates.len() {
-            candidates.select_nth_unstable_by(prefix_len, Self::compare_ranked_postings);
-        }
-        candidates[..prefix_len].sort_unstable_by(Self::compare_ranked_postings);
-    }
-
-    pub(super) fn has_broad_fast_path_term(
-        terms: &[String],
-        df_by_term: &HashMap<String, u64>,
-        docs: u64,
-    ) -> bool {
-        terms.iter().any(|term| {
-            Self::term_df_too_broad_for_fast_path(*df_by_term.get(term).unwrap_or(&0), docs)
-        })
-    }
-
-    pub(super) fn term_df_too_broad_for_fast_path(df: u64, docs: u64) -> bool {
-        if df > TERM_POSTINGS_FAST_PATH_MAX_ROWS_PER_TERM {
-            return true;
-        }
-
-        docs >= TERM_POSTINGS_FAST_PATH_RATIO_MIN_DOCS
-            && df.saturating_mul(TERM_POSTINGS_FAST_PATH_MAX_DOC_RATIO_DENOMINATOR)
-                >= docs.saturating_mul(TERM_POSTINGS_FAST_PATH_MAX_DOC_RATIO_NUMERATOR)
-    }
-
-    pub(super) async fn load_term_postings_for_terms(
-        &self,
-        terms: &[String],
-    ) -> RepoResult<HashMap<String, Arc<[CachedPostingRow]>>> {
-        let now = Instant::now();
-        let mut by_term = HashMap::<String, Arc<[CachedPostingRow]>>::new();
-        let mut missing_terms = Vec::<String>::new();
-
-        {
-            let cache = self.term_postings_cache.read().await;
-            for term in terms {
-                let cache_key = publication_cache_key(&format!("posting:{term}"));
-                if let Some(entry) = cache_key
-                    .as_deref()
-                    .and_then(|cache_key| cache.get(cache_key))
-                {
-                    if now.duration_since(entry.fetched_at) <= TERM_POSTINGS_CACHE_TTL {
-                        by_term.insert(term.clone(), Arc::clone(&entry.rows));
-                        continue;
-                    }
-                }
-                missing_terms.push(term.clone());
-            }
-        }
-
-        if !missing_terms.is_empty() {
-            let postings_table = self.table_ref("v_live_search_postings");
-            let terms_array = sql_array_strings(&missing_terms);
-            let query = format!(
-                "SELECT
-  term,
-  source_host,
-  doc_id AS event_uid,
-  doc_len,
-  tf
-FROM {postings_table}
-WHERE term IN {terms_array}
-FORMAT JSONEachRow",
-            );
-
-            let fetched_rows: Vec<FetchedPostingRow> =
-                self.map_backend(self.query_rows(&query, None).await)?;
-            let mut grouped = HashMap::<String, Vec<CachedPostingRow>>::new();
-            for row in fetched_rows {
-                grouped.entry(row.term).or_default().push(CachedPostingRow {
-                    source_host: row.source_host,
-                    event_uid: row.event_uid,
-                    doc_len: row.doc_len,
-                    tf: row.tf,
-                });
-            }
-
-            let mut cache = self.term_postings_cache.write().await;
-
-            for term in missing_terms {
-                let rows_vec = grouped.remove(&term).unwrap_or_default();
-                let rows: Arc<[CachedPostingRow]> = Arc::from(rows_vec.into_boxed_slice());
-                by_term.insert(term.clone(), Arc::clone(&rows));
-                if rows.len() <= TERM_POSTINGS_CACHE_MAX_ROWS_PER_TERM {
-                    if let Some(cache_key) = publication_cache_key(&format!("posting:{term}")) {
-                        cache.insert(
-                            cache_key,
-                            TermPostingsCacheEntry {
-                                rows,
-                                fetched_at: now,
-                            },
-                        );
-                    }
-                }
-            }
-
-            let mut cached_rows_total = cache.values().map(|entry| entry.rows.len()).sum::<usize>();
-            while cache.len() > TERM_POSTINGS_CACHE_MAX_ENTRIES
-                || cached_rows_total > TERM_POSTINGS_CACHE_MAX_ROWS_TOTAL
-            {
-                if let Some(oldest_key) = cache
-                    .iter()
-                    .min_by_key(|(_, entry)| entry.fetched_at)
-                    .map(|(k, _)| k.clone())
-                {
-                    if let Some(evicted) = cache.remove(&oldest_key) {
-                        cached_rows_total = cached_rows_total.saturating_sub(evicted.rows.len());
-                    }
-                } else {
-                    break;
-                }
-            }
-        }
-
-        for term in terms {
-            by_term
-                .entry(term.clone())
-                .or_insert_with(|| Arc::from(Vec::<CachedPostingRow>::new().into_boxed_slice()));
-        }
-        Ok(by_term)
-    }
-
     pub(super) async fn load_search_doc_extras(
         &self,
         document_identities: &[SearchDocumentIdentity],
-        use_document_codex_flag: bool,
     ) -> RepoResult<HashMap<SearchDocumentIdentity, SearchDocExtraCacheEntry>> {
         let now = Instant::now();
         let mut by_identity = HashMap::<SearchDocumentIdentity, SearchDocExtraCacheEntry>::new();
@@ -1398,8 +972,7 @@ FORMAT JSONEachRow",
         }
 
         if !missing_identities.is_empty() {
-            let query =
-                self.build_search_events_hydrate_sql(&missing_identities, use_document_codex_flag)?;
+            let query = self.build_search_events_hydrate_sql(&missing_identities)?;
             let fetched_rows: Vec<SearchDocExtraRow> =
                 self.map_backend(self.query_rows(&query, None).await)?;
 
@@ -1453,12 +1026,39 @@ FORMAT JSONEachRow",
         Ok(by_identity)
     }
 
+    /// `search_events`' bounded ranking + hydration path (issue #597 WI-06).
+    ///
+    /// Two statements, both bounded: one SQL ranking pass over the term-pruned,
+    /// locator-authorized postings ([`Self::build_search_events_ranking_sql`]),
+    /// then one hydration read for the bounded winner identities. What this
+    /// replaces:
+    ///
+    /// * the in-process scorer, fed by an unbounded `SELECT … FROM
+    ///   v_live_search_postings WHERE term IN (…)` with no `LIMIT` that
+    ///   materialized every posting for every query term into process memory
+    ///   (F4), plus its 15 s posting cache;
+    /// * the broad-term bail (F2), which returned zero rows for exactly the
+    ///   queries most in need of a bound and handed them to —
+    /// * the exact fallback (F1): an unfiltered `GROUP BY` over
+    ///   `v_live_search_documents` holding `any(text_content)` /
+    ///   `any(payload_json)` in aggregate state, triggered whenever the fast
+    ///   pass returned empty for ANY reason, including "there is genuinely no
+    ///   match". An empty result is now an empty result.
+    ///
+    /// Filters are applied twice on purpose. In ranking they are fixed-width
+    /// predicates on posting columns (which `mv_search_postings` copies
+    /// verbatim from `search_documents`, so they are exact for every dimension
+    /// except the codex payload flag). After hydration
+    /// [`Self::passes_search_doc_filters`] re-checks all of them against the
+    /// document row, which is what keeps `exclude_codex_mcp` exact: postings
+    /// carry no `has_codex_mcp`, so ranking can apply only the fixed-width
+    /// `source_name` / internal-tool-name recall half.
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn search_events_rows(
         &self,
         terms: &[String],
         docs: u64,
-        avgdl: f64,
+        total_doc_len: u64,
         include_tool_events: bool,
         event_kinds: Option<&[SearchEventKind]>,
         exclude_codex_mcp: bool,
@@ -1468,145 +1068,114 @@ FORMAT JSONEachRow",
         min_score: f64,
         limit: u16,
     ) -> RepoResult<Vec<SearchRow>> {
-        let (rows, _candidate_count) = self
-            .search_events_rows_fast_pass(
-                terms,
-                docs,
-                avgdl,
+        // `limit` is already `dedupe_fetch_limit(user_limit)` = 3x, and the
+        // ranking window over-fetches that by another 3x. The two multipliers
+        // cover different losses and both are needed: the outer one absorbs the
+        // #539 mirror collapse in `dedupe_search_rows`, the inner one absorbs
+        // the drops that happen BEFORE dedup — a ranked posting with no live
+        // document row, and the exact `has_codex_mcp` / event-kind re-check
+        // that ranking can only approximate. The product is still capped by
+        // `MCP_SEARCH_CANDIDATE_MAX`, so the window is bounded regardless.
+        let candidate_fetch_size = mcp_candidate_fetch_size(limit);
+        let ranking_sql = self.build_search_events_ranking_sql(
+            terms,
+            include_tool_events,
+            event_kinds,
+            exclude_codex_mcp,
+            session_id,
+            session_ids,
+            min_should_match,
+            min_score,
+            (docs, total_doc_len),
+            candidate_fetch_size,
+        )?;
+        let candidates: Vec<SearchEventsCandidateRow> =
+            self.map_backend(self.query_rows(&ranking_sql, None).await)?;
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let document_identities = candidates
+            .iter()
+            .map(|candidate| {
+                SearchDocumentIdentity::new(
+                    candidate.source_host.clone(),
+                    candidate.event_uid.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let doc_extras = self.load_search_doc_extras(&document_identities).await?;
+
+        let mut rows = Vec::<SearchRow>::with_capacity(candidates.len().min(usize::from(limit)));
+        for candidate in candidates {
+            let identity = SearchDocumentIdentity::new(
+                candidate.source_host.clone(),
+                candidate.event_uid.clone(),
+            );
+            // No document row for a ranked posting means the posting's document
+            // revision is gone: a provable staleness drop, never a fallback.
+            let Some(extra) = doc_extras.get(&identity) else {
+                continue;
+            };
+            if !Self::passes_search_doc_filters(
+                extra,
                 include_tool_events,
                 event_kinds,
                 exclude_codex_mcp,
                 session_id,
                 session_ids,
-                min_should_match,
-                min_score,
-                limit,
-                usize::MAX,
-            )
-            .await?;
-        if !rows.is_empty() {
-            return Ok(rows);
-        }
-
-        self.search_events_rows_exact_sql(
-            terms,
-            docs,
-            avgdl,
-            include_tool_events,
-            event_kinds,
-            exclude_codex_mcp,
-            session_id,
-            session_ids,
-            min_should_match,
-            min_score,
-            limit,
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(super) async fn search_events_rows_exact_sql(
-        &self,
-        terms: &[String],
-        docs: u64,
-        avgdl: f64,
-        include_tool_events: bool,
-        event_kinds: Option<&[SearchEventKind]>,
-        exclude_codex_mcp: bool,
-        session_id: Option<&str>,
-        session_ids: Option<&[String]>,
-        min_should_match: u16,
-        min_score: f64,
-        limit: u16,
-    ) -> RepoResult<Vec<SearchRow>> {
-        let df_map = self.df_map(terms).await?;
-        let mut idf_by_term = HashMap::<String, f64>::new();
-        for term in terms {
-            let df = *df_map.get(term).unwrap_or(&0);
-            idf_by_term.insert(term.clone(), Self::bm25_idf(docs, df));
-        }
-
-        let use_document_codex_flag = self.search_documents_has_codex_flag().await?;
-        let fallback_sql = self.build_search_events_sql(
-            terms,
-            &idf_by_term,
-            avgdl,
-            include_tool_events,
-            event_kinds,
-            exclude_codex_mcp,
-            use_document_codex_flag,
-            session_id,
-            session_ids,
-            min_should_match,
-            min_score,
-            limit,
-        )?;
-
-        let mut fallback_rows: Vec<SearchRow> =
-            self.map_backend(self.query_rows(&fallback_sql, None).await)?;
-        fallback_rows.sort_by(|a, b| {
-            b.score
-                .total_cmp(&a.score)
-                .then_with(|| a.event_uid.cmp(&b.event_uid))
-                .then_with(|| a.source_host.cmp(&b.source_host))
-        });
-        Ok(fallback_rows)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(super) async fn search_events_rows_by_strategy(
-        &self,
-        strategy_hint: SearchStrategyHint,
-        terms: &[String],
-        docs: u64,
-        avgdl: f64,
-        include_tool_events: bool,
-        event_kinds: Option<&[SearchEventKind]>,
-        exclude_codex_mcp: bool,
-        session_id: Option<&str>,
-        session_ids: Option<&[String]>,
-        min_should_match: u16,
-        min_score: f64,
-        limit: u16,
-    ) -> RepoResult<Vec<SearchRow>> {
-        match strategy_hint {
-            SearchStrategyHint::PreferPerformance => {
-                self.search_events_rows(
-                    terms,
-                    docs,
-                    avgdl,
-                    include_tool_events,
-                    event_kinds,
-                    exclude_codex_mcp,
-                    session_id,
-                    session_ids,
-                    min_should_match,
-                    min_score,
-                    limit,
-                )
-                .await
+            ) {
+                continue;
             }
-            SearchStrategyHint::Exact => {
-                self.search_events_rows_exact_sql(
-                    terms,
-                    docs,
-                    avgdl,
-                    include_tool_events,
-                    event_kinds,
-                    exclude_codex_mcp,
-                    session_id,
-                    session_ids,
-                    min_should_match,
-                    min_score,
-                    limit,
-                )
-                .await
+            rows.push(SearchRow {
+                source_host: candidate.source_host,
+                event_uid: candidate.event_uid,
+                session_id: extra.session_id.clone(),
+                event_time: extra.event_time.clone(),
+                source_name: extra.source_name.clone(),
+                harness: extra.harness.clone(),
+                inference_provider: extra.inference_provider.clone(),
+                event_class: extra.event_class.clone(),
+                payload_type: extra.payload_type.clone(),
+                actor_role: extra.actor_role.clone(),
+                name: extra.name.clone(),
+                phase: extra.phase.clone(),
+                source_ref: extra.source_ref.clone(),
+                doc_len: extra.doc_len,
+                text_preview: extra.text_preview.clone(),
+                text_content: extra.text_content.clone(),
+                payload_json: extra.payload_json.clone(),
+                score: candidate.score,
+                matched_terms: candidate.matched_terms,
+            });
+            if rows.len() >= usize::from(limit) {
+                break;
             }
         }
+        Ok(rows)
     }
 
+    /// ONE bounded over-fetch pass per request (issue #597 §1.6).
+    ///
+    /// This replaces the retired offset-refill loop, which re-executed the
+    /// entire ranking statement — including every corpus-sized preamble
+    /// relation — with increasing offsets up to 16 times, each followed by a
+    /// detail statement, and then failed with
+    /// `backend("MCP search duplicate scan budget exhausted")`. A single ranked
+    /// window is over-fetched by [`mcp_candidate_fetch_size`]; when dedup and
+    /// validation eat enough of a SATURATED window that fewer than
+    /// `unique_fetch_limit` unique hits survive, the valid hits are returned
+    /// with [`McpSearchPage::incomplete_due_to_candidate_budget`] rather than an
+    /// error. `resource_exhausted` stays reserved for a #600 envelope
+    /// violation.
+    ///
+    /// The engine is chosen by the issue-598 `open_v2` readiness latch — the
+    /// same authority the `open` cutover and the issue-599 listing path use.
+    /// While the canonical read indexes are not published the legacy
+    /// projected-header engine still serves; it is deleted wholesale in the
+    /// projector-retirement PR.
     #[allow(clippy::too_many_arguments)]
-    pub(super) async fn search_mcp_event_rows(
+    pub(super) async fn search_mcp_event_page(
         &self,
         terms: &[String],
         event_types: &[McpEventType],
@@ -1616,114 +1185,597 @@ FORMAT JSONEachRow",
         source_name: Option<&str>,
         min_should_match: u16,
         min_score: f64,
-        limit: u16,
-    ) -> RepoResult<(Vec<SearchMcpEventRow>, u64, u64, bool)> {
-        let page_limit = limit.max(1);
-        let target_rows = usize::from(limit);
-        let mut offset = 0_u64;
-        let mut page_count = 0_u16;
-        let mut rows = Vec::<SearchMcpEventRow>::with_capacity(target_rows);
-        let mut corpus_stats = self.cached_corpus_stats().await;
-        let mut snapshot = None::<(u64, u64, bool, u64)>;
+        unique_fetch_limit: u16,
+    ) -> RepoResult<McpSearchPage> {
+        if self.canonical_list_path_ready().await {
+            return self
+                .search_mcp_event_page_v2(
+                    terms,
+                    event_types,
+                    session_id,
+                    turn_seq,
+                    harness,
+                    source_name,
+                    min_should_match,
+                    min_score,
+                    unique_fetch_limit,
+                )
+                .await;
+        }
+        self.search_mcp_event_page_v1(
+            terms,
+            event_types,
+            session_id,
+            turn_seq,
+            harness,
+            source_name,
+            min_should_match,
+            min_score,
+            unique_fetch_limit,
+        )
+        .await
+    }
 
-        loop {
-            if page_count >= MCP_SEARCH_MAX_CANDIDATE_PAGES {
-                return Err(RepoError::backend(
-                    "MCP search duplicate scan budget exhausted; narrow the query",
-                ));
-            }
-            page_count += 1;
+    /// Legacy engine: ranks and hydrates through the `mcp_open_*` projection.
+    /// Unchanged apart from losing the refill loop — one ranking statement, one
+    /// detail statement, and the same global projector gates it has always
+    /// enforced. Retired with the projector.
+    #[allow(clippy::too_many_arguments)]
+    async fn search_mcp_event_page_v1(
+        &self,
+        terms: &[String],
+        event_types: &[McpEventType],
+        session_id: Option<&str>,
+        turn_seq: Option<u32>,
+        harness: Option<&str>,
+        source_name: Option<&str>,
+        min_should_match: u16,
+        min_score: f64,
+        unique_fetch_limit: u16,
+    ) -> RepoResult<McpSearchPage> {
+        let candidate_fetch_size = mcp_candidate_fetch_size(unique_fetch_limit);
+        let corpus_stats = self.cached_corpus_stats().await;
+        let scanned_corpus_stats = corpus_stats.is_none();
 
-            let scanned_corpus_stats = corpus_stats.is_none();
-            let sql = self.build_search_mcp_events_sql(
-                terms,
-                event_types,
-                session_id,
-                turn_seq,
-                harness,
-                source_name,
-                min_should_match,
-                min_score,
-                corpus_stats,
-                page_limit,
-                offset,
-            )?;
-            let candidate_rows: Vec<SearchMcpCandidateRow> =
-                self.map_backend(self.query_rows(&sql, None).await)?;
-            let metadata = candidate_rows
-                .iter()
-                .find(|row| row.row_kind == 1)
-                .ok_or_else(|| RepoError::backend("MCP search candidate query omitted metadata"))?;
-            let page_corpus_stats = (metadata.docs, metadata.total_doc_len);
-            if scanned_corpus_stats {
-                self.cache_corpus_stats(page_corpus_stats.0, page_corpus_stats.1, Instant::now())
-                    .await;
-                corpus_stats = Some(page_corpus_stats);
-            }
-            if metadata.projection_ready == 0 {
-                return Err(RepoError::backend(
-                    "MCP search read model is not ready; run `moraine db migrate`",
-                ));
-            }
-            if metadata.projection_clean == 0 {
-                return Err(RepoError::ReadModelChanged);
-            }
-
-            let page_snapshot = (
-                metadata.docs,
-                metadata.total_doc_len,
-                metadata.scope_exists != 0,
-                metadata.projection_revision,
-            );
-            match snapshot {
-                None => snapshot = Some(page_snapshot),
-                Some(expected) if expected != page_snapshot => {
-                    return Err(RepoError::ReadModelChanged);
-                }
-                Some(_) => {}
-            }
-
-            let candidates = candidate_rows
-                .into_iter()
-                .filter(|row| row.row_kind == 0)
-                .collect::<Vec<_>>();
-            let candidate_count = candidates.len();
-            if candidates.is_empty() {
-                break;
-            }
-
-            let detail_sql = self.build_search_mcp_event_details_sql(&candidates)?;
-            let detail_rows: Vec<SearchMcpEventRow> =
-                self.map_backend(self.query_rows(&detail_sql, None).await)?;
-            let mut details_by_identity = detail_rows
-                .into_iter()
-                .map(|row| ((row.source_host.clone(), row.event_uid.clone()), row))
-                .collect::<HashMap<_, _>>();
-
-            for candidate in candidates {
-                let identity = (candidate.source_host, candidate.event_uid);
-                let Some(mut detail) = details_by_identity.remove(&identity) else {
-                    return Err(RepoError::ReadModelChanged);
-                };
-                detail.raw_score = candidate.raw_score;
-                detail.matched_terms = candidate.matched_terms;
-                // Ranking is defined by the candidate snapshot. Preserve its
-                // timestamp if the projection publishes between the two reads.
-                detail.event_unix_ms = candidate.event_unix_ms;
-                rows.push(detail);
-            }
-            Self::sort_search_mcp_event_rows(&mut rows);
-            rows = Self::dedupe_mcp_search_rows(rows, limit);
-
-            if rows.len() >= target_rows || candidate_count < usize::from(page_limit) {
-                break;
-            }
-            offset = offset.saturating_add(candidate_count as u64);
+        let sql = self.build_search_mcp_events_sql(
+            terms,
+            event_types,
+            session_id,
+            turn_seq,
+            harness,
+            source_name,
+            min_should_match,
+            min_score,
+            corpus_stats,
+            candidate_fetch_size,
+        )?;
+        let candidate_rows: Vec<SearchMcpCandidateRow> =
+            self.map_backend(self.query_rows(&sql, None).await)?;
+        let metadata = candidate_rows
+            .iter()
+            .find(|row| row.row_kind == 1)
+            .ok_or_else(|| RepoError::backend("MCP search candidate query omitted metadata"))?;
+        let docs = metadata.docs;
+        let total_doc_len = metadata.total_doc_len;
+        let scope_exists = metadata.scope_exists != 0;
+        if scanned_corpus_stats {
+            self.cache_corpus_stats(docs, total_doc_len, Instant::now())
+                .await;
+        }
+        if metadata.projection_ready == 0 {
+            return Err(RepoError::backend(
+                "MCP search read model is not ready; run `moraine db migrate`",
+            ));
+        }
+        if metadata.projection_clean == 0 {
+            return Err(RepoError::ReadModelChanged);
         }
 
-        let (docs, total_doc_len, scope_exists, _) = snapshot
-            .ok_or_else(|| RepoError::backend("MCP search candidate query omitted metadata"))?;
-        Ok((rows, docs, total_doc_len, scope_exists))
+        let candidates = candidate_rows
+            .into_iter()
+            .filter(|row| row.row_kind == 0)
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            return Ok(McpSearchPage {
+                rows: Vec::new(),
+                docs,
+                total_doc_len,
+                scope_exists,
+                incomplete_due_to_candidate_budget: false,
+            });
+        }
+        let saturated = candidates.len() as u32 == candidate_fetch_size;
+
+        let detail_sql = self.build_search_mcp_event_details_sql(&candidates)?;
+        let detail_rows: Vec<SearchMcpEventRow> =
+            self.map_backend(self.query_rows(&detail_sql, None).await)?;
+        let mut details_by_identity = detail_rows
+            .into_iter()
+            .map(|row| ((row.source_host.clone(), row.event_uid.clone()), row))
+            .collect::<HashMap<_, _>>();
+
+        let mut rows = Vec::<SearchMcpEventRow>::with_capacity(candidates.len());
+        for candidate in candidates {
+            let identity = (candidate.source_host, candidate.event_uid);
+            let Some(mut detail) = details_by_identity.remove(&identity) else {
+                return Err(RepoError::ReadModelChanged);
+            };
+            detail.raw_score = candidate.raw_score;
+            detail.matched_terms = candidate.matched_terms;
+            // Ranking is defined by the candidate snapshot. Preserve its
+            // timestamp if the projection publishes between the two reads.
+            detail.event_unix_ms = candidate.event_unix_ms;
+            rows.push(detail);
+        }
+        Self::sort_search_mcp_event_rows(&mut rows);
+        let rows = Self::dedupe_mcp_search_rows(rows, unique_fetch_limit);
+
+        Ok(McpSearchPage {
+            incomplete_due_to_candidate_budget: Self::candidate_budget_incomplete(
+                saturated,
+                rows.len(),
+                unique_fetch_limit,
+            ),
+            rows,
+            docs,
+            total_doc_len,
+            scope_exists,
+        })
+    }
+
+    /// The bounded canonical engine (issue #597 §1–§2). Statement budget for a
+    /// request: 1 ranking + 1 candidate derivation + 1 dedup keys + 4 winner
+    /// hydration, plus 1 for turn or session scope existence and 1 for a cold
+    /// corpus-stats refresh — at most 9, against the retired loop's 32 and the
+    /// Interactive `statement_cap` of 256.
+    ///
+    /// Reads no `mcp_open_*` relation and enforces no global projector gate, so
+    /// an actively-ingesting session A can no longer disable search for session
+    /// B. Candidate validity is proven per row instead — twice: by the locator
+    /// version join during ranking, and by the candidate's presence at the same
+    /// `event_version` in live navigation during derivation.
+    #[allow(clippy::too_many_arguments)]
+    async fn search_mcp_event_page_v2(
+        &self,
+        terms: &[String],
+        event_types: &[McpEventType],
+        session_id: Option<&str>,
+        turn_seq: Option<u32>,
+        harness: Option<&str>,
+        source_name: Option<&str>,
+        min_should_match: u16,
+        min_score: f64,
+        unique_fetch_limit: u16,
+    ) -> RepoResult<McpSearchPage> {
+        let (docs, total_doc_len) = self.corpus_stats().await?;
+        let empty_page = |scope_exists: bool| McpSearchPage {
+            rows: Vec::new(),
+            docs,
+            total_doc_len,
+            scope_exists,
+            incomplete_due_to_candidate_budget: false,
+        };
+
+        // Phase 0 — scope existence, and the turn's live uid set.
+        let mut turn_event_uids: Option<Vec<String>> = None;
+        let scope_exists = match (session_id, turn_seq) {
+            (Some(session_id), Some(turn_seq)) => {
+                let sql = self.build_search_turn_event_uids_sql(session_id, turn_seq);
+                let rows: Vec<TurnEventUidRow> =
+                    self.map_backend(self.query_rows(&sql, None).await)?;
+                if rows.is_empty() {
+                    // The turn does not exist. `search_sessions_v1` turns a
+                    // false `scope_exists` into `not_found`; a turn that exists
+                    // but matches nothing returns true with zero hits.
+                    return Ok(empty_page(false));
+                }
+                // Above the cap the uid literal set is dropped and the turn is
+                // re-checked exactly against the derived `turn_seq` after
+                // candidate derivation. Correct either way; the fallback only
+                // spends candidate budget on out-of-turn events.
+                if rows.len() <= MAX_TURN_SCOPE_UIDS {
+                    turn_event_uids = Some(
+                        rows.into_iter()
+                            .map(|row| row.event_uid)
+                            .collect::<Vec<_>>(),
+                    );
+                }
+                true
+            }
+            (Some(session_id), None) => {
+                let sql = self.build_search_scope_exists_sql(session_id);
+                let rows: Vec<ScopeExistsRow> =
+                    self.map_backend(self.query_rows(&sql, None).await)?;
+                let exists = rows.first().is_some_and(|row| row.scope_exists != 0);
+                if !exists {
+                    return Ok(empty_page(false));
+                }
+                true
+            }
+            (None, Some(_)) => {
+                return Err(RepoError::invalid_argument(
+                    "turn-scoped search requires session_id",
+                ));
+            }
+            (None, None) => true,
+        };
+
+        // Phase 1 — the single bounded ranking pass.
+        let candidate_fetch_size = mcp_candidate_fetch_size(unique_fetch_limit);
+        let ranking_sql = self.build_search_ranking_sql(&SearchRankingParams {
+            terms,
+            event_types,
+            session_id,
+            turn_event_uids: turn_event_uids.as_deref(),
+            harness,
+            source_name,
+            min_should_match,
+            min_score,
+            corpus_stats: (docs, total_doc_len),
+            limit: candidate_fetch_size,
+        })?;
+        let candidates: Vec<SearchCandidateRow> =
+            self.map_backend(self.query_rows(&ranking_sql, None).await)?;
+        if candidates.is_empty() {
+            return Ok(empty_page(scope_exists));
+        }
+        let saturated = candidates.len() as u32 == candidate_fetch_size;
+
+        let mut candidate_session_ids = candidates
+            .iter()
+            .map(|candidate| candidate.session_id.clone())
+            .collect::<Vec<_>>();
+        candidate_session_ids.sort_unstable();
+        candidate_session_ids.dedup();
+        let candidate_uids = candidates
+            .iter()
+            .map(|candidate| candidate.event_uid.clone())
+            .collect::<Vec<_>>();
+
+        // Phase 2 — content-free derivation over the candidate sessions only.
+        let derivation_sql =
+            self.build_search_candidate_derivation_sql(&candidate_session_ids, &candidate_uids)?;
+        let derivations: Vec<SearchCandidateDerivationRow> =
+            self.map_backend(self.query_rows(&derivation_sql, None).await)?;
+        let mut derivation_by_identity = derivations
+            .into_iter()
+            .map(|row| ((row.source_host.clone(), row.event_uid.clone()), row))
+            .collect::<HashMap<_, _>>();
+
+        // Phase 3 — the two fixed-width dedup inputs.
+        let dedup_sql = self.build_search_dedup_keys_sql(&candidates)?;
+        let dedup_rows: Vec<SearchDedupKeyRow> =
+            self.map_backend(self.query_rows(&dedup_sql, None).await)?;
+        let mut dedup_by_identity = dedup_rows
+            .into_iter()
+            .map(|row| ((row.source_host.clone(), row.event_uid.clone()), row))
+            .collect::<HashMap<_, _>>();
+
+        // Phase 4 — assemble, drop the provably-stale, dedup, trim.
+        let scope = self.cfg.session_scope.clone();
+        let mut rows = Vec::<SearchMcpEventRow>::with_capacity(candidates.len());
+        for candidate in candidates {
+            let identity = (candidate.source_host.clone(), candidate.event_uid.clone());
+            // No live navigation row at the candidate's version: the locator
+            // authorized it, navigation does not carry it at that version, so
+            // it is provably stale. A silent drop, never an error.
+            let Some(derived) = derivation_by_identity.remove(&identity) else {
+                continue;
+            };
+            if derived.event_version != candidate.post_version
+                || derived.session_id != candidate.session_id
+            {
+                continue;
+            }
+            // Project scope is re-checked EXACTLY against the navigation
+            // `argMinIf(cwd, …)`; the directory recall filter in ranking is not
+            // scope enforcement.
+            if let Some(scope) = scope.as_ref() {
+                let cwd = derived.origin_cwd.as_str();
+                let in_scope = scope
+                    .roots
+                    .iter()
+                    .any(|root| cwd == root.as_str() || cwd.starts_with(&format!("{root}/")));
+                if !in_scope {
+                    continue;
+                }
+            }
+            // Turn scope above the uid cap: the exact re-check.
+            if let Some(turn_seq) = turn_seq {
+                if turn_event_uids.is_none() && derived.turn_seq != turn_seq {
+                    continue;
+                }
+            }
+            // The dedup-key read is a THIRD version check, against
+            // `search_documents` at the candidate's exact `post_version`. Its
+            // absence is not "no digest available": it means the document
+            // revision that produced this posting is gone, so the posting is
+            // stale — drop it.
+            //
+            // This is also what keeps `mcp_search_rows_are_equivalent` honest.
+            // With dedup running BEFORE hydration, `text_content` is empty on
+            // every row, so its empty-digest fallback (`a.text_content ==
+            // b.text_content`) would report every digest-less pair as identical
+            // content and collapse unrelated events. There is no digest-less
+            // row to reach it with.
+            let Some(dedup) = dedup_by_identity.remove(&identity) else {
+                continue;
+            };
+            rows.push(Self::canonical_candidate_row(candidate, derived, dedup));
+        }
+        if rows.is_empty() {
+            return Ok(McpSearchPage {
+                rows,
+                docs,
+                total_doc_len,
+                scope_exists,
+                incomplete_due_to_candidate_budget: saturated,
+            });
+        }
+        // NOT `sort_search_mcp_event_rows`: that orders by `event_unix_ms`
+        // (display time), which is the v1 ranking key but not the v2 one.
+        Self::sort_canonical_search_rows(&mut rows);
+        let mut rows = Self::dedupe_mcp_search_rows(rows, unique_fetch_limit);
+        let incomplete_due_to_candidate_budget =
+            Self::candidate_budget_incomplete(saturated, rows.len(), unique_fetch_limit);
+
+        // Phase 5 — winner-only hydration.
+        self.hydrate_canonical_search_winners(&mut rows).await?;
+
+        Ok(McpSearchPage {
+            rows,
+            docs,
+            total_doc_len,
+            scope_exists,
+            incomplete_due_to_candidate_budget,
+        })
+    }
+
+    /// `saturated && short` — the exact §1.6 predicate, evaluated once after
+    /// dedup. A window that was NOT saturated returned the whole ranking, so a
+    /// short result is simply the complete answer and must never set the
+    /// marker.
+    pub(super) fn candidate_budget_incomplete(
+        saturated: bool,
+        unique_hits: usize,
+        unique_fetch_limit: u16,
+    ) -> bool {
+        saturated && unique_hits < usize::from(unique_fetch_limit)
+    }
+
+    /// The v2 ranking order, restated in Rust over the same keys the ranking
+    /// statement's `ORDER BY` uses, so the documented order holds even if the
+    /// rows arrive re-ordered.
+    ///
+    /// The second key is the locator's `sort_time`, NOT the reported
+    /// `event_unix_ms` (`display_time`). The two differ for an event whose
+    /// `record_ts` does not parse, and the difference is only observable on an
+    /// exact `raw_score` tie — where it decides which hit wins.
+    pub(super) fn sort_canonical_search_rows(rows: &mut [SearchMcpEventRow]) {
+        rows.sort_by(|a, b| {
+            b.raw_score
+                .total_cmp(&a.raw_score)
+                .then_with(|| b.ranking_sort_time_ms.cmp(&a.ranking_sort_time_ms))
+                .then_with(|| a.event_uid.cmp(&b.event_uid))
+                .then_with(|| a.source_host.cmp(&b.source_host))
+        });
+    }
+
+    /// Fold one ranked candidate plus its content-free derivation and
+    /// fixed-width dedup keys into the row shape the response mapper consumes.
+    /// Wide content is filled in later, for winners only.
+    fn canonical_candidate_row(
+        candidate: SearchCandidateRow,
+        derived: SearchCandidateDerivationRow,
+        dedup: SearchDedupKeyRow,
+    ) -> SearchMcpEventRow {
+        let SearchDedupKeyRow {
+            text_content_digest,
+            payload_phase,
+            ..
+        } = dedup;
+        SearchMcpEventRow {
+            event_uid: candidate.event_uid,
+            source_host: candidate.source_host,
+            session_id: candidate.session_id,
+            source_name: candidate.source_name,
+            harness: candidate.harness,
+            inference_provider: String::new(),
+            endpoint_kind: String::new(),
+            event_class: candidate.event_class,
+            payload_type: candidate.payload_type,
+            actor_role: candidate.actor_role,
+            name: candidate.name,
+            phase: candidate.phase,
+            payload_phase,
+            // The locator's fixed coordinates, re-rendered in the v1 display
+            // form. The dedup rule reads the parsed halves from
+            // `SearchMcpEventRow::source_ref`, so keeping one representation
+            // keeps `mcp_search_rows_are_codex_final_answer_mirrors` untouched.
+            source_ref: format!(
+                "{}:{}:{}",
+                candidate.source_file, candidate.source_generation, candidate.source_line_no
+            ),
+            doc_len: candidate.doc_len,
+            text_preview: String::new(),
+            text_content: String::new(),
+            text_content_digest,
+            payload_json: String::new(),
+            mcp_event_type: String::new(),
+            raw_score: candidate.raw_score,
+            matched_terms: candidate.matched_terms,
+            event_time: derived.display_time,
+            event_unix_ms: derived.display_time_ms,
+            event_order: derived.event_order,
+            turn_seq: derived.turn_seq,
+            event_ordinal: derived.event_ordinal,
+            turn_event_count: 0,
+            turn_completed: 0,
+            turn_terminal_event_uid: String::new(),
+            call_id: String::new(),
+            item_id: String::new(),
+            model: String::new(),
+            session_started_at_unix_ms: 0,
+            session_updated_at_unix_ms: 0,
+            session_title: String::new(),
+            session_slug: String::new(),
+            session_summary: String::new(),
+            session_completed: 0,
+            // Carried only so hydration can bound the `events` scan by the
+            // winners' own `event_ts`; never reported.
+            hydration_event_ts_ms: derived.event_ts_ms,
+            ranking_sort_time_ms: candidate.sort_time_ms,
+        }
+    }
+
+    /// Phase 5 (issue #597 §2.5): four batched statements decorate the ≤K
+    /// winners. Never a per-winner loop.
+    async fn hydrate_canonical_search_winners(
+        &self,
+        rows: &mut [SearchMcpEventRow],
+    ) -> RepoResult<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut session_ids = rows
+            .iter()
+            .map(|row| row.session_id.clone())
+            .collect::<Vec<_>>();
+        session_ids.sort_unstable();
+        session_ids.dedup();
+        let event_uids = rows
+            .iter()
+            .map(|row| row.event_uid.clone())
+            .collect::<Vec<_>>();
+
+        let totals_sql = self.build_session_totals_batch_sql(&session_ids);
+        let totals: Vec<SessionTotalsBatchRow> =
+            self.map_backend(self.query_rows(&totals_sql, None).await)?;
+        let totals_by_session = totals
+            .into_iter()
+            .map(|row| (row.session_id.clone(), row))
+            .collect::<HashMap<_, _>>();
+
+        let metadata_sql = self.build_session_metadata_batch_sql(&session_ids);
+        let metadata: Vec<SessionMetaBatchRow> =
+            self.map_backend(self.query_rows(&metadata_sql, None).await)?;
+        let mut metadata_by_session: HashMap<String, Vec<MetaRow>> = HashMap::default();
+        for row in metadata {
+            metadata_by_session
+                .entry(row.session_id)
+                .or_default()
+                .push(MetaRow {
+                    event_ts: row.event_ts,
+                    event_uid: row.event_uid,
+                    event_kind: row.event_kind,
+                    payload_json: row.payload_json,
+                });
+        }
+
+        // One statement yields BOTH grains. Per-turn rows decorate the hit;
+        // the session-level `completed` is `argMax(turn_completed, turn_seq)`
+        // over the same rows — v1's two-level rule (`build_session_terminal_sql`
+        // and the projector agree on it), which is NOT the hit's own turn.
+        // Reporting the hit's turn flag as `session_completed` would call a
+        // session complete because the matched turn happened to end in
+        // `task_complete`.
+        let turns_sql = self.build_search_turn_aggregates_sql(&session_ids);
+        let turns: Vec<SearchTurnAggregateRow> =
+            self.map_backend(self.query_rows(&turns_sql, None).await)?;
+        let mut session_completed = HashMap::<String, (u32, u8)>::new();
+        for turn in &turns {
+            let entry = session_completed
+                .entry(turn.session_id.clone())
+                .or_insert((turn.turn_seq, turn.turn_completed));
+            if turn.turn_seq >= entry.0 {
+                *entry = (turn.turn_seq, turn.turn_completed);
+            }
+        }
+        let turns_by_key = turns
+            .into_iter()
+            .map(|row| ((row.session_id.clone(), row.turn_seq), row))
+            .collect::<HashMap<_, _>>();
+
+        // The wide read's `event_ts` bound is computed from the winners' own
+        // canonical timestamps, so it prunes without ever excluding a winner.
+        let bounds = Self::search_hydration_bounds(rows);
+        let wide_sql = self.build_search_wide_hydration_sql(&session_ids, &event_uids, bounds)?;
+        let wide: Vec<SearchWideRow> = self.map_backend(self.query_rows(&wide_sql, None).await)?;
+        let mut wide_by_identity = wide
+            .into_iter()
+            .map(|row| ((row.source_host.clone(), row.event_uid.clone()), row))
+            .collect::<HashMap<_, _>>();
+
+        for row in rows.iter_mut() {
+            if let Some(totals) = totals_by_session.get(&row.session_id) {
+                row.inference_provider = totals.inference_provider.clone();
+                row.session_started_at_unix_ms = totals.first_event_unix_ms;
+                row.session_updated_at_unix_ms = totals.last_event_unix_ms;
+                if row.source_name.is_empty() {
+                    row.source_name = totals.source.clone();
+                }
+                if row.harness.is_empty() {
+                    row.harness = totals.harness.clone();
+                }
+                let mut precedence = metadata_precedence(
+                    metadata_by_session
+                        .get(&row.session_id)
+                        .map(Vec::as_slice)
+                        .unwrap_or_default(),
+                );
+                precedence.omp_dispatch_title = totals.omp_dispatch_title.clone();
+                let (title, summary) = list_title_and_summary(&totals.source, &precedence);
+                row.session_title = title;
+                row.session_summary = summary;
+                row.session_slug = precedence.session_slug.clone();
+            }
+            if let Some(turn) = turns_by_key.get(&(row.session_id.clone(), row.turn_seq)) {
+                row.turn_event_count = turn.turn_event_count;
+                row.turn_completed = turn.turn_completed;
+                row.turn_terminal_event_uid = turn.turn_terminal_event_uid.clone();
+            }
+            if let Some((_, completed)) = session_completed.get(&row.session_id) {
+                row.session_completed = *completed;
+            }
+            if let Some(wide) =
+                wide_by_identity.remove(&(row.source_host.clone(), row.event_uid.clone()))
+            {
+                row.endpoint_kind = wide.endpoint_kind;
+                row.call_id = wide.call_id;
+                row.item_id = wide.item_id;
+                row.model = wide.model;
+                row.source_ref = wide.source_ref;
+                row.text_preview = wide.text_preview;
+                row.text_content = wide.text_content;
+                row.payload_json = wide.payload_json;
+                if row.inference_provider.is_empty() {
+                    row.inference_provider = wide.inference_provider;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The closed `event_ts` window of the winner rows, plus the epoch branch
+    /// when any winner carries the malformed-`record_ts` sentinel.
+    fn search_hydration_bounds(rows: &[SearchMcpEventRow]) -> Option<EventTsBounds> {
+        let mut min = i64::MAX;
+        let mut max = i64::MIN;
+        let mut include_epoch = false;
+        for row in rows {
+            let ts = row.hydration_event_ts_ms;
+            if ts == 0 {
+                include_epoch = true;
+                continue;
+            }
+            min = min.min(ts);
+            max = max.max(ts);
+        }
+        let range = (min <= max).then_some((min, max));
+        (range.is_some() || include_epoch).then_some(EventTsBounds {
+            range,
+            include_epoch,
+        })
     }
 
     pub(super) fn sort_search_mcp_event_rows(rows: &mut [SearchMcpEventRow]) {
@@ -1939,173 +1991,6 @@ FORMAT JSONEachRow",
         deduped
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub(super) async fn search_events_rows_fast_pass(
-        &self,
-        terms: &[String],
-        docs: u64,
-        avgdl: f64,
-        include_tool_events: bool,
-        event_kinds: Option<&[SearchEventKind]>,
-        exclude_codex_mcp: bool,
-        session_id: Option<&str>,
-        session_ids: Option<&[String]>,
-        min_should_match: u16,
-        min_score: f64,
-        limit: u16,
-        candidate_limit: usize,
-    ) -> RepoResult<(Vec<SearchRow>, usize)> {
-        #[derive(Clone, Copy)]
-        struct CandidateRef<'a> {
-            row: &'a CachedPostingRow,
-            score: f64,
-            matched_terms: u64,
-        }
-
-        let df_map = self.df_map(terms).await?;
-        if Self::has_broad_fast_path_term(terms, &df_map, docs) {
-            return Ok((Vec::new(), 0));
-        }
-
-        let postings_by_term = self.load_term_postings_for_terms(terms).await?;
-        let use_document_codex_flag = self.search_documents_has_codex_flag().await?;
-        let k1 = self.cfg.bm25_k1.max(0.01);
-        let b = self.cfg.bm25_b.clamp(0.0, 1.0);
-        let mut idf_by_term = HashMap::<&str, f64>::new();
-        for term in terms {
-            let df = *df_map.get(term).unwrap_or(&0);
-            idf_by_term.insert(term.as_str(), Self::bm25_idf(docs, df));
-        }
-
-        let mut accum_by_identity = HashMap::<(&str, &str), SearchScoreAccum<'_>>::new();
-        for (idx, term) in terms.iter().enumerate() {
-            if idx >= 64 {
-                break;
-            }
-            let idf = *idf_by_term.get(term.as_str()).unwrap_or(&0.0);
-            if idf <= 0.0 {
-                continue;
-            }
-
-            if let Some(rows) = postings_by_term.get(term) {
-                for row in rows.iter() {
-                    let entry = accum_by_identity
-                        .entry((row.source_host.as_str(), row.event_uid.as_str()))
-                        .or_insert_with(|| SearchScoreAccum {
-                            row,
-                            score: 0.0,
-                            matched_mask: 0,
-                        });
-
-                    entry.score += idf * Self::bm25_term_score(row.tf, row.doc_len, avgdl, k1, b);
-                    entry.matched_mask |= 1u64 << idx;
-                }
-            }
-        }
-
-        let mut fast_candidates = Vec::<CandidateRef<'_>>::new();
-        for acc in accum_by_identity.values() {
-            let matched_terms = acc.matched_mask.count_ones() as u64;
-            if matched_terms < min_should_match as u64 || acc.score < min_score {
-                continue;
-            }
-            fast_candidates.push(CandidateRef {
-                row: acc.row,
-                score: acc.score,
-                matched_terms,
-            });
-        }
-
-        if fast_candidates.is_empty() {
-            return Ok((Vec::new(), 0));
-        }
-
-        let candidate_count = fast_candidates.len();
-        if candidate_limit < fast_candidates.len() {
-            fast_candidates.select_nth_unstable_by(candidate_limit, |a, b| {
-                b.score
-                    .total_cmp(&a.score)
-                    .then_with(|| a.row.event_uid.cmp(&b.row.event_uid))
-                    .then_with(|| a.row.source_host.cmp(&b.row.source_host))
-            });
-            fast_candidates.truncate(candidate_limit);
-        }
-        fast_candidates.sort_by(|a, b| {
-            b.score
-                .total_cmp(&a.score)
-                .then_with(|| a.row.event_uid.cmp(&b.row.event_uid))
-                .then_with(|| a.row.source_host.cmp(&b.row.source_host))
-        });
-
-        let mut fast_rows = Vec::<SearchRow>::new();
-        let hydrate_chunk_size = (limit as usize).saturating_mul(8).max(128);
-        let mut offset = 0usize;
-        while offset < fast_candidates.len() && fast_rows.len() < limit as usize {
-            let end = (offset + hydrate_chunk_size).min(fast_candidates.len());
-            let document_identities = fast_candidates[offset..end]
-                .iter()
-                .map(|row| {
-                    SearchDocumentIdentity::new(
-                        row.row.source_host.clone(),
-                        row.row.event_uid.clone(),
-                    )
-                })
-                .collect::<Vec<_>>();
-            let doc_extras = self
-                .load_search_doc_extras(&document_identities, use_document_codex_flag)
-                .await?;
-
-            for row in &fast_candidates[offset..end] {
-                let identity = SearchDocumentIdentity::new(
-                    row.row.source_host.clone(),
-                    row.row.event_uid.clone(),
-                );
-                let Some(extra) = doc_extras.get(&identity) else {
-                    continue;
-                };
-                if !Self::passes_search_doc_filters(
-                    extra,
-                    include_tool_events,
-                    event_kinds,
-                    exclude_codex_mcp,
-                    session_id,
-                    session_ids,
-                ) {
-                    continue;
-                }
-
-                fast_rows.push(SearchRow {
-                    source_host: row.row.source_host.clone(),
-                    event_uid: row.row.event_uid.clone(),
-                    session_id: extra.session_id.clone(),
-                    event_time: extra.event_time.clone(),
-                    source_name: extra.source_name.clone(),
-                    harness: extra.harness.clone(),
-                    inference_provider: extra.inference_provider.clone(),
-                    event_class: extra.event_class.clone(),
-                    payload_type: extra.payload_type.clone(),
-                    actor_role: extra.actor_role.clone(),
-                    name: extra.name.clone(),
-                    phase: extra.phase.clone(),
-                    source_ref: extra.source_ref.clone(),
-                    doc_len: extra.doc_len,
-                    text_preview: extra.text_preview.clone(),
-                    text_content: extra.text_content.clone(),
-                    payload_json: extra.payload_json.clone(),
-                    score: row.score,
-                    matched_terms: row.matched_terms,
-                });
-
-                if fast_rows.len() >= limit as usize {
-                    break;
-                }
-            }
-            offset = end;
-        }
-
-        Ok((fast_rows, candidate_count))
-    }
-
     pub(super) fn conversation_candidate_limit(limit: u16) -> usize {
         (limit as usize)
             .saturating_mul(CONVERSATION_CANDIDATE_MULTIPLIER)
@@ -2128,7 +2013,7 @@ FORMAT JSONEachRow",
         from_unix_ms: Option<i64>,
         to_unix_ms: Option<i64>,
         recent_from_unix_ms: Option<i64>,
-        candidate_session_ids: Option<&[String]>,
+        session_filter: ConversationSessionFilter<'_>,
     ) -> (String, String) {
         let terms_array_sql = sql_array_strings(terms);
         let mut postings_filters = vec![format!("p.term IN {}", terms_array_sql)];
@@ -2169,11 +2054,12 @@ FORMAT JSONEachRow",
             ));
         }
 
-        if let Some(candidate_session_ids) = candidate_session_ids {
-            if !candidate_session_ids.is_empty() {
+        match session_filter {
+            ConversationSessionFilter::Discovery => {}
+            ConversationSessionFilter::Sessions(session_ids) => {
                 postings_filters.push(format!(
                     "p.session_id IN {}",
-                    sql_array_strings(candidate_session_ids)
+                    sql_array_strings(session_ids)
                 ));
             }
         }
@@ -2224,7 +2110,7 @@ FORMAT JSONEachRow",
             from_unix_ms,
             to_unix_ms,
             None,
-            None,
+            ConversationSessionFilter::Discovery,
         );
 
         let (mode_join_sql, mode_filter_sql) = if let Some(selected_mode) = mode {
@@ -2328,7 +2214,7 @@ FORMAT JSONEachRow",
             from_unix_ms,
             to_unix_ms,
             Some(recent_from_unix_ms),
-            None,
+            ConversationSessionFilter::Discovery,
         );
 
         let (mode_join_sql, mode_filter_sql) = if let Some(selected_mode) = mode {
@@ -2407,9 +2293,12 @@ FORMAT JSONEachRow",
             self.map_backend(self.query_rows(&persistent_sql, None).await)?;
         let truncated = persistent_rows.len() >= candidate_limit;
         if truncated {
+            // The persistent window saturated: its bounded prefix IS the
+            // session set. Merging the recent window on top would not make it
+            // more complete, and #597/F5 no longer has an unbounded branch to
+            // fall back to.
             return Ok(ConversationCandidateSet {
                 rows: persistent_rows,
-                truncated: true,
             });
         }
 
@@ -2463,10 +2352,7 @@ FORMAT JSONEachRow",
             rows.truncate(max_rows);
         }
 
-        Ok(ConversationCandidateSet {
-            rows,
-            truncated: false,
-        })
+        Ok(ConversationCandidateSet { rows })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2483,7 +2369,7 @@ FORMAT JSONEachRow",
         from_unix_ms: Option<i64>,
         to_unix_ms: Option<i64>,
         mode: Option<ConversationMode>,
-        candidate_session_ids: Option<&[String]>,
+        candidate_session_ids: &[String],
     ) -> RepoResult<String> {
         if terms.is_empty() {
             return Err(RepoError::invalid_argument(
@@ -2506,7 +2392,7 @@ FORMAT JSONEachRow",
             from_unix_ms,
             to_unix_ms,
             None,
-            candidate_session_ids,
+            ConversationSessionFilter::Sessions(candidate_session_ids),
         );
         let (mode_join_sql, mode_filter_sql) = if let Some(selected_mode) = mode {
             let mode_subquery = self.mode_subquery();
@@ -3108,7 +2994,16 @@ FORMAT JSONEachRow",
             .exclude_codex_mcp
             .unwrap_or(self.cfg.default_exclude_codex_mcp);
         let bypass_cache = query.bypass_cache.unwrap_or(false);
+        // Issue #597 §1.5/F3: `oracle_exact` was the caller-facing door into the
+        // unbounded exact aggregation. It is refused rather than silently
+        // downgraded, so a caller that depended on exact-scan semantics learns
+        // that it no longer exists instead of quietly getting different results.
         let effective_strategy_hint = query.strategy_hint.unwrap_or_default();
+        if effective_strategy_hint == SearchStrategyHint::Exact {
+            return Err(RepoError::invalid_argument(
+                "oracle_exact was retired in #597; interactive search has no exact-scan path",
+            ));
+        }
 
         let session_id = query.session_id.clone();
         if let Some(session_id) = session_id.as_deref() {
@@ -3159,11 +3054,10 @@ FORMAT JSONEachRow",
         let publication_cache_available = publication_cache_key("").is_some();
         let hits = if bypass_cache || !publication_cache_available {
             let rows = self
-                .search_events_rows_by_strategy(
-                    effective_strategy_hint,
+                .search_events_rows(
                     &terms,
                     docs,
-                    avgdl,
+                    total_doc_len,
                     include_tool_events,
                     event_kinds.as_deref(),
                     exclude_codex_mcp,
@@ -3195,11 +3089,10 @@ FORMAT JSONEachRow",
                 cached_hits
             } else {
                 let fresh_rows = self
-                    .search_events_rows_by_strategy(
-                        effective_strategy_hint,
+                    .search_events_rows(
                         &terms,
                         docs,
-                        avgdl,
+                        total_doc_len,
                         include_tool_events,
                         event_kinds.as_deref(),
                         exclude_codex_mcp,
@@ -3308,67 +3201,98 @@ FORMAT JSONEachRow",
             .max(1)
             .min(terms.len() as u16);
         let min_score = query.min_score.unwrap_or(self.cfg.bm25_default_min_score);
-        let cache_key = publication_cache_key(&Self::search_mcp_events_cache_key(
-            &terms,
-            &event_types,
-            query.session_id.as_deref(),
-            query.harness.as_deref(),
-            query.source_name.as_deref(),
-            query.turn_seq,
-            min_should_match,
-            min_score,
-            effective_n_hits,
-        ));
+        // #570 freshness (issue #597 §2.7): a request carrying `session_id`
+        // neither READS nor WRITES the result cache. A session-scoped search is
+        // by construction a self-review of a session that may be writing right
+        // now, and the publication token that namespaces every cache does not
+        // move on an append-only tick, so a 15 s entry can pin a pre-append
+        // empty answer well past the p95 <= 2 s freshness budget. The previous
+        // guard here reasoned only about `scope_exists`/`docs`, which is
+        // exactly what let that through. Unscoped traffic — which dominates —
+        // keeps its cache-hit rate untouched.
+        let cacheable = query.session_id.is_none();
+        let cache_key = cacheable
+            .then(|| {
+                publication_cache_key(&Self::search_mcp_events_cache_key(
+                    &terms,
+                    &event_types,
+                    query.session_id.as_deref(),
+                    query.harness.as_deref(),
+                    query.source_name.as_deref(),
+                    query.turn_seq,
+                    min_should_match,
+                    min_score,
+                    effective_n_hits,
+                ))
+            })
+            .flatten();
         let cached_result = match cache_key.as_deref() {
             Some(cache_key) => self.search_mcp_events_cache_get(cache_key).await,
             None => None,
         };
         let cache_hit = cached_result.is_some();
-        tracing::info!(cache_hit, "mcp_search_cache");
+        tracing::info!(cache_hit, cacheable, "mcp_search_cache");
 
-        let (hits, truncated, docs, avgdl, scope_exists) = if let Some(cached) = cached_result {
-            (
-                cached.hits,
-                cached.truncated,
-                cached.docs,
-                cached.avgdl,
-                true,
-            )
-        } else {
-            let (mut rows, docs, total_doc_len, scope_exists) = self
-                .search_mcp_event_rows(
-                    &terms,
-                    &event_types,
-                    query.session_id.as_deref(),
-                    query.turn_seq,
-                    query.harness.as_deref(),
-                    query.source_name.as_deref(),
-                    min_should_match,
-                    min_score,
-                    unique_fetch_limit,
+        let (hits, truncated, docs, avgdl, scope_exists, incomplete) =
+            if let Some(cached) = cached_result {
+                (
+                    cached.hits,
+                    cached.truncated,
+                    cached.docs,
+                    cached.avgdl,
+                    true,
+                    false,
                 )
-                .await?;
-            let avgdl = if docs == 0 {
-                0.0
             } else {
-                (total_doc_len as f64 / docs as f64).max(1.0)
-            };
-            let truncated = rows.len() > effective_n_hits as usize;
-            if truncated {
-                rows.truncate(effective_n_hits as usize);
-            }
-            let hits = Self::map_search_mcp_rows_to_hits(rows);
-            // Projection publication and first ingest can make a negative or
-            // empty answer become positive immediately. Preserve that
-            // visibility by caching only stable, published-corpus results.
-            if scope_exists && docs > 0 {
-                if let Some(cache_key) = cache_key {
-                    self.search_mcp_events_cache_put(cache_key, &hits, truncated, docs, avgdl)
-                        .await;
+                let page = self
+                    .search_mcp_event_page(
+                        &terms,
+                        &event_types,
+                        query.session_id.as_deref(),
+                        query.turn_seq,
+                        query.harness.as_deref(),
+                        query.source_name.as_deref(),
+                        min_should_match,
+                        min_score,
+                        unique_fetch_limit,
+                    )
+                    .await?;
+                let McpSearchPage {
+                    mut rows,
+                    docs,
+                    total_doc_len,
+                    scope_exists,
+                    incomplete_due_to_candidate_budget,
+                } = page;
+                let avgdl = if docs == 0 {
+                    0.0
+                } else {
+                    (total_doc_len as f64 / docs as f64).max(1.0)
+                };
+                let truncated = rows.len() > effective_n_hits as usize;
+                if truncated {
+                    rows.truncate(effective_n_hits as usize);
                 }
-            }
-            (hits, truncated, docs, avgdl, scope_exists)
-        };
+                let hits = Self::map_search_mcp_rows_to_hits(rows);
+                // Projection publication and first ingest can make a negative or
+                // empty answer become positive immediately. Preserve that
+                // visibility by caching only stable, published-corpus results —
+                // and never cache a result the candidate budget cut short.
+                if scope_exists && docs > 0 && !incomplete_due_to_candidate_budget {
+                    if let Some(cache_key) = cache_key {
+                        self.search_mcp_events_cache_put(cache_key, &hits, truncated, docs, avgdl)
+                            .await;
+                    }
+                }
+                (
+                    hits,
+                    truncated,
+                    docs,
+                    avgdl,
+                    scope_exists,
+                    incomplete_due_to_candidate_budget,
+                )
+            };
         let took_ms = started.elapsed().as_millis() as u32;
 
         Ok(SearchMcpEventsResult {
@@ -3378,6 +3302,7 @@ FORMAT JSONEachRow",
             event_types,
             scope_exists,
             truncated,
+            incomplete_due_to_candidate_budget: incomplete,
             stats: SearchMcpEventsStats {
                 docs,
                 avgdl,
@@ -3452,21 +3377,26 @@ FORMAT JSONEachRow",
         }
 
         let avgdl = (total_doc_len as f64 / docs as f64).max(1.0);
-        let df_map = self.df_map(&terms).await?;
+        // ONE df formula ships (issue #597 §2.6). The retired `df_map` used
+        // `uniqExact(tuple(source_host, doc_id))` over `v_live_search_postings`
+        // while ranking used `count()` over the locator-authorized relation;
+        // the two agreed only while that join stayed 1:1. Both are now
+        // `count()` over the same bounded ranking CTE.
+        let df_map = self.bounded_term_df_map(&terms).await?;
 
         let mut idf_by_term = HashMap::<String, f64>::new();
         for term in &terms {
             let df = *df_map.get(term).unwrap_or(&0);
-            let idf = if df == 0 {
-                (1.0 + ((docs as f64 + 0.5) / 0.5)).ln()
-            } else {
-                let n = docs.max(df) as f64;
-                (1.0 + ((n - df as f64 + 0.5) / (df as f64 + 0.5))).ln()
-            };
-            idf_by_term.insert(term.clone(), idf.max(0.0));
+            idf_by_term.insert(term.clone(), Self::bm25_idf(docs, df));
         }
 
-        let candidate_set = match self
+        // Issue #597 §1.5/F5. A candidate-stage error propagates instead of
+        // being downgraded to an unrestricted scan; zero candidates is zero
+        // results; and a SATURATED candidate window keeps its bounded prefix as
+        // the session predicate rather than dropping the predicate entirely.
+        // Saturation is the case that mattered: it fired exactly when the
+        // corpus was large enough for the unbounded query to hurt.
+        let candidate_set = self
             .fetch_conversation_candidates(
                 &terms,
                 &idf_by_term,
@@ -3478,29 +3408,29 @@ FORMAT JSONEachRow",
                 query.to_unix_ms,
                 query.mode,
             )
-            .await
-        {
-            Ok(set) => set,
-            Err(err) => {
-                warn!("search_conversations candidate stage failed; falling back to exact path: {err}");
-                ConversationCandidateSet::default()
-            }
-        };
-        let candidate_limit = Self::conversation_candidate_limit(limit);
-        let candidate_session_ids = if candidate_set.truncated
-            || candidate_set.rows.is_empty()
-            || candidate_set.rows.len() >= candidate_limit
-        {
-            None
-        } else {
-            Some(
-                candidate_set
-                    .rows
-                    .into_iter()
-                    .map(|row| row.session_id)
-                    .collect::<Vec<_>>(),
-            )
-        };
+            .await?;
+        let candidate_session_ids = candidate_set
+            .rows
+            .into_iter()
+            .map(|row| row.session_id)
+            .collect::<Vec<_>>();
+        if candidate_session_ids.is_empty() {
+            return Ok(ConversationSearchResults {
+                query_id,
+                query: query_text.to_string(),
+                terms,
+                stats: ConversationSearchStats {
+                    docs,
+                    avgdl,
+                    took_ms: started.elapsed().as_millis() as u32,
+                    result_count: 0,
+                    requested_limit,
+                    effective_limit: limit,
+                    limit_capped,
+                },
+                hits: Vec::new(),
+            });
+        }
 
         let sql = self.build_search_conversations_sql(
             &terms,
@@ -3514,7 +3444,7 @@ FORMAT JSONEachRow",
             query.from_unix_ms,
             query.to_unix_ms,
             query.mode,
-            candidate_session_ids.as_deref(),
+            &candidate_session_ids,
         )?;
 
         let rows: Vec<ConversationSearchRow> =

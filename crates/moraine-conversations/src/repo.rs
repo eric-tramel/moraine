@@ -11,9 +11,8 @@ use crate::domain::{
     ConversationSearchResults, FileAttentionQuery, FileAttentionTouch, McpEventOpen,
     McpSessionListFilter, McpSessionListItem, McpSessionOpen, McpTurnOpen, OpenContext,
     OpenEventRequest, Page, PageRequest, RepoConfig, SearchEventsQuery, SearchEventsResult,
-    SearchMcpEventsQuery, SearchMcpEventsResult, SessionEventsQuery, SessionMetadata,
-    SessionMetadataSearchQuery, SessionMetadataSearchResults, TraceEvent, Turn, TurnListFilter,
-    TurnSummary,
+    SearchMcpEventsQuery, SearchMcpEventsResult, SessionEventsQuery, SessionMetadata, TraceEvent,
+    Turn, TurnListFilter, TurnSummary,
 };
 use crate::error::{RepoError, RepoResult};
 
@@ -137,11 +136,6 @@ pub trait ConversationRepository: Send + Sync {
         &self,
         query: ConversationSearchQuery,
     ) -> RepoResult<ConversationSearchResults>;
-
-    async fn search_session_metadata(
-        &self,
-        query: SessionMetadataSearchQuery,
-    ) -> RepoResult<SessionMetadataSearchResults>;
 
     async fn file_attention(
         &self,

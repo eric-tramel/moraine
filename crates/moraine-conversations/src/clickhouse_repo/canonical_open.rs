@@ -2201,10 +2201,7 @@ mod tests {
 
     /// No reader statement may read or gate on the retired projection tables.
     fn assert_no_projection(sql: &str) {
-        assert!(
-            !sql.contains("mcp_open_"),
-            "reader touched mcp_open_*:\n{sql}"
-        );
+        super::super::sql::canonical_assertions::assert_no_projection("reader", sql);
     }
 
     #[tokio::test]

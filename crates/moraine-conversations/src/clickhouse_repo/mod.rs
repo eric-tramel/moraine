@@ -89,9 +89,8 @@ use crate::domain::{
     SearchEventHit, SearchEventKind, SearchEventsQuery, SearchEventsResult, SearchEventsStats,
     SearchMcpEventHit, SearchMcpEventsQuery, SearchMcpEventsResult, SearchMcpEventsStats,
     SearchStrategyHint, SessionAnalytics, SessionAnalyticsQuery, SessionEventsDirection,
-    SessionEventsQuery, SessionMetadata, SessionMetadataSearchHit, SessionMetadataSearchQuery,
-    SessionMetadataSearchResults, SessionMetadataSearchStats, SessionOriginScope, SessionStep,
-    SessionTurn, ToolResult, TraceEvent, Turn, TurnListFilter, TurnSummary, WebSearchEvent,
+    SessionEventsQuery, SessionMetadata, SessionOriginScope, SessionStep, SessionTurn, ToolResult,
+    TraceEvent, Turn, TurnListFilter, TurnSummary, WebSearchEvent,
 };
 use crate::error::{RepoError, RepoResult};
 use crate::repo::ConversationRepository;
@@ -111,6 +110,7 @@ mod repo_impl;
 mod rows;
 mod scope;
 mod search;
+mod search_canonical;
 mod sql;
 
 #[cfg(test)]
@@ -130,7 +130,6 @@ pub struct ClickHouseConversationRepository {
     stats_cache: Arc<RwLock<SearchStatsCache>>,
     search_cache: Arc<RwLock<HashMap<String, SearchEventsCacheEntry>>>,
     mcp_search_cache: Arc<RwLock<HashMap<String, SearchMcpEventsCacheEntry>>>,
-    term_postings_cache: Arc<RwLock<HashMap<String, TermPostingsCacheEntry>>>,
     search_doc_extra_cache: Arc<RwLock<HashMap<String, SearchDocExtraCacheEntry>>>,
     analytics_cache: Arc<[Mutex<Option<AnalyticsCacheEntry>>; ANALYTICS_RANGE_COUNT]>,
     /// Sessions already proven to fall inside `cfg.session_scope`, mapped to
@@ -165,7 +164,6 @@ impl ClickHouseConversationRepository {
             stats_cache: Arc::new(RwLock::new(SearchStatsCache::default())),
             search_cache: Arc::new(RwLock::new(HashMap::new())),
             mcp_search_cache: Arc::new(RwLock::new(HashMap::new())),
-            term_postings_cache: Arc::new(RwLock::new(HashMap::new())),
             search_doc_extra_cache: Arc::new(RwLock::new(HashMap::new())),
             analytics_cache: Arc::new(std::array::from_fn(|_| Mutex::new(None))),
             scoped_session_cache: Arc::new(RwLock::new(HashMap::new())),

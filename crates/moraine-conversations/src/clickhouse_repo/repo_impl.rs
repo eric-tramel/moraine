@@ -323,16 +323,6 @@ impl ConversationRepository for ClickHouseConversationRepository {
         .await
     }
 
-    async fn search_session_metadata(
-        &self,
-        query: SessionMetadataSearchQuery,
-    ) -> RepoResult<SessionMetadataSearchResults> {
-        self.run_publication_consistent(PublicationReadClass::MovingFeed, || {
-            ClickHouseConversationRepository::search_session_metadata(self, query.clone())
-        })
-        .await
-    }
-
     async fn file_attention(
         &self,
         query: FileAttentionQuery,

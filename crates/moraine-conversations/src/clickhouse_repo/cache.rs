@@ -4,23 +4,11 @@ pub(super) const BENCHMARK_REPLAY_SOURCE: &str = "benchmark-replay";
 pub(super) const ANALYTICS_CACHE_TTL: Duration = Duration::from_secs(30);
 pub(super) const ANALYTICS_RANGE_COUNT: usize = AnalyticsRange::ALL.len();
 pub(super) const CORPUS_STATS_CACHE_TTL: Duration = Duration::from_secs(30);
-pub(super) const TERM_DF_CACHE_TTL: Duration = Duration::from_secs(300);
-pub(super) const TERM_DF_CACHE_MAX_ENTRIES: usize = 16_384;
 pub(super) const SCOPED_SESSION_CACHE_MAX_ENTRIES: usize = 16_384;
-pub(super) const SEARCH_SCHEMA_CACHE_TTL: Duration = Duration::from_secs(60);
 pub(super) const SEARCH_RESULT_CACHE_TTL: Duration = Duration::from_secs(15);
 pub(super) const SEARCH_RESULT_CACHE_MAX_ENTRIES: usize = 256;
 pub(super) const MCP_SEARCH_RESULT_CACHE_TTL: Duration = Duration::from_secs(15);
 pub(super) const MCP_SEARCH_RESULT_CACHE_MAX_ENTRIES: usize = 256;
-pub(super) const TERM_POSTINGS_CACHE_TTL: Duration = Duration::from_secs(15);
-pub(super) const TERM_POSTINGS_CACHE_MAX_ENTRIES: usize = 2048;
-pub(super) const TERM_POSTINGS_CACHE_MAX_ROWS_PER_TERM: usize = 131_072;
-pub(super) const TERM_POSTINGS_CACHE_MAX_ROWS_TOTAL: usize = 262_144;
-pub(super) const TERM_POSTINGS_FAST_PATH_MAX_ROWS_PER_TERM: u64 =
-    TERM_POSTINGS_CACHE_MAX_ROWS_PER_TERM as u64;
-pub(super) const TERM_POSTINGS_FAST_PATH_RATIO_MIN_DOCS: u64 = 10_000;
-pub(super) const TERM_POSTINGS_FAST_PATH_MAX_DOC_RATIO_NUMERATOR: u64 = 1;
-pub(super) const TERM_POSTINGS_FAST_PATH_MAX_DOC_RATIO_DENOMINATOR: u64 = 4;
 // 60s (issue #443): hydrated doc rows are near-immutable — an event_uid's
 // content only moves when a mutable source (cursor bubble) re-emits it — and
 // agents issue bursts of overlapping searches, so a short TTL re-reads the
@@ -65,56 +53,16 @@ pub(super) struct CorpusStatsCacheEntry {
     pub(super) fetched_at: Instant,
 }
 
-#[derive(Debug, Clone)]
-pub(super) struct TermDfCacheEntry {
-    pub(super) publication_token: String,
-    pub(super) df: u64,
-    pub(super) fetched_at: Instant,
-}
-
-impl TermDfCacheEntry {
-    fn is_fresh(&self, now: Instant, publication_token: &str) -> bool {
-        self.publication_token == publication_token
-            && now
-                .checked_duration_since(self.fetched_at)
-                .unwrap_or_default()
-                <= TERM_DF_CACHE_TTL
-    }
-}
-
+/// Issue #597 deleted the second `df` formula and the schema probe that once
+/// lived here. Ranking's `df` is now `count() OVER (PARTITION BY term)` inside
+/// the one bounded ranking CTE, computed over version- and
+/// generation-authorized postings; the retired `term_df_by_term` cache fed an
+/// in-process scorer with `uniqExact(tuple(source_host, doc_id))`, a DIFFERENT
+/// formula that agreed with ranking's only while the live-postings join stayed
+/// 1:1. One df formula ships.
 #[derive(Debug, Default)]
 pub(super) struct SearchStatsCache {
     pub(super) corpus_stats: Option<CorpusStatsCacheEntry>,
-    pub(super) term_df_by_term: HashMap<String, TermDfCacheEntry>,
-    pub(super) has_codex_flag_column: Option<(bool, Instant)>,
-}
-
-fn insert_term_df_cache_entry(
-    cache: &mut HashMap<String, TermDfCacheEntry>,
-    term: String,
-    entry: TermDfCacheEntry,
-    max_entries: usize,
-) {
-    if max_entries == 0 {
-        return;
-    }
-
-    while !cache.contains_key(&term) && cache.len() >= max_entries {
-        // Prefer an entry from another publication revision. If concurrent
-        // operations race, evicting either revision can only cost a cache hit:
-        // lookups still require an exact token match.
-        let eviction = cache
-            .iter()
-            .find(|(_, cached)| cached.publication_token != entry.publication_token)
-            .or_else(|| cache.iter().min_by_key(|(_, cached)| cached.fetched_at))
-            .map(|(term, _)| term.clone());
-        let Some(eviction) = eviction else {
-            break;
-        };
-        cache.remove(&eviction);
-    }
-
-    cache.insert(term, entry);
 }
 
 pub(super) fn scoped_session_cache_contains(
@@ -167,12 +115,6 @@ pub(super) struct SearchMcpEventsCacheEntry {
     pub(super) truncated: bool,
     pub(super) docs: u64,
     pub(super) avgdl: f64,
-    pub(super) fetched_at: Instant,
-}
-
-#[derive(Debug, Clone)]
-pub(super) struct TermPostingsCacheEntry {
-    pub(super) rows: Arc<[CachedPostingRow]>,
     pub(super) fetched_at: Instant,
 }
 
@@ -462,25 +404,16 @@ impl ClickHouseConversationRepository {
         let from_stats: Vec<CorpusStatsRow> =
             self.map_backend(self.query_rows(&from_stats_query, None).await)?;
 
-        if let Some(row) = from_stats.first() {
-            if row.docs > 0 {
-                self.cache_corpus_stats(row.docs, row.total_doc_len, now)
-                    .await;
-                return Ok((row.docs, row.total_doc_len));
-            }
-        }
-
-        let fallback_query = format!(
-            "SELECT toUInt64(count()) AS docs, toUInt64(ifNull(sum(doc_len), 0)) AS total_doc_len FROM {} WHERE doc_len > 0 FORMAT JSONEachRow",
-            self.table_ref("v_live_search_documents")
-        );
-        let fallback: Vec<CorpusStatsRow> =
-            self.map_backend(self.query_rows(&fallback_query, None).await)?;
-        let resolved = if let Some(row) = fallback.first() {
-            (row.docs, row.total_doc_len)
-        } else {
-            (0, 0)
-        };
+        // Issue #597 §1.5/F6: `docs = 0` is a legitimate answer and every caller
+        // already handles it. The deleted fallback re-read
+        // `count(), sum(doc_len) FROM v_live_search_documents WHERE doc_len > 0`
+        // — a whole-corpus aggregation — every time the stats view reported an
+        // empty corpus, which is precisely the state a cold or freshly migrated
+        // backend is in.
+        let resolved = from_stats
+            .first()
+            .map(|row| (row.docs, row.total_doc_len))
+            .unwrap_or((0, 0));
 
         if let Some(publication_token) = publication_cache_key("corpus-stats") {
             let mut cache = self.stats_cache.write().await;
@@ -511,39 +444,6 @@ impl ClickHouseConversationRepository {
         }
     }
 
-    pub(super) async fn cache_term_df_values(
-        &self,
-        terms: impl IntoIterator<Item = String>,
-        map: &HashMap<String, u64>,
-        fetched_at: Instant,
-    ) {
-        let Some(publication_token) = publication_cache_token() else {
-            return;
-        };
-        let mut cache = self.stats_cache.write().await;
-        if cache.term_df_by_term.len() >= TERM_DF_CACHE_MAX_ENTRIES {
-            cache.term_df_by_term.retain(|_, entry| {
-                fetched_at
-                    .checked_duration_since(entry.fetched_at)
-                    .unwrap_or_default()
-                    <= TERM_DF_CACHE_TTL
-            });
-        }
-        for term in terms {
-            let df = *map.get(&term).unwrap_or(&0);
-            insert_term_df_cache_entry(
-                &mut cache.term_df_by_term,
-                term,
-                TermDfCacheEntry {
-                    publication_token: publication_token.clone(),
-                    df,
-                    fetched_at,
-                },
-                TERM_DF_CACHE_MAX_ENTRIES,
-            );
-        }
-    }
-
     pub(super) async fn load_hot_queries_for_prewarm(
         &self,
         limit: usize,
@@ -570,107 +470,11 @@ FORMAT JSONEachRow",
         let rows: Vec<HotQueryRow> = self.map_backend(self.query_rows(&query, None).await)?;
         Ok(rows.into_iter().map(|row| row.raw_query).collect())
     }
-
-    pub(super) async fn df_map(&self, terms: &[String]) -> RepoResult<HashMap<String, u64>> {
-        let now = Instant::now();
-        let publication_token = publication_cache_token();
-        let postings_table = self.table_ref("v_live_search_postings");
-
-        let mut map = HashMap::<String, u64>::new();
-        let mut missing_terms = Vec::<String>::new();
-
-        {
-            let cache = self.stats_cache.read().await;
-            for term in terms {
-                if let Some(entry) = publication_token.as_deref().and_then(|token| {
-                    cache
-                        .term_df_by_term
-                        .get(term)
-                        .filter(|entry| entry.is_fresh(now, token))
-                }) {
-                    map.insert(term.clone(), entry.df);
-                    continue;
-                }
-                missing_terms.push(term.clone());
-            }
-        }
-
-        if missing_terms.is_empty() {
-            return Ok(map);
-        }
-
-        let missing_terms_array = sql_array_strings(&missing_terms);
-        let df_query = format!(
-            "SELECT term, toUInt64(uniqExact(tuple(source_host, doc_id))) AS df FROM {postings_table} WHERE term IN {missing_terms_array} GROUP BY term FORMAT JSONEachRow",
-        );
-        let rows: Vec<DfRow> = self.map_backend(self.query_rows(&df_query, None).await)?;
-        for row in rows {
-            map.insert(row.term, row.df);
-        }
-
-        for term in &missing_terms {
-            map.entry(term.clone()).or_insert(0);
-        }
-
-        self.cache_term_df_values(missing_terms, &map, now).await;
-        Ok(map)
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn term_df_entry(publication_token: &str, fetched_at: Instant) -> TermDfCacheEntry {
-        TermDfCacheEntry {
-            publication_token: publication_token.to_string(),
-            df: 1,
-            fetched_at,
-        }
-    }
-
-    #[test]
-    fn term_df_cache_replaces_revisions_and_remains_bounded() {
-        const TEST_LIMIT: usize = 8;
-        let now = Instant::now();
-        let mut cache = HashMap::new();
-
-        for revision in 0..64 {
-            insert_term_df_cache_entry(
-                &mut cache,
-                "repeat".to_string(),
-                term_df_entry(&format!("revision-{revision}"), now),
-                TEST_LIMIT,
-            );
-            assert_eq!(cache.len(), 1);
-        }
-        assert_eq!(cache["repeat"].publication_token, "revision-63");
-
-        for revision in 0..64 {
-            insert_term_df_cache_entry(
-                &mut cache,
-                format!("term-{revision}"),
-                term_df_entry(&format!("revision-{revision}"), now),
-                TEST_LIMIT,
-            );
-            assert!(cache.len() <= TEST_LIMIT);
-        }
-    }
-
-    #[test]
-    fn term_df_cache_never_reuses_a_concurrent_revision() {
-        let now = Instant::now();
-        let mut cache = HashMap::new();
-
-        insert_term_df_cache_entry(&mut cache, "term".to_string(), term_df_entry("new", now), 1);
-        // An older operation can finish its cache population after a newer
-        // operation. Last-writer-wins may cost the newer revision a hit, but
-        // the exact-token check prevents it from consuming the old value.
-        insert_term_df_cache_entry(&mut cache, "term".to_string(), term_df_entry("old", now), 1);
-
-        assert!(cache["term"].is_fresh(now, "old"));
-        assert!(!cache["term"].is_fresh(now, "new"));
-    }
 
     #[test]
     fn scoped_session_cache_replaces_revisions_and_remains_bounded() {

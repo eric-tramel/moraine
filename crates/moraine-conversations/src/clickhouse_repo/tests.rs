@@ -1,7 +1,5 @@
 use super::file_attention::merge_file_attention_touches;
-use super::search::{
-    RankedPosting, SearchScoreAccum, CODEX_FINAL_ANSWER_MIRROR_MAX_TIMESTAMP_DELTA_MS,
-};
+use super::search::{ConversationSessionFilter, CODEX_FINAL_ANSWER_MIRROR_MAX_TIMESTAMP_DELTA_MS};
 use super::*;
 
 fn sample_search_doc() -> SearchDocExtraCacheEntry {
@@ -101,6 +99,8 @@ fn sample_mcp_search_row(event_uid: &str, raw_score: f64, event_unix_ms: i64) ->
         session_slug: String::new(),
         session_summary: String::new(),
         session_completed: 0,
+        hydration_event_ts_ms: event_unix_ms,
+        ranking_sort_time_ms: event_unix_ms,
     }
 }
 
@@ -191,7 +191,6 @@ async fn mcp_search_sql_excludes_internal_tool_calls() {
             0.0,
             Some((1, 1)),
             20,
-            0,
         )
         .expect("build MCP event search SQL")
     })
@@ -221,23 +220,28 @@ async fn mcp_search_sql_excludes_internal_tool_calls() {
 }
 
 #[test]
-fn live_search_queries_use_the_full_document_view_contract() {
+fn exact_oracle_still_pins_the_full_document_view_contract() {
+    // The oracle survives ONLY under cfg(test) (issue #597 §1.5/F1+F3). This
+    // test is deliberately kept rather than deleted: it is what makes the
+    // oracle's `O(D x doc_bytes)` shape visible, so the contrast with
+    // `search_events_ranking_reads_no_content_and_no_documents` is explicit
+    // rather than asserted in prose.
     let client = ClickHouseClient::new(moraine_config::ClickHouseConfig::default())
         .expect("build ClickHouse client");
     let repo = ClickHouseConversationRepository::new(client, RepoConfig::default());
     let terms = vec!["needle".to_string()];
     let idf = HashMap::from([("needle".to_string(), 1.0)]);
 
-    let ranking_sql = repo
-        .build_search_events_sql(
+    let oracle_sql = repo
+        .build_search_events_exact_oracle_sql(
             &terms, &idf, 10.0, true, None, true, true, None, None, 1, 0.0, 20,
         )
-        .expect("build live search ranking SQL");
+        .expect("build exact oracle SQL");
     let hydration_sql = repo
-        .build_search_events_hydrate_sql(&[SearchDocumentIdentity::new("host-a", "event-a")], true)
+        .build_search_events_hydrate_sql(&[SearchDocumentIdentity::new("host-a", "event-a")])
         .expect("build live search hydration SQL");
 
-    for sql in [&ranking_sql, &hydration_sql] {
+    for sql in [&oracle_sql, &hydration_sql] {
         assert!(sql.contains("FROM `moraine`.`v_live_search_documents` AS t"));
         for required in [
             "t.source_host",
@@ -264,11 +268,34 @@ fn live_search_queries_use_the_full_document_view_contract() {
             );
         }
     }
-    assert!(ranking_sql.contains("GROUP BY t.source_host, t.event_uid"));
-    assert!(ranking_sql.contains("ON d.source_host = p.source_host"));
-    assert!(ranking_sql.contains("GROUP BY p.doc_id, p.source_host"));
+    assert!(oracle_sql.contains("GROUP BY t.source_host, t.event_uid"));
+    assert!(oracle_sql.contains("ON d.source_host = p.source_host"));
+    assert!(oracle_sql.contains("GROUP BY p.doc_id, p.source_host"));
     assert!(hydration_sql.contains("requested.source_host = t.source_host"));
     assert!(hydration_sql.contains("GROUP BY t.source_host, t.event_uid"));
+}
+
+/// The F8 deletion. When the schema probe reported `has_codex_mcp` absent, the
+/// bounded hydration statement fell back to
+/// `positionCaseInsensitiveUTF8(t.payload_json, 'codex-mcp')`, decompressing
+/// every requested payload to compute one boolean.
+///
+/// MUTATION: restore the `use_document_codex_flag` branch and emit the
+/// `positionCaseInsensitiveUTF8` expression; this test fails.
+#[test]
+fn hydration_reads_the_codex_flag_column_and_never_scans_payloads_for_it() {
+    let client = ClickHouseClient::new(moraine_config::ClickHouseConfig::default())
+        .expect("build ClickHouse client");
+    let repo = ClickHouseConversationRepository::new(client, RepoConfig::default());
+    let sql = repo
+        .build_search_events_hydrate_sql(&[SearchDocumentIdentity::new("host-a", "event-a")])
+        .expect("build live search hydration SQL");
+
+    assert!(sql.contains("toUInt8(any(t.has_codex_mcp)) AS has_codex_mcp"));
+    assert!(
+        !sql.contains("positionCaseInsensitiveUTF8"),
+        "hydration must not scan payloads for the codex flag: {sql}"
+    );
 }
 
 #[test]
@@ -338,6 +365,58 @@ fn safe_filter_value_validation() {
     assert!(!is_safe_filter_value("drop table;"));
 }
 
+/// F5. Three conditions used to collapse to `candidate_session_ids = None`,
+/// which emitted NO session predicate — a whole-corpus postings scan. The type
+/// now has no variant that means that, but a `Sessions(&[])` that quietly
+/// emitted nothing would reopen the hole with the type change still in place
+/// (mutation M16 showed exactly that).
+///
+/// So: `Sessions` ALWAYS emits the predicate. An empty list produces
+/// `p.session_id IN []`, which matches nothing — zero candidates means zero
+/// results, which is the correct answer and the one the retired code refused to
+/// give. `search_conversations_impl` returns early before it ever gets here.
+///
+/// MUTATION: wrap the push in `if !session_ids.is_empty()`; this fails.
+#[test]
+fn conversation_scoring_always_emits_a_session_predicate() {
+    let client = ClickHouseClient::new(moraine_config::ClickHouseConfig::default())
+        .expect("build ClickHouse client");
+    let repo = ClickHouseConversationRepository::new(client, RepoConfig::default());
+    let terms = vec!["needle".to_string()];
+
+    for (label, sessions) in [
+        ("empty", Vec::<String>::new()),
+        ("populated", vec!["sess-a".to_string()]),
+    ] {
+        let (_, filter_sql) = repo.build_conversation_postings_filter_sql(
+            &terms,
+            true,
+            false,
+            None,
+            None,
+            None,
+            ConversationSessionFilter::Sessions(&sessions),
+        );
+        assert!(
+            filter_sql.contains("p.session_id IN "),
+            "the {label} session set must still restrict the postings scan: {filter_sql}"
+        );
+    }
+
+    // Discovery is the ONE relation allowed no session predicate, and it is
+    // bounded by its own LIMIT instead.
+    let (_, discovery_sql) = repo.build_conversation_postings_filter_sql(
+        &terms,
+        true,
+        false,
+        None,
+        None,
+        None,
+        ConversationSessionFilter::Discovery,
+    );
+    assert!(!discovery_sql.contains("p.session_id IN "));
+}
+
 #[test]
 fn sql_array_builders_escape_values() {
     let values = vec!["a".to_string(), "b'c".to_string()];
@@ -346,18 +425,53 @@ fn sql_array_builders_escape_values() {
     assert!(out.contains("'b''c'"));
 }
 
+/// F-TIE. The v2 ranking statement orders by the locator's `sort_time`, while
+/// the REPORTED `event.timestamp` is navigation's `display_time` — they differ
+/// exactly for an event whose `record_ts` does not parse, and only when
+/// `raw_score` ties. That is precisely when the tiebreak decides the answer, so
+/// the Rust-side order must use the same key the SQL did.
+///
+/// MUTATION: point `sort_canonical_search_rows` at `event_unix_ms` (i.e. reuse
+/// `sort_search_mcp_event_rows`, which is correct for the v1 engine) and this
+/// fails: the malformed-`record_ts` row sorts first by display time and last by
+/// sort time.
 #[test]
-fn evidence_snippet_prefers_matching_metadata_over_nonmatching_summary() {
-    let terms = vec!["quartz".to_string()];
-    let snippet = evidence_snippet(
-        "General session summary.",
-        "{\"metadata\":{\"codename\":\"quartz\"}}",
-        &terms,
-        80,
-    );
+fn canonical_search_rows_order_by_sort_time_not_display_time() {
+    // Two hits, identical score. `evt-broken` has an unparseable `record_ts`:
+    // its `sort_time` is the epoch sentinel (ranked last) while its
+    // `display_time` falls back to `ingested_at`, which is LATER than the other
+    // row's (which would rank it first).
+    let mut good = sample_mcp_search_row("evt-good", 9.0, 1_767_434_520_000);
+    good.ranking_sort_time_ms = 1_767_434_520_000;
+    let mut broken = sample_mcp_search_row("evt-broken", 9.0, 1_767_434_999_000);
+    broken.ranking_sort_time_ms = 0;
+
+    let mut rows = vec![broken.clone(), good.clone()];
+    ClickHouseConversationRepository::sort_canonical_search_rows(&mut rows);
     assert_eq!(
-        snippet.as_deref(),
-        Some("{\"metadata\":{\"codename\":\"quartz\"}}")
+        rows.iter()
+            .map(|row| row.event_uid.as_str())
+            .collect::<Vec<_>>(),
+        vec!["evt-good", "evt-broken"],
+        "v2 order is by the locator sort_time"
+    );
+
+    // The reported timestamp is untouched: it stays `display_time`, byte
+    // identical with what `open` reports for the same event.
+    assert_eq!(rows[1].event_unix_ms, 1_767_434_999_000);
+
+    // The v1 sort really does disagree — without this the test could pass
+    // against an implementation that never distinguished the two keys.
+    let mut v1_rows = vec![broken, good];
+    ClickHouseConversationRepository::sort_search_mcp_event_rows(&mut v1_rows);
+    assert_eq!(
+        v1_rows
+            .iter()
+            .map(|row| row.event_uid.as_str())
+            .collect::<Vec<_>>(),
+        vec!["evt-broken", "evt-good"],
+        "the two sort keys must genuinely disagree on this fixture, or it \
+         proves nothing"
     );
 }
 
@@ -421,28 +535,6 @@ fn prewarm_query_filter_rejects_single_term_queries() {
             32
         )
     );
-}
-
-#[test]
-fn broad_fast_path_term_guard_uses_row_cap_and_corpus_ratio() {
-    assert!(
-        ClickHouseConversationRepository::term_df_too_broad_for_fast_path(
-            TERM_POSTINGS_FAST_PATH_MAX_ROWS_PER_TERM + 1,
-            1_000_000
-        )
-    );
-    assert!(ClickHouseConversationRepository::term_df_too_broad_for_fast_path(25_000, 100_000));
-    assert!(!ClickHouseConversationRepository::term_df_too_broad_for_fast_path(24_999, 100_000));
-
-    let terms = vec!["the".to_string(), "rare".to_string()];
-    let mut df_by_term = HashMap::<String, u64>::new();
-    df_by_term.insert("the".to_string(), 25_000);
-    df_by_term.insert("rare".to_string(), 12);
-    assert!(ClickHouseConversationRepository::has_broad_fast_path_term(
-        &terms,
-        &df_by_term,
-        100_000
-    ));
 }
 
 #[test]
@@ -986,185 +1078,6 @@ fn open_context_filter_clause_respects_include_system_events_flag() {
 }
 
 #[test]
-fn cached_posting_ranker_matches_full_sort_reference() {
-    let posting = |event_uid: &str, doc_len: u32, tf: u16| CachedPostingRow {
-        source_host: "host-a".to_string(),
-        event_uid: event_uid.to_string(),
-        doc_len,
-        tf,
-    };
-    let terms = ["alpha", "beta", "gamma"]
-        .into_iter()
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    let mut alpha_rows = vec![
-        posting("u1", 100, 2),
-        posting("u2", 120, 1),
-        posting("tie-a", 100, 1),
-    ];
-    let mut beta_rows = vec![
-        posting("u1", 100, 1),
-        posting("u3", 80, 4),
-        posting("tie-b", 100, 1),
-    ];
-    for doc in 0..300 {
-        let event_uid = format!("bulk-{doc:03}");
-        alpha_rows.push(posting(&event_uid, 100, 1));
-        beta_rows.push(posting(&event_uid, 100, 1));
-    }
-    let postings_by_term = HashMap::<String, Arc<[CachedPostingRow]>>::from([
-        (
-            "alpha".to_string(),
-            Arc::from(alpha_rows.into_boxed_slice()),
-        ),
-        ("beta".to_string(), Arc::from(beta_rows.into_boxed_slice())),
-        (
-            "gamma".to_string(),
-            Arc::from(
-                vec![
-                    posting("u2", 120, 3),
-                    posting("u3", 80, 1),
-                    posting("tie-a", 100, 1),
-                    posting("tie-b", 100, 1),
-                ]
-                .into_boxed_slice(),
-            ),
-        ),
-    ]);
-    let df_by_term = postings_by_term
-        .iter()
-        .map(|(term, rows)| (term.clone(), rows.len() as u64))
-        .collect::<HashMap<_, _>>();
-    let docs = 100_u64;
-    let avgdl = 100.0;
-    let k1 = 1.2;
-    let b = 0.75;
-    let min_should_match = 2;
-
-    let actual = ClickHouseConversationRepository::rank_cached_postings(
-        &terms,
-        &postings_by_term,
-        &df_by_term,
-        docs,
-        avgdl,
-        k1,
-        b,
-        min_should_match,
-        0.0,
-    );
-
-    let mut reference_by_identity = HashMap::<(&str, &str), SearchScoreAccum<'_>>::new();
-    for (idx, term) in terms.iter().enumerate() {
-        let idf = ClickHouseConversationRepository::bm25_idf(docs, df_by_term[term]);
-        for row in postings_by_term[term].iter() {
-            let entry = reference_by_identity
-                .entry((row.source_host.as_str(), row.event_uid.as_str()))
-                .or_insert(SearchScoreAccum {
-                    row,
-                    score: 0.0,
-                    matched_mask: 0,
-                });
-            entry.score += idf
-                * ClickHouseConversationRepository::bm25_term_score(
-                    row.tf,
-                    row.doc_len,
-                    avgdl,
-                    k1,
-                    b,
-                );
-            entry.matched_mask |= 1_u64 << idx;
-        }
-    }
-    let mut expected = reference_by_identity
-        .into_values()
-        .filter_map(|acc| {
-            let matched_terms = u64::from(acc.matched_mask.count_ones());
-            (matched_terms >= u64::from(min_should_match)).then_some(RankedPosting {
-                row: acc.row,
-                score: acc.score,
-                matched_terms,
-            })
-        })
-        .collect::<Vec<_>>();
-    expected.sort_unstable_by(|a, b| {
-        b.score
-            .total_cmp(&a.score)
-            .then_with(|| a.row.event_uid.cmp(&b.row.event_uid))
-            .then_with(|| a.row.source_host.cmp(&b.row.source_host))
-    });
-
-    assert_eq!(actual.len(), expected.len());
-    assert!(actual.len() > 256, "fixture must exercise partial ordering");
-    assert_eq!(
-        expected[255].score, expected[256].score,
-        "fixture must place a score tie across the partial-order boundary"
-    );
-    for (actual, expected) in actual.iter().zip(&expected).take(256) {
-        assert_eq!(actual.row.event_uid, expected.row.event_uid);
-        assert_eq!(actual.matched_terms, expected.matched_terms);
-        assert!(
-            (actual.score - expected.score).abs() < 1e-12,
-            "score mismatch for {}: {} != {}",
-            actual.row.event_uid,
-            actual.score,
-            expected.score
-        );
-    }
-}
-
-#[test]
-fn cached_posting_ranker_keeps_identical_uids_from_different_hosts_distinct() {
-    let terms = vec!["alpha".to_string(), "beta".to_string()];
-    let postings_by_term = HashMap::<String, Arc<[CachedPostingRow]>>::from([
-        (
-            "alpha".to_string(),
-            Arc::from(
-                vec![CachedPostingRow {
-                    source_host: "host-a".to_string(),
-                    event_uid: "shared-uid".to_string(),
-                    doc_len: 2,
-                    tf: 1,
-                }]
-                .into_boxed_slice(),
-            ),
-        ),
-        (
-            "beta".to_string(),
-            Arc::from(
-                vec![CachedPostingRow {
-                    source_host: "host-b".to_string(),
-                    event_uid: "shared-uid".to_string(),
-                    doc_len: 2,
-                    tf: 1,
-                }]
-                .into_boxed_slice(),
-            ),
-        ),
-    ]);
-    let df_by_term = HashMap::from([("alpha".to_string(), 1), ("beta".to_string(), 1)]);
-
-    let ranked = ClickHouseConversationRepository::rank_cached_postings(
-        &terms,
-        &postings_by_term,
-        &df_by_term,
-        2,
-        2.0,
-        1.2,
-        0.75,
-        1,
-        0.0,
-    );
-
-    assert_eq!(ranked.len(), 2);
-    assert_eq!(ranked[0].row.event_uid, "shared-uid");
-    assert_eq!(ranked[1].row.event_uid, "shared-uid");
-    assert_eq!(ranked[0].row.source_host, "host-a");
-    assert_eq!(ranked[1].row.source_host, "host-b");
-    assert_eq!(ranked[0].matched_terms, 1);
-    assert_eq!(ranked[1].matched_terms, 1);
-}
-
-#[test]
 fn bm25_idf_treats_identical_uids_on_two_hosts_as_two_documents() {
     let host_qualified = ClickHouseConversationRepository::bm25_idf(2, 2);
     let uid_only_bug = ClickHouseConversationRepository::bm25_idf(2, 1);
@@ -1172,125 +1085,6 @@ fn bm25_idf_treats_identical_uids_on_two_hosts_as_two_documents() {
     assert!((host_qualified - 1.2_f64.ln()).abs() < 1e-12);
     assert!((uid_only_bug - 2.0_f64.ln()).abs() < 1e-12);
     assert!(host_qualified < uid_only_bug);
-}
-
-#[test]
-#[ignore = "autoresearch benchmark harness"]
-fn autoresearch_retrieval_benchmark() {
-    const DOCS: usize = 65_536;
-    const TERM_COUNT: usize = 8;
-    const SERIAL_BATCH: usize = 20;
-    const SERIAL_SAMPLES: usize = 9;
-    const CONCURRENT_THREADS: usize = 4;
-    const CONCURRENT_BATCH: usize = 10;
-    const CONCURRENT_SAMPLES: usize = 7;
-
-    let terms = (0..TERM_COUNT)
-        .map(|term| format!("term-{term}"))
-        .collect::<Vec<_>>();
-    let postings_by_term = terms
-        .iter()
-        .enumerate()
-        .map(|(term_index, term)| {
-            let rows = (0..DOCS)
-                .filter_map(|doc| {
-                    let mixed = (doc as u64)
-                        .wrapping_mul(0x9e37_79b9_7f4a_7c15)
-                        .rotate_left((term_index * 7) as u32)
-                        ^ (term_index as u64).wrapping_mul(0xd6e8_feb8_6659_fd93);
-                    mixed.is_multiple_of(5).then(|| CachedPostingRow {
-                        source_host: "host-a".to_string(),
-                        event_uid: format!("event-{doc:05}"),
-                        doc_len: 64 + (mixed % 448) as u32,
-                        tf: 1 + ((mixed >> 11) % 7) as u16,
-                    })
-                })
-                .collect::<Vec<_>>();
-            (term.clone(), Arc::from(rows.into_boxed_slice()))
-        })
-        .collect::<HashMap<String, Arc<[CachedPostingRow]>>>();
-    let df_by_term = postings_by_term
-        .iter()
-        .map(|(term, rows)| (term.clone(), rows.len() as u64))
-        .collect::<HashMap<_, _>>();
-
-    let rank_once = || {
-        ClickHouseConversationRepository::rank_cached_postings(
-            &terms,
-            &postings_by_term,
-            &df_by_term,
-            DOCS as u64,
-            256.0,
-            1.2,
-            0.75,
-            2,
-            0.0,
-        )
-    };
-    let expected = rank_once();
-    assert!(expected.len() > 256, "benchmark corpus is too small");
-    let expected_len = expected.len();
-    let expected_first = expected[0].row.event_uid.as_str();
-
-    for _ in 0..3 {
-        let ranked = std::hint::black_box(rank_once());
-        assert_eq!(ranked.len(), expected_len);
-        assert_eq!(ranked[0].row.event_uid, expected_first);
-    }
-
-    let mut serial_samples = Vec::with_capacity(SERIAL_SAMPLES);
-    for _ in 0..SERIAL_SAMPLES {
-        let started = Instant::now();
-        let mut observed = 0_usize;
-        for _ in 0..SERIAL_BATCH {
-            let ranked = std::hint::black_box(rank_once());
-            observed ^= ranked.len();
-            observed ^= ranked[0].row.event_uid.len();
-        }
-        std::hint::black_box(observed);
-        serial_samples.push(started.elapsed().as_nanos() as u64 / SERIAL_BATCH as u64);
-    }
-    serial_samples.sort_unstable();
-    let serial_ns = serial_samples[SERIAL_SAMPLES / 2];
-
-    let mut concurrent_samples = Vec::with_capacity(CONCURRENT_SAMPLES);
-    for _ in 0..CONCURRENT_SAMPLES {
-        let started = Instant::now();
-        std::thread::scope(|scope| {
-            let handles = (0..CONCURRENT_THREADS)
-                .map(|_| {
-                    scope.spawn(|| {
-                        let mut observed = 0_usize;
-                        for _ in 0..CONCURRENT_BATCH {
-                            let ranked = std::hint::black_box(rank_once());
-                            observed ^= ranked.len();
-                            observed ^= ranked[0].row.event_uid.len();
-                        }
-                        observed
-                    })
-                })
-                .collect::<Vec<_>>();
-            for handle in handles {
-                std::hint::black_box(handle.join().expect("benchmark worker panicked"));
-            }
-        });
-        let query_count = CONCURRENT_THREADS * CONCURRENT_BATCH;
-        concurrent_samples.push(started.elapsed().as_nanos() as u64 / query_count as u64);
-    }
-    concurrent_samples.sort_unstable();
-    let concurrent_ns = concurrent_samples[CONCURRENT_SAMPLES / 2];
-
-    println!("METRIC retrieval_concurrent_ns_per_query={concurrent_ns}");
-    println!("METRIC retrieval_serial_ns_per_query={serial_ns}");
-    println!(
-        "METRIC retrieval_concurrent_qps={:.3}",
-        1_000_000_000.0 / concurrent_ns as f64
-    );
-    println!(
-        "METRIC retrieval_serial_qps={:.3}",
-        1_000_000_000.0 / serial_ns as f64
-    );
-    println!("METRIC retrieval_candidate_count={expected_len}");
 }
 
 // --- issue #600: typed budget-error classification at the repo boundary ---

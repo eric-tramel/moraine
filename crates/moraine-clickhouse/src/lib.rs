@@ -1685,6 +1685,11 @@ pub fn bundled_migrations() -> Vec<Migration> {
             name: "036_canonical_read_indexes.sql",
             sql: include_str!("../../../sql/036_canonical_read_indexes.sql"),
         },
+        Migration {
+            version: "037",
+            name: "037_search_ranking_metadata.sql",
+            sql: include_str!("../../../sql/037_search_ranking_metadata.sql"),
+        },
     ]
 }
 
@@ -3203,6 +3208,65 @@ mod tests {
             sql.matches("INSERT INTO moraine.search_postings").count(),
             1,
             "032 may repair only zero-posting documents, not rebuild the historical corpus"
+        );
+    }
+
+    /// Issue #597 §2.3 / correction C1. The v1 dedup digest was
+    /// `hex(SHA256(mcp_open_events.text_content))` over the FULL projected text
+    /// (the projector copies `events.text_content` verbatim), so 037's digest
+    /// must be taken over the full `text_content` too. Narrowing it to
+    /// `substring(text_content, 1, 65536)` would newly collapse two events that
+    /// differ only past 64 KiB — a silent #539/#565 equivalence change.
+    ///
+    /// MUTATION: replace the expression with the `substring(...)` form and this
+    /// test fails on the `!contains("substring")` assertion.
+    #[test]
+    fn migration_037_digests_full_text_content() {
+        let migration = bundled_migrations()
+            .into_iter()
+            .find(|migration| migration.version == "037")
+            .expect("migration 037 must be registered");
+        let sql = migration.sql;
+
+        let digest_statement = sql
+            .split("ALTER TABLE moraine.search_documents")
+            .find(|statement| statement.contains("ADD COLUMN IF NOT EXISTS text_digest"))
+            .expect("037 must add the text_digest column");
+        assert!(
+            digest_statement
+                .contains("ADD COLUMN IF NOT EXISTS text_digest String MATERIALIZED hex(SHA256(text_content))"),
+            "037 must digest the full text_content: {digest_statement}"
+        );
+        assert!(
+            !digest_statement.contains("substring"),
+            "037 must NOT narrow the digest domain (#539/#565 equivalence): {digest_statement}"
+        );
+        assert!(sql.contains(
+            "ADD COLUMN IF NOT EXISTS payload_phase LowCardinality(String)\n    MATERIALIZED JSONExtractString(payload_json, 'phase')"
+        ));
+        // Purely additive: no drop, no truncate, no view/MV recreation. Checked
+        // against the executable body, with `--` comment lines stripped.
+        let body = sql
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("--"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for forbidden in [
+            "DROP COLUMN",
+            "TRUNCATE",
+            "CREATE MATERIALIZED VIEW",
+            "CREATE VIEW",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "037 must stay additive but contains `{forbidden}`"
+            );
+        }
+        // #603's MATERIALIZE COLUMN prerequisite must stay documented in the
+        // migration body itself, not only in a plan file.
+        assert!(
+            sql.contains("MATERIALIZE COLUMN") && sql.contains("#603"),
+            "037 must name #603's MATERIALIZE COLUMN prerequisite"
         );
     }
 
