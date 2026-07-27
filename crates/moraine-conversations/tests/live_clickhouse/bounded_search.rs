@@ -88,7 +88,17 @@ async fn publish_and_promote(
         .await
         .context("failed to read the open_v2 readiness key")?
     {
-        bail!("canonical backfill completed without publishing open_v2 readiness");
+        // Report the audit's own numbers. Guessing which check withheld
+        // readiness cost two speculative fixes (#613, #614) before this gate
+        // could say what it actually observed.
+        let outcome = clickhouse
+            .core_index_audit_outcome()
+            .await
+            .context("failed to read the core-index audit outcome")?;
+        bail!(
+            "canonical backfill completed without publishing open_v2 readiness; \
+             audit outcome = {outcome:?}"
+        );
     }
     Ok(())
 }
