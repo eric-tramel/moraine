@@ -89,8 +89,9 @@ use crate::domain::{
     SearchEventHit, SearchEventKind, SearchEventsQuery, SearchEventsResult, SearchEventsStats,
     SearchMcpEventHit, SearchMcpEventsQuery, SearchMcpEventsResult, SearchMcpEventsStats,
     SearchStrategyHint, SessionAnalytics, SessionAnalyticsQuery, SessionEventsDirection,
-    SessionEventsQuery, SessionMetadata, SessionOriginScope, SessionStep, SessionTurn, ToolResult,
-    TraceEvent, Turn, TurnListFilter, TurnSummary, WebSearchEvent,
+    SessionEventsQuery, SessionMetadata, SessionOriginScope, SessionSearchQuery,
+    SessionSearchResults, SessionStep, SessionTurn, ToolResult, TraceEvent, Turn, TurnListFilter,
+    TurnSummary, WebSearchEvent,
 };
 use crate::error::{RepoError, RepoResult};
 use crate::repo::ConversationRepository;

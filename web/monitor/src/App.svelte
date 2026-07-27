@@ -6,11 +6,14 @@
   import SessionsPanel from './lib/components/sessions/SessionsPanel.svelte';
   import TopBar from './lib/components/TopBar.svelte';
   import { fetchAnalytics, fetchHealth, fetchStatus } from './lib/api/client';
-  import { fetchSessions } from './lib/api/sessions';
+  import { fetchSessions, searchSessions } from './lib/api/sessions';
   import { FAST_POLL_INTERVAL_MS, SLOW_POLL_INTERVAL_MS } from './lib/constants';
   import { analyticsRangeStore } from './lib/state/monitor';
   import {
+    failedSessionSearch,
     filteredSessionsStore,
+    idleSessionSearch,
+    sessionSearchStore,
     sessionsCursorStore,
     sessionsErrorStore,
     sessionsFilterStore,
@@ -31,6 +34,13 @@
 
   const SESSIONS_POLL_INTERVAL_MS = 30_000;
   const SESSIONS_PAGE_SIZE = 50;
+  /**
+   * Keystroke settle before a search reaches the backend. Every search is a
+   * real BM25 ranking over the whole corpus, so typing must not issue one per
+   * character.
+   */
+  const SEARCH_DEBOUNCE_MS = 250;
+  const SEARCH_RESULT_LIMIT = 25;
 
   /** Whether the reader has paged past page 1. See `refreshSessions`. */
   let sessionsPaged = false;
@@ -51,6 +61,7 @@
   $: sessionsLoadingMore = $sessionsLoadingMoreStore;
   $: sessionsHasMore = $sessionsHasMoreStore;
   $: sessionsError = $sessionsErrorStore;
+  $: sessionSearch = $sessionSearchStore;
 
   // The harness vocabulary is served, not scraped from the loaded page: with a
   // paged feed, options derived from loaded rows would omit every harness whose
@@ -186,14 +197,94 @@
     setTheme(event.detail);
   }
 
+  /**
+   * Whole-corpus search (issue-599 WI-09).
+   *
+   * The search input is no longer a filter over the loaded page — it is a
+   * server-side ranking over every session this backend may serve. A blank
+   * query clears the results back to `null`, which is what returns the panel to
+   * the time-ordered feed; setting `[]` there would render as "nothing matched".
+   */
+  let searchTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Bumped by every search so a late response cannot overwrite a newer one. */
+  let searchGeneration = 0;
+
+  function clearSearch(): void {
+    if (searchTimer !== null) {
+      clearTimeout(searchTimer);
+      searchTimer = null;
+    }
+    searchGeneration += 1;
+    sessionSearchStore.set({ ...idleSessionSearch });
+  }
+
+  async function runSearch(query: string): Promise<void> {
+    const generation = ++searchGeneration;
+    const filter = get(sessionsFilterStore);
+    sessionSearchStore.update((state) => ({
+      ...state,
+      query,
+      loading: true,
+      error: null,
+      errorKind: null,
+    }));
+    try {
+      const page = await searchSessions(query, {
+        limit: SEARCH_RESULT_LIMIT,
+        harness: filter.harness === 'all' ? null : filter.harness,
+      });
+      if (generation !== searchGeneration) return;
+      sessionSearchStore.set({
+        query,
+        results: page.sessions,
+        loading: false,
+        error: null,
+        errorKind: null,
+        truncated: page.truncated,
+        hitsTruncated: page.hitsTruncated,
+        incomplete: page.incomplete,
+        dropped: page.dropped,
+      });
+    } catch (error) {
+      if (generation !== searchGeneration) return;
+      // No fallback to a local filter: answering a failed search with a
+      // page-local title match would report a subset of one page as the
+      // corpus-wide answer. `failedSessionSearch` owns what a failure looks
+      // like — in particular that `results` stays `null` — so the rule is
+      // testable rather than living in this `catch`.
+      sessionSearchStore.set(failedSessionSearch(query, error));
+    }
+  }
+
+  function scheduleSearch(query: string): void {
+    if (searchTimer !== null) {
+      clearTimeout(searchTimer);
+    }
+    searchTimer = setTimeout(() => {
+      searchTimer = null;
+      void runSearch(query);
+    }, SEARCH_DEBOUNCE_MS);
+  }
+
   function handleFilterChange(event: CustomEvent<SessionsFilter>): void {
     const previous = get(sessionsFilterStore);
-    sessionsFilterStore.set(event.detail);
+    const next = event.detail;
+    sessionsFilterStore.set(next);
+
+    const query = next.query.trim();
+    const harnessChanged = previous.harness !== next.harness;
     // `harness` narrows the query the server runs, so it cannot be answered
     // from the loaded pages alone: changing it restarts the feed from page 1.
-    // `status` and `query` are page-local and need no round trip.
-    if (previous.harness !== event.detail.harness) {
+    // `status` is the only control still answered locally.
+    if (harnessChanged) {
       void loadSessions();
+    }
+    if (query === '') {
+      clearSearch();
+    } else if (previous.query.trim() !== query || harnessChanged) {
+      // A harness change re-runs the active search too: the server applies it,
+      // so the previous results answer a different question.
+      scheduleSearch(query);
     }
   }
 
@@ -219,6 +310,10 @@
       window.clearInterval(fastInterval);
       window.clearInterval(slowInterval);
       window.clearInterval(sessionsInterval);
+      if (searchTimer !== null) {
+        clearTimeout(searchTimer);
+        searchTimer = null;
+      }
     };
   });
 </script>
@@ -246,6 +341,7 @@
       loadingMore={sessionsLoadingMore}
       hasMore={sessionsHasMore}
       errorMessage={sessionsError}
+      search={sessionSearch}
       on:filterChange={handleFilterChange}
       on:loadMore={loadMoreSessions}
     />

@@ -483,12 +483,14 @@ async fn list_sessions_semantics_are_identical_on_both_paths() {
         // session set and on every per-item field.
         //
         // The CURSOR is deliberately excluded from that comparison and asserted
-        // to differ instead. The two paths anchor on different values — the
-        // header path on the projector's exact aggregate, the directory path on
-        // the live-generation `max_observed_event_time` it also reports — so a
-        // token is only meaningful to the path that minted it. Comparing the
-        // tokens for equality would re-assert the false premise this test used
-        // to carry, and would fail the moment the anchors legitimately diverge.
+        // to differ instead. Each path anchors on the `updated_at` IT reports,
+        // and those come from different relations — the header path from the
+        // projector's exact aggregate, the directory path from the
+        // live-generation `max_observed_event_time` — so a token is only
+        // meaningful to the path that minted it. Comparing the tokens for
+        // equality would re-assert the false premise this test used to carry,
+        // and would fail the moment the two relations legitimately diverge (the
+        // fixture holds them equal, which is the ordinary corpus).
         let (reference_path, reference) = &pages[0];
         for (path, page) in &pages[1..] {
             assert_eq!(
@@ -761,40 +763,29 @@ async fn list_mcp_sessions_directory_page_never_prefilters_mcp_internal_mode() {
     .await;
 }
 
-/// One Phase-A candidate row.
-/// Render a millisecond instant the way ClickHouse renders `DateTime64(3)`.
-fn format_directory_display_time(unix_ms: i64) -> String {
-    let secs = unix_ms.div_euclid(1_000);
-    let millis = unix_ms.rem_euclid(1_000);
-    let days = secs.div_euclid(86_400);
-    let time_of_day = secs.rem_euclid(86_400);
-    // 1970-01-01 + `days`, via the civil-from-days algorithm.
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    format!(
-        "{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02}.{millis:03}",
-        time_of_day / 3_600,
-        (time_of_day % 3_600) / 60,
-        time_of_day % 60
-    )
+/// The directory display form paired with [`candidate_row`]'s default keyset,
+/// for candidates whose RENDERING is not what the test is about.
+const CANDIDATE_DISPLAY_TIME: &str = "2026-01-01 10:10:00";
+
+/// One directory candidate row. Content-free and time-free apart from the
+/// keyset: `cand_last_ms` is what the page orders by, keysets on, mints its
+/// cursor from AND reports, and `cand_last_time` is that same value's display
+/// form from the same aggregate.
+fn candidate_row(session_id: &str, cand_last_ms: i64) -> serde_json::Value {
+    candidate_row_at(session_id, cand_last_ms, CANDIDATE_DISPLAY_TIME)
 }
 
-fn candidate_row(session_id: &str, cand_last_ms: i64) -> serde_json::Value {
-    // `cand_last_time` is the display form of the same instant: the directory
-    // path orders by `cand_last_ms` and reports its display form, so a fixture
-    // that let them describe different instants would not model the real row.
+/// [`candidate_row`] with the two halves of the keyset paired explicitly, for
+/// the tests that assert WHICH statement a rendered timestamp came from.
+fn candidate_row_at(
+    session_id: &str,
+    cand_last_ms: i64,
+    cand_last_time: &str,
+) -> serde_json::Value {
     json!({
         "session_id": session_id,
         "cand_last_ms": cand_last_ms,
-        "cand_last_time": format_directory_display_time(cand_last_ms),
+        "cand_last_time": cand_last_time,
     })
 }
 
@@ -880,10 +871,17 @@ async fn list_mcp_sessions_directory_page_rechecks_origin_scope_against_the_hydr
 async fn list_mcp_sessions_directory_page_orders_and_anchors_on_the_directory_keyset() {
     scoped(async {
         // The directory aggregate and the hydrated aggregate are different
-        // numbers whenever an event version has been superseded. Ordering and
-        // the cursor MUST use the directory value — it is the only one the next
-        // page's `HAVING` can compare against — and the item REPORTS that same
-        // directory value, so the page is sorted by the field it returns (B1).
+        // numbers whenever an event version has been superseded, and ONE of
+        // them is this operation's `updated_at` (issue-599 B1):
+        //
+        // * ORDERING, the CURSOR and the ITEM all read the directory value. It
+        //   is the only one the next page's `HAVING` can compare against, so
+        //   anchoring on anything else skips every session whose aggregate
+        //   falls between — and the published contract says the response is
+        //   sorted by the `updated_at` it reports, which is only true if the
+        //   two are the same number.
+        // * The hydrated value stays internal: Phase C re-filters the requested
+        //   window against it, and nothing renders it.
         //
         // sess-p: directory 1_767_400_000_000, exact 1_767_300_000_000
         // sess-q: directory 1_767_350_000_000, exact 1_767_350_000_000
@@ -892,8 +890,8 @@ async fn list_mcp_sessions_directory_page_orders_and_anchors_on_the_directory_ke
             let mut responses = vec![ScriptedResponse::rows(
                 &["FROM `moraine`.`mcp_session_directory` AS d", "LIMIT 16"],
                 json!([
-                    candidate_row("sess-p", 1_767_400_000_000_i64),
-                    candidate_row("sess-q", 1_767_350_000_000_i64),
+                    candidate_row_at("sess-p", 1_767_400_000_000_i64, "2026-01-02 22:26:40.000"),
+                    candidate_row_at("sess-q", 1_767_350_000_000_i64, "2026-01-02 08:33:20.000"),
                 ]),
             )];
             responses.extend(hydration_script(
@@ -927,14 +925,33 @@ async fn list_mcp_sessions_directory_page_orders_and_anchors_on_the_directory_ke
             page.items[0].session_id, "sess-p",
             "survivors must be ordered by the directory keyset, not the hydrated timestamp"
         );
-        // B1: the response reports the value the page was ORDERED and KEYSET
-        // by, so it is sorted by the field it returns. sess-p's directory
-        // aggregate (1_767_400_000_000) sits above its hydrated exact value
-        // (1_767_300_000_000) — the re-inserted-event case — and it is the
-        // aggregate that is reported.
+        // The RENDERED timestamp is the directory keyset, in both the millis and
+        // its display form — the value the page is ORDERED and PAGED by, which
+        // is what `docs/mcp-search-interface-spec.md` publishes. sess-p's
+        // directory aggregate (1_767_400_000_000) sits above its hydrated exact
+        // value (1_767_300_000_000), the re-inserted-event case, and the item
+        // reports the former.
+        //
+        // MUTATION: report `totals.last_event_unix_ms` from
+        // `hydrated_session_summary` instead of `keyset.last_unix_ms`. The run
+        // panics FIRST on the order assertion above (`left: "sess-q", right:
+        // "sess-p"`), never reaching this one; neutralise the preceding asserts
+        // and the cursor assertion fails too, minting `sess-q`.
+        //
+        // An earlier revision of this comment claimed the reverse — that the
+        // cursor assertion survives, so the page is "ordered by a number it does
+        // not return". That diagnosis is inverted. Since round 4 the rendered
+        // field IS the sort key and the cursor source, so a mutation moves all
+        // three together: ordering and rendering stay in agreement, on the wrong
+        // value, and the cursor is minted from a number Phase A's `HAVING`
+        // cannot compare against — the page-2 skip this test exists to prevent.
         assert_eq!(
             page.items[0].last_event_unix_ms, 1_767_400_000_000_i64,
-            "the item must report the directory aggregate it was ordered by"
+            "the item must report the value the page is ordered and paged by"
+        );
+        assert_eq!(
+            page.items[0].last_event_time, "2026-01-02 22:26:40.000",
+            "the display form must come from the same directory aggregate as the millis"
         );
 
         let cursor = page.next_cursor.expect("next cursor");
@@ -2409,6 +2426,859 @@ async fn web_feed_propagates_backend_and_json_each_row_decode_errors() {
             }
             assert_script_consumed(&state, 1);
         }
+    })
+    .await;
+}
+
+// ---------------------------------------------------------------------------
+// issue-599 WI-09 — session DISCOVERY BY CONTENT.
+// ---------------------------------------------------------------------------
+
+/// The happy path, end to end through the mock: issue #597's bounded ranking
+/// picks the candidates, the issue-599 hydration and fold turn them into the
+/// SAME summary type the time-ordered feed serves, and ranked order survives.
+#[tokio::test(flavor = "multi_thread")]
+async fn session_search_returns_ranked_summaries_from_the_shared_discovery_fold() {
+    scoped(async {
+        let (repo, _state) = build_directory_repo().await;
+
+        let result = repo
+            .search_session_summaries(SessionSearchQuery {
+                query: "hello world".to_string(),
+                limit: Some(10),
+                ..SessionSearchQuery::default()
+            })
+            .await
+            .expect("whole-corpus session search");
+
+        // `evt-c-42` outranks `evt-a-11` (12.5 vs 7.0), so `sess_c` leads. The
+        // response is session-grained: two ranked EVENTS in two sessions become
+        // two sessions, deduplicated by the session a hit sits in.
+        assert_eq!(
+            result
+                .sessions
+                .iter()
+                .map(|session| session.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["sess_c", "sess_a"],
+        );
+
+        // Every summary field the feed reports is hydrated, not carried from
+        // the ranking row. `total_turns`, `tool_calls` and the title chain only
+        // exist after Phase B.
+        let leader = &result.sessions[0];
+        assert_eq!(leader.total_events, 30);
+        assert_eq!(leader.tool_calls, 6);
+        assert_eq!(leader.title.as_deref(), Some("Session C title"));
+        assert_eq!(leader.session_slug.as_deref(), Some("project-c"));
+        assert_eq!(leader.last_event_unix_ms, 1_767_435_000_000);
+        assert_eq!(leader.last_event_time, "2026-01-03 10:10:00");
+        assert!(!result.incomplete);
+        // Nothing was cut: two ranked sessions for a requested ten, both
+        // hydrated and both disclosed.
+        assert!(!result.truncated);
+        assert!(!result.hits_truncated);
+        assert!(!result.dropped);
+    })
+    .await;
+}
+
+/// **The dedup guard.** Ranking is EVENT grained and a matching session is
+/// normally matched several times. `two_distinct_events_in_one_turn` ranks two
+/// genuinely different events INSIDE `sess_c`, which is the shape every other
+/// fixture lacked — and without which the guard could not fail.
+///
+/// MUTATION: replace `if seen.insert(...) { ranked_session_ids.push(...) }` in
+/// `search_session_summaries_impl` with an unconditional push; `sess_c` is then
+/// returned twice, `result_count` counts hits while claiming to count sessions,
+/// and this fails on the very first assertion.
+#[tokio::test(flavor = "multi_thread")]
+async fn session_search_returns_one_row_per_session_when_a_session_is_hit_twice() {
+    scoped(async {
+        let (repo, _state) = build_repo_with_options(
+            100,
+            MockOptions {
+                open_v2_reader_ready: Some(true),
+                two_distinct_events_in_one_turn: true,
+                ..MockOptions::default()
+            },
+        )
+        .await;
+
+        let result = repo
+            .search_session_summaries(SessionSearchQuery {
+                query: "hello world".to_string(),
+                limit: Some(10),
+                ..SessionSearchQuery::default()
+            })
+            .await
+            .expect("whole-corpus session search");
+
+        assert_eq!(
+            result
+                .sessions
+                .iter()
+                .map(|session| session.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["sess_c"],
+            "two ranked hits inside one session are one result row",
+        );
+        // Two hits collapsed into one session is not "more sessions existed".
+        assert!(!result.truncated);
+        assert!(!result.dropped);
+    })
+    .await;
+}
+
+/// The hit-to-session fan-in the over-fetch exists for, with `limit` set below
+/// the number of ranked HITS: the ranking is asked for `limit x
+/// SESSION_SEARCH_HITS_PER_SESSION` events precisely because several of them
+/// land in one session.
+///
+/// MUTATION: clamp the internal hit budget back to `self.cfg.max_results` —
+/// `session_search_hit_budget(limit).min(max_results)` in
+/// `search_session_summaries_impl` — the shipped shape before this fix. The
+/// fixture's `max_results` is already 1, so the ranking then receives
+/// `n_hits = 1`, sees only `evt-c-42`, and the assertion that the ranking was
+/// asked for MORE hits than the sessions requested fails.
+#[tokio::test(flavor = "multi_thread")]
+async fn session_search_over_fetches_hits_because_hits_cluster_inside_a_session() {
+    scoped(async {
+        // `max_results == 1` is the shape that made the old clamp inert: it is
+        // simultaneously the session limit and the hit ceiling.
+        let (repo, state) = build_repo_with_options(
+            1,
+            MockOptions {
+                open_v2_reader_ready: Some(true),
+                two_distinct_events_in_one_turn: true,
+                ..MockOptions::default()
+            },
+        )
+        .await;
+
+        let result = repo
+            .search_session_summaries(SessionSearchQuery {
+                query: "hello world".to_string(),
+                limit: Some(1),
+                ..SessionSearchQuery::default()
+            })
+            .await
+            .expect("whole-corpus session search");
+
+        assert_eq!(
+            result
+                .sessions
+                .iter()
+                .map(|session| session.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["sess_c"],
+        );
+
+        // The ranking statement's candidate window is `3 x (n_hits + 1)`
+        // (`mcp_candidate_fetch_size`), so the internal hit budget is
+        // observable in the SQL. One session was requested against a backend
+        // whose `max_results` is also 1, and the budget must still be
+        // `1 x SESSION_SEARCH_HITS_PER_SESSION = 4` hits: `3 x (4 + 1) = 15`.
+        // The pre-fix shape clamped the budget to `max_results`, giving
+        // `n_hits = 1` and a window of `3 x (1 + 1) = 6`.
+        let queries = state.queries.lock().expect("queries lock").clone();
+        let ranking = queries
+            .iter()
+            .find(|query| query.contains("FROM term_postings AS p"))
+            .expect("a bounded ranking statement");
+        let window = ranking
+            .rsplit_once("\nLIMIT ")
+            .and_then(|(_, tail)| tail.split_whitespace().next())
+            .and_then(|value| value.parse::<u32>().ok())
+            .expect("a ranking LIMIT");
+        assert_eq!(
+            window, 15,
+            "the internal hit budget must not collapse to the caller-facing `max_results`",
+        );
+    })
+    .await;
+}
+
+/// A ranked session the exact re-check removed is not silently absent. Nothing
+/// refills it, so an answer shorter than `limit` must say it is a strict subset
+/// of what the ranking offered rather than reading as "the corpus holds one".
+///
+/// MUTATION: hard-code `dropped: false` in `search_session_summaries_impl`;
+/// the scoped arm below then claims completeness and this fails.
+#[tokio::test(flavor = "multi_thread")]
+async fn session_search_reports_that_the_exact_recheck_shortened_the_answer() {
+    scoped(async {
+        let query = || SessionSearchQuery {
+            query: "hello world".to_string(),
+            limit: Some(10),
+            ..SessionSearchQuery::default()
+        };
+
+        let (intact_repo, _state) = build_scoped_directory_repo_with_options(
+            &["/repo"],
+            MockOptions {
+                out_of_scope_hydrated_cwd_for_sess_a: false,
+                ..MockOptions::default()
+            },
+        )
+        .await;
+        let intact = intact_repo
+            .search_session_summaries(query())
+            .await
+            .expect("in-scope search");
+        assert_eq!(intact.sessions.len(), 2);
+        assert!(
+            !intact.dropped,
+            "control arm: nothing was removed, so nothing may be reported as removed",
+        );
+
+        let (shortened_repo, _state) = build_scoped_directory_repo_with_options(
+            &["/repo"],
+            MockOptions {
+                out_of_scope_hydrated_cwd_for_sess_a: true,
+                ..MockOptions::default()
+            },
+        )
+        .await;
+        let shortened = shortened_repo
+            .search_session_summaries(query())
+            .await
+            .expect("scoped search");
+        assert_eq!(shortened.sessions.len(), 1);
+        assert!(
+            shortened.dropped,
+            "an answer shortened by the exact re-check must not claim completeness",
+        );
+        // And it is NOT reported as "raise your limit": nothing more would come.
+        assert!(!shortened.truncated);
+    })
+    .await;
+}
+
+/// **The readiness guard.** While the issue-598 canonical read indexes are
+/// unpublished, `mcp_event_navigation` is EMPTY. Hydrating discovery from it
+/// anyway answers every query with `sessions: []` — a confident "the whole
+/// corpus was searched and nothing matched" — at the same moment
+/// `list_mcp_sessions` is still serving those very sessions from the projected
+/// headers. Both discovery surfaces must branch on the same latch.
+///
+/// The fixture models **a store whose backfill has not started**: the canonical
+/// relations are empty for every reader. That is the pre-backfill worst case,
+/// and the shape that makes the branch observable at all. A not-ready store can
+/// also be PARTIALLY backfilled — `open_v2.ready` is published only after the
+/// coverage sweep completes and the overlap audit passes, so rows can be
+/// present while coverage is incomplete — but that regime is out of scope on
+/// both discovery surfaces precisely because both refuse the canonical read
+/// model until the latch flips, rather than reading it and answering short.
+///
+/// MUTATION: delete the `if canonical_ready` branch in
+/// `search_session_summaries_impl` and always call
+/// `hydrate_session_list_chunk`; the mock's canonical relations answer nothing
+/// on a not-ready backend and the first assertion fails.
+#[tokio::test(flavor = "multi_thread")]
+async fn session_search_serves_summaries_while_the_canonical_indexes_are_unpublished() {
+    scoped(async {
+        let (repo, state) = build_repo_with_options(
+            100,
+            MockOptions {
+                open_v2_reader_ready: Some(false),
+                ..MockOptions::default()
+            },
+        )
+        .await;
+
+        let result = repo
+            .search_session_summaries(SessionSearchQuery {
+                query: "hello world".to_string(),
+                limit: Some(10),
+                ..SessionSearchQuery::default()
+            })
+            .await
+            .expect("whole-corpus session search on a not-ready store");
+
+        assert!(
+            !result.sessions.is_empty(),
+            "a not-ready store must serve session summaries, never an empty match set",
+        );
+
+        // The sibling surface answers from the same read model in the same
+        // regime, which is the disagreement this guard exists to prevent.
+        let feed = repo
+            .list_mcp_sessions(
+                McpSessionListFilter {
+                    start_unix_ms: 0,
+                    end_unix_ms: 1_800_000_000_000,
+                    mode: None,
+                    harness: None,
+                    source_name: None,
+                    sort: ConversationListSort::Desc,
+                },
+                PageRequest::default(),
+            )
+            .await
+            .expect("session feed on a not-ready store");
+        assert!(!feed.items.is_empty());
+        for session in &result.sessions {
+            assert!(
+                feed.items
+                    .iter()
+                    .any(|item| item.session_id == session.session_id),
+                "search disclosed {} which the feed does not serve",
+                session.session_id,
+            );
+        }
+
+        let queries = state.queries.lock().expect("queries lock").clone();
+        assert!(
+            queries
+                .iter()
+                .any(|query| query.contains("current_headers AS")),
+            "the fallback must hydrate from the projected headers",
+        );
+        assert!(
+            !queries
+                .iter()
+                .any(|query| query.contains("AS counter_user_messages")),
+            "a not-ready store must not be hydrated from the canonical navigation index",
+        );
+    })
+    .await;
+}
+
+/// The fallback narrows SERVER-SIDE, through the one predicate builder the
+/// projected-header feed uses. A fallback that hydrated unnarrowed rows would
+/// disclose out-of-scope sessions and render sessions under a harness the
+/// caller did not ask for.
+///
+/// MUTATION: stop threading `harness` / `source_name` into
+/// `hydrate_session_headers`, or drop the scope clause from
+/// `header_visibility_clauses`; the corresponding assertion below fails.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_projected_header_fallback_narrows_through_the_shared_predicate_builder() {
+    scoped(async {
+        // A `--project-only` backend whose canonical read indexes are not
+        // published: the projected headers are the only read model available.
+        let (repo, state) = build_scoped_repo(&["/repo"]).await;
+
+        repo.search_session_summaries(SessionSearchQuery {
+            query: "hello world".to_string(),
+            limit: Some(10),
+            harness: Some("codex".to_string()),
+            source_name: Some("ci-codex".to_string()),
+            ..SessionSearchQuery::default()
+        })
+        .await
+        .expect("scoped, narrowed search on a not-ready store");
+
+        let queries = state.queries.lock().expect("queries lock").clone();
+        let hydration = queries
+            .iter()
+            .find(|query| query.contains("current_headers AS") && query.contains("s.session_id IN"))
+            .expect("a projected-header hydration statement");
+        assert!(hydration.contains("s.tombstone = 0"));
+        assert!(hydration.contains("notEmpty(trimBoth(s.session_id))"));
+        assert!(hydration.contains("s.origin_cwd = '/repo'"));
+        assert!(hydration.contains("startsWith(s.origin_cwd, '/repo/')"));
+        assert!(hydration.contains("s.harness = 'codex'"));
+        assert!(hydration.contains("s.source = 'ci-codex'"));
+    })
+    .await;
+}
+
+/// **The scope guard, wired.** A ranked hit is not permission to disclose the
+/// session it sits in.
+///
+/// This check is REDUNDANT with issue #597's own Phase 4 re-check, and
+/// deliberately so. Both compute the identical
+/// `ifNull(argMinIf(n.cwd, tuple(n.event_ts, n.event_uid), n.cwd != ''), '')`
+/// over `navigation_live_from()` — `build_session_totals_batch_sql` and
+/// `build_search_candidate_derivation_sql`'s `session_cwd` CTE — and the whole
+/// request is pinned to one publication, so in production the two values are
+/// the same value and cannot disagree. The fold-level check is kept anyway so
+/// that ONE function decides disclosure for BOTH discovery surfaces: a
+/// per-surface copy is a second place for a scope rule to rot, and a scope rule
+/// that rots discloses sessions. The coherent authority for the rule itself is
+/// the unit test `search_never_discloses_a_session_outside_the_configured_scope`.
+///
+/// The fixture below therefore drives an input combination the pinned
+/// publication makes physically unreachable — `/repo` from the derivation arm
+/// and `/elsewhere` from the totals arm inside one request — because that is
+/// the only way to isolate the fold-level guard from the ranking-level one. It
+/// is not a claim that the two relations can disagree.
+///
+/// The in-scope arm runs first and is not decoration: it proves the mock's
+/// totals arm is still matching and still serving `sess_a`, so the scoped arm's
+/// shorter answer can only be the guard.
+///
+/// MUTATION: delete the `if let Some(scope) = session_scope` block in
+/// `ClickHouseConversationRepository::hydrated_session_summary`, or pass `None`
+/// for the scope from `search_session_summaries_impl`; the scoped arm below
+/// then discloses `sess_a` and this fails.
+#[tokio::test(flavor = "multi_thread")]
+async fn session_search_never_discloses_a_session_outside_the_project_scope() {
+    scoped(async {
+        let query = || SessionSearchQuery {
+            query: "hello world".to_string(),
+            limit: Some(10),
+            ..SessionSearchQuery::default()
+        };
+
+        let (in_scope_repo, _state) = build_scoped_directory_repo_with_options(
+            &["/repo"],
+            MockOptions {
+                out_of_scope_hydrated_cwd_for_sess_a: false,
+                ..MockOptions::default()
+            },
+        )
+        .await;
+        let in_scope = in_scope_repo
+            .search_session_summaries(query())
+            .await
+            .expect("in-scope search");
+        assert_eq!(
+            in_scope
+                .sessions
+                .iter()
+                .map(|session| session.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["sess_c", "sess_a"],
+            "control arm: both ranked sessions hydrate inside /repo",
+        );
+
+        let (scoped_repo, _state) = build_scoped_directory_repo_with_options(
+            &["/repo"],
+            MockOptions {
+                out_of_scope_hydrated_cwd_for_sess_a: true,
+                ..MockOptions::default()
+            },
+        )
+        .await;
+        let scoped_result = scoped_repo
+            .search_session_summaries(query())
+            .await
+            .expect("scoped search");
+        assert_eq!(
+            scoped_result
+                .sessions
+                .iter()
+                .map(|session| session.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["sess_c"],
+            "a session whose hydrated origin_cwd is outside the scope must not be disclosed",
+        );
+    })
+    .await;
+}
+
+/// Ranking hydrates snippets, `text_content` and `payload_json` to score and
+/// preview events. None of it may reach a discovery caller — the search
+/// response is the same navigation-scalar-and-label shape the feed proved flat
+/// under 50x fatter transcripts (issue-599 §5.3).
+///
+/// MUTATION: add any content-bearing field to `SessionSearchResults` (or to
+/// `McpSessionListItem`) and populate it from `ranked.hits`; this fails.
+#[tokio::test(flavor = "multi_thread")]
+async fn session_search_results_carry_no_transcript_content() {
+    scoped(async {
+        let (repo, _state) = build_directory_repo().await;
+
+        let result = repo
+            .search_session_summaries(SessionSearchQuery {
+                query: "hello world".to_string(),
+                limit: Some(10),
+                ..SessionSearchQuery::default()
+            })
+            .await
+            .expect("whole-corpus session search");
+        assert!(!result.sessions.is_empty(), "fixture must return sessions");
+
+        // Serialize the whole result and assert on the KEYS, so a future field
+        // cannot smuggle content in under a name this test never heard of.
+        let payload = serde_json::to_value(&result).expect("serializable results");
+        let mut keys = Vec::new();
+        collect_keys(&payload, &mut keys);
+        for forbidden in [
+            "snippet",
+            "text_content",
+            "text_preview",
+            "payload_json",
+            "events",
+            "turns",
+            "hits",
+        ] {
+            assert!(
+                !keys.iter().any(|key| key == forbidden),
+                "search results must not carry {forbidden:?}: {payload}"
+            );
+        }
+
+        // And the corpus fixture's own message bodies, by value.
+        let rendered = payload.to_string();
+        for body in [
+            "best assistant event in session c with extra context",
+            "weaker assistant event in session a with extra context",
+        ] {
+            assert!(
+                !rendered.contains(body),
+                "search results leaked message content {body:?}: {rendered}"
+            );
+        }
+    })
+    .await;
+}
+
+fn collect_keys(value: &serde_json::Value, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, nested) in map {
+                out.push(key.clone());
+                collect_keys(nested, out);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_keys(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// **The cross-surface agreement guard, through REAL hydration (issue-599 B1).**
+///
+/// The two surfaces select different sessions — one by recency, one by
+/// relevance — but for a session BOTH return they must describe it identically.
+/// The monitor derives `status` from `last_event_unix_ms` against a 60 s
+/// activity window, so a disagreement there is not cosmetic: it renders one
+/// session `active` in the feed and `completed` in search, from one store, at
+/// one instant.
+///
+/// The fixture is what gives this test teeth. `directory_aggregate_ahead_of_
+/// hydration_for_sess_a` puts `sess_a`'s Phase-A `cand_last_ms` exactly one
+/// activity window above its hydrated `last_event_unix_ms` — the
+/// re-inserted-event regime, and the only regime in which "which value does the
+/// feed render?" is answerable. With the two equal (every other fixture) this
+/// assertion cannot fail however the code is written.
+///
+/// MUTATION: give the SEARCH arm an `updated_at` of its own again — in
+/// `search_session_summaries_impl`'s canonical arm, replace
+/// `keysets.get(session_id.as_str())?.keyset()` with a `SessionKeyset` built
+/// from `hydrated.get(session_id.as_str())?.totals.last_event_unix_ms`. The
+/// search then reports 1_767_262_200_000 while the feed reports
+/// 1_767_262_260_000 and this fails.
+///
+/// Note the mutation has to be applied to ONE surface: reporting the hydrated
+/// value from the shared fold changes both, they agree again, and this test
+/// stays green while `both_discovery_paths_report_the_directory_keyset_they_page_by`
+/// and `list_mcp_sessions_directory_page_orders_and_anchors_on_the_directory_keyset`
+/// are the ones that catch it.
+#[tokio::test(flavor = "multi_thread")]
+async fn both_discovery_surfaces_describe_one_session_identically() {
+    scoped(async {
+        let (repo, _state) = build_repo_with_options(
+            100,
+            MockOptions {
+                open_v2_reader_ready: Some(true),
+                directory_aggregate_ahead_of_hydration_for_sess_a: true,
+                ..MockOptions::default()
+            },
+        )
+        .await;
+
+        let feed = repo
+            .list_mcp_sessions(
+                McpSessionListFilter {
+                    start_unix_ms: 0,
+                    end_unix_ms: 1_800_000_000_000,
+                    mode: None,
+                    harness: None,
+                    source_name: None,
+                    sort: ConversationListSort::Desc,
+                },
+                PageRequest {
+                    limit: 25,
+                    cursor: None,
+                },
+            )
+            .await
+            .expect("session feed");
+
+        let searched = repo
+            .search_session_summaries(SessionSearchQuery {
+                query: "hello world".to_string(),
+                limit: Some(10),
+                ..SessionSearchQuery::default()
+            })
+            .await
+            .expect("whole-corpus session search");
+
+        let overlap: Vec<(&McpSessionListItem, &McpSessionListItem)> = searched
+            .sessions
+            .iter()
+            .filter_map(|ranked| {
+                feed.items
+                    .iter()
+                    .find(|listed| listed.session_id == ranked.session_id)
+                    .map(|listed| (ranked, listed))
+            })
+            .collect();
+        assert!(
+            overlap
+                .iter()
+                .any(|(ranked, _)| ranked.session_id == "sess_a"),
+            "the fixture must put the skewed session on BOTH surfaces, or this proves nothing",
+        );
+        for (ranked, listed) in overlap {
+            assert_eq!(
+                ranked, listed,
+                "the two discovery surfaces described {} differently",
+                ranked.session_id,
+            );
+        }
+    })
+    .await;
+}
+
+/// **The `dropped` disclosure guard (issue-599 WI-09).**
+///
+/// `dropped` plus `truncated` makes `limit - result_count` an exact count of
+/// what the answer withheld. That is acceptable only because project scope can
+/// never be one of the causes: BOTH ranking arms apply the configured scope
+/// while they are still choosing candidates, so an out-of-scope session never
+/// enters the ranked set and cannot be subtracted from it afterwards. Were it
+/// otherwise, `?q=term&limit=50` on a `--project-only` backend would report an
+/// exact, per-term count of activity outside the caller's scope.
+///
+/// The two arms of this test are the two ways a session can leave the answer:
+///
+/// * scope, removed DURING ranking — the answer is shorter and `dropped` stays
+///   false, because nothing was subtracted after ranking;
+/// * the hydrated-scope re-check, which is defence in depth and physically
+///   unreachable under one pinned publication (see
+///   `session_search_never_discloses_a_session_outside_the_project_scope`), and
+///   is driven here only to show it is not what carries the count.
+///
+/// MUTATION: delete the `if let Some(scope)` block in
+/// `search_mcp_event_page_v2`; `sess_a` then reaches the ranked set, is removed
+/// by the post-hydration re-check instead, and the first arm's
+/// `assert!(!dropped)` fails.
+///
+/// Deleting the `posting_origin_clause` push in `build_search_mcp_events_sql`
+/// does NOT fail this test; an earlier revision of this comment offered it as
+/// an equivalent recipe and it was never executed. That builder is the
+/// pre-cutover projected-header path, while this fixture sets
+/// `open_v2_reader_ready: Some(true)` and therefore issues the canonical v2
+/// statement, which never carries that clause. The v1 clause is guarded —
+/// by `search::search_mcp_events_applies_session_origin_scope`, not here.
+///
+/// That mutation only reaches `dropped` because the first arm ALSO sets
+/// `out_of_scope_hydrated_cwd_for_sess_a`. Without it the ranking mutation is
+/// still observable — `sess_a` gets disclosed and the `assert_eq!` above fails
+/// first — but the run never evaluates the `dropped` assertion, so the bit this
+/// test is named for would be pinned by nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_project_scope_removal_never_reaches_the_dropped_bit() {
+    scoped(async {
+        let query = || SessionSearchQuery {
+            query: "hello world".to_string(),
+            limit: Some(10),
+            ..SessionSearchQuery::default()
+        };
+
+        // Scope removes `sess_a`'s only hit while RANKING. The answer is one
+        // session shorter than the unscoped control…
+        let (ranking_scoped, _state) = build_scoped_directory_repo_with_options(
+            &["/repo"],
+            MockOptions {
+                out_of_scope_cwd_for_second_candidate: true,
+                // Armed but unreachable while ranking does its job: `sess_a`
+                // never gets hydrated, so this cannot affect the answer. It is
+                // what makes the ranking guard's removal show up as `dropped`
+                // rather than as an earlier, different failure.
+                out_of_scope_hydrated_cwd_for_sess_a: true,
+                ..MockOptions::default()
+            },
+        )
+        .await;
+        let ranked_out = ranking_scoped
+            .search_session_summaries(query())
+            .await
+            .expect("scoped search");
+        assert_eq!(
+            ranked_out
+                .sessions
+                .iter()
+                .map(|session| session.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["sess_c"],
+            "an out-of-scope session must not be disclosed",
+        );
+        // …and `dropped` stays clear, so the count of what scope withheld is
+        // not derivable from the envelope.
+        assert!(
+            !ranked_out.dropped,
+            "a scope removal happens before ranking answers and must not be reported as a \
+             post-ranking subtraction",
+        );
+
+        // The post-hydration re-check is what `dropped` reports, and it is a
+        // different input entirely.
+        let (hydration_scoped, _state) = build_scoped_directory_repo_with_options(
+            &["/repo"],
+            MockOptions {
+                out_of_scope_hydrated_cwd_for_sess_a: true,
+                ..MockOptions::default()
+            },
+        )
+        .await;
+        let hydrated_out = hydration_scoped
+            .search_session_summaries(query())
+            .await
+            .expect("scoped search");
+        assert_eq!(hydrated_out.sessions.len(), 1);
+        assert!(hydrated_out.dropped);
+    })
+    .await;
+}
+
+/// **The over-fetch ceiling, at every reachable `limit` REGION (issue-599
+/// WI-09, issue #597 §1).**
+///
+/// The internal hit budget sets the ranking's candidate window — the most
+/// expensive stage of the request — so it is asserted here as the SQL the
+/// request actually issued, not as the arithmetic
+/// `session_search_hit_budget_holds_its_bounds_across_the_whole_reachable_domain`
+/// already pins in a unit test.
+///
+/// The three cases are the three shapes of that function, and `limit = 50` is
+/// the one the previous tests missed entirely — which is exactly where the
+/// previous expression collapsed the fan-in to 1:1 and made `truncated`
+/// unsettable.
+///
+/// MUTATION: delete the `.min(SESSION_SEARCH_HIT_BUDGET_MAX)` clamp in
+/// `session_search_hit_budget`; the `limit = 25` window becomes
+/// `min(3 x 101, 256) = 256` and that case fails.
+/// MUTATION: raise `SESSION_SEARCH_HITS_PER_SESSION` from 4 to 100; the clamp
+/// absorbs it at `limit = 25` and `limit = 50`, but `limit = 1` budgets 50
+/// instead of 4 and its window becomes 153, so the first case fails. Covering
+/// the small-`limit` region is what makes this test see that constant at all —
+/// the single-shape test it replaced could not.
+#[tokio::test(flavor = "multi_thread")]
+async fn session_search_over_fetch_is_bounded_at_every_reachable_limit_region() {
+    scoped(async {
+        // `max_results = 25` is the shipped default (`config/moraine.toml`) and
+        // 25 is what the monitor's search client asks for, so the backend here
+        // is configured wide enough to let every region through and the
+        // per-case `limit` is what varies.
+        for (limit, expected_window, label) in [
+            // budget = min(1 x 4, 50).max(2) = 4; 3 x (4 + 1) = 15.
+            (1_u16, 15_u32, "the 4x fan-in region"),
+            // budget = min(25 x 4, 50).max(37) = 50; 3 x (50 + 1) = 153.
+            (25, 153, "the shipped default shape"),
+            // budget = min(50 x 4, 50).max(75) = 75; 3 x (75 + 1) = 228. The
+            // 1.5x floor, not the ceiling, is what decides this one.
+            (50, 228, "the largest page a caller may ask for"),
+        ] {
+            let (repo, state) = build_repo_with_options(
+                50,
+                MockOptions {
+                    open_v2_reader_ready: Some(true),
+                    ..MockOptions::default()
+                },
+            )
+            .await;
+
+            repo.search_session_summaries(SessionSearchQuery {
+                query: "hello world".to_string(),
+                limit: Some(limit),
+                ..SessionSearchQuery::default()
+            })
+            .await
+            .expect("whole-corpus session search");
+
+            let queries = state.queries.lock().expect("queries lock").clone();
+            let ranking = queries
+                .iter()
+                .find(|query| query.contains("FROM term_postings AS p"))
+                .expect("a bounded ranking statement");
+            let window = ranking
+                .rsplit_once("\nLIMIT ")
+                .and_then(|(_, tail)| tail.split_whitespace().next())
+                .and_then(|value| value.parse::<u32>().ok())
+                .expect("a ranking LIMIT");
+            assert_eq!(
+                window, expected_window,
+                "{label} (limit {limit}): candidate window changed",
+            );
+            assert!(
+                window < 256,
+                "{label} (limit {limit}): must not sit on the hard candidate ceiling: {window}",
+            );
+            // The fan-in is what the window is FOR: a window of `3 x (limit + 1)`
+            // would mean the ranking was asked for exactly `limit` hits, which
+            // bounds the distinct sessions at `limit` and makes
+            // `truncated: ranked_sessions > limit` structurally unsettable.
+            assert!(
+                window > 3 * (u32::from(limit) + 1),
+                "{label} (limit {limit}): the fan-in collapsed to 1:1",
+            );
+        }
+    })
+    .await;
+}
+
+/// **The one-verdict guard (issue-599 WI-09).**
+///
+/// A content search branches on the issue-598 readiness latch TWICE — once to
+/// pick the ranking engine, once to pick the hydration read model — and both
+/// branches must see the SAME verdict. Probing separately costs a second
+/// `mcp_read_index_state` point read on every pre-cutover search, and, because
+/// the latch flips when a backfill publishes, two probes in one request can
+/// disagree: the answer would then be ranked over the `mcp_open_*` projection
+/// and hydrated from the canonical navigation index, a mixed regime nothing
+/// tests and `list_mcp_sessions` cannot produce.
+///
+/// The backend is declared NOT ready on purpose. A positive verdict latches on
+/// first success (`canonical_list_path_ready`), so a second probe would be
+/// served from the latch and this count could not see it.
+///
+/// MUTATION: restore `if self.canonical_list_path_ready().await` inside
+/// `search_mcp_event_page` (or drop `canonical_ready` from
+/// `McpEventRankingOptions`); the count becomes 2 and this fails.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_content_search_resolves_canonical_readiness_exactly_once() {
+    scoped(async {
+        let (repo, state) = build_repo_with_options(
+            100,
+            MockOptions {
+                open_v2_reader_ready: Some(false),
+                ..MockOptions::default()
+            },
+        )
+        .await;
+
+        repo.search_session_summaries(SessionSearchQuery {
+            query: "hello world".to_string(),
+            limit: Some(10),
+            ..SessionSearchQuery::default()
+        })
+        .await
+        .expect("whole-corpus session search on a not-ready store");
+
+        // One logical probe is TWO statements — the `system.tables` existence
+        // check and the state read itself (`ClickHouseClient::read_index_state`)
+        // — so counting the state read alone is what counts VERDICTS.
+        let probes = state
+            .readiness_probe_queries
+            .lock()
+            .expect("readiness probe lock")
+            .iter()
+            .filter(|query| !query.contains("FROM system.tables"))
+            .count();
+        assert_eq!(
+            probes, 1,
+            "ranking and hydration must share one readiness verdict, not probe for one each",
+        );
     })
     .await;
 }

@@ -1,11 +1,33 @@
 <script lang="ts">
   import { createEventDispatcher } from 'svelte';
+  import { sessionCountLabel } from '../../state/sessions';
   import type { SessionsFilter } from '../../types/sessions';
 
   export let filter: SessionsFilter;
   /** The harness vocabulary served by `/api/v1/status`, not scraped from the loaded page. */
   export let harnesses: string[] = [];
+  /** Rows on screen, i.e. AFTER the client-side `status` narrowing. */
   export let count = 0;
+  /**
+   * Rows the SERVER's ranking answered with, before local narrowing; `null`
+   * when no search is in effect.
+   *
+   * This is the population `truncated` / `hitsTruncated` / `incomplete` /
+   * `dropped` all describe, and it is why the count and the qualifier cannot be
+   * derived from the same number.
+   */
+  export let resultCount: number | null = null;
+  export let searchLoading = false;
+  /** A search was attempted and did not answer. Nothing may be counted. */
+  export let searchFailed = false;
+  /** SESSION grain: more ranked sessions existed than the server returned. */
+  export let truncated = false;
+  /** HIT grain: the ranking filled its event-hit budget. */
+  export let hitsTruncated = false;
+  /** The ranking's bounded candidate window was exhausted first (#597 §1.6). */
+  export let incomplete = false;
+  /** The server's exact re-check removed ranked sessions and did not refill. */
+  export let dropped = false;
 
   // The server derives exactly these two (`completed` flag, else the activity
   // window). `cancelled` and `error` were offered here and have never been
@@ -17,17 +39,32 @@
   function update(next: Partial<SessionsFilter>): void {
     dispatch('change', { ...filter, ...next });
   }
+
+  // The label is a pure function in `state/sessions.ts`, not an expression
+  // here: it has to reason about two different populations (rows on screen vs
+  // the server's answer) and that decision deserves a test of its own.
+  $: countLabel = sessionCountLabel({
+    rendered: count,
+    serverResults: resultCount,
+    searchLoading,
+    searchFailed,
+    truncated,
+    hitsTruncated,
+    incomplete,
+    dropped,
+  });
 </script>
 
 <div class="mv-filterbar">
   <div class="mv-search">
     <span class="mv-search-icon" aria-hidden="true">⌕</span>
-    <!-- Honest label: the feed carries no message content, so this narrows the
-         loaded pages by label and id. Whole-corpus search arrives with #597. -->
+    <!-- Whole-corpus search (issue-599 WI-09): the server ranks message content
+         across every session this backend serves, so the label no longer has to
+         confess to being page-local. -->
     <input
       class="mv-search-input"
-      placeholder="Filter loaded sessions by title or id"
-      aria-label="Filter loaded sessions by title or id"
+      placeholder="Search all sessions by content"
+      aria-label="Search all sessions by content"
       value={filter.query}
       on:input={(e) => update({ query: e.currentTarget.value })}
     />
@@ -61,8 +98,6 @@
         </select>
       </label>
     {/if}
-    <!-- "loaded", never "{count} / {total}": the feed is paged and reports no
-         corpus total, so a ratio here would invent a denominator. -->
-    <span class="mv-filter-count mono">{count} loaded</span>
+    <span class="mv-filter-count mono">{countLabel}</span>
   </div>
 </div>

@@ -1,13 +1,96 @@
 use super::canonical_list::{
     candidate_fetch_size, hydration_chunk_size, DirectoryCandidateRow, DirectoryPageParams,
-    HydratedSession, SessionMetaBatchRow, SessionTerminalBatchRow, SessionTotalsBatchRow,
+    HydratedSession, SessionKeyset, SessionKeysetBatchRow, SessionMetaBatchRow,
+    SessionTerminalBatchRow, SessionTotalsBatchRow,
 };
 use super::canonical_open::{list_title_and_summary, total_turns_from_parts, MetaRow};
+use super::search::McpEventRankingOptions;
 use super::*;
 use crate::cursor::{
     ACCEPTED_MCP_SESSION_LIST_CURSOR_VERSIONS, MCP_SESSION_LIST_CURSOR_VERSION_DIRECTORY,
     MCP_SESSION_LIST_CURSOR_VERSION_HEADERS,
 };
+
+/// Sessions returned by a content search when the caller names no `limit`.
+const SESSION_SEARCH_DEFAULT_LIMIT: u16 = 10;
+
+/// Ranked sessions one content search may return, clamped HERE rather than
+/// left to whichever transport called in.
+///
+/// `/api/v1/sessions/search` applies the same bound (`SESSION_SEARCH_MAX_LIMIT`
+/// in `moraine-monitor-core`) and is today the only caller, so this changes no
+/// answer. It is here because every bound below — the hit budget, the fan-in
+/// floor, and therefore the ranking's candidate window — is derived from
+/// `limit`, and a derivation whose safety depends on a constant in another
+/// crate is not a bound, it is a coincidence. With this clamp the whole
+/// reachable domain is `1..=SESSION_SEARCH_MAX_LIMIT` and
+/// [`session_search_hit_budget`]'s invariants can be (and are) asserted over
+/// all of it.
+pub(super) const SESSION_SEARCH_MAX_LIMIT: u16 = 50;
+
+/// Ranked EVENT hits requested per requested SESSION, while
+/// [`SESSION_SEARCH_HIT_BUDGET_MAX`] allows it. Hits cluster inside a session —
+/// a query that matches a session usually matches it several times — so a 1:1
+/// request would return a fraction of the sessions asked for.
+///
+/// This factor is applied to an INTERNAL hit budget that is deliberately not
+/// clamped to the caller-facing `[mcp] max_results`. It used to be, and in
+/// every shipped configuration `max_results` is also the session limit, so the
+/// budget collapsed to exactly `limit` and this constant never did anything.
+/// See [`super::search::McpEventRankingOptions::hit_cap`].
+const SESSION_SEARCH_HITS_PER_SESSION: u16 = 4;
+
+/// Ceiling on the internal hit budget, and the reason the fan-in factor cannot
+/// grow the ranking's cost without bound.
+///
+/// The hit budget sets `unique_fetch_limit`, which sets the ranking's candidate
+/// window through `mcp_candidate_fetch_size` — the most expensive stage of the
+/// whole request. Left as `limit x factor`, the shipped default shape
+/// (`max_results = 25`, a client asking for 25) produced a budget of 100, a
+/// window of `min(3 x 101, 256) = 256`, and therefore pinned the HARD ceiling
+/// [`super::search_canonical::MCP_SEARCH_CANDIDATE_MAX`] on every default
+/// interactive search — 3.3x the pre-fix cost, on the default path, ungated.
+///
+/// `50` is not a fresh magic number: it is the largest `n_hits` the MCP event
+/// search tool itself accepts (`n_hits must be between 1 and 50`), so an
+/// internal consumer may out-fetch `max_results` but never spends more ranking
+/// budget than the tool path's own documented maximum.
+const SESSION_SEARCH_HIT_BUDGET_MAX: u16 = 50;
+
+/// The internal hit budget for a page of `limit` ranked sessions.
+///
+/// Three shapes, in `limit` order, and the reason for each:
+///
+/// * `limit <= 12` — the full `SESSION_SEARCH_HITS_PER_SESSION` fan-in.
+/// * `13 <= limit <= 33` — [`SESSION_SEARCH_HIT_BUDGET_MAX`] binds and the
+///   effective factor DECAYS as `50 / limit` (4.0 down to 1.52). This is the
+///   deliberate degradation: a bounded ranking cost is worth more than a
+///   constant fan-in, and it is what keeps the shipped default shape
+///   (`limit = 25`) at a candidate window of 153 instead of the hard ceiling.
+/// * `limit >= 34` — the decay would take the factor to 1.0, so a FLOOR of
+///   `1.5x` takes over. That floor is not cosmetic: the budget must exceed
+///   `limit`, or `ranked.hits` bounds the distinct sessions at `limit`,
+///   `truncated: ranked_sessions > limit` becomes structurally unsettable, and
+///   the fan-in this function exists for collapses to 1:1 at exactly the
+///   largest page a caller may ask for. `.max(limit + 1)` states that
+///   requirement literally rather than leaving it implied by the arithmetic.
+///
+/// Over the whole reachable domain `1..=SESSION_SEARCH_MAX_LIMIT` this yields a
+/// budget in `4..=75`, always strictly greater than `limit`, and therefore a
+/// candidate window `C = mcp_candidate_fetch_size(budget + 1)` in `15..=228` —
+/// strictly below [`super::search_canonical::MCP_SEARCH_CANDIDATE_MAX`], which
+/// stays a guard against a raised cap rather than a number requests land on.
+/// `session_search_hit_budget_holds_its_bounds_across_the_whole_reachable_domain`
+/// asserts all of it, per `limit`.
+pub(super) fn session_search_hit_budget(limit: u16) -> u16 {
+    // 1.5x, rounded UP so an odd `limit` cannot land just under the floor, and
+    // never below `limit + 1` (which is what 1.5x rounds to at `limit = 1`).
+    let fan_in_floor = (limit.saturating_mul(3).saturating_add(1) / 2).max(limit.saturating_add(1));
+    limit
+        .saturating_mul(SESSION_SEARCH_HITS_PER_SESSION)
+        .min(SESSION_SEARCH_HIT_BUDGET_MAX)
+        .max(fan_in_floor)
+}
 
 impl ClickHouseConversationRepository {
     pub(super) async fn list_conversations_impl(
@@ -162,7 +245,10 @@ FORMAT JSONEachRow",
     /// historical and the operation carries no MCP-specific behavior.
     ///
     /// **Cursor contract (issue-599 §1.2).** The token is a VALUE anchor over
-    /// `(updated_at, session_id)`, not a snapshot. A session that receives
+    /// `(updated_at, session_id)` — the `updated_at` the page ORDERS by and the
+    /// same one it REPORTS, because both are [`SessionKeyset::last_unix_ms`]
+    /// (`docs/mcp-search-interface-spec.md`: "The response is always sorted by
+    /// the `updated_at` it reports"). It is not a snapshot. A session that receives
     /// events while a caller pages moves its `updated_at` ahead of the anchor
     /// and will not be seen again on a later page; restarting from page 1
     /// observes the new order. Unrelated appends never invalidate the cursor.
@@ -317,7 +403,7 @@ FORMAT JSONEachRow",
         // under this filter and keyset.
         let directory_exhausted = candidates.len() < fetch as usize;
 
-        let mut survivors: Vec<SurvivingCandidate> = Vec::new();
+        let mut survivors: Vec<McpSessionListItem> = Vec::new();
         let mut last_resolved: Option<(i64, String)> = None;
         for batch in candidates.chunks(hydration_chunk_size(limit) as usize) {
             if survivors.len() > usize::from(limit) {
@@ -344,14 +430,15 @@ FORMAT JSONEachRow",
         }
 
         // Phase A ordered CANDIDATES; hydration is unordered, so re-establish
-        // the keyset order here — on the directory value Phase A ordered and
-        // filtered by, never on the hydrated timestamp, which the next page's
-        // `HAVING` cannot compare against (see `DirectoryCandidateRow`).
+        // the keyset order here. `last_event_unix_ms` IS the directory value
+        // Phase A ordered and filtered by (`SessionKeyset`), which is what lets
+        // the sort, the cursor and the response all read one field — and what
+        // makes the page sorted by the `updated_at` it reports.
         survivors.sort_by(|a, b| {
             let ordering = a
-                .keyset_ms
-                .cmp(&b.keyset_ms)
-                .then_with(|| a.item.session_id.cmp(&b.item.session_id));
+                .last_event_unix_ms
+                .cmp(&b.last_event_unix_ms)
+                .then_with(|| a.session_id.cmp(&b.session_id));
             match sort {
                 ConversationListSort::Desc => ordering.reverse(),
                 ConversationListSort::Asc => ordering,
@@ -365,10 +452,10 @@ FORMAT JSONEachRow",
             // page dropped are served by the next one.
             survivors
                 .last()
-                .map(|survivor| {
+                .map(|item| {
                     Self::mint_session_list_cursor(
-                        survivor.keyset_ms,
-                        &survivor.item.session_id,
+                        item.last_event_unix_ms,
+                        &item.session_id,
                         filter_sig,
                         sort,
                         MCP_SESSION_LIST_CURSOR_VERSION_DIRECTORY,
@@ -403,12 +490,33 @@ FORMAT JSONEachRow",
         };
 
         Ok(Page {
-            items: survivors
-                .into_iter()
-                .map(|survivor| survivor.item)
-                .collect(),
+            items: survivors,
             next_cursor,
         })
+    }
+
+    /// The directory `updated_at` for a bounded id set a NON-paging selector
+    /// chose, keyed by session id.
+    ///
+    /// The time-ordered page gets this for free from Phase A; content ranking
+    /// has no Phase A and buys it here, so that both surfaces report the value
+    /// the feed also orders and pages by rather than each deriving its own. One
+    /// PK-pruned, content-free statement — see
+    /// [`Self::build_session_keyset_batch_sql`].
+    async fn session_keyset_batch(
+        &self,
+        session_ids: &[String],
+    ) -> RepoResult<HashMap<String, SessionKeysetBatchRow>> {
+        if session_ids.is_empty() {
+            return Ok(HashMap::default());
+        }
+        let sql = self.build_session_keyset_batch_sql(session_ids);
+        let rows: Vec<SessionKeysetBatchRow> =
+            self.map_backend(self.query_rows(&sql, None).await)?;
+        Ok(rows
+            .into_iter()
+            .map(|row| (row.session_id.clone(), row))
+            .collect())
     }
 
     /// Phase B (issue-599 §1.4): three batched statements hydrate the whole
@@ -469,17 +577,268 @@ FORMAT JSONEachRow",
         Ok(hydrated)
     }
 
-    /// Phase C (issue-599 §1.5): re-apply the exact filters to one candidate's
-    /// hydrated values and fold it into a list item, or drop it. The candidate's
-    /// keyset value travels with the item because ordering and cursor minting
-    /// must read it, not the hydrated timestamp.
-    fn session_list_item(
-        candidate: &DirectoryCandidateRow,
+    /// Session DISCOVERY BY CONTENT (issue-599 WI-09).
+    ///
+    /// Candidate selection is issue #597's bounded postings ranking, reached
+    /// through the SAME repository entry point MCP `search_sessions` uses, so
+    /// there is one ranking, one corpus-stats cache and one candidate-budget
+    /// contract rather than a monitor-only copy. Everything after ranking is
+    /// [`Self::list_mcp_sessions_impl`]'s hydration and visibility rules, on
+    /// whichever read model that operation is currently serving — so the two
+    /// discovery surfaces cannot disagree about who may be served, what a
+    /// session is called, or which harness it ran under.
+    ///
+    /// **Readiness is branched on exactly like the sibling list path.** While
+    /// the issue-598 canonical read indexes are unpublished, `mcp_event_navigation`
+    /// is empty and hydrating from it would answer every query with "nothing in
+    /// the corpus matched" — a confident falsehood, served with `ok: true`,
+    /// while `/api/v1/sessions` was still serving the same sessions from the
+    /// projected headers. The not-ready arm hydrates from
+    /// `mcp_open_publication_headers` instead, which is what
+    /// [`Self::list_mcp_sessions_headers`] reads, so session summaries stay
+    /// available throughout the cutover (docs/monitor-http-api.md).
+    ///
+    /// **Readiness is resolved ONCE, at the top, and threaded into both
+    /// stages.** Ranking branches on the latch to pick its engine and hydration
+    /// branches on it to pick its read model. Probing twice costs a second
+    /// `mcp_read_index_state` point read on every pre-cutover search, and — the
+    /// reason that matters — the latch flips when a backfill publishes, so two
+    /// probes in one request can disagree and produce an answer ranked over the
+    /// `mcp_open_*` projection and then hydrated from the canonical navigation
+    /// index. `list_mcp_sessions_impl` branches once and cannot straddle the
+    /// flip; this must not be weaker.
+    ///
+    /// Statement budget: 1 readiness point read (skipped once the latch is
+    /// positive for the process), ranking at most 9 (issue #597 §1), then the
+    /// directory keyset batch + hydration — 4 (directory) or 1 (headers) — so
+    /// at most 14, bounded well inside the Interactive `statement_cap` even at
+    /// `SESSION_SEARCH_MAX_LIMIT`.
+    ///
+    /// Ranking hydrates message text to build snippets. **None of it survives
+    /// this function** — the only thing carried out of `ranked` is the ordered
+    /// list of session ids.
+    pub(super) async fn search_session_summaries_impl(
+        &self,
+        query: SessionSearchQuery,
+    ) -> RepoResult<SessionSearchResults> {
+        let canonical_ready = self.canonical_list_path_ready().await;
+        let max_results = self.cfg.max_results.max(1);
+        // Two clamps: the operation's own documented bound, then the backend's
+        // `max_results`. The first is what makes `limit` — and therefore every
+        // budget derived from it below — bounded by this crate rather than by
+        // whichever transport happened to call in.
+        let limit = query
+            .limit
+            .unwrap_or(SESSION_SEARCH_DEFAULT_LIMIT)
+            .clamp(1, SESSION_SEARCH_MAX_LIMIT)
+            .min(max_results);
+        // Several ranked hits routinely land in one session, so asking the
+        // ranking for exactly `limit` hits answers with far fewer than `limit`
+        // sessions. The over-fetch is an INTERNAL budget and is passed as the
+        // ranking's own ceiling: clamping it to the caller-facing `max_results`
+        // (as this did) makes it inert, because `max_results` is also what
+        // `limit` is clamped to, so the two collapse to the same number in
+        // every shipped configuration.
+        let hit_budget = session_search_hit_budget(limit);
+
+        let ranked = self
+            .search_mcp_events_ranked(
+                SearchMcpEventsQuery {
+                    query: query.query.clone(),
+                    cancellation_token: query.cancellation_token.clone(),
+                    n_hits: Some(hit_budget),
+                    // Whole-corpus by construction: a session or turn scope here
+                    // would make this a within-session search, which is `open`'s
+                    // job, not discovery's.
+                    session_id: None,
+                    turn_seq: None,
+                    event_types: None,
+                    harness: query.harness.clone(),
+                    source_name: query.source_name.clone(),
+                    min_score: None,
+                    min_should_match: None,
+                },
+                McpEventRankingOptions {
+                    hit_cap: hit_budget,
+                    canonical_ready: Some(canonical_ready),
+                },
+            )
+            .await?;
+
+        // Distinct sessions in RANK order: a session's best hit is its rank.
+        // Ranking is EVENT-grained and a matching session is normally matched
+        // several times, so without this a session is rendered once per hit and
+        // `result_count` counts hits while claiming to count sessions.
+        let mut ranked_session_ids: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for hit in &ranked.hits {
+            if hit.session_id.trim().is_empty() {
+                continue;
+            }
+            if seen.insert(hit.session_id.as_str()) {
+                ranked_session_ids.push(hit.session_id.clone());
+            }
+        }
+        let ranked_sessions = ranked_session_ids.len();
+        ranked_session_ids.truncate(usize::from(limit));
+        let considered = ranked_session_ids.len();
+
+        // ONE hydration round, not a chunk loop: `hydration_chunk_size(limit)`
+        // is at least `limit + 1` and the id list is at most `limit`, so the
+        // LIST path's chunking would always produce exactly one batch here.
+        // (LIST needs the loop because its Phase A over-fetches a whole
+        // multi-chunk candidate budget; a ranking hands back at most `limit`.)
+        //
+        // Ranked order is the response order in BOTH arms, so each folds over
+        // the ranked id sequence and not over the (unordered) hydration map.
+        //
+        // The SAME verdict the ranking used, never a fresh probe.
+        let sessions = if canonical_ready {
+            // The directory value FIRST, for the same reason the time-ordered
+            // page derives it first: it is this operation's `updated_at`, and
+            // an id with no row here has no live published generation — the
+            // canonical replacement for the retired `tombstone` column, and
+            // exactly what would keep it out of Phase A on the feed. Dropping
+            // it here is what makes the two surfaces agree about visibility as
+            // well as about the value, and hydration is narrowed to what
+            // survives so no statement pays for a session that cannot be
+            // served.
+            let keysets = self.session_keyset_batch(&ranked_session_ids).await?;
+            let live_ids: Vec<String> = ranked_session_ids
+                .iter()
+                .filter(|session_id| keysets.contains_key(session_id.as_str()))
+                .cloned()
+                .collect();
+            let hydrated = self.hydrate_session_list_chunk(&live_ids).await?;
+            ranked_session_ids
+                .iter()
+                .filter_map(|session_id| {
+                    Self::hydrated_session_summary(
+                        session_id,
+                        keysets.get(session_id.as_str())?.keyset(),
+                        &hydrated,
+                        self.cfg.session_scope.as_ref(),
+                        query.harness.as_deref(),
+                        query.source_name.as_deref(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        } else {
+            let mut headers = self
+                .hydrate_session_headers(
+                    &ranked_session_ids,
+                    query.harness.as_deref(),
+                    query.source_name.as_deref(),
+                )
+                .await?;
+            ranked_session_ids
+                .iter()
+                .filter_map(|session_id| headers.remove(session_id.as_str()))
+                .collect::<Vec<_>>()
+        };
+
+        let bounds = SessionSearchBounds::derive(
+            ranked_sessions,
+            limit,
+            considered,
+            sessions.len(),
+            ranked.truncated,
+        );
+
+        Ok(SessionSearchResults {
+            query_id: ranked.query_id,
+            query: ranked.query,
+            terms: ranked.terms,
+            sessions,
+            truncated: bounds.truncated,
+            hits_truncated: bounds.hits_truncated,
+            incomplete: ranked.incomplete_due_to_candidate_budget,
+            dropped: bounds.dropped,
+        })
+    }
+
+    /// Hydrate a bounded set of session ids from the PROJECTED HEADERS, keyed
+    /// by session id.
+    ///
+    /// The not-ready counterpart to [`Self::hydrate_session_list_chunk`]. One
+    /// statement, and its visibility predicates come from
+    /// [`Self::header_visibility_clauses`] — the same builder
+    /// [`Self::list_mcp_sessions_headers`] uses — so a session the feed would
+    /// serve and a session a search may disclose are decided by one rule set.
+    ///
+    /// An id with no row in the answer was dropped (tombstoned, out of scope,
+    /// wrong harness/source, unpublished); the caller reports that rather than
+    /// silently returning a shorter page.
+    async fn hydrate_session_headers(
+        &self,
+        session_ids: &[String],
+        harness: Option<&str>,
+        source_name: Option<&str>,
+    ) -> RepoResult<HashMap<String, McpSessionListItem>> {
+        if session_ids.is_empty() {
+            return Ok(HashMap::default());
+        }
+        let mut clauses = self.header_visibility_clauses(harness, source_name);
+        clauses.push(format!(
+            "s.session_id IN {}",
+            sql_array_strings(session_ids)
+        ));
+        let sql = self.build_session_headers_sql(
+            &clauses.join("\n  AND "),
+            "s.session_id ASC",
+            session_ids.len(),
+        );
+        let rows: Vec<McpSessionListRow> = self.map_backend(self.query_rows(&sql, None).await)?;
+        Ok(rows
+            .into_iter()
+            .map(|row| (row.session_id.clone(), Self::map_mcp_session_list_row(row)))
+            .collect())
+    }
+
+    /// One hydrated session folded into the summary both discovery paths serve,
+    /// or dropped.
+    ///
+    /// **This is the single authority for who may be served at all, and for
+    /// what a session's facets are, on the canonical read model.** The blank id
+    /// rule, the tombstone rule, the exact project-scope re-check and the exact
+    /// harness/source equality live here and nowhere else, so time-ordered LIST
+    /// and content-ranked SEARCH cannot disagree about a session's visibility
+    /// or about whether it belongs to a requested harness. A second copy would
+    /// be a second place for it to rot — and a scope check that rots discloses
+    /// sessions.
+    ///
+    /// `harness` / `source_name` are re-checked EXACTLY because neither
+    /// candidate pass can decide them. LIST's directory predicate is
+    /// `has(groupUniqArray(harness), …)` over the session's whole history;
+    /// SEARCH's ranking predicate is `p.harness = …` on a single POSTING. The
+    /// summary's own `harness` is `argMax(…)` — the session's LATEST value — so
+    /// both passes admit a session whose current harness differs from the one
+    /// asked for, and rendering it would show a card whose `harness` field
+    /// contradicts the filter that produced it.
+    ///
+    /// **`updated_at` is the caller's [`SessionKeyset`], on BOTH paths, and it
+    /// is a required argument for exactly that reason.** The time-ordered page
+    /// can only ORDER and keyset by the directory aggregate — it is the only
+    /// value its next `HAVING` can compare against — so that is what it
+    /// reports, and a ranked search buys the same value for its winners
+    /// ([`ClickHouseConversationRepository::build_session_keyset_batch_sql`])
+    /// rather than deriving a second one from hydration. Two quantities
+    /// answering "when did this session last have an event" is what made the
+    /// page unsorted by the field it returns AND made one session render two
+    /// ways: `endedAt` drives the monitor's `active`/`completed` derivation, so
+    /// a 60 s difference is a contradiction in words, not in rounding
+    /// (issue-599 B1).
+    ///
+    /// `first_event_*` stays hydrated: nothing orders or pages by it, and the
+    /// exact `FINAL`-deduped lower bound is the better answer for `started_at`.
+    fn hydrated_session_summary(
+        session_id: &str,
+        keyset: SessionKeyset<'_>,
         hydrated: &HashMap<String, HydratedSession>,
-        filter: &McpSessionListFilter,
         session_scope: Option<&SessionOriginScope>,
-    ) -> Option<SurvivingCandidate> {
-        let session_id = candidate.session_id.as_str();
+        harness: Option<&str>,
+        source_name: Option<&str>,
+    ) -> Option<McpSessionListItem> {
         // Belt-and-braces with the SQL guard: a blank session_id never appears,
         // never consumes a LIMIT slot, and never anchors a cursor. mcp-core
         // applies the same `trim().is_empty()` rejection and the two halves
@@ -496,21 +855,15 @@ FORMAT JSONEachRow",
         if totals.total_events == 0 {
             return None;
         }
-        // Both passes are published-filtered (Phase A carries the same
-        // `(host, name, file, generation) IN published` tuple-IN), so this is
-        // not a generation-visibility re-check. It refines the window on the
-        // EXACT hydrated bounds, which can sit inside the directory's
-        // aggregate when a re-inserted event lowered a display time.
-        if totals.last_event_unix_ms < filter.start_unix_ms
-            || totals.first_event_unix_ms >= filter.end_unix_ms
-        {
-            return None;
-        }
-        // Project scope is re-checked EXACTLY here. Phase A's
-        // `argMinIfMerge(origin_cwd_state)` applies the same rule, but merged
-        // over the directory's live-generation rows rather than the
-        // `FINAL`-deduped navigation rows, so it is a recall filter like the
-        // others. Scope decides what a caller may see, so a false positive is
+        // Project scope is re-checked EXACTLY here, against the hydrated
+        // `origin_cwd`. For LIST the candidate pass is the directory's
+        // `argMinIfMerge(origin_cwd_state)`, merged over live-generation rows
+        // rather than the `FINAL`-deduped navigation rows — a genuine recall
+        // filter. For SEARCH the ranking's directory subquery is recall too,
+        // and issue #597's own Phase 4 already re-checks the same value; this
+        // is then redundant with it and kept anyway, so that ONE function
+        // decides disclosure for both surfaces instead of each surface owning
+        // a copy. Scope decides what a caller may see, so a false positive is
         // not acceptable and it does not rest on recall.
         if let Some(scope) = session_scope {
             let cwd = totals.origin_cwd.as_str();
@@ -522,83 +875,96 @@ FORMAT JSONEachRow",
                 return None;
             }
         }
-        // Exact, case-sensitive equality against the hydrated aggregates: the
-        // directory's `mode_hint` / `groupUniqArray` predicates are recall
-        // filters only.
-        if filter.mode.is_some_and(|mode| totals.mode != mode.as_str()) {
+        // Exact, case-sensitive equality against the hydrated aggregates. Both
+        // candidate passes are recall-only here (see the function doc).
+        if harness.is_some_and(|harness| totals.harness != harness) {
             return None;
         }
-        if filter
-            .harness
-            .as_deref()
-            .is_some_and(|harness| totals.harness != harness)
-        {
-            return None;
-        }
-        if filter
-            .source_name
-            .as_deref()
-            .is_some_and(|source_name| totals.source != source_name)
-        {
+        if source_name.is_some_and(|source_name| totals.source != source_name) {
             return None;
         }
 
         let precedence = session.precedence();
         let (title, session_summary) = list_title_and_summary(&totals.source, &precedence);
-        Some(SurvivingCandidate {
-            keyset_ms: candidate.cand_last_ms,
-            item: McpSessionListItem {
-                session_id: session_id.to_string(),
-                first_event_time: totals.first_event_time.clone(),
-                first_event_unix_ms: totals.first_event_unix_ms,
-                // Report the value this page was ORDERED and KEYSET by, not
-                // the hydrated exact one: the published contract sorts by the
-                // `updated_at` the response reports, and Phase A can only
-                // order on the directory aggregate. The two differ only when
-                // an event is re-inserted within one live generation with a
-                // decreased display time — `SimpleAggregateFunction(max)`
-                // cannot retract that, navigation read `FINAL` can — so
-                // `cand_last_ms >= totals.last_event_unix_ms`, equal in every
-                // ordinary case (issue-599 B1).
-                last_event_time: candidate.cand_last_time.clone(),
-                last_event_unix_ms: candidate.cand_last_ms,
-                total_turns: total_turns_from_parts(
-                    totals.total_events,
-                    totals.max_override,
-                    totals.counter_user_messages,
-                ),
-                total_events: totals.total_events,
-                mode: Self::parse_mode(&totals.mode),
-                completed: session.completed,
-                title: non_empty_string(title),
-                source: non_empty_string(totals.source.clone()),
-                harness: non_empty_string(totals.harness.clone()),
-                inference_provider: non_empty_string(totals.inference_provider.clone()),
-                session_slug: non_empty_string(precedence.session_slug),
-                session_summary: non_empty_string(session_summary),
-                tool_calls: totals.tool_calls,
-            },
+        Some(McpSessionListItem {
+            session_id: session_id.to_string(),
+            first_event_time: totals.first_event_time.clone(),
+            first_event_unix_ms: totals.first_event_unix_ms,
+            last_event_time: keyset.last_time.to_string(),
+            last_event_unix_ms: keyset.last_unix_ms,
+            total_turns: total_turns_from_parts(
+                totals.total_events,
+                totals.max_override,
+                totals.counter_user_messages,
+            ),
+            total_events: totals.total_events,
+            mode: Self::parse_mode(&totals.mode),
+            completed: session.completed,
+            title: non_empty_string(title),
+            source: non_empty_string(totals.source.clone()),
+            harness: non_empty_string(totals.harness.clone()),
+            inference_provider: non_empty_string(totals.inference_provider.clone()),
+            session_slug: non_empty_string(precedence.session_slug),
+            session_summary: non_empty_string(session_summary),
+            tool_calls: totals.tool_calls,
         })
     }
 
-    /// The pre-#599 projected-header discovery page, kept behind the
-    /// canonical read-index readiness gate for stores whose issue-598 backfill
-    /// has not published coverage yet.
-    async fn list_mcp_sessions_headers(
-        &self,
+    /// Phase C (issue-599 §1.5): re-apply the exact filters to one candidate's
+    /// hydrated values and fold it into a list item, or drop it. The candidate
+    /// carries the [`SessionKeyset`] the item reports, so ordering, cursor
+    /// minting and rendering all read one number and cannot drift apart.
+    fn session_list_item(
+        candidate: &DirectoryCandidateRow,
+        hydrated: &HashMap<String, HydratedSession>,
         filter: &McpSessionListFilter,
-        filter_sig: String,
-        sort: ConversationListSort,
-        limit: u16,
-        cursor: Option<McpSessionListCursor>,
-    ) -> RepoResult<Page<McpSessionListItem>> {
-        let snapshot = require_active_publication_snapshot("projected MCP session list reads");
-        let headers = self.table_ref("mcp_open_publication_headers");
-        let history = self.table_ref("v_published_source_generation_history");
-        let dirty_sessions = self.table_ref("mcp_open_dirty_sessions");
-        let captured_heads = snapshot.captured_source_heads_sql(&history);
+        session_scope: Option<&SessionOriginScope>,
+    ) -> Option<McpSessionListItem> {
+        let session_id = candidate.session_id.as_str();
+        let item = Self::hydrated_session_summary(
+            session_id,
+            candidate.keyset(),
+            hydrated,
+            session_scope,
+            filter.harness.as_deref(),
+            filter.source_name.as_deref(),
+        )?;
+        let totals = &hydrated.get(session_id)?.totals;
+        // Both passes are published-filtered (Phase A carries the same
+        // `(host, name, file, generation) IN published` tuple-IN), so this is
+        // not a generation-visibility re-check. It refines the window on the
+        // EXACT hydrated bounds, which can sit inside the directory's
+        // aggregate when a re-inserted event lowered a display time.
+        if totals.last_event_unix_ms < filter.start_unix_ms
+            || totals.first_event_unix_ms >= filter.end_unix_ms
+        {
+            return None;
+        }
+        // Exact, case-sensitive equality against the hydrated aggregates: the
+        // directory's `mode_hint` predicate is a recall filter only. Harness and
+        // source are re-checked in the shared fold above, because SEARCH needs
+        // the identical check and a second copy is a second place to rot.
+        if filter.mode.is_some_and(|mode| totals.mode != mode.as_str()) {
+            return None;
+        }
+        Some(item)
+    }
 
-        let mut where_clauses = vec![
+    /// The projected-header VISIBILITY rules, in one place.
+    ///
+    /// This is the header read model's counterpart to
+    /// [`Self::hydrated_session_summary`]. On the headers these values are
+    /// materialized and exact — `origin_cwd`, `harness` and `source` are
+    /// columns, not recall hints — so the rules are enforced in SQL rather than
+    /// re-checked in Rust, which is what the pre-#599 list path has always
+    /// done. Both discovery surfaces build their header predicate from here, so
+    /// one rule set decides who may be served on this read model too.
+    fn header_visibility_clauses(
+        &self,
+        harness: Option<&str>,
+        source_name: Option<&str>,
+    ) -> Vec<String> {
+        let mut clauses = vec![
             // A blank session_id is never a real session (e.g. the orphan
             // Workflow-journal events ingested before #386's exclusion). Drop
             // them here so they never consume a LIMIT slot or anchor the keyset
@@ -607,14 +973,6 @@ FORMAT JSONEachRow",
             // skip agree on what counts as blank.
             "s.tombstone = 0".to_string(),
             "notEmpty(trimBoth(s.session_id))".to_string(),
-            format!(
-                "toUnixTimestamp64Milli(s.last_event_time) >= {}",
-                filter.start_unix_ms
-            ),
-            format!(
-                "toUnixTimestamp64Milli(s.first_event_time) < {}",
-                filter.end_unix_ms
-            ),
         ];
         if let Some(scope) = self.cfg.session_scope.as_ref() {
             let roots = scope
@@ -629,45 +987,39 @@ FORMAT JSONEachRow",
                 })
                 .collect::<Vec<_>>()
                 .join(" OR ");
-            where_clauses.push(format!("({roots})"));
+            clauses.push(format!("({roots})"));
         }
-        if let Some(mode) = filter.mode {
-            where_clauses.push(format!("s.mode = {}", sql_quote(mode.as_str())));
+        if let Some(harness) = harness {
+            clauses.push(format!("s.harness = {}", sql_quote(harness)));
         }
-        if let Some(harness) = filter.harness.as_deref() {
-            where_clauses.push(format!("s.harness = {}", sql_quote(harness)));
+        if let Some(source_name) = source_name {
+            clauses.push(format!("s.source = {}", sql_quote(source_name)));
         }
-        if let Some(source_name) = filter.source_name.as_deref() {
-            where_clauses.push(format!("s.source = {}", sql_quote(source_name)));
-        }
+        clauses
+    }
 
-        if let Some(cursor) = &cursor {
-            let (time_cmp, session_cmp) = match sort {
-                ConversationListSort::Desc => ("<", "<"),
-                ConversationListSort::Asc => (">", ">"),
-            };
-            where_clauses.push(format!(
-                "(toUnixTimestamp64Milli(s.last_event_time) {time_cmp} {} OR (toUnixTimestamp64Milli(s.last_event_time) = {} AND s.session_id {session_cmp} {}))",
-                cursor.last_event_unix_ms,
-                cursor.last_event_unix_ms,
-                sql_quote(&cursor.session_id)
-            ));
-        }
+    /// The projected-header projection, shared by the time-ordered feed and the
+    /// ranked search.
+    ///
+    /// Callers differ only in `where_sql`, `order_sql` and `limit`. Everything
+    /// that decides which header REVISION is current and whether it may be
+    /// served at all — publication source-head authorization, dirty-revision
+    /// fencing, the `LIMIT 1 BY session_id` collapse — is single-sourced here.
+    ///
+    /// Listing is a moving-feed read over the already materialized session
+    /// headers. Source-head authorization pins each candidate to this
+    /// operation's publication snapshot, while the dirty revision prevents a
+    /// header from being served after its canonical session changes. This
+    /// avoids rebuilding all list metadata from the canonical event corpus on
+    /// every page.
+    fn build_session_headers_sql(&self, where_sql: &str, order_sql: &str, limit: usize) -> String {
+        let snapshot = require_active_publication_snapshot("projected MCP session list reads");
+        let headers = self.table_ref("mcp_open_publication_headers");
+        let history = self.table_ref("v_published_source_generation_history");
+        let dirty_sessions = self.table_ref("mcp_open_dirty_sessions");
+        let captured_heads = snapshot.captured_source_heads_sql(&history);
 
-        let where_sql = where_clauses.join("\n  AND ");
-        let order_dir = match sort {
-            ConversationListSort::Desc => "DESC",
-            ConversationListSort::Asc => "ASC",
-        };
-        let limit_plus = (limit as usize) + 1;
-
-        // Listing is a moving-feed read over the already materialized session
-        // headers. Source-head authorization pins each candidate to this
-        // operation's publication snapshot, while the dirty revision prevents a
-        // header from being served after its canonical session changes. This
-        // avoids rebuilding all list metadata from the canonical event corpus on
-        // every page.
-        let query = format!(
+        format!(
             "WITH
   {captured_heads} AS captured_heads,
 current_dirty AS (
@@ -714,15 +1066,61 @@ SELECT
   s.list_session_summary AS session_summary
 FROM current_headers AS s
 WHERE {where_sql}
-ORDER BY s.last_event_time {order_dir}, s.session_id {order_dir}
-LIMIT {limit_plus}
+ORDER BY {order_sql}
+LIMIT {limit}
 FORMAT JSONEachRow",
-            headers = headers,
-            dirty_sessions = dirty_sessions,
-            captured_heads = captured_heads,
-            where_sql = where_sql,
-            order_dir = order_dir,
-            limit_plus = limit_plus,
+        )
+    }
+
+    /// The pre-#599 projected-header discovery page, kept behind the
+    /// canonical read-index readiness gate for stores whose issue-598 backfill
+    /// has not published coverage yet.
+    async fn list_mcp_sessions_headers(
+        &self,
+        filter: &McpSessionListFilter,
+        filter_sig: String,
+        sort: ConversationListSort,
+        limit: u16,
+        cursor: Option<McpSessionListCursor>,
+    ) -> RepoResult<Page<McpSessionListItem>> {
+        let mut where_clauses = self
+            .header_visibility_clauses(filter.harness.as_deref(), filter.source_name.as_deref());
+        where_clauses.push(format!(
+            "toUnixTimestamp64Milli(s.last_event_time) >= {}",
+            filter.start_unix_ms
+        ));
+        where_clauses.push(format!(
+            "toUnixTimestamp64Milli(s.first_event_time) < {}",
+            filter.end_unix_ms
+        ));
+        if let Some(mode) = filter.mode {
+            where_clauses.push(format!("s.mode = {}", sql_quote(mode.as_str())));
+        }
+
+        if let Some(cursor) = &cursor {
+            let (time_cmp, session_cmp) = match sort {
+                ConversationListSort::Desc => ("<", "<"),
+                ConversationListSort::Asc => (">", ">"),
+            };
+            where_clauses.push(format!(
+                "(toUnixTimestamp64Milli(s.last_event_time) {time_cmp} {} OR (toUnixTimestamp64Milli(s.last_event_time) = {} AND s.session_id {session_cmp} {}))",
+                cursor.last_event_unix_ms,
+                cursor.last_event_unix_ms,
+                sql_quote(&cursor.session_id)
+            ));
+        }
+
+        let where_sql = where_clauses.join("\n  AND ");
+        let order_dir = match sort {
+            ConversationListSort::Desc => "DESC",
+            ConversationListSort::Asc => "ASC",
+        };
+        let limit_plus = (limit as usize) + 1;
+
+        let query = self.build_session_headers_sql(
+            &where_sql,
+            &format!("s.last_event_time {order_dir}, s.session_id {order_dir}"),
+            limit_plus,
         );
 
         let rows: Vec<McpSessionListRow> = self.map_backend(self.query_rows(&query, None).await)?;
@@ -993,12 +1391,512 @@ FORMAT JSONEachRow",
     }
 }
 
-/// A Phase-A candidate that survived Phase C, paired with the directory keyset
-/// value it was selected by. `keyset_ms` — not `item.last_event_unix_ms` —
-/// orders the page and mints the continuation cursor, because it is the only
-/// value the next page's Phase A can filter on
-/// ([`DirectoryCandidateRow::cand_last_ms`]).
-struct SurvivingCandidate {
-    keyset_ms: i64,
-    item: McpSessionListItem,
+/// The bounded-answer facts a ranked session page reports, and the ONE place
+/// they are derived (issue-599 WI-09).
+///
+/// They are separate because their causes are separate and so are their
+/// remedies. `incomplete` is not here: it is issue #597's candidate-budget
+/// verdict, propagated verbatim from the ranking with nothing derived from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SessionSearchBounds {
+    /// SESSION grain: the ranking yielded more distinct sessions than `limit`.
+    truncated: bool,
+    /// EVENT grain: the ranking filled its hit budget.
+    hits_truncated: bool,
+    /// The exact post-ranking re-check shortened the answer, unrefilled.
+    ///
+    /// Never a project-scope removal: both ranking arms apply scope while they
+    /// choose candidates, so an out-of-scope session is not in `considered` to
+    /// begin with. See [`crate::domain::SessionSearchResults::dropped`] for why
+    /// that distinction is a disclosure property and not a detail.
+    dropped: bool,
+}
+
+impl SessionSearchBounds {
+    /// * `ranked_sessions` — distinct sessions the ranking yielded, BEFORE the
+    ///   trim to `limit`.
+    /// * `considered` — sessions actually hydrated, i.e.
+    ///   `min(ranked_sessions, limit)`.
+    /// * `disclosed` — sessions that survived the exact re-check.
+    /// * `ranking_hit_truncated` — the ranking's own report, at EVENT grain.
+    ///
+    /// **`truncated` must not absorb `ranking_hit_truncated`.** Ranking is over
+    /// events and hits cluster inside a session, so a term appearing thirty
+    /// times in ONE session fills the hit budget while yielding one session.
+    /// Reporting that as `truncated` tells the reader "more sessions existed
+    /// than `limit` returned, raise `limit`" — advice that returns the same one
+    /// session forever, and a statement about the corpus that is false.
+    fn derive(
+        ranked_sessions: usize,
+        limit: u16,
+        considered: usize,
+        disclosed: usize,
+        ranking_hit_truncated: bool,
+    ) -> Self {
+        Self {
+            truncated: ranked_sessions > usize::from(limit),
+            hits_truncated: ranking_hit_truncated,
+            dropped: disclosed < considered,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn totals(session_id: &str, origin_cwd: &str) -> SessionTotalsBatchRow {
+        SessionTotalsBatchRow {
+            session_id: session_id.to_string(),
+            total_events: 12,
+            tool_calls: 2,
+            max_override: 0,
+            counter_user_messages: 3,
+            first_event_time: "2026-01-01 10:00:00".to_string(),
+            first_event_unix_ms: 1_767_261_600_000,
+            last_event_unix_ms: 1_767_262_200_000,
+            origin_cwd: origin_cwd.to_string(),
+            source: "codex".to_string(),
+            harness: "codex".to_string(),
+            inference_provider: "openai".to_string(),
+            omp_dispatch_title: String::new(),
+            mode: "tool_calling".to_string(),
+        }
+    }
+
+    fn hydrated(rows: Vec<SessionTotalsBatchRow>) -> HashMap<String, HydratedSession> {
+        rows.into_iter()
+            .map(|totals| {
+                (
+                    totals.session_id.clone(),
+                    HydratedSession {
+                        totals,
+                        metadata: Vec::new(),
+                        completed: false,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn scope(roots: &[&str]) -> Option<SessionOriginScope> {
+        SessionOriginScope::from_roots(roots.iter().copied())
+    }
+
+    /// The directory `updated_at` every fixture session carries, and its
+    /// display form. The SEARCH arm buys it with
+    /// `build_session_keyset_batch_sql`; the LIST arm gets it from Phase A.
+    const KEYSET_MS: i64 = 1_767_262_260_000;
+    const KEYSET_TIME: &str = "2026-01-01 10:11:00";
+
+    fn keyset() -> SessionKeyset<'static> {
+        SessionKeyset {
+            last_unix_ms: KEYSET_MS,
+            last_time: KEYSET_TIME,
+        }
+    }
+
+    /// The SEARCH arm of the shared fold: no time window, no mode.
+    fn searched(
+        session_id: &str,
+        hydrated: &HashMap<String, HydratedSession>,
+        session_scope: Option<&SessionOriginScope>,
+        harness: Option<&str>,
+        source_name: Option<&str>,
+    ) -> Option<McpSessionListItem> {
+        ClickHouseConversationRepository::hydrated_session_summary(
+            session_id,
+            keyset(),
+            hydrated,
+            session_scope,
+            harness,
+            source_name,
+        )
+    }
+
+    fn candidate(session_id: &str) -> DirectoryCandidateRow {
+        DirectoryCandidateRow {
+            session_id: session_id.to_string(),
+            cand_last_ms: KEYSET_MS,
+            cand_last_time: KEYSET_TIME.to_string(),
+        }
+    }
+
+    fn unfiltered_list_filter() -> McpSessionListFilter {
+        McpSessionListFilter {
+            start_unix_ms: 0,
+            end_unix_ms: i64::MAX,
+            mode: None,
+            sort: ConversationListSort::Desc,
+            harness: None,
+            source_name: None,
+        }
+    }
+
+    /// **The scope guard.** A ranked hit is not permission to disclose the
+    /// session it sits in: `--project-only` decides that, and it decides it on
+    /// the hydrated `origin_cwd`, exactly.
+    ///
+    /// The fixture is deliberately mixed rather than all-out-of-scope: an
+    /// in-scope session, a same-prefix-different-directory sibling (the classic
+    /// `startsWith` false positive), a nested child that MUST be kept, and a
+    /// session whose harness recorded no cwd at all. A guard that only dropped
+    /// the obviously-foreign row would still pass an all-out-of-scope fixture.
+    #[test]
+    fn search_never_discloses_a_session_outside_the_configured_scope() {
+        let scope = scope(&["/work/moraine"]);
+        let rows = vec![
+            totals("in-scope-root", "/work/moraine"),
+            totals("in-scope-child", "/work/moraine/crates/x"),
+            // `/work/moraine-other` starts with `/work/moraine` as a STRING but
+            // is a different project.
+            totals("prefix-sibling", "/work/moraine-other"),
+            totals("foreign", "/elsewhere/repo"),
+            // A harness that records no cwd matches no root (issue-599 §4).
+            totals("no-cwd", ""),
+        ];
+        let hydrated = hydrated(rows);
+
+        let disclosed: Vec<String> = [
+            "in-scope-root",
+            "in-scope-child",
+            "prefix-sibling",
+            "foreign",
+            "no-cwd",
+        ]
+        .into_iter()
+        .filter_map(|session_id| searched(session_id, &hydrated, scope.as_ref(), None, None))
+        .map(|item| item.session_id)
+        .collect();
+
+        assert_eq!(disclosed, vec!["in-scope-root", "in-scope-child"]);
+    }
+
+    /// The unscoped backend is the control arm: without it, a fold that dropped
+    /// EVERY session would pass the guard above.
+    #[test]
+    fn an_unscoped_backend_discloses_every_hydrated_session() {
+        let hydrated = hydrated(vec![
+            totals("a", "/work/moraine"),
+            totals("b", "/elsewhere/repo"),
+            totals("c", ""),
+        ]);
+        let disclosed: Vec<String> = ["a", "b", "c"]
+            .into_iter()
+            .filter_map(|session_id| searched(session_id, &hydrated, None, None, None))
+            .map(|item| item.session_id)
+            .collect();
+        assert_eq!(disclosed, vec!["a", "b", "c"]);
+    }
+
+    /// **The facet guard.** `harness` / `source` reach candidate selection as
+    /// recall predicates on relations that are not the summary's own value:
+    /// LIST pushes `has(groupUniqArray(harness), …)` over the session's whole
+    /// history, SEARCH pushes `p.harness = …` on a single POSTING. The summary
+    /// reports `argMax(harness)` — the LATEST value. So both passes admit a
+    /// session that later renders under a different harness, and only the exact
+    /// re-check can drop it.
+    ///
+    /// MUTATION: delete either `is_some_and` block in
+    /// `hydrated_session_summary`; the narrowed arms below then disclose
+    /// `re-harnessed` / `re-sourced` and this fails.
+    #[test]
+    fn both_discovery_paths_drop_a_session_whose_current_facet_differs() {
+        let mut re_harnessed = totals("re-harnessed", "/work/moraine");
+        re_harnessed.harness = "omp".to_string();
+        let mut re_sourced = totals("re-sourced", "/work/moraine");
+        re_sourced.source = "omp".to_string();
+        let hydrated = hydrated(vec![
+            totals("matches", "/work/moraine"),
+            re_harnessed,
+            re_sourced,
+        ]);
+        let ids = ["matches", "re-harnessed", "re-sourced"];
+
+        // Control arm: unnarrowed, every candidate is disclosed, so the arms
+        // below can only be shortened by the re-check.
+        let unnarrowed: Vec<String> = ids
+            .into_iter()
+            .filter_map(|session_id| searched(session_id, &hydrated, None, None, None))
+            .map(|item| item.session_id)
+            .collect();
+        assert_eq!(unnarrowed, ids.to_vec());
+
+        let by_harness: Vec<String> = ids
+            .into_iter()
+            .filter_map(|session_id| searched(session_id, &hydrated, None, Some("codex"), None))
+            .map(|item| item.session_id)
+            .collect();
+        assert_eq!(by_harness, vec!["matches", "re-sourced"]);
+
+        let by_source: Vec<String> = ids
+            .into_iter()
+            .filter_map(|session_id| searched(session_id, &hydrated, None, None, Some("codex")))
+            .map(|item| item.session_id)
+            .collect();
+        assert_eq!(by_source, vec!["matches", "re-harnessed"]);
+
+        // And the time-ordered path answers identically, because it reaches the
+        // same fold rather than owning a copy of the rule.
+        let listed: Vec<String> = ids
+            .into_iter()
+            .filter_map(|session_id| {
+                ClickHouseConversationRepository::session_list_item(
+                    &candidate(session_id),
+                    &hydrated,
+                    &McpSessionListFilter {
+                        harness: Some("codex".to_string()),
+                        ..unfiltered_list_filter()
+                    },
+                    None,
+                )
+            })
+            .map(|item| item.session_id)
+            .collect();
+        assert_eq!(listed, by_harness);
+    }
+
+    /// Every disclosed summary's own `harness` / `source` equals the value the
+    /// request narrowed by. This is the property a reader sees: a card rendered
+    /// `source: "omp"` under `?source=pi` is the defect, whatever produced it.
+    #[test]
+    fn a_narrowed_search_never_renders_a_session_under_another_facet() {
+        let mut drifted = totals("drifted", "/work/moraine");
+        drifted.harness = "omp".to_string();
+        drifted.source = "omp".to_string();
+        let hydrated = hydrated(vec![totals("kept", "/work/moraine"), drifted]);
+
+        for (harness, source_name) in [(Some("codex"), None), (None, Some("codex"))] {
+            let disclosed = ["kept", "drifted"]
+                .into_iter()
+                .filter_map(|session_id| {
+                    searched(session_id, &hydrated, None, harness, source_name)
+                })
+                .collect::<Vec<_>>();
+            assert!(!disclosed.is_empty(), "fixture must disclose something");
+            for item in disclosed {
+                if let Some(harness) = harness {
+                    assert_eq!(item.harness.as_deref(), Some(harness), "{item:?}");
+                }
+                if let Some(source_name) = source_name {
+                    assert_eq!(item.source.as_deref(), Some(source_name), "{item:?}");
+                }
+            }
+        }
+    }
+
+    /// The canonical replacement for the retired `tombstone` column: a session
+    /// with no live navigation rows under the pinned publication has no totals
+    /// row, or a zero-event one, and is not discoverable by either path.
+    #[test]
+    fn a_session_with_no_live_rows_is_not_discoverable() {
+        let mut zeroed = totals("emptied", "/work/moraine");
+        zeroed.total_events = 0;
+        let hydrated = hydrated(vec![zeroed]);
+
+        assert!(searched("emptied", &hydrated, None, None, None).is_none());
+        assert!(searched("never-hydrated", &hydrated, None, None, None).is_none());
+        assert!(searched("   ", &hydrated, None, None, None).is_none());
+    }
+
+    /// **The one-`updated_at` guard (issue-599 B1).** Both discovery paths
+    /// report the DIRECTORY keyset — the value the time-ordered page also
+    /// orders by and mints its cursor from — and neither reports the hydrated
+    /// aggregate.
+    ///
+    /// The fixture's keyset is deliberately 60 s ahead of the hydrated value —
+    /// exactly the monitor's activity window — because that is the width at
+    /// which a divergence stops being cosmetic: `monitor_session_json` derives
+    /// `status` from `last_event_unix_ms`, so two surfaces disagreeing by that
+    /// much render one session `active` and `completed` at one instant. With
+    /// the two values equal (every ordinary session) neither half of this test
+    /// could fail however the code were written.
+    ///
+    /// MUTATION: report `totals.last_event_unix_ms` instead of
+    /// `keyset.last_unix_ms` in `hydrated_session_summary`; the first block
+    /// fails.
+    #[test]
+    fn both_discovery_paths_report_the_directory_keyset_they_page_by() {
+        let hydrated = hydrated(vec![totals("sess-a", "/work/moraine")]);
+        let filter = unfiltered_list_filter();
+
+        let ranked = searched("sess-a", &hydrated, None, None, None).expect("in-scope session");
+        assert_eq!(ranked.last_event_unix_ms, KEYSET_MS);
+        assert_eq!(ranked.last_event_time, KEYSET_TIME);
+        // The hydrated aggregate is a DIFFERENT number, and is not what either
+        // surface reports.
+        assert_ne!(ranked.last_event_unix_ms, 1_767_262_200_000);
+        // `started_at` still comes from hydration: nothing orders or pages by
+        // it, and the exact `FINAL`-deduped bound is the better answer.
+        assert_eq!(ranked.first_event_unix_ms, 1_767_261_600_000);
+
+        let listed = ClickHouseConversationRepository::session_list_item(
+            &candidate("sess-a"),
+            &hydrated,
+            &filter,
+            None,
+        )
+        .expect("surviving candidate");
+        // The listed item is the SAME object the ranked search returns, field
+        // for field. Asserting the whole item, not just the timestamps, is what
+        // stops the next field that gets "adjusted for paging" from
+        // reintroducing the divergence under a different name.
+        assert_eq!(listed, ranked);
+    }
+
+    /// **The hit-budget bounds, over the WHOLE reachable domain.**
+    ///
+    /// `limit` is clamped to `1..=SESSION_SEARCH_MAX_LIMIT` inside
+    /// `search_session_summaries_impl`, so this is not a sample of the input
+    /// space — it is all of it. Each assertion is one of the properties
+    /// `session_search_hit_budget` exists to hold, and the previous shape
+    /// (`.max(limit).min(MAX.max(limit))`) violated two of them at every
+    /// `limit >= 50`: the budget collapsed to exactly `limit`, which makes the
+    /// fan-in 1:1 and `truncated: ranked_sessions > limit` unsettable.
+    ///
+    /// MUTATION: drop the `.max(fan_in_floor)` and the loop panics at
+    /// `limit 34: fan-in 50/34 fell below 1.5x` — the floor assertion, not the
+    /// "must exceed" one, and well before `limit = 50`. Drop the
+    /// `.min(SESSION_SEARCH_HIT_BUDGET_MAX)` instead and it panics at
+    /// `limit 22: window 256 pinned the hard candidate ceiling`, because 22
+    /// already derives `min(3 × 89, 256) = 256`.
+    ///
+    /// Both recipes are stated at the limit where the loop ACTUALLY stops. An
+    /// earlier revision named `limit = 50` for both; the loop never gets there,
+    /// so a contributor checking the stated limit would look in the wrong place.
+    #[test]
+    fn session_search_hit_budget_holds_its_bounds_across_the_whole_reachable_domain() {
+        use super::super::search_canonical::{mcp_candidate_fetch_size, MCP_SEARCH_CANDIDATE_MAX};
+
+        let mut previous = 0;
+        for limit in 1..=SESSION_SEARCH_MAX_LIMIT {
+            let budget = session_search_hit_budget(limit);
+
+            // 1. The budget must EXCEED the session limit, or the ranking's own
+            //    hit ceiling bounds the distinct sessions at `limit` and
+            //    `truncated` can never be set.
+            assert!(
+                budget > limit,
+                "limit {limit}: budget {budget} does not exceed the session limit",
+            );
+            // 2. The fan-in degrades but never collapses: 4x while the ceiling
+            //    allows, and never below 1.5x.
+            assert!(
+                budget * 2 >= limit * 3,
+                "limit {limit}: fan-in {budget}/{limit} fell below 1.5x",
+            );
+            assert!(
+                budget <= limit * SESSION_SEARCH_HITS_PER_SESSION,
+                "limit {limit}: budget {budget} exceeds the {SESSION_SEARCH_HITS_PER_SESSION}x \
+                 fan-in it is derived from",
+            );
+            // 3. Monotone in `limit`: asking for more sessions never buys a
+            //    smaller ranking.
+            assert!(budget >= previous, "limit {limit}: budget went backwards");
+            previous = budget;
+
+            // 4. The derived candidate window stays strictly BELOW the hard
+            //    ceiling, so that constant remains a guard against a raised cap
+            //    rather than the number requests land on.
+            let window = mcp_candidate_fetch_size(budget + 1);
+            assert!(
+                window < MCP_SEARCH_CANDIDATE_MAX,
+                "limit {limit}: window {window} pinned the hard candidate ceiling",
+            );
+        }
+
+        // The three documented shapes, at their boundaries.
+        assert_eq!(session_search_hit_budget(1), 4, "full 4x fan-in");
+        assert_eq!(session_search_hit_budget(12), 48, "last 4x limit");
+        assert_eq!(session_search_hit_budget(13), 50, "the ceiling binds");
+        assert_eq!(session_search_hit_budget(25), 50, "the shipped default");
+        assert_eq!(
+            session_search_hit_budget(33),
+            50,
+            "last ceiling-bound limit"
+        );
+        assert_eq!(
+            session_search_hit_budget(34),
+            51,
+            "the 1.5x floor takes over"
+        );
+        assert_eq!(session_search_hit_budget(50), 75, "the largest page");
+        // …and the windows those derive, which is what the cost actually is.
+        assert_eq!(
+            mcp_candidate_fetch_size(session_search_hit_budget(1) + 1),
+            15
+        );
+        assert_eq!(
+            mcp_candidate_fetch_size(session_search_hit_budget(25) + 1),
+            153
+        );
+        assert_eq!(
+            mcp_candidate_fetch_size(session_search_hit_budget(50) + 1),
+            228
+        );
+    }
+
+    /// **The bounded-answer derivation.** Each fact is asserted through an
+    /// input that sets it and leaves the others clear, so a field wired to a
+    /// neighbour, deleted, or inverted has nowhere to hide.
+    ///
+    /// MUTATION (the shipped defect): restore
+    /// `truncated: ranked_sessions > limit || ranking_hit_truncated`; the
+    /// `one_session_hit_many_times` case then reports `truncated: true` and
+    /// this fails.
+    #[test]
+    fn the_bounded_answer_facts_are_derived_from_independent_causes() {
+        // Everything fitted: two ranked sessions for a requested ten, both
+        // disclosed, hit budget not filled.
+        let complete = SessionSearchBounds::derive(2, 10, 2, 2, false);
+        assert_eq!(
+            complete,
+            SessionSearchBounds {
+                truncated: false,
+                hits_truncated: false,
+                dropped: false,
+            }
+        );
+
+        // SESSION grain: eleven ranked sessions, ten returned.
+        let more_sessions = SessionSearchBounds::derive(11, 10, 10, 10, false);
+        assert!(more_sessions.truncated);
+        assert!(!more_sessions.hits_truncated);
+        assert!(!more_sessions.dropped);
+
+        // HIT grain, and the case the old `||` got wrong: a term appearing
+        // thirty times in ONE session fills the hit budget and yields ONE
+        // session. There is nothing more to return at the session grain, and
+        // raising `limit` returns the same one session forever.
+        let one_session_hit_many_times = SessionSearchBounds::derive(1, 10, 1, 1, true);
+        assert!(
+            !one_session_hit_many_times.truncated,
+            "one ranked session is not 'more sessions existed than limit returned'",
+        );
+        assert!(one_session_hit_many_times.hits_truncated);
+        assert!(!one_session_hit_many_times.dropped);
+
+        // The exact re-check shortened the answer and nothing refilled it.
+        let shortened = SessionSearchBounds::derive(4, 10, 4, 1, false);
+        assert!(shortened.dropped);
+        assert!(!shortened.truncated);
+        assert!(!shortened.hits_truncated);
+
+        // A full page that dropped nothing is not "dropped", even though it is
+        // exactly `limit` long.
+        let exactly_limit = SessionSearchBounds::derive(10, 10, 10, 10, false);
+        assert!(!exactly_limit.dropped);
+        assert!(!exactly_limit.truncated);
+
+        // And the causes compose rather than mask each other.
+        let everything = SessionSearchBounds::derive(11, 10, 10, 3, true);
+        assert_eq!(
+            everything,
+            SessionSearchBounds {
+                truncated: true,
+                hits_truncated: true,
+                dropped: true,
+            }
+        );
+    }
 }

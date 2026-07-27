@@ -49,6 +49,55 @@ pub(super) struct McpSearchPage {
     pub(super) incomplete_due_to_candidate_budget: bool,
 }
 
+/// The two knobs an INTERNAL consumer of the event ranking may set and the
+/// public `search_mcp_events` tool may not.
+///
+/// It is a struct rather than two positional arguments because both are
+/// easy-to-transpose small scalars whose defaults are correct for the tool path
+/// and wrong for the internal one.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct McpEventRankingOptions {
+    /// Ceiling on ranked HITS.
+    ///
+    /// `max_results` bounds *rows a caller may receive*, and a consumer that
+    /// folds many hits into one result row is not bounded by the same number.
+    /// Session discovery by content ranks EVENTS and answers in SESSIONS —
+    /// several hits routinely land in one session — so it must be able to ask
+    /// for more hits than the sessions it returns. Clamping its request to
+    /// `max_results` made the over-fetch inert in every shipped configuration,
+    /// because `max_results` is also the session limit.
+    ///
+    /// It is still bounded, and bounded from BOTH sides rather than by
+    /// `limit x factor` alone: see [`super::list::session_search_hit_budget`],
+    /// which caps the fan-in so the derived candidate window cannot reach
+    /// [`super::search_canonical::MCP_SEARCH_CANDIDATE_MAX`], and floors it
+    /// above `limit` so the fan-in cannot collapse to 1:1 at the largest page.
+    /// `effective_n_hits` stays part of the result cache key, so two callers
+    /// with different ceilings cannot serve each other's windows.
+    pub(super) hit_cap: u16,
+    /// The issue-598 `open_v2` readiness verdict, when the caller has already
+    /// resolved it.
+    ///
+    /// `None` means "probe it" and is right for a request whose only readiness
+    /// branch is the ranking engine. `Some` is required of any caller that
+    /// branches on readiness AGAIN after ranking: a second probe is a second
+    /// point read, and — because the latch flips when a backfill publishes —
+    /// two probes in one request can disagree, ranking over the `mcp_open_*`
+    /// projection and then hydrating from the canonical navigation index.
+    pub(super) canonical_ready: Option<bool>,
+}
+
+impl McpEventRankingOptions {
+    /// The public tool's settings: hits bounded by the rows a caller may
+    /// receive, readiness resolved by the ranking itself.
+    pub(super) fn for_tool_caller(cfg: &RepoConfig) -> Self {
+        Self {
+            hit_cap: cfg.max_results,
+            canonical_ready: None,
+        }
+    }
+}
+
 impl ClickHouseConversationRepository {
     /// Session headers that are authorized by the operation's captured source
     /// heads and by the current canonical session contents.
@@ -1174,6 +1223,12 @@ FORMAT JSONEachRow",
     /// While the canonical read indexes are not published the legacy
     /// projected-header engine still serves; it is deleted wholesale in the
     /// projector-retirement PR.
+    ///
+    /// `canonical_ready` is that latch's verdict, PASSED IN rather than probed
+    /// here: a request whose later stages also branch on readiness must reach
+    /// them with the same verdict this one used, or a backfill publishing
+    /// mid-request produces one answer ranked over the `mcp_open_*` projection
+    /// and hydrated from the canonical navigation index.
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn search_mcp_event_page(
         &self,
@@ -1186,8 +1241,9 @@ FORMAT JSONEachRow",
         min_should_match: u16,
         min_score: f64,
         unique_fetch_limit: u16,
+        canonical_ready: bool,
     ) -> RepoResult<McpSearchPage> {
-        if self.canonical_list_path_ready().await {
+        if canonical_ready {
             return self
                 .search_mcp_event_page_v2(
                     terms,
@@ -3273,10 +3329,30 @@ FORMAT JSONEachRow",
         })
     }
 
+    /// Event-grained MCP search as CALLERS see it: `n_hits` is clamped to the
+    /// caller-facing `[mcp] max_results`, which is the number of RESULT ROWS a
+    /// tool response may contain. Readiness is resolved inside, because this
+    /// request has no earlier stage that already needed the verdict.
     pub(super) async fn search_mcp_events_impl(
         &self,
         query: SearchMcpEventsQuery,
     ) -> RepoResult<SearchMcpEventsResult> {
+        self.search_mcp_events_ranked(query, McpEventRankingOptions::for_tool_caller(&self.cfg))
+            .await
+    }
+
+    /// The ranking with the knobs an INTERNAL consumer may set.
+    ///
+    /// See [`McpEventRankingOptions`] for why each exists. Everything else —
+    /// validation, tokenization, the result cache, the truncation report — is
+    /// the tool path's, unchanged, so an internal consumer cannot drift into a
+    /// second ranking with its own rules.
+    pub(super) async fn search_mcp_events_ranked(
+        &self,
+        query: SearchMcpEventsQuery,
+        options: McpEventRankingOptions,
+    ) -> RepoResult<SearchMcpEventsResult> {
+        let hit_cap = options.hit_cap.max(1);
         let query_text = query.query.trim();
         if query_text.is_empty() {
             return Err(RepoError::invalid_argument("query cannot be empty"));
@@ -3314,7 +3390,7 @@ FORMAT JSONEachRow",
         let event_types = Self::normalize_mcp_event_types(query.event_types)?;
 
         let requested_n_hits = query.n_hits.unwrap_or(10).max(1);
-        let effective_n_hits = requested_n_hits.min(self.cfg.max_results);
+        let effective_n_hits = requested_n_hits.min(hit_cap);
         let limit_capped = requested_n_hits > effective_n_hits;
         let unique_fetch_limit = effective_n_hits.saturating_add(1);
 
@@ -3367,6 +3443,17 @@ FORMAT JSONEachRow",
                     false,
                 )
             } else {
+                // Resolved HERE and not one frame down, so that a caller which
+                // already needed the verdict for a later stage pays for one
+                // point read instead of two — and, more importantly, so one
+                // request cannot straddle a mid-request readiness flip by
+                // ranking on one read model and hydrating from the other. A
+                // cache hit skips this entirely, which is why it is not hoisted
+                // above the lookup.
+                let canonical_ready = match options.canonical_ready {
+                    Some(ready) => ready,
+                    None => self.canonical_list_path_ready().await,
+                };
                 let page = self
                     .search_mcp_event_page(
                         &terms,
@@ -3378,6 +3465,7 @@ FORMAT JSONEachRow",
                         min_should_match,
                         min_score,
                         unique_fetch_limit,
+                        canonical_ready,
                     )
                     .await?;
                 let McpSearchPage {

@@ -134,6 +134,21 @@ impl ConversationRepository for ClickHouseConversationRepository {
         .await
     }
 
+    async fn search_session_summaries(
+        &self,
+        query: SessionSearchQuery,
+    ) -> RepoResult<SessionSearchResults> {
+        // Same read class as the two operations it is composed of
+        // (`search_mcp_events` and `list_mcp_sessions`): a corpus-wide ranking
+        // has no single anchored session, and pinning the whole request to one
+        // publication snapshot is what keeps the ranking pass and the hydration
+        // pass describing the same store.
+        self.run_publication_consistent(PublicationReadClass::MovingFeed, || {
+            self.search_session_summaries_impl(query.clone())
+        })
+        .await
+    }
+
     async fn list_turns(
         &self,
         session_id: &str,

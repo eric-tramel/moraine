@@ -6,9 +6,9 @@ use moraine_conversations::{
     McpSessionListFilter, McpSessionListItem, McpSessionOpen, McpTurnOpen, OpenContext,
     OpenEventRequest, Page, PageRequest, RepoConfig, RepoResult, SearchEventsQuery,
     SearchEventsResult, SearchMcpEventsQuery, SearchMcpEventsResult, SessionAnalytics,
-    SessionAnalyticsQuery, SessionEventsQuery, SessionMetadata, StoreDiagnostics, StoreHealth,
-    TablePreview, TablePreviewQuery, TableSummaries, TraceEvent, Turn, TurnListFilter, TurnSummary,
-    WebSearchEvent,
+    SessionAnalyticsQuery, SessionEventsQuery, SessionMetadata, SessionSearchQuery,
+    SessionSearchResults, StoreDiagnostics, StoreHealth, TablePreview, TablePreviewQuery,
+    TableSummaries, TraceEvent, Turn, TurnListFilter, TurnSummary, WebSearchEvent,
 };
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use tokio::io::{AsyncWriteExt, ReadHalf, WriteHalf};
@@ -198,6 +198,13 @@ impl ConversationRepository for BlockingRepository {
             self.block_forever().await
         }
         self.inner.list_mcp_sessions(filter, page).await
+    }
+
+    async fn search_session_summaries(
+        &self,
+        query: SessionSearchQuery,
+    ) -> RepoResult<SessionSearchResults> {
+        self.inner.search_session_summaries(query).await
     }
 
     async fn list_turns(
