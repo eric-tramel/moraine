@@ -16,7 +16,8 @@ use crate::domain::{
     McpSessionListFilter, McpSessionListItem, McpSessionOpen, McpTurnOpen, OpenContext,
     OpenEventRequest, Page, PageRequest, RepoConfig, SearchEventsQuery, SearchEventsResult,
     SearchEventsStats, SearchMcpEventsQuery, SearchMcpEventsResult, SearchMcpEventsStats,
-    SessionEventsQuery, SessionMetadata, TraceEvent, Turn, TurnListFilter, TurnSummary,
+    SessionEventsQuery, SessionMetadata, SessionSearchQuery, SessionSearchResults, TraceEvent,
+    Turn, TurnListFilter, TurnSummary,
 };
 use crate::error::{RepoError, RepoResult};
 use crate::repo::ConversationRepository;
@@ -42,6 +43,7 @@ pub struct InMemoryConversationResponses {
     /// [`Self::list_mcp_sessions`], so a caller that drops the cursor is served
     /// page 1 again and the overlap is visible to the test.
     pub list_mcp_sessions_by_cursor: BTreeMap<String, RepoResult<Page<McpSessionListItem>>>,
+    pub search_session_summaries: Option<RepoResult<SessionSearchResults>>,
     pub canonical_open_session_page: Option<CanonicalSessionPageResponse>,
     /// A static session traversal: the page served after a given
     /// `after_turn_seq`, with `0` keying the uncursored first page. Takes
@@ -83,6 +85,7 @@ pub struct InMemoryConversationCalls {
     pub get_session_metadata: Vec<String>,
     pub get_mcp_session: Vec<String>,
     pub list_mcp_sessions: Vec<(McpSessionListFilter, PageRequest)>,
+    pub search_session_summaries: Vec<SessionSearchQuery>,
     pub canonical_open_session_page: Vec<(String, u16, Option<CanonicalContinuation>)>,
     pub list_turns: Vec<(String, TurnListFilter, PageRequest)>,
     pub get_turn: Vec<(String, u32)>,
@@ -392,6 +395,30 @@ impl ConversationRepository for InMemoryConversationRepository {
             mutex_lock(&self.minted_session_cursors).insert(next.clone(), filter_sig);
         }
         result
+    }
+
+    async fn search_session_summaries(
+        &self,
+        query: SessionSearchQuery,
+    ) -> RepoResult<SessionSearchResults> {
+        self.record(|calls| calls.search_session_summaries.push(query.clone()));
+        response_or!(
+            self,
+            search_session_summaries,
+            SessionSearchResults {
+                query_id: query
+                    .cancellation_token
+                    .clone()
+                    .unwrap_or_else(|| "in-memory".to_string()),
+                query: query.query.clone(),
+                terms: Vec::new(),
+                sessions: Vec::new(),
+                truncated: false,
+                hits_truncated: false,
+                incomplete: false,
+                dropped: false,
+            }
+        )
     }
 
     async fn list_turns(

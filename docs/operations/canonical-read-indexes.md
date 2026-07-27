@@ -81,6 +81,20 @@ cross-surface switch. As of this build:
   candidate page from `mcp_event_navigation` plus the metadata-bearing `events`
   rows. It reads no `mcp_open_*` relation and no `v_session_summary` /
   `v_conversation_trace` / `v_turn_summary` view.
+  - **Discovery by CONTENT shares the same hydration.** The monitor's
+    `/api/v1/sessions/search` route picks candidates with issue #597's bounded
+    postings ranking and then runs the identical hydration and fold, so the
+    project-scope re-check, the exact `harness`/`source` re-check, the tombstone
+    rule, and the title/summary precedence are single-sourced across both
+    discovery surfaces. Having no keyset page of its own, it also issues one
+    `mcp_session_directory` point-range read over the ids it ranked, so the
+    `updated_at` it reports is the same `max(max_observed_event_time)` the feed
+    orders, pages and renders by rather than a second aggregate of its own —
+    which is what lets both surfaces derive the same `status` for one session at
+    one instant. It branches on the readiness gate below exactly as the
+    feed does and falls back to the same projected headers, so a not-ready store
+    answers a search with the sessions that matched rather than with an empty
+    result set that would read as "the whole corpus was searched".
   - **Readiness gate.** The shared operation selects the directory path only
     when the `open_v2` key reads ready — the same key `open` consults — and
     otherwise serves the pre-#599 `mcp_open_publication_headers` page. The

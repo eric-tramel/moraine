@@ -55,6 +55,33 @@ export interface SessionsResponse {
   code?: string;
 }
 
+/**
+ * `/api/v1/sessions/search` — whole-corpus content search.
+ *
+ * `sessions` are the SAME summary objects the feed returns, in ranked order,
+ * so a result opens through `/api/v1/sessions/:id/page` like any other row.
+ * There is no cursor: a relevance ranking is bounded, not paged.
+ */
+export interface SessionSearchResponse {
+  ok: boolean;
+  read_model?: 'live';
+  query?: string;
+  terms?: string[];
+  sessions?: SessionSummary[];
+  limit?: number;
+  result_count?: number;
+  /** SESSION grain: more ranked sessions existed than the bound returned. */
+  truncated?: boolean;
+  /** HIT grain: the ranking filled its event-hit budget. */
+  hits_truncated?: boolean;
+  /** The ranking's bounded candidate window was exhausted first. */
+  incomplete?: boolean;
+  /** Ranked sessions were removed by the exact re-check and not refilled. */
+  dropped?: boolean;
+  error?: string;
+  code?: string;
+}
+
 /** One turn from `/api/v1/sessions/:id/page`: counts, references, summaries. */
 export interface SessionTurn {
   turnSeq: number;
@@ -105,11 +132,13 @@ export interface SessionPageResponse {
 }
 
 /**
- * Client-side narrowing of the sessions already loaded.
+ * The session-panel controls.
  *
- * `harness` and `status` are the two the server can answer; `query` is
- * page-local by construction (see `filterSessions`) until issue #597 ships a
- * server-side search.
+ * `query` is NOT a client-side filter. It is the whole-corpus search the server
+ * runs (`/api/v1/sessions/search`), debounced by the panel; only `status` is
+ * narrowed on what is already rendered, and `harness` is applied both locally
+ * (for instant feedback) and server-side (which is what makes it correct across
+ * pages and across a search).
  */
 export interface SessionsFilter {
   query: string;

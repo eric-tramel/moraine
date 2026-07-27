@@ -120,6 +120,25 @@ pub(crate) struct MockOptions {
     /// the exact Phase 4 re-check can drop it (the directory recall filter
     /// admitted it).
     pub(crate) out_of_scope_cwd_for_second_candidate: bool,
+    /// Report an out-of-scope HYDRATED `origin_cwd` for `sess_a` in the Phase B
+    /// totals batch — the value session-summary discovery re-checks scope
+    /// against. Distinct from
+    /// [`Self::out_of_scope_cwd_for_second_candidate`], which describes the
+    /// per-EVENT navigation value the ranking path re-checks: the two guards
+    /// read different relations and each needs its own way to be made to fail.
+    pub(crate) out_of_scope_hydrated_cwd_for_sess_a: bool,
+    /// Report a directory `cand_last_ms` for `sess_a` that sits one monitor
+    /// activity window ABOVE its hydrated `last_event_unix_ms`.
+    ///
+    /// This is the re-inserted-event regime: the directory's
+    /// `SimpleAggregateFunction(max)` accumulates every physically inserted
+    /// version and cannot retract a superseded one, while
+    /// `mcp_event_navigation` read `FINAL` sees only the winner — so
+    /// `cand_last_ms >= last_event_unix_ms` always, with equality in the
+    /// ordinary case. Without this option every fixture session has the two
+    /// values equal, and "which of them do the two surfaces RENDER, and do they
+    /// render the same one?" is unobservable.
+    pub(crate) directory_aggregate_ahead_of_hydration_for_sess_a: bool,
     /// The requested turn's live uid set exceeds `MAX_TURN_SCOPE_UIDS`, so
     /// ranking falls back to session recall and the turn is enforced only by
     /// the exact Phase 4 re-check.
@@ -196,6 +215,29 @@ pub(crate) fn test_clickhouse_config(url: String) -> ClickHouseConfig {
         allow_newer_server: false,
     }
 }
+/// Whether the migration-036 canonical read indexes carry rows at all.
+///
+/// **The regime modelled here is "a store whose backfill has not started."** Its
+/// `mcp_session_directory` / `mcp_event_navigation` are EMPTY for every reader,
+/// not only for readers that consulted the latch — which is what makes a
+/// MISSING readiness branch observable. A fixture that answered canonical
+/// statements regardless of readiness would hide exactly the defect where a
+/// reader skips the gate and then reports an empty index as "nothing in the
+/// corpus matched".
+///
+/// It is deliberately NOT the only shape a not-ready store can have.
+/// `open_v2.ready` is published only after the coverage sweep completes AND the
+/// overlap audit passes (`canonical_indexes.rs`), so a store can legitimately
+/// report not-ready with a PARTIALLY backfilled `mcp_event_navigation` — rows
+/// present, coverage incomplete. Empty is the pre-backfill worst case and the
+/// one that discriminates the branch; the partial regime, where canonical
+/// hydration would answer with a silently short result set, is out of scope on
+/// both discovery surfaces because both refuse the canonical read model
+/// entirely until the latch flips.
+fn canonical_read_indexes_published(state: &MockState) -> bool {
+    state.options.open_v2_reader_ready != Some(false)
+}
+
 /// The subset of `rows` whose `session_id` appears in a batched statement's
 /// `session_id IN ['…']` array literal — the mock's stand-in for the
 /// primary-key prune the real hydration statements get.
@@ -793,18 +835,34 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
         }
 
         // --- issue-599 canonical-first session discovery -------------------
-        // Phase A: the content-free directory candidate page. The same three
-        // fixture sessions the projected-header page serves, so the two paths
-        // can be asserted against identical expectations.
+        // The directory read, in BOTH its shapes: the time-ordered page's
+        // Phase A, and the ranked search's keyset batch for ids it already
+        // chose. They project the same two columns from the same relation, so
+        // one fixture answers both — which is the point, because both surfaces
+        // must report the same `updated_at` for one session.
         if query.contains("FROM `moraine`.`mcp_session_directory` AS d")
             && query.contains("AS cand_last_ms")
         {
-            // `cand_last_time` is the display form of `cand_last_ms` — the
-            // value the directory path both orders by and reports. It matches
-            // the projected header fixture exactly, because the aggregate and
-            // the hydrated value agree for every session that was not
-            // re-ingested; they diverge only when a re-inserted event lowered
-            // a display time within one live generation.
+            if !canonical_read_indexes_published(&state) {
+                return (StatusCode::OK, json_each_row(json!([])));
+            }
+            // `cand_last_ms` is the aggregate the directory page orders,
+            // keysets AND renders by. It equals the hydrated fixture value by
+            // default, as it does for every session that was not re-ingested —
+            // the two diverge only when a re-inserted event lowered a display
+            // time within one live generation, which
+            // `directory_aggregate_ahead_of_hydration_for_sess_a` models.
+            let (sess_a_cand_last_ms, sess_a_cand_last_time) = if state
+                .options
+                .directory_aggregate_ahead_of_hydration_for_sess_a
+            {
+                // One monitor activity window (60 s) ahead of the hydrated
+                // `1_767_262_200_000`, and still below `sess_b`, so the page
+                // order is unchanged and only the RENDERED value can differ.
+                (1_767_262_260_000_i64, "2026-01-01 10:11:00")
+            } else {
+                (1_767_262_200_000_i64, "2026-01-01 10:10:00")
+            };
             let candidates = json!([
                 {
                     "session_id": "sess_c",
@@ -818,8 +876,8 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
                 },
                 {
                     "session_id": "sess_a",
-                    "cand_last_ms": 1_767_262_200_000_i64,
-                    "cand_last_time": "2026-01-01 10:10:00"
+                    "cand_last_ms": sess_a_cand_last_ms,
+                    "cand_last_time": sess_a_cand_last_time
                 }
             ]);
             let rows = candidates
@@ -828,7 +886,14 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
                 .iter()
                 .filter(|row| {
                     let session_id = row["session_id"].as_str().unwrap_or_default();
-                    // Honor whichever keyset the page carries.
+                    // The keyset batch names its ids explicitly; a fixture that
+                    // ignored the `IN` set would answer for sessions the caller
+                    // never ranked.
+                    if let Some((_, tail)) = query.split_once("AND d.session_id IN [") {
+                        let ids = tail.split(']').next().unwrap_or_default();
+                        return ids.contains(&format!("'{session_id}'"));
+                    }
+                    // Otherwise honor whichever keyset the page carries.
                     if query.contains("session_id < 'sess_b'") {
                         return session_id < "sess_b";
                     }
@@ -1216,6 +1281,17 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
 
         // Phase B1: batched totals.
         if query.contains("AS counter_user_messages") && query.contains("GROUP BY nav.session_id") {
+            if !canonical_read_indexes_published(&state) {
+                return (StatusCode::OK, json_each_row(json!([])));
+            }
+            // The hydrated `origin_cwd` for `sess_a`. This is the value the
+            // shared discovery fold re-checks project scope against, and the
+            // ONLY input that can drop a session that ranking already admitted.
+            let sess_a_cwd = if state.options.out_of_scope_hydrated_cwd_for_sess_a {
+                "/elsewhere"
+            } else {
+                "/repo"
+            };
             let totals = json!([
                     {
                         "session_id": "sess_c",
@@ -1261,7 +1337,7 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
                         "first_event_unix_ms": 1_767_261_600_000_i64,
                         "last_event_time": "2026-01-01 10:10:00",
                         "last_event_unix_ms": 1_767_262_200_000_i64,
-                        "origin_cwd": "/repo",
+                        "origin_cwd": sess_a_cwd,
             "source": "codex",
                         "harness": "codex",
                         "inference_provider": "openai",
@@ -1280,6 +1356,9 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
             && query.contains("e.payload_json AS payload_json")
             && query.contains("WHERE e.session_id IN [")
         {
+            if !canonical_read_indexes_published(&state) {
+                return (StatusCode::OK, json_each_row(json!([])));
+            }
             let metadata = json!([
                 {
                     "session_id": "sess_c",
@@ -1306,6 +1385,9 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
         if query.contains("argMax(turn_completed, turn_seq)")
             && query.contains("GROUP BY session_id, turn_seq")
         {
+            if !canonical_read_indexes_published(&state) {
+                return (StatusCode::OK, json_each_row(json!([])));
+            }
             let terminal = json!([
                 { "session_id": "sess_c", "completed": 1_u8 },
                 { "session_id": "sess_b", "completed": 1_u8 },

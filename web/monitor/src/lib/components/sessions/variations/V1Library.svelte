@@ -14,6 +14,8 @@
    * traversal with the cursor the previous page minted.
    */
   export let sessions: SessionSummary[];
+  /** Whether these rows are ranked search results rather than the feed. */
+  export let searching = false;
 
   const TURN_PAGE_SIZE = 25;
 
@@ -135,7 +137,11 @@
 <div class="mv-v1">
   <div class="mv-v1-list mv-list">
     {#if sessions.length === 0}
-      <div class="mv-empty">No sessions match these filters.</div>
+      <div class="mv-empty">
+        {searching
+          ? 'No sessions match this search.'
+          : 'No sessions match these filters.'}
+      </div>
     {/if}
     {#each sessions as session (session.id)}
       <SessionCard

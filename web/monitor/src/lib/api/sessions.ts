@@ -1,5 +1,6 @@
 import type {
   SessionPageResponse,
+  SessionSearchResponse,
   SessionSummary,
   SessionTranscript,
   SessionTurn,
@@ -47,6 +48,43 @@ export interface FetchSessionPageParams {
   /** A `next_cursor` from a previous page of the same session. */
   cursor?: string | null;
 }
+
+export interface SearchSessionsParams {
+  harness?: string | null;
+  source?: string | null;
+  limit?: number;
+}
+
+/**
+ * The four bounded-answer signals, kept distinct because they have different
+ * remedies. `truncated` is answered by raising `limit`; `hitsTruncated`,
+ * `incomplete` and `dropped` are not.
+ */
+export interface SessionSearchPage {
+  /** The query the server actually ranked, after trimming. */
+  query: string;
+  /** Ranked best-first. The SAME summary objects `fetchSessions` returns. */
+  sessions: SessionSummary[];
+  /** SESSION grain: more ranked sessions existed than the bound returned. */
+  truncated: boolean;
+  /**
+   * HIT grain: the ranking filled its event-hit budget, so matching events
+   * existed that it never examined. A term matching one session thirty times
+   * sets this and leaves `truncated` false.
+   */
+  hitsTruncated: boolean;
+  /** The ranking's bounded candidate window was exhausted first (#597 §1.6). */
+  incomplete: boolean;
+  /**
+   * Ranked sessions were removed by the server's exact post-ranking re-check
+   * and nothing refilled them, so this answer is a strict subset of what was
+   * ranked rather than everything that matched.
+   */
+  dropped: boolean;
+}
+
+/** Ranked sessions per search. The route clamps to `1..=50`, then to the backend's `max_results`. */
+const DEFAULT_SEARCH_LIMIT = 25;
 
 export interface SessionTurnPage {
   /** Absent when the server asked for a reopen. */
@@ -131,6 +169,57 @@ export async function fetchSessions(params: FetchSessionsParams = {}): Promise<S
     hasMore: data.has_more ?? nextCursor !== null,
     window: data.window ?? null,
     limit: data.limit ?? limit,
+  };
+}
+
+/**
+ * Whole-corpus session search.
+ *
+ * This is what replaced the page-local `query` filter (issue-599 WI-09). The
+ * server ranks message content across every session this backend may serve, and
+ * returns session SUMMARIES — no snippets, no transcripts — so the response
+ * stays flat as the corpus grows and a result opens through the same
+ * `fetchSessionPage` reader a listed session does.
+ *
+ * The caller is responsible for debouncing; every call is a real backend
+ * ranking.
+ */
+export async function searchSessions(
+  query: string,
+  params: SearchSessionsParams = {},
+): Promise<SessionSearchPage> {
+  const search = new URLSearchParams({
+    q: query.trim(),
+    limit: String(params.limit ?? DEFAULT_SEARCH_LIMIT),
+  });
+  appendOptional(search, 'harness', params.harness);
+  appendOptional(search, 'source', params.source);
+
+  const response = await fetch(`/api/v1/sessions/search?${search.toString()}`, {
+    headers: { Accept: 'application/json' },
+  });
+  if (!response.ok) {
+    throw await failure(response);
+  }
+
+  const data = (await response.json()) as SessionSearchResponse;
+  if (!data.ok || !Array.isArray(data.sessions)) {
+    throw new MonitorApiError(
+      data.error || 'malformed session search response',
+      response.status,
+      data.code ?? null,
+    );
+  }
+
+  return {
+    query: data.query ?? query.trim(),
+    // Ranked order is the server's answer. Never re-sort it here: relevance is
+    // the whole point of the route, and recency ordering would discard it.
+    sessions: data.sessions,
+    truncated: data.truncated ?? false,
+    hitsTruncated: data.hits_truncated ?? false,
+    incomplete: data.incomplete ?? false,
+    dropped: data.dropped ?? false,
   };
 }
 

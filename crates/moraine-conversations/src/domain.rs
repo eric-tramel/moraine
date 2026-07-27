@@ -426,7 +426,12 @@ pub struct McpSessionOpen {
     pub snapshot: Option<McpOpenSnapshot>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// One session as BOTH discovery surfaces render it.
+///
+/// `PartialEq` is derived so "the ranked search and the time-ordered feed
+/// describe this session identically" can be ONE assertion rather than a field
+/// checklist a newly added field silently falls off (issue-599 B1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct McpSessionListItem {
     pub session_id: String,
     pub first_event_time: String,
@@ -455,6 +460,92 @@ pub struct McpSessionListItem {
     /// MCP's `session_json` does not emit it.
     #[serde(default)]
     pub tool_calls: u64,
+}
+
+/// Session DISCOVERY BY CONTENT (issue-599 WI-09): the ranked counterpart to
+/// [`McpSessionListFilter`].
+///
+/// The two discovery inputs differ only in how candidates are chosen — a time
+/// window versus a BM25 ranking over the whole permitted corpus — and agree on
+/// everything after: the same exact project-scope re-check, the same LIST
+/// title/summary fold, and the same [`McpSessionListItem`] output. A result
+/// therefore opens through exactly the reader a listed session opens through.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SessionSearchQuery {
+    pub query: String,
+    /// Reported back as the result's `query_id`. Cancellation itself targets
+    /// the active query envelope's request id, not this token.
+    #[serde(skip)]
+    pub cancellation_token: Option<String>,
+    /// Maximum SESSIONS to return. Clamped to the backend's `max_results`.
+    #[serde(default)]
+    pub limit: Option<u16>,
+    #[serde(default)]
+    pub harness: Option<String>,
+    #[serde(default)]
+    pub source_name: Option<String>,
+}
+
+/// Ranked whole-corpus session search results.
+///
+/// Carries **no** transcript content — no snippet, no `text_content`, no
+/// `payload_json`. The ranking pass reads message text to score it; nothing it
+/// read survives into this type, so a search response stays flat as transcripts
+/// grow, exactly like the session feed (issue-599 §5.3).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionSearchResults {
+    pub query_id: String,
+    /// The trimmed query text that was ranked.
+    pub query: String,
+    /// The tokenized query terms, for a client that wants to highlight.
+    pub terms: Vec<String>,
+    /// Sessions in ranked order, best first.
+    pub sessions: Vec<McpSessionListItem>,
+    /// SESSION grain: the ranking yielded more distinct sessions than `limit`
+    /// allowed, so raising `limit` returns more of them.
+    ///
+    /// Deliberately NOT the hit-grain signal. Ranking is over EVENTS and hits
+    /// cluster inside a session, so "more hits existed" and "more sessions
+    /// existed" are different facts with different remedies; conflating them
+    /// tells a reader to raise `limit` when raising `limit` cannot help. See
+    /// [`Self::hits_truncated`].
+    pub truncated: bool,
+    /// HIT grain: the ranking filled its internal event-hit budget, so matching
+    /// events existed that it never examined and sessions beyond those returned
+    /// may exist.
+    ///
+    /// A term that matches one session thirty times sets this and leaves
+    /// [`Self::truncated`] false, which is the honest description of that
+    /// corpus: one session matched, and the answer is complete at the session
+    /// grain. The hit budget scales with `limit`, so raising `limit` widens the
+    /// window this reports on — but it is not a promise of more sessions.
+    pub hits_truncated: bool,
+    /// Issue #597 §1.6, propagated verbatim: the single bounded candidate
+    /// window was saturated and post-ranking validation cut it short. The
+    /// sessions present are valid and a true ranking prefix; this is never an
+    /// error.
+    pub incomplete: bool,
+    /// Ranked sessions were removed by the exact post-ranking re-check — exact
+    /// harness/source, the tombstone rule, a blank id — and were NOT refilled
+    /// from further down the ranking.
+    ///
+    /// Without it a request that returns three sessions for `limit = 10`
+    /// because seven were dropped is indistinguishable from one where the
+    /// corpus genuinely held three, i.e. it would claim to be complete when it
+    /// is a strict subset of what the ranking offered.
+    ///
+    /// **Project scope cannot set this bit.** Both ranking arms apply the
+    /// configured scope while they are still choosing candidates — against the
+    /// navigation `argMinIf(cwd, …)` on the canonical path, against
+    /// `mcp_open_publication_headers.origin_cwd` on the pre-cutover path — so
+    /// an out-of-scope session never enters the ranked set and cannot be
+    /// subtracted from it afterwards. That is what stops `limit -
+    /// result_count`, which is exact whenever `truncated` is also set, from
+    /// being a per-term count of activity outside the caller's scope. The
+    /// post-hydration scope re-check exists so ONE function decides disclosure
+    /// for both discovery surfaces; it is defence in depth, not this bit's
+    /// cause.
+    pub dropped: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

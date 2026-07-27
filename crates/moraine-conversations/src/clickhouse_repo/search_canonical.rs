@@ -42,9 +42,30 @@ use super::*;
 /// single pass. There is deliberately no second pass: the retired refill loop
 /// re-executed every corpus-sized preamble up to 16 times per request.
 pub(super) const MCP_SEARCH_CANDIDATE_MULTIPLIER: u32 = 3;
-/// Hard ceiling on one ranking pass's candidate window. `n_hits` is 1..=50 and
-/// is further capped by `max_results`, so `C ∈ [2, 153]` in practice; the
-/// constant bounds the window even if those caps are raised.
+/// Hard ceiling on one ranking pass's candidate window.
+///
+/// Two callers set `n_hits`, and each derives a bounded budget, so
+/// `C ∈ [2, 228]` in practice and this constant guards against a RAISED cap
+/// rather than being a number requests land on:
+///
+/// * the MCP event search tool, whose contract validates `n_hits ∈ 1..=50` and
+///   which additionally clamps to `[mcp] max_results`. Worst case
+///   `C = 3 × (50 + 1) = 153`;
+/// * session discovery by content, whose INTERNAL hit budget is deliberately
+///   NOT clamped to `max_results` — a consumer that folds many hits into one
+///   result row is not bounded by the rows a caller may receive. It is bounded
+///   instead by [`super::list::session_search_hit_budget`], which caps the
+///   budget at 75 over its whole reachable `limit` domain (`1..=50`, clamped in
+///   the repository, not by a route). Worst case `C = 3 × (75 + 1) = 228`, at
+///   the largest page a caller may ask for; the shipped default (`limit = 25`)
+///   derives 153.
+///
+/// The second caller is why "further capped by `max_results`" no longer holds
+/// as the reason. Do not restore that wording: out-fetching `max_results` is
+/// the point of that path, and the second bullet is the bound that replaced it.
+/// Without an explicit budget ceiling there, the shipped default shape
+/// (`max_results = 25`, a client asking for 25) derives `C = 256` and pins this
+/// constant on every interactive search.
 pub(super) const MCP_SEARCH_CANDIDATE_MAX: u32 = 256;
 /// Turn-scoped ranking inlines the turn's live event uids as a literal `IN`
 /// set. Above this many events in one turn the request falls back to

@@ -19,7 +19,8 @@ use moraine_conversations::{
     CanonicalReadOutcome, ConversationListSort, ConversationMode, CoreIndexHealth, IngestHeartbeat,
     IngestHeartbeatRead, McpSessionListFilter, McpSessionListItem, McpSessionOpen, McpTurnCompact,
     PageRequest, PublicationDiagnostics, QueryClass, QueryEnvelope, RepoError, SessionLookback,
-    StoreConnectionMetrics, StoreHealth, StoreProbe, TablePreviewQuery, TableSummaries,
+    SessionSearchQuery, StoreConnectionMetrics, StoreHealth, StoreProbe, TablePreviewQuery,
+    TableSummaries,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -96,6 +97,14 @@ struct SessionsQuery {
 struct SessionPageQuery {
     limit: Option<u32>,
     cursor: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SessionSearchParams {
+    q: Option<String>,
+    limit: Option<u32>,
+    harness: Option<String>,
+    source: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -236,6 +245,23 @@ fn dashboard_routes(read_limits: Arc<MonitorReadLimits>) -> Router<Arc<AppState>
         .route("/web-searches", get(api_web_searches))
         .route("/tables/:table", get(api_table_rows))
         .route("/sessions", get(api_sessions))
+        // `/sessions/search` is a fixed path, never a session named "search",
+        // and route ORDER has nothing to do with it. The three `/sessions`
+        // routes here have one, two and three path segments respectively, so no
+        // request path can match two of them and there is no precedence
+        // question to get wrong. (`/sessions/search/page` reaches the page
+        // handler with `id = "search"`, which is correct: a session really
+        // called `search` is still readable.)
+        //
+        // Precedence would start to matter only if a two-segment parameterised
+        // sibling were added — `/sessions/:id` — and it would still be safe,
+        // because axum routes through matchit, whose radix trie prefers a
+        // static segment over a parameter regardless of insertion order.
+        // `matchit_prefers_a_static_segment_over_a_parameter_at_any_registration_order`
+        // pins that property against a router built for the purpose: insurance
+        // for that future, not the mechanism keeping this table unambiguous
+        // today.
+        .route("/sessions/search", get(api_session_search))
         .route("/sessions/:id/page", get(api_session_page))
         .route_layer(middleware::from_fn_with_state(
             read_limits,
@@ -305,12 +331,20 @@ async fn monitor_read_admission(
 /// outcomes never reach this mapping: they travel as `Ok(None)`/empty
 /// results, not as `RepoError`.
 ///
-/// A rejected continuation token is the one repository failure caused by the
-/// request rather than the backend, so it is a 400. Paging must be able to tell
-/// "your cursor is stale, restart the feed" apart from "the store is down":
-/// `list_mcp_sessions` refuses a cursor minted by the other read path, and a
-/// caller that reads that as a transient 503 and retries would page a silent
-/// gap instead of restarting (issue-599 §1.2).
+/// The two repository failures caused by the REQUEST rather than by the
+/// backend are 400s, because a client must be able to tell "fix your request"
+/// apart from "the store is down" — the second is worth retrying and the first
+/// never is.
+///
+/// * A rejected continuation token: paging must distinguish "your cursor is
+///   stale, restart the feed" from a transient outage, or a caller that retries
+///   pages a silent gap instead of restarting (issue-599 §1.2).
+/// * An invalid argument: the repository validates inputs the route cannot
+///   (`search_sessions` rejects a query with no searchable terms, and the
+///   tokenizer's rules are the repository's to own — a route that re-derived
+///   them in its own language would be a second copy that rots). Reported as
+///   503 this rendered a typo as an outage, permanently and unrecoverably, for
+///   any query the tokenizer cannot split.
 fn repo_error_status(error: &RepoError) -> (StatusCode, Option<&'static str>) {
     match error {
         RepoError::DeadlineExceeded { .. } => {
@@ -320,6 +354,7 @@ fn repo_error_status(error: &RepoError) -> (StatusCode, Option<&'static str>) {
             (StatusCode::TOO_MANY_REQUESTS, Some("resource_exhausted"))
         }
         RepoError::InvalidCursor(_) => (StatusCode::BAD_REQUEST, Some("invalid_cursor")),
+        RepoError::InvalidArgument(_) => (StatusCode::BAD_REQUEST, Some("invalid_argument")),
         _ => (StatusCode::SERVICE_UNAVAILABLE, None),
     }
 }
@@ -1060,6 +1095,121 @@ async fn api_sessions(
     )
 }
 
+/// Route bound on ranked sessions per search. Well below `/api/v1/sessions`'
+/// `200`, deliberately: a BM25 ranking's value is concentrated in its head, and
+/// every ranked session costs a hydration slot in the same bounded budget the
+/// feed spends. The backend's `max_results` clamps this further.
+const SESSION_SEARCH_MAX_LIMIT: u32 = 50;
+
+/// Default ranked sessions per search, matching the repository's own default.
+const SESSION_SEARCH_DEFAULT_LIMIT: u32 = 10;
+
+/// Whole-corpus session search (issue-599 WI-09).
+///
+/// Ranked by content over the entire corpus this backend may serve — not over
+/// the page the client happens to have loaded, which is what the interim
+/// client-side filter could do and said so. Results are the SAME summary
+/// objects `/api/v1/sessions` returns, built by
+/// [`monitor_session_json`], so a result opens through
+/// `/api/v1/sessions/:id/page` exactly like a listed session.
+///
+/// There is deliberately no `cursor`. A keyset over a relevance ranking is not
+/// the keyset the feed uses — scores are not a monotone anchor and a
+/// re-ranked corpus would silently skip or repeat — so this route bounds
+/// instead of paging, and says so with `truncated`.
+///
+/// Project scope is enforced by the repository operation, against each
+/// session's hydrated `origin_cwd`; the ranking's own directory predicate is a
+/// recall filter. This handler composes no second repository read, so there is
+/// no path by which it can assemble an out-of-scope session.
+async fn api_session_search(
+    Query(params): Query<SessionSearchParams>,
+    Extension(backend): Extension<Arc<BackendRepository>>,
+) -> Response {
+    let repository = backend.repository();
+    let query = params.q.as_deref().map(str::trim).unwrap_or_default();
+    if query.is_empty() {
+        // Not an empty result: an absent or blank `q` is a client bug, and
+        // answering it with "no sessions match" would read as an empty corpus.
+        return bad_request("q must be a non-empty search query".to_string());
+    }
+
+    // Two clamps, as on the feed: the route's documented bound, then the
+    // backend's own `max_results`. The response reports the second.
+    let requested = params
+        .limit
+        .unwrap_or(SESSION_SEARCH_DEFAULT_LIMIT)
+        .clamp(1, SESSION_SEARCH_MAX_LIMIT) as u16;
+    let limit = requested.min(repository.config().max_results.max(1));
+
+    let results = match repository
+        .search_session_summaries(SessionSearchQuery {
+            query: query.to_string(),
+            // The #600 envelope this route runs inside. Threading its request id
+            // is what makes the repository's `query_id` — and therefore the
+            // statements it issues — traceable back to one HTTP request, and it
+            // is absent exactly when the route is not enveloped.
+            cancellation_token: QueryEnvelope::current()
+                .ok()
+                .map(|envelope| envelope.request_id().to_string()),
+            limit: Some(limit),
+            // A cleared dashboard filter arrives as an empty value; treat it as
+            // absent rather than as a filter that matches nothing.
+            harness: optional_filter_value(params.harness.as_deref()),
+            source_name: optional_filter_value(params.source.as_deref()),
+        })
+        .await
+    {
+        Ok(results) => results,
+        Err(error) => {
+            return repo_error_response(format!("session search failed: {error}"), &error);
+        }
+    };
+
+    let now_ms = unix_now_ms();
+    let sessions = results
+        .sessions
+        .iter()
+        .map(|session| monitor_session_json(session, now_ms))
+        .collect::<Vec<_>>();
+
+    json_response(
+        json!({
+            "ok": true,
+            "read_model": "live",
+            "query": results.query,
+            "terms": results.terms,
+            "sessions": sessions,
+            "limit": limit,
+            "result_count": sessions.len(),
+            // Four distinct facts about the bound, never collapsed. Ranking is
+            // over EVENTS and answers in SESSIONS, and the exact re-check runs
+            // after both, so "there is more" and "this is short" have different
+            // causes with different remedies. None of them is an error and the
+            // sessions returned are a true ranking prefix in every case.
+            //
+            //   truncated      more ranked SESSIONS existed than `limit`
+            //                  returned. Raising `limit` returns more.
+            //   hits_truncated the ranking filled its event-hit budget, so
+            //                  matching events existed that it never examined.
+            //                  Raising `limit` widens that window but promises
+            //                  no additional sessions.
+            //   incomplete     the ranking's bounded candidate window was
+            //                  exhausted before the answer could be filled
+            //                  (issue #597 §1.6). Raising `limit` cannot help.
+            //   dropped        ranked sessions were removed by the exact
+            //                  post-ranking re-check (scope, harness/source,
+            //                  tombstone) and nothing refilled them, so this
+            //                  answer is a strict subset of what was ranked.
+            "truncated": results.truncated,
+            "hits_truncated": results.hits_truncated,
+            "incomplete": results.incomplete,
+            "dropped": results.dropped,
+        }),
+        StatusCode::OK,
+    )
+}
+
 fn bad_request(message: String) -> Response {
     json_response(
         json!({"ok": false, "error": message}),
@@ -1721,8 +1871,8 @@ mod tests {
         AnalyticsWindow, CanonicalReadAnchor, CanonicalSessionPage, CanonicalSessionSignals,
         ConversationMode, ConversationRepository, InMemoryConversationRepository,
         InMemoryConversationResponses, IngestHeartbeat, McpTurnCompact, Page, RepoConfig,
-        SessionMetadata, StoreDiagnostics, TableColumn, TablePreview, TableSummary, TurnSummary,
-        WebSearchEvent,
+        SessionMetadata, SessionSearchResults, StoreDiagnostics, TableColumn, TablePreview,
+        TableSummary, TurnSummary, WebSearchEvent,
     };
     use std::collections::BTreeMap;
     use std::fs;
@@ -3376,6 +3526,500 @@ mod tests {
         assert_eq!(payload["session"]["turns"][0]["turnSeq"], json!(1));
     }
 
+    // -----------------------------------------------------------------------
+    // issue-599 WI-09 — whole-corpus session search.
+    // -----------------------------------------------------------------------
+
+    fn search_params(q: &str) -> SessionSearchParams {
+        SessionSearchParams {
+            q: Some(q.to_string()),
+            limit: None,
+            harness: None,
+            source: None,
+        }
+    }
+
+    fn search_results(sessions: Vec<McpSessionListItem>) -> SessionSearchResults {
+        SessionSearchResults {
+            query_id: "monitor-search".to_string(),
+            query: "repository".to_string(),
+            terms: vec!["repository".to_string()],
+            sessions,
+            truncated: false,
+            hits_truncated: false,
+            incomplete: false,
+            dropped: false,
+        }
+    }
+
+    /// **Scope: the SERIALIZER, not the store.** Both routes are handed the
+    /// identical `McpSessionListItem` here, so what this proves is that
+    /// `api_session_search` and `api_sessions` render one summary the same way
+    /// — same keys, same values, no search-shaped near-miss that would need its
+    /// own reader.
+    ///
+    /// It deliberately cannot observe the two routes being handed DIFFERENT
+    /// items for one session; only real hydration can produce that, and the
+    /// repository integration test
+    /// `both_discovery_surfaces_describe_one_session_identically` is what
+    /// covers it. `status_is_derived_from_ended_at_so_a_divergent_timestamp_is
+    /// _a_cross_surface_contradiction` below is the other half: why a
+    /// divergence there would not stay cosmetic.
+    #[tokio::test]
+    async fn search_results_are_rendered_by_the_same_summary_serializer_as_the_feed() {
+        let (backend, _) = fake_backend(InMemoryConversationResponses {
+            search_session_summaries: Some(Ok(search_results(vec![sample_session()]))),
+            list_mcp_sessions: Some(Ok(Page {
+                items: vec![sample_session()],
+                next_cursor: None,
+            })),
+            ..Default::default()
+        })
+        .await;
+        let (feed_backend, _) = fake_backend(InMemoryConversationResponses {
+            list_mcp_sessions: Some(Ok(Page {
+                items: vec![sample_session()],
+                next_cursor: None,
+            })),
+            ..Default::default()
+        })
+        .await;
+
+        let searched = response_json(
+            api_session_search(Query(search_params("repository")), Extension(backend)).await,
+        )
+        .await;
+        let listed =
+            response_json(api_sessions(Query(sessions_query()), Extension(feed_backend)).await)
+                .await;
+
+        assert_eq!(searched["sessions"][0], listed["sessions"][0]);
+        assert_eq!(searched["read_model"], json!("live"));
+        assert_eq!(searched["result_count"], json!(1));
+        assert_eq!(searched["query"], json!("repository"));
+    }
+
+    /// Why the two discovery surfaces must agree about `last_event_unix_ms` and
+    /// not merely "about roughly when the session ended".
+    ///
+    /// `monitor_session_json` derives `status` from `endedAt` against a 60 s
+    /// activity window, so two renderings of one session that differ by that
+    /// window differ by a WORD: `active` versus `completed`. Two relations in
+    /// the store can answer "when did this session last have an event" — the
+    /// directory's `max(max_observed_event_time)` and navigation's
+    /// `argMax(display_time)`, the former never below the latter — and for a
+    /// while the feed reported one and the ranked search the other. This is the
+    /// consequence that made that unacceptable, which is why both surfaces now
+    /// report the directory value (`SessionKeyset`).
+    ///
+    /// MUTATION: make `status` a constant; this fails.
+    ///
+    /// Widening `SESSION_ACTIVE_WINDOW_MS` does NOT fail it, and an earlier
+    /// revision of this comment offered that as a second recipe without running
+    /// it. The test builds its gap FROM the constant
+    /// (`last_event_unix_ms = now_ms - SESSION_ACTIVE_WINDOW_MS`), so widening
+    /// the window widens the gap in lockstep — there is no fixed "gap used
+    /// here". Verified at 600_000 and 86_400_000; both pass.
+    #[test]
+    fn status_is_derived_from_ended_at_so_a_divergent_timestamp_is_a_cross_surface_contradiction() {
+        let now_ms = 1_767_262_260_000_i64;
+        let mut session = sample_session();
+        session.completed = false;
+
+        // The hydrated aggregate.
+        session.last_event_unix_ms = now_ms - SESSION_ACTIVE_WINDOW_MS;
+        let hydrated = monitor_session_json(&session, now_ms);
+        // The directory aggregate, which is >= the hydrated one, never below.
+        session.last_event_unix_ms = now_ms;
+        let keyset = monitor_session_json(&session, now_ms);
+
+        assert_eq!(hydrated["status"], json!("completed"));
+        assert_eq!(keyset["status"], json!("active"));
+        assert_ne!(
+            hydrated["status"], keyset["status"],
+            "a timestamp difference of one activity window is a status contradiction, \
+             not a rounding difference"
+        );
+    }
+
+    /// The ranking pass reads message text to score and preview it. A search
+    /// response must stay the same flat navigation-scalar shape the feed proved
+    /// under 50x fatter transcripts (issue-599 §5.3).
+    ///
+    /// MUTATION: emit any hit-derived content on the response (a `snippet`, a
+    /// `highlight`, a `preview`); this fails on the key scan.
+    #[tokio::test]
+    async fn search_response_carries_summaries_and_no_transcript_content() {
+        let (backend, _) = fake_backend(InMemoryConversationResponses {
+            search_session_summaries: Some(Ok(search_results(vec![sample_session()]))),
+            ..Default::default()
+        })
+        .await;
+
+        let payload = response_json(
+            api_session_search(Query(search_params("repository")), Extension(backend)).await,
+        )
+        .await;
+
+        let mut keys = Vec::new();
+        all_keys(&payload, &mut keys);
+        for forbidden in [
+            "turns",
+            "steps",
+            "text",
+            "events",
+            "payload_json",
+            "snippet",
+            "text_content",
+            "text_preview",
+        ] {
+            assert!(
+                !keys.iter().any(|key| key == forbidden),
+                "search response must not carry {forbidden:?}: {payload}"
+            );
+        }
+
+        let mut fields = payload["sessions"][0]
+            .as_object()
+            .expect("session object")
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        fields.sort();
+        assert_eq!(
+            fields,
+            vec![
+                "displayLabel",
+                "endedAt",
+                "eventCount",
+                "harness",
+                "id",
+                "inferenceProvider",
+                "mode",
+                "sessionSlug",
+                "sessionSummary",
+                "source",
+                "startedAt",
+                "status",
+                "title",
+                "toolCallCount",
+                "turnCount",
+            ]
+        );
+    }
+
+    /// The four bounded-answer signals stay distinct on the wire. Collapsing
+    /// any pair tells a reader to apply the wrong remedy: "raise `limit`" when
+    /// the ranking ran out of candidate budget, or "this is everything" when
+    /// the exact re-check removed half the answer.
+    ///
+    /// The matrix is exhaustive over all sixteen combinations, so a field wired
+    /// to its neighbour's value cannot survive.
+    #[tokio::test]
+    async fn search_reports_every_bounded_answer_signal_separately() {
+        for bits in 0u8..16 {
+            let (truncated, hits_truncated, incomplete, dropped) =
+                (bits & 1 != 0, bits & 2 != 0, bits & 4 != 0, bits & 8 != 0);
+            let (backend, _) = fake_backend(InMemoryConversationResponses {
+                search_session_summaries: Some(Ok(SessionSearchResults {
+                    truncated,
+                    hits_truncated,
+                    incomplete,
+                    dropped,
+                    ..search_results(vec![sample_session()])
+                })),
+                ..Default::default()
+            })
+            .await;
+            let payload = response_json(
+                api_session_search(Query(search_params("repository")), Extension(backend)).await,
+            )
+            .await;
+            assert_eq!(payload["truncated"], json!(truncated), "bits={bits}");
+            assert_eq!(
+                payload["hits_truncated"],
+                json!(hits_truncated),
+                "bits={bits}"
+            );
+            assert_eq!(payload["incomplete"], json!(incomplete), "bits={bits}");
+            assert_eq!(payload["dropped"], json!(dropped), "bits={bits}");
+        }
+    }
+
+    /// A blank or absent query is a client bug. Answering it with an empty
+    /// result set would render as "nothing in the corpus matches", which is a
+    /// different and false statement.
+    #[tokio::test]
+    async fn a_blank_search_query_is_refused_rather_than_answered_with_no_results() {
+        for q in [None, Some(String::new()), Some("   ".to_string())] {
+            let (backend, repository) = fake_backend(InMemoryConversationResponses {
+                search_session_summaries: Some(Ok(search_results(vec![sample_session()]))),
+                ..Default::default()
+            })
+            .await;
+            let response = api_session_search(
+                Query(SessionSearchParams {
+                    q: q.clone(),
+                    limit: None,
+                    harness: None,
+                    source: None,
+                }),
+                Extension(backend),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "q={q:?}");
+            assert!(
+                repository.calls().search_session_summaries.is_empty(),
+                "q={q:?}: a blank query must not reach the repository",
+            );
+        }
+    }
+
+    /// Search narrowing must reach the repository, and a cleared dashboard
+    /// filter must arrive as "no filter" rather than as a filter for the empty
+    /// string. Both clamps on `limit` are real and the second one is the
+    /// backend's own `max_results`.
+    #[tokio::test]
+    async fn search_parameters_reach_the_shared_repository_query() {
+        let (backend, repository) = fake_backend(InMemoryConversationResponses {
+            search_session_summaries: Some(Ok(search_results(Vec::new()))),
+            ..Default::default()
+        })
+        .await;
+
+        let payload = response_json(
+            api_session_search(
+                Query(SessionSearchParams {
+                    q: Some("  repository inspection  ".to_string()),
+                    limit: Some(9_999),
+                    harness: Some(" codex ".to_string()),
+                    source: Some("   ".to_string()),
+                }),
+                Extension(backend),
+            )
+            .await,
+        )
+        .await;
+
+        let calls = repository.calls().search_session_summaries;
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].query, "repository inspection");
+        assert_eq!(calls[0].harness.as_deref(), Some("codex"));
+        assert_eq!(calls[0].source_name, None);
+        // `9_999` clamps to the route's own bound, then to `RepoConfig`'s
+        // `max_results` (25). The response reports the effective value.
+        assert_eq!(calls[0].limit, Some(25));
+        assert_eq!(payload["limit"], json!(25));
+        assert_eq!(payload["sessions"], json!([]));
+        assert_eq!(payload["result_count"], json!(0));
+    }
+
+    /// Search is one repository read, and a failure of it keeps the same
+    /// budget-classified envelope every other monitor read uses. A deadline
+    /// answered as an empty result set would read as "nothing matches".
+    ///
+    /// **The client-error arm is the load-bearing one.** The repository owns
+    /// the tokenizer, so it — not the route — decides that `?q=x` or a
+    /// Cyrillic query carries no searchable term, and it says so with
+    /// `InvalidArgument`. Classified as 503 that rendered as "Search
+    /// unavailable", i.e. an outage banner for a typo, permanently, with a
+    /// retry that could never succeed.
+    ///
+    /// MUTATION: delete the `RepoError::InvalidArgument` arm from
+    /// `repo_error_status`; the `invalid_argument` row falls through to
+    /// `503`/no-code and this fails.
+    #[tokio::test]
+    async fn a_failed_search_is_classified_by_whether_the_client_or_the_store_is_at_fault() {
+        let cases = [
+            (
+                RepoError::deadline_exceeded("search deadline exceeded"),
+                StatusCode::GATEWAY_TIMEOUT,
+                Some("deadline_exceeded"),
+            ),
+            (
+                RepoError::resource_exhausted("statement cap"),
+                StatusCode::TOO_MANY_REQUESTS,
+                Some("resource_exhausted"),
+            ),
+            (
+                RepoError::invalid_argument(
+                    "query has no searchable terms (tokens shorter than 2 characters are excluded)",
+                ),
+                StatusCode::BAD_REQUEST,
+                Some("invalid_argument"),
+            ),
+            (
+                RepoError::backend("clickhouse is unreachable"),
+                StatusCode::SERVICE_UNAVAILABLE,
+                None,
+            ),
+        ];
+
+        for (error, expected_status, expected_code) in cases {
+            let label = format!("{error}");
+            let (backend, _) = fake_backend(InMemoryConversationResponses {
+                search_session_summaries: Some(Err(error)),
+                ..Default::default()
+            })
+            .await;
+
+            let response =
+                api_session_search(Query(search_params("repository")), Extension(backend)).await;
+            assert_eq!(response.status(), expected_status, "{label}");
+            let payload = response_json(response).await;
+            assert_eq!(payload["ok"], json!(false), "{label}");
+            match expected_code {
+                Some(code) => assert_eq!(payload["code"], json!(code), "{label}"),
+                None => assert!(payload.get("code").is_none(), "{label}: {payload}"),
+            }
+        }
+    }
+
+    /// The route runs inside a #600 interactive envelope — asserted through the
+    /// REAL router, not a synthetic probe route bolted onto the middleware.
+    ///
+    /// The handler threads `QueryEnvelope::current()`'s request id into the
+    /// repository query, so the recorded call proves an envelope was in scope
+    /// when the read was issued. A route registered outside the envelope layer
+    /// records `None` here.
+    ///
+    /// MUTATION: register `/sessions/search` on `versioned_routes` in
+    /// `monitor_router` instead of inside `dashboard_routes` — i.e. beside
+    /// `/capabilities`, which is the one route deliberately outside the
+    /// envelope `route_layer` — or pass `cancellation_token: None` from the
+    /// handler; either fails.
+    ///
+    /// Moving the route WITHIN `dashboard_routes` does not: `route_layer` is
+    /// applied to that whole router in `monitor_router`, above both the
+    /// `admitted` group and the bare `/health` group, so no reordering of
+    /// `.route(...)` lines there can leave a route unenveloped. A previous
+    /// version of this comment named that reordering, and it survives.
+    #[tokio::test]
+    async fn the_session_search_route_runs_inside_an_interactive_monitor_envelope() {
+        let (state, repository) = fake_state(InMemoryConversationResponses {
+            search_session_summaries: Some(Ok(search_results(vec![sample_session()]))),
+            ..Default::default()
+        });
+        let app = monitor_router(state);
+
+        let (status, _) = router_json(&app, "/api/v1/sessions/search?q=repository").await;
+        assert_eq!(status, StatusCode::OK);
+        let (second_status, _) = router_json(&app, "/api/v1/sessions/search?q=repository").await;
+        assert_eq!(second_status, StatusCode::OK);
+
+        let calls = repository.calls().search_session_summaries;
+        assert_eq!(calls.len(), 2);
+        let ids = calls
+            .iter()
+            .map(|call| {
+                call.cancellation_token
+                    .clone()
+                    .expect("the handler must see a #600 envelope")
+            })
+            .collect::<Vec<_>>();
+        for id in &ids {
+            assert!(
+                id.starts_with("moraine-monitor-"),
+                "monitor request ids must carry the monitor kind: {id}"
+            );
+        }
+        // Per request, never per client.
+        assert_ne!(ids[0], ids[1]);
+    }
+
+    /// `search` is a fixed path segment, not a session id — and a session that
+    /// really is called `search` is still readable.
+    ///
+    /// Both halves are asserted by the RESPONSE BODY, not by "did not 404".
+    /// The two handlers answer different shapes, so a 404-only assertion would
+    /// pass even if `/sessions/search/page` had been answered by the search
+    /// handler, or vice versa.
+    #[tokio::test]
+    async fn search_is_a_fixed_path_and_does_not_shadow_the_session_page_route() {
+        let (state, _) = fake_state(InMemoryConversationResponses {
+            search_session_summaries: Some(Ok(search_results(vec![sample_session()]))),
+            canonical_open_session_page: Some(Ok(Some(CanonicalReadOutcome::Page(
+                sample_session_page(vec![sample_turn(1)], None),
+            )))),
+            ..Default::default()
+        });
+        let app = monitor_router(state);
+
+        let (status, payload) = router_json(&app, "/api/v1/sessions/search?q=repository").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(session_ids(&payload), vec!["session-1"]);
+        // The search envelope, not a session page.
+        assert_eq!(payload["terms"], json!(["repository"]));
+        assert!(payload.get("session").is_none(), "{payload}");
+
+        // …and the parameterized sibling still resolves, for the session id
+        // `search`, with the PAGE envelope.
+        let (page_status, page_payload) =
+            router_json(&app, "/api/v1/sessions/search/page?limit=1").await;
+        assert_eq!(page_status, StatusCode::OK);
+        assert!(
+            page_payload["session"].is_object(),
+            "`/sessions/search/page` must reach the session page handler: {page_payload}"
+        );
+        assert!(page_payload.get("terms").is_none(), "{page_payload}");
+    }
+
+    /// **Insurance, not the current mechanism.** Today's `/sessions` routes are
+    /// unambiguous because their segment counts differ (1, 2 and 3), so nothing
+    /// in `dashboard_routes` depends on static-over-parameter precedence — the
+    /// registration comment there says so, and this test is deliberately built
+    /// against a SYNTHETIC router the real table does not have.
+    ///
+    /// It exists for the day a two-segment `/sessions/:id` is added, which is
+    /// when `/sessions/search` would start to need the rule. Two earlier
+    /// versions of that comment each named a mechanism that was not the
+    /// operative one — first REGISTRATION ORDER, which axum does not use at
+    /// all, then matchit precedence, which the real table never reaches — so
+    /// the property is pinned here rather than asserted in prose, and labelled
+    /// for what it is.
+    ///
+    /// This registers the PARAMETER FIRST and asserts the static segment still
+    /// wins, because insertion order is the thing a contributor would otherwise
+    /// assume matters.
+    #[tokio::test]
+    async fn matchit_prefers_a_static_segment_over_a_parameter_at_any_registration_order() {
+        async fn param() -> &'static str {
+            "param"
+        }
+        async fn statik() -> &'static str {
+            "static"
+        }
+
+        for register_static_first in [false, true] {
+            let router: Router<()> = if register_static_first {
+                Router::new()
+                    .route("/sessions/search", get(statik))
+                    .route("/sessions/:id", get(param))
+            } else {
+                Router::new()
+                    .route("/sessions/:id", get(param))
+                    .route("/sessions/search", get(statik))
+            };
+            let response = router
+                .oneshot(
+                    Request::builder()
+                        .uri("/sessions/search")
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            let body = axum::body::to_bytes(response.into_body(), 64)
+                .await
+                .expect("body");
+            assert_eq!(
+                std::str::from_utf8(&body).expect("utf8"),
+                "static",
+                "register_static_first={register_static_first}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn api_health_redacts_full_heartbeat_internals() {
         let (backend, _) = fake_backend(InMemoryConversationResponses {
@@ -3627,6 +4271,10 @@ mod tests {
             (
                 "/api/v1/sessions?since=30d&limit=1",
                 "/api/sessions?since=30d&limit=1",
+            ),
+            (
+                "/api/v1/sessions/search?q=repository",
+                "/api/sessions/search?q=repository",
             ),
         ];
         for (canonical_path, legacy_path) in route_matrix {

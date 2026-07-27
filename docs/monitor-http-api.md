@@ -21,6 +21,7 @@ All canonical routes are `GET` routes and successful responses use JSON.
 | `/api/v1/tables/:table` | `limit` | Return the named table's schema and a bounded row preview. `:table` is a path parameter. |
 | `/api/v1/web-searches` | `limit` | Return a bounded list of normalized web-search activity. |
 | `/api/v1/sessions` | `since`, `limit`, `cursor`, `harness`, `source`, `mode`, `sort` | Return one keyset page of session **summaries**. Never transcripts. |
+| `/api/v1/sessions/search` | `q`, `limit`, `harness`, `source` | Rank sessions by message content across the whole permitted corpus. Returns the same session **summaries**. Never transcripts. |
 | `/api/v1/sessions/:id/page` | `limit`, `cursor` | Return one bounded page of a session's turns. `:id` is a path parameter. |
 
 The session collection carries summaries only. It has no `turns` key and no
@@ -31,7 +32,160 @@ repository operations the MCP `list_sessions` and `open` tools use, so the two
 surfaces report the same session facts.
 
 `/api/v1/sessions/:id` itself is still not a route: the detail path is
-`/api/v1/sessions/:id/page`.
+`/api/v1/sessions/:id/page`. `/api/v1/sessions/search` is a fixed path, not a
+session id; a session that happens to be named `search` is still readable at
+`/api/v1/sessions/search/page`.
+
+### Session Search
+
+`/api/v1/sessions/search` answers "which sessions talked about this?" It ranks
+message content across every session this backend is configured to serve — not
+across the pages a client happens to have loaded — and returns session
+summaries. It reads the same bounded ranking the MCP `search_sessions` tool
+uses, then the same session hydration the feed uses, so for any session both
+routes return, the summary object is identical field for field — including
+`endedAt` and the `status` derived from it — and a result opens through
+`/api/v1/sessions/:id/page` like any other row. The two routes select different
+sessions, by relevance and by recency; they never describe the same session
+differently.
+
+```json
+{
+  "ok": true,
+  "read_model": "live",
+  "query": "projection runaway",
+  "terms": ["projection", "runaway"],
+  "sessions": [ ... summary objects, identical in shape to /api/v1/sessions ... ],
+  "limit": 10,
+  "result_count": 2,
+  "truncated": false,
+  "hits_truncated": false,
+  "incomplete": false,
+  "dropped": false
+}
+```
+
+- `q` is required and must be non-empty after trimming. A missing or blank `q`
+  is HTTP `400`, never an empty result set: "you asked nothing" and "nothing
+  matches" are different answers and must not render alike.
+- `limit` defaults to `10` and is clamped to `1..=50`, then further to the
+  backend's `[mcp] max_results`. The response reports the value actually used.
+- `sessions` is ordered by relevance, best first. Clients must not re-sort it;
+  the feed's recency order does not apply here.
+- **There is no `cursor` and no `has_more`.** A relevance ranking is bounded
+  rather than paged: scores are not a monotone keyset anchor, and a cursor over
+  them would silently skip or repeat as the corpus changes. A `next_cursor` from
+  `/api/v1/sessions` belongs to the feed's query and is not redeemable here.
+- **Four separate signals describe the bound**, tabulated below. None of them is
+  an error, and the sessions returned are a true prefix of the ranking in every
+  case.
+- The response carries no snippets, highlights, or matched text. Ranking reads
+  message bodies to score them; none of that reaches the client, so a search
+  response stays flat as transcripts grow, exactly like the session feed.
+- `harness` and `source` narrow the ranking server-side, with the same trimming
+  and same blank-means-no-filter rule as the feed. There is no `since`, `mode`,
+  or `sort`: the route ranks, it does not window or order.
+- Results are restricted to this backend's configured project scope
+  (`--project-only`). Scope is applied against each session's exact origin
+  directory *while candidates are being ranked*, and the same rule is applied
+  again after hydration, so an out-of-scope session is never disclosed and
+  never even reaches the ranked set. `harness` and `source` are re-checked
+  exactly after hydration, so a
+  narrowed search never returns a session whose reported `harness`/`source`
+  contradicts the filter, and never disagrees with `/api/v1/sessions` under the
+  same narrowing.
+
+#### The four bounded-answer signals
+
+Ranking is over *events* and the response is over *sessions*, and an exact
+re-check runs after both, so "there is more" and "this is short" have different
+causes and different remedies. They are reported separately for that reason.
+
+| Field | Grain | What it means | Remedy |
+| --- | --- | --- | --- |
+| `truncated` | session | More ranked **sessions** existed than `limit` returned. | Raise `limit`, up to the route maximum of `50`. See the note below on what that buys. |
+| `hits_truncated` | event | The ranking filled its internal event-hit budget, so matching **events** existed that it never examined. Sessions beyond those returned may exist. | Raising `limit` widens the hit budget too, but promises no additional sessions. |
+| `incomplete` | ranking | The ranking's bounded candidate window was saturated before the answer could be filled (issue #597 §1.6). | None; narrow the query. |
+| `dropped` | response | Ranked sessions were removed by the exact post-ranking re-check — exact `harness`/`source`, the tombstone rule — and nothing refilled them, so this answer is a strict subset of what was ranked. | None; it is not a shortfall of the corpus. |
+
+A term that appears thirty times in one session returns `result_count: 1` with
+`truncated: false` and `hits_truncated: true`. That is the honest description:
+one session matched, and raising `limit` returns the same one session. Clients
+must not present `hits_truncated` as "raise your limit for more sessions", and
+must not present `dropped` or `incomplete` as a complete answer.
+
+##### What raising `limit` actually buys
+
+The ranking is over *events*, so the server asks it for more hits than the
+sessions it intends to return — several hits routinely land in one session.
+That internal budget is bounded, and the bound is what makes raising `limit`
+sub-linear rather than useless:
+
+| `limit` | internal hit budget | effective hits per requested session |
+| --- | --- | --- |
+| 1–12 | `4 × limit` | 4.0 |
+| 13–33 | 50 | 3.8 down to 1.5 |
+| 34–50 | `ceil(1.5 × limit)` | 1.5 |
+
+So a larger `limit` never buys a *smaller* ranking, but it does not buy a
+proportionally larger one either: between 13 and 33 the budget is a constant
+50, so raising `limit` inside that band returns more sessions from the same
+ranking window rather than from a wider one. The budget is monotone
+non-decreasing, not strictly increasing.
+
+`truncated` stays meaningful at every `limit` the route accepts: the budget
+always exceeds `limit`, so the ranking can always yield more distinct sessions
+than the page returns. Read it together with `hits_truncated`, though.
+`truncated` is computed only over the hits the budget admitted, so a clustered
+corpus — 25 sessions holding 3 hits each, at `limit: 50` — can answer
+`truncated: false` while lower-ranked matching sessions were never examined.
+Only `truncated: false` **and** `hits_truncated: false` together mean the corpus
+held no more matching sessions. This is why the dashboard's own count label
+qualifies on `truncated || hitsTruncated` rather than on `truncated` alone.
+
+##### What `dropped` discloses
+
+`dropped` carries no id and no reason, and the envelope carries no explicit
+count of what was removed. It would be wrong to describe it as carrying no
+magnitude, though: when `truncated` is also set the answer was cut from exactly
+`limit` ranked sessions, so `limit - result_count` is precisely how many the
+re-check removed. Suppressing `result_count` or `limit` here would hide nothing
+— `result_count` is the length of `sessions`, and a client knows the `limit` it
+asked for — so this documents what can be counted rather than pretending
+nothing can be.
+
+- **Never project scope.** A `--project-only` backend does not rank
+  out-of-scope sessions at all. Scope is applied while candidates are still
+  being chosen — against the navigation `argMinIf(cwd, …)` on the canonical
+  path, and against `mcp_open_publication_headers.origin_cwd` on the
+  pre-cutover path — so an out-of-scope session never enters the ranked set and
+  can never be part of `limit - result_count`. This route therefore cannot be
+  used to count out-of-scope activity for a search term. The identical scope
+  rule is re-applied after hydration as well, so that one function decides
+  disclosure for both discovery surfaces; that copy is defence in depth and is
+  not what the bit reports.
+- **Facet drift and tombstones.** What `dropped` does report is a session whose
+  *current* `harness`/`source` differs from the one the request narrowed by
+  (ranking matches per posting, a summary reports the session's latest value),
+  or one whose rows are no longer live under the pinned publication. A caller
+  who supplies `harness` or `source` can therefore learn how many of the top
+  `limit` matches have drifted or been retired. That is a fact about sessions
+  the caller is already permitted to see.
+
+#### Known limitation: the query tokenizer is ASCII-only
+
+Queries are tokenized on runs of `[A-Za-z0-9_]` of length 2 to 64. A query with
+no such run therefore yields no searchable term and is refused with HTTP `400`
+and `code: "invalid_argument"`. This includes any query written **entirely in a
+non-Latin script** — CJK, Cyrillic, Greek, Hebrew, Arabic, Devanagari — and any
+query that is a single character. The refusal is permanent for that query text,
+not transient, and retrying it will not succeed.
+
+This is a property of the indexing tokenizer (issue #597), not of this route:
+the same restriction applies to the MCP event search. Clients should render the
+`400` as a hint to rephrase, never as a service failure — and must not
+re-implement the rule locally, since the server owns it and the two copies would
+drift.
 
 `/api/v1/status` carries `known_harnesses`: the vocabulary the session feed's
 `harness` filter accepts. It is served because `harness` narrows a keyset-paged
@@ -45,7 +199,14 @@ feed's own read path gate on. Until then the route returns `503` with
 backfill or overlap audit has not completed. Session summaries stay available
 throughout; only the transcript detail is withheld.
 
-Successful analytics, web-search, and session responses carry
+That sentence covers **both** discovery routes. `/api/v1/sessions` and
+`/api/v1/sessions/search` branch on the same readiness key and hydrate their
+summaries from the pre-cutover projected headers while it is unset, so a
+not-ready backend answers a search with the sessions that matched — never with
+an empty `sessions` array, which would assert that the whole corpus was searched
+and nothing matched.
+
+Successful analytics, web-search, session, and session-search responses carry
 `"read_model":"live"`: their rows are authorized against published source
 generations. Table listing and bounded table preview carry
 `"read_model":"audit"` because they intentionally inspect physical relations,
@@ -83,8 +244,8 @@ The example version values are illustrative. Field semantics are:
   error.
 - `features.analytics` means the analytics collection route is implemented.
 - `features.sessions` means the session collection is implemented. It does not
-  separately advertise the session page route; a build that serves the
-  collection serves the page route too.
+  separately advertise the session page or session search routes; a build that
+  serves the collection serves those too.
 - `features.table_inspection` means table listing and bounded table preview are
   implemented.
 - `features.web_searches` means the normalized web-search collection is
@@ -115,6 +276,9 @@ unsigned integer is a malformed query and returns HTTP `400`.
 | `/api/v1/sessions` | `mode` | none | `chat`, `tool_calling`, `mcp_internal`, or `web_search` |
 | `/api/v1/sessions` | `harness`, `source` | none | any value; trimmed, and blank-after-trim means "no filter" |
 | `/api/v1/sessions` | `cursor` | none | an opaque `next_cursor` from a previous page |
+| `/api/v1/sessions/search` | `q` | none | **required**; trimmed, and blank-after-trim is HTTP `400` |
+| `/api/v1/sessions/search` | `limit` | `10` | clamped to `1..=50`, then to the backend's configured `[mcp] max_results` |
+| `/api/v1/sessions/search` | `harness`, `source` | none | any value; trimmed, and blank-after-trim means "no filter" |
 | `/api/v1/sessions/:id/page` | `limit` | `50` | clamped to `1..=200` |
 | `/api/v1/sessions/:id/page` | `cursor` | none | an opaque `next_cursor` from a previous page of the **same** session |
 | `/api/v1/web-searches` | `limit` | `100` | clamped to `1..=1000` |
@@ -140,7 +304,10 @@ question with a wider result set. A `cursor` that is present but blank is also
 The session `limit` is clamped twice. The route's own bound is `1..=200`; the
 backend then applies its configured `[mcp] max_results`. The response's `limit`
 field reports the second, effective value — the number of sessions the page was
-actually allowed to contain.
+actually allowed to contain. `/api/v1/sessions/search` clamps the same way with
+a lower route bound of `1..=50`, because a relevance ranking's value is
+concentrated in its head and each ranked session costs a hydration slot in the
+same bounded budget the feed spends.
 
 ### Session Paging
 
@@ -277,20 +444,25 @@ details; clients should branch on the HTTP status and `code`, not match
 arbitrary message text.
 
 A failure that the server can classify also carries an additive machine-readable
-`code`: `deadline_exceeded`, `resource_exhausted`, `invalid_cursor`, or
-`canonical_reader_unavailable`. The field is absent when the failure has no
-classification, so clients must tolerate its absence.
+`code`: `deadline_exceeded`, `resource_exhausted`, `invalid_cursor`,
+`invalid_argument`, or `canonical_reader_unavailable`. The field is absent when
+the failure has no classification, so clients must tolerate its absence.
+
+`invalid_argument` and `invalid_cursor` are the two classifications that mean
+*the request is at fault*: they are permanent for that request and retrying is
+useless. Every other classification describes the store or its budgets and may
+succeed on retry. Clients must not render a `400` as a service outage.
 
 | Status | Meaning |
 | --- | --- |
 | `200 OK` | The request completed. Inspect diagnostic fields such as `clickhouse.healthy`; `200` does not mean every component is healthy. |
-| `400 Bad Request` | The query could not be deserialized, a table identifier was rejected, a filter value was not recognized, or a continuation cursor was refused. Every refused cursor carries `code: "invalid_cursor"`, whether the route or the backend refused it. A rejected table identifier uses `{"ok":false,"error":"invalid table name"}`. Framework-generated malformed-query responses are not guaranteed to use the application JSON envelope. |
+| `400 Bad Request` | The query could not be deserialized, a table identifier was rejected, a filter value was not recognized, a required `q` was missing or blank, a repository operation rejected an argument the route could not validate itself, or a continuation cursor was refused. Every refused cursor carries `code: "invalid_cursor"`, whether the route or the backend refused it; a backend-rejected argument carries `code: "invalid_argument"` — most commonly a `q` the indexing tokenizer cannot split into any searchable term (see *Known limitation: the query tokenizer is ASCII-only*). A rejected table identifier uses `{"ok":false,"error":"invalid table name"}`. Framework-generated malformed-query responses are not guaranteed to use the application JSON envelope. |
 | `403 Forbidden` | Static-file path traversal or a path that resolves outside the configured static root. The JSON error is `{"ok":false,"error":"forbidden"}`. |
 | `404 Not Found` | No requested static file exists, or a requested session is unknown or outside this backend's configured scope. The JSON error is `{"ok":false,"error":"not found"}` or `{"ok":false,"error":"session not found"}`. |
 | `405 Method Not Allowed` | The path exists but does not support the requested HTTP method. A JSON error envelope is not guaranteed. |
 | `429 Too Many Requests` | Concurrent-read admission overflow, or a repository read that exhausted a non-time query budget. Carries `code: "resource_exhausted"`. |
 | `500 Internal Server Error` | The static root cannot be resolved or a selected static file cannot be read. |
-| `503 Service Unavailable` | A required repository or ClickHouse read failed with no budget classification, or `/api/v1/sessions/:id/page` was called on a backend that has not published its canonical read indexes — the latter carries `code: "canonical_reader_unavailable"`. Handler-generated responses use the JSON error envelope. |
+| `503 Service Unavailable` | A required repository or ClickHouse read failed with no budget classification **and was not the caller's fault** — a rejected argument or cursor is a `400`, not this — or `/api/v1/sessions/:id/page` was called on a backend that has not published its canonical read indexes, which carries `code: "canonical_reader_unavailable"`. Handler-generated responses use the JSON error envelope. |
 | `504 Gateway Timeout` | A repository read exceeded its query-budget deadline. Carries `code: "deadline_exceeded"`. |
 
 `/api/v1/health` returns `503` when the required store-health read, ping, or
@@ -333,7 +505,8 @@ build are used according to the server's static-directory resolution rules.
 Because unmatched paths enter static-file handling, an unknown path under
 `/api/v1` is not evidence that an API resource exists. Clients must use the
 routes in the matrix above rather than inferring paths from them; in particular
-`/api/v1/sessions/:id` is not a route, while `/api/v1/sessions/:id/page` is.
+`/api/v1/sessions/:id` is not a route, while `/api/v1/sessions/:id/page` and
+`/api/v1/sessions/search` are.
 
 ## MCP Protocol Is Unchanged
 

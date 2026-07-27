@@ -62,6 +62,15 @@ const STATIC_PATHNAMES = ['/', '/app.js', '/styles.css'] as const;
 const SESSION_FIXTURE_ID = 'session-monitor-fixture';
 const SESSIONS_PAGE_TWO_CURSOR = 'cursor-page-2';
 const SESSION_PAGE_PATHNAME = `/api/v1/sessions/${SESSION_FIXTURE_ID}/page`;
+const SESSION_SEARCH_PATHNAME = '/api/v1/sessions/search';
+/**
+ * A session the FEED never returns, whose title shares no substring with the
+ * search term. It is reachable only because the server ranked message content
+ * across the whole corpus — which is exactly what WI-09 replaced the page-local
+ * filter with, and what no client-side predicate could produce.
+ */
+const SEARCH_ONLY_SESSION_ID = 'session-only-findable-by-content';
+const SEARCH_TERM = 'projection';
 
 function sessionSummaryFixture(id: string, title: string) {
   return {
@@ -217,6 +226,38 @@ async function setupMockMonitorApi(page: Page): Promise<void> {
     });
   });
 
+  // Registered before the `:id/page` route below; Playwright gives priority to
+  // the most recently registered matching handler, and this path must never be
+  // read as a session whose id is "search".
+  await page.route('**/api/v1/sessions/search?*', async (route) => {
+    const url = new URL(route.request().url());
+    const q = (url.searchParams.get('q') ?? '').trim();
+    const matches =
+      q === SEARCH_TERM
+        ? [
+            sessionSummaryFixture(
+              SEARCH_ONLY_SESSION_ID,
+              'Retire the read-model rebuild',
+            ),
+          ]
+        : [];
+    await route.fulfill({
+      json: {
+        ok: true,
+        read_model: 'live',
+        query: q,
+        terms: q ? q.split(/\s+/) : [],
+        sessions: matches,
+        limit: 25,
+        result_count: matches.length,
+        truncated: false,
+        hits_truncated: false,
+        incomplete: false,
+        dropped: false,
+      },
+    });
+  });
+
   await page.route('**/api/v1/sessions/*/page?*', async (route) => {
     const url = new URL(route.request().url());
     const sessionId = decodeURIComponent(url.pathname.split('/').slice(-2)[0]);
@@ -351,14 +392,15 @@ test('loads dashboard and handles core interactions', async ({ page }) => {
   await expect(counter).toHaveText('2 loaded');
   await expect(page.getByRole('button', { name: 'Load more sessions' })).toHaveCount(0);
 
-  // Filter bar: searching narrows the loaded sessions
+  // Filter bar: the input is a whole-corpus server search, and says so.
   await expect(page.locator('.mv-search-input')).toHaveAttribute(
     'placeholder',
-    'Filter loaded sessions by title or id',
+    'Search all sessions by content',
   );
   await page.locator('.mv-search-input').fill('nothing-should-match-xyz');
-  await expect(page.locator('.mv-empty')).toContainText('No sessions match');
+  await expect(page.locator('#sessionsPanel .mv-empty')).toContainText('No sessions match');
   await page.locator('.mv-search-clear').click();
+  await expect(counter).toHaveText('2 loaded');
 
   // Theme segmented switch
   const htmlThemeBefore = await page.locator('html').getAttribute('data-theme');
@@ -403,4 +445,152 @@ test('keeps dashboard and detail views inside the mobile viewport', async ({ pag
   await expect(page.locator('.mv-sidepanel')).toBeVisible();
   await expect(page.locator('.mv-nodes')).toBeVisible();
   await expectNoPageOverflow(page);
+});
+
+test('search reaches the server and opens a result no local filter could find', async ({
+  page,
+}) => {
+  const runtimeTraffic = trackRuntimeTraffic(page);
+  await page.goto('/');
+  await expect(page.locator('#sessionsPanel')).toBeVisible();
+  await expect(page.locator('.mv-card')).toHaveCount(1);
+
+  // The searched term appears in no loaded row's title, id, slug or label. The
+  // deleted page-local filter matched exactly those fields, so it could only
+  // have produced an empty list here.
+  await expect(page.locator('.mv-card-title').first()).toHaveText('Inspect the repository');
+  // Typed one character at a time, which is the only input shape a debounce can
+  // be observed through: `fill()` emits a single event and would report one
+  // request whether or not the debounce exists.
+  await page.locator('.mv-search-input').pressSequentially(SEARCH_TERM, { delay: 20 });
+
+  await expect
+    .poll(() => runtimeTraffic.apiPathnames.filter((p) => p === SESSION_SEARCH_PATHNAME).length, {
+      message: 'expected the query to reach the server-side search route',
+    })
+    .toBeGreaterThan(0);
+  await expect(page.locator('.mv-card-title')).toHaveText(['Retire the read-model rebuild']);
+  await expect(page.locator('.mv-filter-count')).toHaveText('1 result');
+  // A ranking is bounded, not paged: the feed's continuation affordance must
+  // not offer to extend a result set its cursor does not describe.
+  await expect(page.getByRole('button', { name: 'Load more sessions' })).toHaveCount(0);
+
+  // The count and the server's bounded-answer flags describe two different
+  // populations as soon as a LOCAL filter narrows the ranked set. `status`
+  // is client-side, so selecting `active` hides the (completed) result — and
+  // the bar must then report both numbers rather than presenting a local
+  // narrowing as the ranking's own answer. This is the wiring the pure
+  // `sessionCountLabel` unit tests cannot reach.
+  const statusSelect = page.locator('.mv-filter select').first();
+  await statusSelect.selectOption('active');
+  await expect(page.locator('.mv-filter-count')).toHaveText('0 of 1 results');
+  await expect(page.locator('.mv-card')).toHaveCount(0);
+  await statusSelect.selectOption('all');
+  await expect(page.locator('.mv-filter-count')).toHaveText('1 result');
+
+  // Every search is a real BM25 ranking over the whole corpus, so typing must
+  // settle before one is issued. The bound is 2, not "fewer than the number of
+  // keystrokes": a debounce degraded to one request per keystroke minus one
+  // would satisfy the looser bound while issuing nine rankings for ten
+  // characters. Two allows for the settle boundary landing mid-word once.
+  const searchRequests = runtimeTraffic.apiPathnames.filter(
+    (p) => p === SESSION_SEARCH_PATHNAME,
+  ).length;
+  expect(
+    searchRequests,
+    `${SEARCH_TERM.length} keystrokes issued ${searchRequests} searches`,
+  ).toBeLessThanOrEqual(2);
+
+  // A result is a session summary, so it opens through the same lazy reader a
+  // listed session does — no search-specific detail path.
+  await page.locator('.mv-card').first().click();
+  await expect(page.locator('.mv-sidepanel')).toBeVisible();
+  await expect
+    .poll(() =>
+      runtimeTraffic.apiPathnames.filter(
+        (p) => p === `/api/v1/sessions/${SEARCH_ONLY_SESSION_ID}/page`,
+      ).length,
+    )
+    .toBe(1);
+  await page.locator('.mv-sidepanel .mv-iconbtn').click();
+
+  // Clearing the query returns the panel to the time-ordered feed rather than
+  // leaving an empty result set on screen.
+  await page.locator('.mv-search-clear').click();
+  await expect(page.locator('.mv-card-title').first()).toHaveText('Inspect the repository');
+  await expect(page.locator('.mv-filter-count')).toHaveText('1 loaded');
+});
+
+test('a failed search is reported, never answered from the loaded page', async ({ page }) => {
+  const runtimeTraffic = trackRuntimeTraffic(page);
+  await page.route('**/api/v1/sessions/search?*', async (route) => {
+    await route.fulfill({
+      status: 504,
+      json: { ok: false, error: 'session search failed: deadline', code: 'deadline_exceeded' },
+    });
+  });
+
+  await page.goto('/');
+  await expect(page.locator('#sessionsPanel')).toBeVisible();
+  // Typed, not `fill()`ed: a failing search must go through the same debounced
+  // path a succeeding one does, or this never exercises the code that runs in
+  // production.
+  await page.locator('.mv-search-input').pressSequentially('repository', { delay: 20 });
+  await expect
+    .poll(() =>
+      runtimeTraffic.apiPathnames.filter((p) => p === SESSION_SEARCH_PATHNAME).length,
+    )
+    .toBeGreaterThan(0);
+
+  // "repository" IS in the loaded row's title. A fallback to the deleted local
+  // filter would therefore render that row and look like a working search.
+  await expect(page.locator('#sessionsPanel .mv-empty').first()).toContainText(
+    'Search unavailable',
+  );
+  await expect(page.locator('.mv-card')).toHaveCount(0);
+
+  // THE POINT OF THE GUARD. The banner alone is also true of the broken
+  // behaviour this replaced, which additionally printed "No sessions match this
+  // search." and "0 results" — a corpus-wide claim the request never
+  // established, beside a banner saying it could not be established.
+  const panel = page.locator('#sessionsPanel');
+  await expect(panel).not.toContainText('No sessions match');
+  await expect(panel).not.toContainText('0 results');
+  await expect(page.locator('.mv-filter-count')).toHaveText('search did not run');
+  // A ranking's continuation affordance must not appear either: there is
+  // nothing to continue.
+  await expect(page.getByRole('button', { name: 'Load more sessions' })).toHaveCount(0);
+
+  // Clearing returns the panel to the feed, so the failure is not sticky.
+  await page.locator('.mv-search-clear').click();
+  await expect(page.locator('.mv-card-title').first()).toHaveText('Inspect the repository');
+  await expect(page.locator('.mv-filter-count')).toHaveText('1 loaded');
+});
+
+test('a query the server cannot tokenize is a hint, not an outage', async ({ page }) => {
+  // The backend owns the tokenizer, so it decides that a one-character or
+  // non-ASCII query carries no searchable term. Reported as `503` this rendered
+  // "Search unavailable" — an outage banner for a typo, with a retry that could
+  // never succeed.
+  await page.route('**/api/v1/sessions/search?*', async (route) => {
+    await route.fulfill({
+      status: 400,
+      json: {
+        ok: false,
+        error:
+          'session search failed: query has no searchable terms (tokens shorter than 2 characters are excluded)',
+        code: 'invalid_argument',
+      },
+    });
+  });
+
+  await page.goto('/');
+  await expect(page.locator('#sessionsPanel')).toBeVisible();
+  await page.locator('.mv-search-input').pressSequentially('x', { delay: 20 });
+
+  const panel = page.locator('#sessionsPanel');
+  await expect(panel.locator('.mv-empty').first()).toContainText('no searchable terms');
+  await expect(panel).not.toContainText('Search unavailable');
+  await expect(panel).not.toContainText('No sessions match');
+  await expect(panel).not.toContainText('0 results');
 });

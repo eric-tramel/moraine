@@ -11,8 +11,8 @@ use crate::domain::{
     ConversationSearchResults, FileAttentionQuery, FileAttentionTouch, McpEventOpen,
     McpSessionListFilter, McpSessionListItem, McpSessionOpen, McpTurnOpen, OpenContext,
     OpenEventRequest, Page, PageRequest, RepoConfig, SearchEventsQuery, SearchEventsResult,
-    SearchMcpEventsQuery, SearchMcpEventsResult, SessionEventsQuery, SessionMetadata, TraceEvent,
-    Turn, TurnListFilter, TurnSummary,
+    SearchMcpEventsQuery, SearchMcpEventsResult, SessionEventsQuery, SessionMetadata,
+    SessionSearchQuery, SessionSearchResults, TraceEvent, Turn, TurnListFilter, TurnSummary,
 };
 use crate::error::{RepoError, RepoResult};
 
@@ -91,6 +91,36 @@ pub trait ConversationRepository: Send + Sync {
         filter: McpSessionListFilter,
         page: PageRequest,
     ) -> RepoResult<Page<McpSessionListItem>>;
+
+    /// Session DISCOVERY BY CONTENT over the whole permitted corpus
+    /// (issue-599 WI-09).
+    ///
+    /// Candidate selection is issue #597's bounded postings ranking; every step
+    /// after it is shared with [`Self::list_mcp_sessions`] — the same read
+    /// model, chosen by the same readiness latch, then the same hydration and
+    /// the same visibility rules — so the two discovery surfaces cannot
+    /// disagree about what a session is, what it is called, whether the caller
+    /// may see it, or which harness it ran under.
+    ///
+    /// Two re-checks against the HYDRATED session are load-bearing:
+    ///
+    /// * **Project scope**, against `origin_cwd`. Scope decides what a caller
+    ///   is allowed to see, so it does not rest on a recall filter.
+    /// * **`harness` / `source_name`, exactly.** Ranking narrows per POSTING
+    ///   (`p.harness = …`) while a summary reports the session's LATEST value,
+    ///   so without this a `harness`-narrowed search returns a card rendered
+    ///   under a different harness — and disagrees with the feed, which has
+    ///   always re-checked exactly.
+    ///
+    /// The result carries session SUMMARIES only. Ranking reads message text to
+    /// score it; none of that text reaches the caller.
+    ///
+    /// The bounded-answer flags on [`SessionSearchResults`] describe different
+    /// facts with different remedies and must be surfaced separately.
+    async fn search_session_summaries(
+        &self,
+        query: SessionSearchQuery,
+    ) -> RepoResult<SessionSearchResults>;
 
     async fn list_turns(
         &self,

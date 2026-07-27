@@ -156,10 +156,12 @@ impl ClickHouseConversationRepository {
     ///   deletes a corpus-sized `events FINAL` scan from every scoped page.
     /// * `harness` / `source` / `mode_hint` are RECALL filters only; the exact
     ///   values are re-checked in Phase C against the hydrated aggregates.
-    /// * **`cand_last_ms` is the operation's single keyset time source.** It is
-    ///   the only time value this statement can filter on, so it is also what
-    ///   Phase C orders survivors by and mints the cursor from
-    ///   ([`DirectoryCandidateRow::cand_last_ms`]).
+    /// * **`cand_last_ms` is the operation's single `updated_at`.** It is the
+    ///   only time value this statement can filter on, so it is what Phase C
+    ///   orders survivors by, mints the cursor from, AND reports
+    ///   ([`DirectoryCandidateRow::cand_last_ms`]). `cand_last_time` is its
+    ///   display form, projected here rather than derived in Rust so the two
+    ///   come from one aggregate.
     pub(super) fn build_session_directory_page_sql(&self, params: &DirectoryPageParams) -> String {
         let directory = self.table_ref("mcp_session_directory");
         let published = self.published_generations_subquery();
@@ -211,6 +213,38 @@ impl ClickHouseConversationRepository {
             "SELECT\n  d.session_id AS session_id,\n  toInt64(toUnixTimestamp64Milli(max(d.max_observed_event_time))) AS cand_last_ms,\n  toString(max(d.max_observed_event_time)) AS cand_last_time,\n  toInt64(toUnixTimestamp64Milli(min(d.min_observed_event_time))) AS cand_first_ms,\n  toUInt8(max(d.mode_hint)) AS mode_hint,\n  argMinIfMerge(d.origin_cwd_state) AS origin_cwd,\n  groupUniqArray(d.harness) AS harnesses,\n  groupUniqArray(d.source_name) AS sources\nFROM {directory} AS d\nWHERE notEmpty(trimBoth(d.session_id))\n  AND (d.source_host, d.source_name, d.source_file, d.source_generation) IN {published}\nGROUP BY d.session_id\nHAVING {having}\nORDER BY cand_last_ms {order_dir}, session_id {order_dir}\nLIMIT {limit}\nFORMAT JSONEachRow",
             having = having.join("\n   AND "),
             limit = params.limit,
+        )
+    }
+
+    /// The SAME directory aggregate Phase A selects by, for a bounded set of
+    /// session ids that some OTHER selector chose — today, content ranking
+    /// (issue-599 WI-09).
+    ///
+    /// Session discovery by content does not page a keyset, so it has no
+    /// Phase A. It still has to report `updated_at`, and the whole point of
+    /// this statement is that it reports the SAME quantity the time-ordered
+    /// feed does. Deriving it from hydration instead would make one session
+    /// carry two different instants depending on which surface asked, and
+    /// `status` in the monitor is derived from that instant against a 60 s
+    /// window — so the divergence is a rendered contradiction, not a rounding
+    /// difference.
+    ///
+    /// Cost: `mcp_session_directory` leads its sort key with `session_id`
+    /// (`sql/036:49`), so an `IN` set of at most `SESSION_SEARCH_MAX_LIMIT`
+    /// ids is a PK-pruned point-range scan of a narrow, content-free table —
+    /// the same shape [`Self::build_search_scope_exists_sql`] already issues on
+    /// every scoped search, widened from one id to K.
+    ///
+    /// A session with no row here has no live published generation, which is
+    /// the canonical replacement for the retired `tombstone` column and is
+    /// exactly what makes it absent from Phase A too. The caller drops it, so
+    /// the two surfaces agree about visibility as well as about the value.
+    pub(super) fn build_session_keyset_batch_sql(&self, session_ids: &[String]) -> String {
+        let directory = self.table_ref("mcp_session_directory");
+        let published = self.published_generations_subquery();
+        let ids = sql_array_strings(session_ids);
+        format!(
+            "SELECT\n  d.session_id AS session_id,\n  toInt64(toUnixTimestamp64Milli(max(d.max_observed_event_time))) AS cand_last_ms,\n  toString(max(d.max_observed_event_time)) AS cand_last_time\nFROM {directory} AS d\nWHERE notEmpty(trimBoth(d.session_id))\n  AND d.session_id IN {ids}\n  AND (d.source_host, d.source_name, d.source_file, d.source_generation) IN {published}\nGROUP BY d.session_id\nFORMAT JSONEachRow"
         )
     }
 
@@ -304,26 +338,28 @@ impl ClickHouseConversationRepository {
 // Deserialization rows.
 // ---------------------------------------------------------------------------
 
-/// One Phase-A candidate. The recall columns (`mode_hint`, `origin_cwd`,
-/// `harnesses`, `sources`) are consumed by the statement's own `HAVING` and
-/// deliberately not deserialized.
-#[derive(Debug, Clone, Deserialize)]
-pub(super) struct DirectoryCandidateRow {
-    pub(super) session_id: String,
-    /// Display form of [`Self::cand_last_ms`], reported as the item's
-    /// `last_event_time` so the response's timestamp is the value the page was
-    /// ordered and keyset by (issue-599 B1). Reporting the hydrated exact value
-    /// instead would leave the page sorted by a field it does not return.
-    pub(super) cand_last_time: String,
-    /// **The operation's one keyset time source.** Phase A orders by it, its
-    /// `HAVING` keyset resumes strictly after it, Phase C sorts survivors by
-    /// it, and the continuation cursor is minted from it. Candidate filtering,
-    /// result ordering and cursor minting must all read this same value or a
-    /// page can skip sessions.
+/// One session's directory `updated_at`, in both the form the page filters,
+/// orders and pages by and the form it renders.
+///
+/// **One quantity, one name.** The alternative this replaced kept the keyset
+/// value beside the item and reported the hydrated aggregate instead, which
+/// made `updated_at` a number the response was NOT ordered by (the published
+/// `docs/mcp-search-interface-spec.md` contract says it is) and made two
+/// discovery surfaces describe one session two ways. Both defects have the same
+/// root: two relations answering "when did this session last have an event".
+/// This type is the answer, and every surface takes it from here.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct SessionKeyset<'a> {
+    /// **The operation's one `updated_at`.** Phase A orders by it, its `HAVING`
+    /// keyset resumes strictly after it, Phase C sorts survivors by it, the
+    /// continuation cursor is minted from it, and the item REPORTS it.
     ///
     /// It is authoritative because it is the ONLY time value Phase A can filter
     /// on: `mcp_session_directory` is the only relation the candidate pass
     /// reads, and `max(max_observed_event_time)` is its only upper time bound.
+    /// Minting a cursor from anything else and then comparing it against
+    /// `cand_last_ms` on the next page silently skips every session whose
+    /// directory aggregate falls between the two.
     ///
     /// The hydrated `SessionTotalsBatchRow::last_event_unix_ms` is a DIFFERENT
     /// number. The directory is an `AggregatingMergeTree` whose
@@ -332,14 +368,53 @@ pub(super) struct DirectoryCandidateRow {
     /// `mcp_event_navigation` is `ReplacingMergeTree(event_version)` read with
     /// `FINAL`, so hydration sees only the winning version. Hence
     /// `cand_last_ms >= last_event_unix_ms`, with equality in the common
-    /// never-re-ingested case. Minting the cursor from the hydrated value and
-    /// then comparing it against `cand_last_ms` on the next page silently skips
-    /// every session whose directory aggregate falls between the two.
-    ///
-    /// The hydrated value is what the item REPORTS as `last_event_unix_ms`
-    /// (response fidelity — it is the same exact aggregate the projected-header
-    /// path served) and is never an ordering or cursor input.
+    /// never-re-ingested case — which is exactly the "it can sit slightly above
+    /// that timestamp; it never sits below" clause the MCP spec publishes.
+    pub(super) last_unix_ms: i64,
+    /// The display form of [`Self::last_unix_ms`], from the same aggregate in
+    /// the same statement rather than formatted in Rust, so the millis and the
+    /// string can never describe two instants.
+    pub(super) last_time: &'a str,
+}
+
+/// One Phase-A candidate. The recall columns (`mode_hint`, `origin_cwd`,
+/// `harnesses`, `sources`) are consumed by the statement's own `HAVING` and
+/// deliberately not deserialized.
+#[derive(Debug, Clone, Deserialize)]
+pub(super) struct DirectoryCandidateRow {
+    pub(super) session_id: String,
+    /// See [`SessionKeyset::last_unix_ms`].
     pub(super) cand_last_ms: i64,
+    /// See [`SessionKeyset::last_time`].
+    pub(super) cand_last_time: String,
+}
+
+impl DirectoryCandidateRow {
+    pub(super) fn keyset(&self) -> SessionKeyset<'_> {
+        SessionKeyset {
+            last_unix_ms: self.cand_last_ms,
+            last_time: self.cand_last_time.as_str(),
+        }
+    }
+}
+
+/// One row of [`ClickHouseConversationRepository::build_session_keyset_batch_sql`]
+/// — the same two columns [`DirectoryCandidateRow`] carries, for ids a
+/// non-paging selector chose.
+#[derive(Debug, Clone, Deserialize)]
+pub(super) struct SessionKeysetBatchRow {
+    pub(super) session_id: String,
+    cand_last_ms: i64,
+    cand_last_time: String,
+}
+
+impl SessionKeysetBatchRow {
+    pub(super) fn keyset(&self) -> SessionKeyset<'_> {
+        SessionKeyset {
+            last_unix_ms: self.cand_last_ms,
+            last_time: self.cand_last_time.as_str(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -351,6 +426,16 @@ pub(super) struct SessionTotalsBatchRow {
     pub(super) counter_user_messages: u64,
     pub(super) first_event_time: String,
     pub(super) first_event_unix_ms: i64,
+    /// The EXACT `FINAL`-deduped upper bound, used to re-filter the requested
+    /// window in Phase C and NOT reported: `updated_at` on both discovery
+    /// surfaces is [`SessionKeyset::last_unix_ms`], the value the feed also
+    /// orders and pages by.
+    ///
+    /// There is deliberately no `last_event_time` beside it. The batch builder
+    /// projected one only for the item's display form, and the item now takes
+    /// that from [`SessionKeyset::last_time`]; carrying a second, unreported
+    /// rendering of "when did this session end" is how the two of them drifted
+    /// apart in the first place.
     pub(super) last_event_unix_ms: i64,
     /// The session's origin cwd under the EXACT rule `scope.rs` applies —
     /// `argMin(cwd, (event_ts, event_uid))` over rows with a non-empty cwd,
@@ -732,10 +817,10 @@ mod tests {
             // `origin_cwd` is intentionally absent: it is batch-only, hydrated
             // for the exact project-scope re-check. The single-session builder
             // has no equivalent because `open(session)` is already scoped
-            // before it runs.
-            // `last_event_time` is deliberately absent: the directory path
-            // reports the value it orders by (`cand_last_time`), so hydrating
-            // the display string here would transfer bytes that are discarded.
+            // before it runs. `last_event_time` is absent for the opposite
+            // reason: the single-session builder projects it and the batch
+            // deliberately does not, because discovery renders
+            // `SessionKeyset::last_time` — the value it also pages by.
             "last_event_unix_ms",
             "source",
             "harness",

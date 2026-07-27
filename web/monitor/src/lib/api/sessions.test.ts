@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { SessionSummary, SessionTurn } from '../types/sessions';
-import { MonitorApiError, fetchSessionPage, fetchSessions } from './sessions';
+import { MonitorApiError, fetchSessionPage, fetchSessions, searchSessions } from './sessions';
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -233,5 +233,122 @@ describe('fetchSessionPage', () => {
       (rejection: unknown) => rejection,
     );
     expect((error as MonitorApiError).code).toBe('canonical_reader_unavailable');
+  });
+});
+
+
+describe('searchSessions', () => {
+  it('asks the server to rank the whole corpus and returns summary rows', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      jsonResponse({
+        ok: true,
+        read_model: 'live',
+        query: 'projection runaway',
+        terms: ['projection', 'runaway'],
+        sessions: [summary('best-match'), summary('second')],
+        limit: 25,
+        result_count: 2,
+        truncated: true,
+        hits_truncated: false,
+        incomplete: false,
+        dropped: false,
+      }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const page = await searchSessions('  projection runaway  ', { limit: 25, harness: 'codex' });
+
+    expect(page.sessions).toEqual([summary('best-match'), summary('second')]);
+    expect(page.query).toBe('projection runaway');
+    expect(page.truncated).toBe(true);
+    expect(page.incomplete).toBe(false);
+
+    const url = requestedUrl(fetchMock);
+    expect(url.pathname).toBe('/api/v1/sessions/search');
+    // The whole point of WI-09: the query goes to the server, not to a
+    // predicate over the loaded page.
+    expect(url.searchParams.get('q')).toBe('projection runaway');
+    expect(url.searchParams.get('limit')).toBe('25');
+    expect(url.searchParams.get('harness')).toBe('codex');
+    // A cleared filter is absent, not an empty value that would match nothing.
+    expect(url.searchParams.has('source')).toBe(false);
+  });
+
+  it('preserves the ranked order the server returned', async () => {
+    // The best match is deliberately the OLDEST session, so any recency sort
+    // sneaking back in would reorder this.
+    const oldest = { ...summary('best-match'), endedAt: 1_500_000_000_000 };
+    const newest = { ...summary('second'), endedAt: 1_900_000_000_000 };
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(jsonResponse({ ok: true, sessions: [oldest, newest] })),
+    );
+
+    const page = await searchSessions('projection');
+    expect(page.sessions.map((s) => s.id)).toEqual(['best-match', 'second']);
+  });
+
+  // The four signals mean four different things and have different remedies.
+  // The matrix is exhaustive so a field wired to its neighbour cannot survive.
+  it('carries every bounded-answer signal through independently', async () => {
+    for (let bits = 0; bits < 16; bits += 1) {
+      const wire = {
+        truncated: (bits & 1) !== 0,
+        hits_truncated: (bits & 2) !== 0,
+        incomplete: (bits & 4) !== 0,
+        dropped: (bits & 8) !== 0,
+      };
+      vi.stubGlobal(
+        'fetch',
+        vi.fn().mockResolvedValue(jsonResponse({ ok: true, sessions: [], ...wire })),
+      );
+
+      const page = await searchSessions('projection');
+      expect(page.sessions).toEqual([]);
+      expect(page.truncated, `bits=${bits}`).toBe(wire.truncated);
+      expect(page.hitsTruncated, `bits=${bits}`).toBe(wire.hits_truncated);
+      expect(page.incomplete, `bits=${bits}`).toBe(wire.incomplete);
+      expect(page.dropped, `bits=${bits}`).toBe(wire.dropped);
+    }
+  });
+
+  // A server that has not yet learned these fields must not be read as
+  // "definitely not truncated" — but the honest default for an absent optional
+  // boolean is `false`, and the server always sends them.
+  it('defaults every absent bounded-answer signal to false', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse({ ok: true, sessions: [] })));
+    const page = await searchSessions('projection');
+    expect(page).toMatchObject({
+      truncated: false,
+      hitsTruncated: false,
+      incomplete: false,
+      dropped: false,
+    });
+  });
+
+  it('throws with the server classification rather than degrading to a local filter', async () => {
+    for (const [status, code] of [
+      [504, 'deadline_exceeded'],
+      [429, 'resource_exhausted'],
+      [400, 'invalid_request'],
+      // The repository owns the tokenizer, so "your query has no searchable
+      // term" arrives as a 400 with its own code — a hint, not an outage.
+      [400, 'invalid_argument'],
+    ] as const) {
+      vi.stubGlobal(
+        'fetch',
+        vi.fn().mockResolvedValue(jsonResponse({ ok: false, error: `boom ${code}`, code }, status)),
+      );
+
+      const error = await searchSessions('projection').then(
+        () => {
+          throw new Error(`expected ${status} to reject`);
+        },
+        (rejection: unknown) => rejection,
+      );
+      expect(error).toBeInstanceOf(MonitorApiError);
+      expect((error as MonitorApiError).status).toBe(status);
+      expect((error as MonitorApiError).code).toBe(code);
+    }
   });
 });
