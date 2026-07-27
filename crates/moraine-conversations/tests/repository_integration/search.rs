@@ -1,4 +1,5 @@
 use super::*;
+use moraine_conversations::ClickHouseConversationRepository;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn search_mcp_events_distinguishes_unready_and_dirty_projection_snapshots() {
@@ -377,8 +378,14 @@ async fn search_conversations_without_time_window_uses_postings_only_fast_path()
             .find(|q| q.contains("GROUP BY e.session_id"))
             .expect("aggregated conversation query should be captured");
 
-        assert!(agg_query.contains("FROM `moraine`.`v_live_search_postings` AS p"));
+        // Issue #597 B6: ONE document population. The scoring statement reads
+        // the same locator-authorized `term_postings` relation that
+        // `bounded_term_df_map` counts `df` over, not the document-authorized
+        // `v_live_search_postings` view.
+        assert!(agg_query.contains("FROM term_postings AS p"));
+        assert!(!agg_query.contains("FROM `moraine`.`v_live_search_postings` AS p"));
         assert!(agg_query.contains("WHERE p.term IN"));
+        assert!(agg_query.contains("AND l.event_version = p.post_version"));
         assert!(!agg_query.contains("PREWHERE"));
         assert!(agg_query.contains("bitCount(groupBitOr(e.term_mask))"));
         assert!(!agg_query.contains("JOIN `moraine`.`search_documents` AS d"));
@@ -622,15 +629,18 @@ async fn a_candidate_without_a_live_document_revision_is_dropped() {
             .await
             .expect("a stale candidate is a silent drop, never an error");
 
-        assert_eq!(
-            result
-                .hits
-                .iter()
-                .map(|hit| hit.event_uid.as_str())
-                .collect::<Vec<_>>(),
-            vec!["evt-c-42"],
-            "the candidate with no live document revision must not be served"
+        let hits = result
+            .hits
+            .iter()
+            .map(|hit| hit.event_uid.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            !hits.contains(&"evt-a-11"),
+            "the candidate with no live document revision must not be served: {hits:?}"
         );
+        // …and the rest of the page is still served — a stale candidate is a
+        // per-row drop, never a request-level failure.
+        assert_eq!(hits, vec!["evt-c-42", "evt-b-9"]);
         // Not an error, and not `incomplete` either: the window was not
         // saturated, so this is the complete answer.
         assert!(!result.incomplete_due_to_candidate_budget);
@@ -779,14 +789,50 @@ async fn search_events_ranks_once_from_postings_and_reads_no_content() {
                 "bounded ranking must not read `{forbidden}`: {ranking}"
             );
         }
+        // Exactly two document reads are legal on this path, and each has to
+        // justify itself:
+        //
+        //  1. the per-candidate extras read, keyed by the ranked identities;
+        //  2. the corpus-stats scalar pair, which is corpus-wide BY DEFINITION
+        //     — there is no bounded form of "how many documents are there" —
+        //     but is `count()` + `sum(doc_len)` only, names no wide column, and
+        //     is cached for `CORPUS_STATS_CACHE_TTL` per publication token.
+        //
+        // Anything else is the corpus-sized document read this issue exists to
+        // remove, so the fallthrough is a hard failure, not a relaxation.
+        let mut corpus_stats_reads = 0;
         for query in &queries {
-            if query.contains("`v_live_search_documents`") {
+            if !query.contains("`v_live_search_documents`")
+                || query.contains("requested_documents AS requested")
+            {
+                continue;
+            }
+            assert!(
+                query.contains("toUInt64(count()) AS docs")
+                    && query.contains("toUInt64(ifNull(sum(d.doc_len), 0)) AS total_doc_len"),
+                "every document read must be keyed by the ranked identities, or \
+                 else be the corpus-stats scalar pair: {query}"
+            );
+            for forbidden in ["text_content", "payload_json"] {
                 assert!(
-                    query.contains("requested_documents AS requested"),
-                    "every document read must be keyed by the ranked identities: {query}"
+                    !query.contains(forbidden),
+                    "the corpus-stats read must stay a content-free scalar pair, \
+                     found `{forbidden}`: {query}"
                 );
             }
+            // …and it counts the population this statement's `df` is counted
+            // over (issue #597 B6), not `search_corpus_stats`'s.
+            assert!(
+                query.contains("FROM `moraine`.`mcp_event_locator` AS l FINAL"),
+                "corpus stats must carry the same locator authorization the \
+                 ranking relation does: {query}"
+            );
+            corpus_stats_reads += 1;
         }
+        assert_eq!(
+            corpus_stats_reads, 1,
+            "corpus stats are read at most once per request: {queries:?}"
+        );
     })
     .await;
 }
@@ -1412,35 +1458,37 @@ async fn search_mcp_events_deduplicates_before_limit_and_reports_truncation() {
 #[tokio::test(flavor = "multi_thread")]
 async fn search_mcp_events_issues_exactly_one_ranking_statement() {
     scoped(async {
-        let (repo, state) = build_repo().await;
+        // Over BOTH engines: this guard used to run only against the retired
+        // v1 path, where a v2 refill-loop regression could not reach it.
+        for path in SearchPath::ALL {
+            let (repo, state) = path.repo().await;
 
-        let result = repo
-            .search_mcp_events(SearchMcpEventsQuery {
-                query: "hello world".to_string(),
-                n_hits: Some(2),
-                min_score: Some(0.0),
-                min_should_match: Some(1),
-                ..SearchMcpEventsQuery::default()
-            })
-            .await
-            .expect("bounded mcp event search");
-        assert!(!result.incomplete_due_to_candidate_budget);
+            let result = repo
+                .search_mcp_events(SearchMcpEventsQuery {
+                    query: "hello world".to_string(),
+                    n_hits: Some(2),
+                    min_score: Some(0.0),
+                    min_should_match: Some(1),
+                    ..SearchMcpEventsQuery::default()
+                })
+                .await
+                .unwrap_or_else(|error| panic!("{path:?}: bounded mcp event search: {error}"));
+            assert!(!result.incomplete_due_to_candidate_budget, "{path:?}");
 
-        let queries = state.queries.lock().expect("queries lock").clone();
-        let ranking = queries
-            .iter()
-            .filter(|query| {
-                query.contains("toUInt8(0) AS row_kind") && query.contains("term_postings AS (")
-            })
-            .count();
-        assert_eq!(
-            ranking, 1,
-            "one bounded ranking pass per request: {queries:?}"
-        );
-        assert!(
-            !queries.iter().any(|query| query.contains(" OFFSET ")),
-            "the refill loop's OFFSET paging must not come back: {queries:?}"
-        );
+            let queries = state.queries.lock().expect("queries lock").clone();
+            let ranking = queries
+                .iter()
+                .filter(|query| path.is_ranking_statement(query))
+                .count();
+            assert_eq!(
+                ranking, 1,
+                "{path:?}: one bounded ranking pass per request: {queries:?}"
+            );
+            assert!(
+                !queries.iter().any(|query| query.contains(" OFFSET ")),
+                "{path:?}: the refill loop's OFFSET paging must not come back: {queries:?}"
+            );
+        }
     })
     .await;
 }
@@ -1490,44 +1538,45 @@ async fn search_mcp_events_classifies_hydration_projection_movement() {
 #[tokio::test(flavor = "multi_thread")]
 async fn search_mcp_events_marks_a_saturated_collapsing_window_incomplete() {
     scoped(async {
-        let (repo, state) = build_repo_with_options(
-            100,
-            MockOptions {
-                saturate_candidate_window: true,
-                open_v2_reader_ready: Some(false),
-                ..MockOptions::default()
-            },
-        )
-        .await;
+        for path in SearchPath::ALL {
+            let (repo, state) = path
+                .repo_with(MockOptions {
+                    saturate_candidate_window: true,
+                    ..MockOptions::default()
+                })
+                .await;
 
-        let result = repo
-            .search_mcp_events(SearchMcpEventsQuery {
-                query: "hello world".to_string(),
-                n_hits: Some(2),
-                min_score: Some(0.0),
-                min_should_match: Some(1),
-                ..SearchMcpEventsQuery::default()
-            })
-            .await
-            .expect("a saturated collapsing window is not an error");
+            let result = repo
+                .search_mcp_events(SearchMcpEventsQuery {
+                    query: "hello world".to_string(),
+                    n_hits: Some(2),
+                    min_score: Some(0.0),
+                    min_should_match: Some(1),
+                    ..SearchMcpEventsQuery::default()
+                })
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("{path:?}: a saturated collapsing window is not an error: {error}")
+                });
 
-        assert!(
-            result.incomplete_due_to_candidate_budget,
-            "a saturated window that dedups short must report the budget marker"
-        );
-        // The hits that ARE returned are valid and are a true ranking prefix.
-        assert_eq!(result.hits.len(), 1);
-        assert_eq!(result.hits[0].event_uid, "evt-sat-0");
+            assert!(
+                result.incomplete_due_to_candidate_budget,
+                "{path:?}: a saturated window that dedups short must report the budget marker"
+            );
+            // The hits that ARE returned are valid and are a true ranking prefix.
+            assert_eq!(result.hits.len(), 1, "{path:?}");
+            assert_eq!(result.hits[0].event_uid, "evt-sat-0", "{path:?}");
 
-        let queries = state.queries.lock().expect("queries lock");
-        let candidate_queries = queries
-            .iter()
-            .filter(|query| query.contains("toUInt8(0) AS row_kind"))
-            .count();
-        assert_eq!(
-            candidate_queries, 1,
-            "the 16-page refill loop must not come back"
-        );
+            let queries = state.queries.lock().expect("queries lock");
+            let candidate_queries = queries
+                .iter()
+                .filter(|query| path.is_ranking_statement(query))
+                .count();
+            assert_eq!(
+                candidate_queries, 1,
+                "{path:?}: the 16-page refill loop must not come back"
+            );
+        }
     })
     .await;
 }
@@ -1558,6 +1607,687 @@ async fn search_mcp_events_reports_event_ordinal_within_turn() {
         assert_eq!(hit.event_order, 42);
         assert_eq!(hit.event_ordinal, 3);
         assert_eq!(hit.turn_event_count, 3);
+    })
+    .await;
+}
+
+// ---------------------------------------------------------------------------
+// Issue #597 B4: the engine matrix.
+//
+// `build_repo()` pins `open_v2_reader_ready = false`, so every MCP search
+// fixture written before this issue exercises the RETIRED v1 engine and cannot
+// fail on a v2 regression. The matrix below runs ONE assertion set over BOTH
+// engines against ONE mock corpus (`mcp_search_detail_row`), the way #599's
+// `ListPath` matrix does for session listing.
+//
+// MUTATION: break either engine's hit assembly and the matrix names the engine
+// that broke.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SearchPath {
+    /// `open_v2.ready = 0`: the projected-header engine, still the fallback.
+    Projection,
+    /// `open_v2.ready = 1`: the bounded canonical engine this issue ships.
+    Canonical,
+}
+
+impl SearchPath {
+    const ALL: [SearchPath; 2] = [SearchPath::Projection, SearchPath::Canonical];
+
+    async fn repo(self) -> (ClickHouseConversationRepository, Arc<MockState>) {
+        self.repo_with(MockOptions::default()).await
+    }
+
+    async fn repo_with(
+        self,
+        options: MockOptions,
+    ) -> (ClickHouseConversationRepository, Arc<MockState>) {
+        build_repo_with_options(
+            100,
+            MockOptions {
+                open_v2_reader_ready: Some(self == SearchPath::Canonical),
+                ..options
+            },
+        )
+        .await
+    }
+
+    /// The ranking pass's statement signature on this engine. v1 carries the
+    /// synthetic `row_kind` metadata row; v2 projects the locator's
+    /// `post_version`.
+    fn is_ranking_statement(self, query: &str) -> bool {
+        match self {
+            SearchPath::Projection => {
+                query.contains("toUInt8(0) AS row_kind") && query.contains("term_postings AS (")
+            }
+            SearchPath::Canonical => {
+                query.contains("term_postings AS (") && query.contains("AS post_version")
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn search_mcp_events_semantics_are_identical_on_both_engines() {
+    scoped(async {
+        for path in SearchPath::ALL {
+            let (repo, _state) = path.repo().await;
+
+            // 1. Global search, enriched hits.
+            let result = repo
+                .search_mcp_events(SearchMcpEventsQuery {
+                    query: "hello world".to_string(),
+                    n_hits: Some(10),
+                    event_types: Some(vec![
+                        McpEventType::ToolResponse,
+                        McpEventType::ToolCall,
+                        McpEventType::UserInput,
+                        McpEventType::AssistantResponse,
+                    ]),
+                    min_score: Some(0.0),
+                    min_should_match: Some(1),
+                    ..SearchMcpEventsQuery::default()
+                })
+                .await
+                .unwrap_or_else(|error| panic!("{path:?}: global search: {error}"));
+            assert_eq!(result.hits.len(), 2, "{path:?}");
+            assert!(!result.truncated, "{path:?}");
+            let top = &result.hits[0];
+            assert_eq!(top.event_uid, "evt-c-42", "{path:?}");
+            assert_eq!(top.session_id, "sess_c", "{path:?}");
+            assert_eq!(top.event_type, McpEventType::AssistantResponse, "{path:?}");
+            assert_eq!(top.source_name.as_deref(), Some("codex"), "{path:?}");
+            assert_eq!(top.event_time, "2026-01-03 10:02:00", "{path:?}");
+            assert_eq!(top.event_order, 42, "{path:?}");
+            assert_eq!(top.turn_seq, 2, "{path:?}");
+            assert_eq!(top.event_ordinal, 3, "{path:?}");
+            assert_eq!(top.turn_event_count, 3, "{path:?}");
+            assert_eq!(top.raw_score, 12.5, "{path:?}");
+            assert_eq!(top.model.as_deref(), Some("gpt-5.3-codex"), "{path:?}");
+            assert_eq!(
+                top.item_id.as_deref(),
+                Some("item-evt-c-42"),
+                "{path:?}: the wide fields must come from the winner's own row"
+            );
+
+            // 2. Session scope.
+            let scoped_result = repo
+                .search_mcp_events(SearchMcpEventsQuery {
+                    query: "hello world".to_string(),
+                    n_hits: Some(5),
+                    session_id: Some("sess_a".to_string()),
+                    event_types: Some(vec![McpEventType::AssistantResponse]),
+                    min_score: Some(0.0),
+                    min_should_match: Some(1),
+                    ..SearchMcpEventsQuery::default()
+                })
+                .await
+                .unwrap_or_else(|error| panic!("{path:?}: session-scoped search: {error}"));
+            assert_eq!(scoped_result.hits.len(), 1, "{path:?}");
+            assert_eq!(scoped_result.hits[0].session_id, "sess_a", "{path:?}");
+            assert_eq!(scoped_result.hits[0].event_uid, "evt-a-11", "{path:?}");
+            assert!(scoped_result.scope_exists, "{path:?}");
+
+            // 3. Turn scope.
+            let turn_result = repo
+                .search_mcp_events(SearchMcpEventsQuery {
+                    query: "cargo failure".to_string(),
+                    n_hits: Some(5),
+                    session_id: Some("sess_c".to_string()),
+                    turn_seq: Some(2),
+                    event_types: Some(vec![McpEventType::ToolResponse]),
+                    min_score: Some(0.0),
+                    min_should_match: Some(1),
+                    ..SearchMcpEventsQuery::default()
+                })
+                .await
+                .unwrap_or_else(|error| panic!("{path:?}: turn-scoped search: {error}"));
+            assert_eq!(turn_result.hits.len(), 1, "{path:?}");
+            let turn_hit = &turn_result.hits[0];
+            assert_eq!(turn_hit.event_uid, "evt-c-tool", "{path:?}");
+            assert_eq!(turn_hit.event_type, McpEventType::ToolResponse, "{path:?}");
+            assert_eq!(turn_hit.turn_seq, 2, "{path:?}");
+            assert_eq!(turn_hit.event_ordinal, 1, "{path:?}");
+            assert_eq!(turn_hit.turn_event_count, 3, "{path:?}");
+            assert_eq!(turn_hit.tool_name.as_deref(), Some("bash"), "{path:?}");
+            assert_eq!(turn_hit.call_id.as_deref(), Some("call-bash-1"), "{path:?}");
+
+            // 4. A turn that does not exist is `not_found`, not "zero hits".
+            let missing_turn = repo
+                .search_mcp_events(SearchMcpEventsQuery {
+                    query: "hello world".to_string(),
+                    n_hits: Some(5),
+                    session_id: Some("sess_c".to_string()),
+                    turn_seq: Some(97),
+                    min_score: Some(0.0),
+                    min_should_match: Some(1),
+                    ..SearchMcpEventsQuery::default()
+                })
+                .await
+                .unwrap_or_else(|error| panic!("{path:?}: missing-turn search: {error}"));
+            assert!(
+                !missing_turn.scope_exists,
+                "{path:?}: a turn that does not exist must report scope_exists = false"
+            );
+
+            // 5. #539 dedup happens BEFORE the limit, and `truncated` is not
+            //    `incomplete`.
+            let deduped = repo
+                .search_mcp_events(SearchMcpEventsQuery {
+                    query: "hello world".to_string(),
+                    n_hits: Some(2),
+                    event_types: Some(vec![
+                        McpEventType::UserInput,
+                        McpEventType::AssistantResponse,
+                        McpEventType::ToolResponse,
+                    ]),
+                    min_score: Some(0.0),
+                    min_should_match: Some(1),
+                    ..SearchMcpEventsQuery::default()
+                })
+                .await
+                .unwrap_or_else(|error| panic!("{path:?}: dedup search: {error}"));
+            assert_eq!(
+                deduped
+                    .hits
+                    .iter()
+                    .map(|hit| hit.event_uid.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["evt-c-42", "evt-a-11"],
+                "{path:?}: the codex mirror must collapse into its canonical row"
+            );
+            assert!(deduped.truncated, "{path:?}");
+            assert_eq!(deduped.stats.effective_n_hits, 2, "{path:?}");
+            assert!(
+                !deduped.incomplete_due_to_candidate_budget,
+                "{path:?}: a window that was not saturated returned the whole \
+                 ranking; `truncated` is not `incomplete`"
+            );
+        }
+    })
+    .await;
+}
+
+/// B1 / #608. `event_uid` is content-addressed over
+/// `source_file|source_generation|source_line_no|source_offset|
+/// record_fingerprint` and deliberately EXCLUDES `session_id`, so one uid
+/// legitimately exists under two sessions — 19,846 of them on the reference
+/// host. Every read after ranking is therefore keyed by
+/// `(source_host, session_id, event_uid)`, and the derivation and hydration
+/// statements filter on that same tuple.
+///
+/// MUTATION (any one of these; each fails this test):
+///   * key `derivation_by_identity` on `(source_host, event_uid)` — the two
+///     derivations collapse, one candidate is hydrated against the OTHER
+///     session's turn/order and the other is dropped;
+///   * key `wide_by_identity` on `(source_host, event_uid)` — one winner gets
+///     the other session's `item_id`/`text`;
+///   * `dedup_by_document.remove(...)` instead of `.get(...)` — the second
+///     candidate is starved of its digest and dropped as if it were stale;
+///   * drop the `(session_id, event_uid)` tuple from
+///     `build_search_candidate_derivation_sql` or
+///     `build_search_wide_hydration_sql`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_uid_attributed_to_two_sessions_hydrates_each_against_its_own_session() {
+    scoped(async {
+        let (repo, _state) = build_repo_with_options(
+            100,
+            MockOptions {
+                open_v2_reader_ready: Some(true),
+                shared_event_uid_across_sessions: true,
+                ..MockOptions::default()
+            },
+        )
+        .await;
+
+        let result = repo
+            .search_mcp_events(SearchMcpEventsQuery {
+                query: "hello world".to_string(),
+                n_hits: Some(5),
+                min_score: Some(0.0),
+                min_should_match: Some(1),
+                ..SearchMcpEventsQuery::default()
+            })
+            .await
+            .expect("a double-attributed uid is two valid hits, not an error");
+
+        let attributions = result
+            .hits
+            .iter()
+            .map(|hit| (hit.session_id.as_str(), hit.event_uid.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            result.hits.len(),
+            2,
+            "both attributions must survive: {attributions:?}"
+        );
+        // The premise: ONE uid string, TWO sessions. If the fixture ever stops
+        // being that shape, every assertion below is satisfiable by a
+        // uid-keyed implementation and this test proves nothing.
+        assert!(
+            result.hits.iter().all(|hit| hit.event_uid == "evt-shared"),
+            "the fixture must be one uid under two sessions: {attributions:?}"
+        );
+        let by_session = |session_id: &str| {
+            result
+                .hits
+                .iter()
+                .find(|hit| hit.session_id == session_id)
+                .unwrap_or_else(|| panic!("a hit for {session_id}"))
+        };
+        // Each hit's derived ordering is its OWN session's, not the other's.
+        let c = by_session("sess_c");
+        assert_eq!(c.turn_seq, 2, "sess_c hit derived from the wrong session");
+        assert_eq!(c.event_order, 42);
+        assert_eq!(c.event_ordinal, 3);
+        assert_eq!(c.turn_event_count, 3);
+        assert_eq!(
+            c.item_id.as_deref(),
+            Some("item-evt-shared-c"),
+            "sess_c hit hydrated from the wrong session's row"
+        );
+
+        let a = by_session("sess_a");
+        assert_eq!(a.turn_seq, 1, "sess_a hit derived from the wrong session");
+        assert_eq!(a.event_order, 11);
+        assert_eq!(a.event_ordinal, 1);
+        assert_eq!(a.turn_event_count, 1);
+        assert_eq!(
+            a.item_id.as_deref(),
+            Some("item-evt-shared-a"),
+            "sess_a hit hydrated from the wrong session's row"
+        );
+    })
+    .await;
+}
+
+/// B2. A scoped caller must not learn that a session outside
+/// `cfg.session_scope` exists. v1 filtered its `scope_state_sql` by
+/// `origin_cwd`, so an out-of-scope session id answered `scope_exists = 0` and
+/// the tool returned `not_found` — indistinguishable from a session id that
+/// never existed. Dropping the predicate turns that into `scope_exists = 1`
+/// plus zero hits, which is a disclosure.
+///
+/// MUTATION: delete the scope branch in `build_search_scope_exists_sql` (or in
+/// `build_search_turn_event_uids_sql` for the turn half); the mock stops seeing
+/// the `argMinIfMerge(d.origin_cwd_state)` / `AS session_origin_cwd` gate,
+/// answers "exists", and this fails.
+#[tokio::test(flavor = "multi_thread")]
+async fn scope_existence_does_not_disclose_a_session_outside_the_project_scope() {
+    scoped(async {
+        let (repo, _state) = build_scoped_directory_repo(&["/repo"]).await;
+
+        for turn_seq in [None, Some(1)] {
+            let result = repo
+                .search_mcp_events(SearchMcpEventsQuery {
+                    query: "hello world".to_string(),
+                    n_hits: Some(5),
+                    // `sess_a` is out of `/repo`.
+                    session_id: Some("sess_a".to_string()),
+                    turn_seq,
+                    min_score: Some(0.0),
+                    min_should_match: Some(1),
+                    ..SearchMcpEventsQuery::default()
+                })
+                .await
+                .expect("an out-of-scope session is not-found, never an error");
+            assert!(
+                !result.scope_exists,
+                "turn_seq={turn_seq:?}: a scoped caller must not learn that an \
+                 out-of-scope session exists"
+            );
+            assert!(result.hits.is_empty(), "turn_seq={turn_seq:?}");
+        }
+    })
+    .await;
+}
+
+/// B3(b). The directory recall filter in ranking is NOT scope enforcement: it
+/// reads `argMinIfMerge(origin_cwd_state)` off the directory, while the hit's
+/// scope is decided by the navigation `argMinIf(cwd, …)`. The two disagree
+/// whenever a later generation carries a different `cwd`, so a candidate the
+/// recall filter admitted must still be re-checked exactly.
+///
+/// MUTATION: delete the `if let Some(scope) = scope.as_ref()` block in
+/// `search_mcp_event_page_v2`; this fails — the out-of-scope hit is served.
+#[tokio::test(flavor = "multi_thread")]
+async fn project_scope_is_re_checked_exactly_after_ranking() {
+    scoped(async {
+        let (repo, _state) = build_scoped_directory_repo_with_options(
+            &["/repo"],
+            MockOptions {
+                out_of_scope_cwd_for_second_candidate: true,
+                ..MockOptions::default()
+            },
+        )
+        .await;
+
+        let result = repo
+            .search_mcp_events(SearchMcpEventsQuery {
+                query: "hello world".to_string(),
+                n_hits: Some(5),
+                min_score: Some(0.0),
+                min_should_match: Some(1),
+                ..SearchMcpEventsQuery::default()
+            })
+            .await
+            .expect("an out-of-scope candidate is a drop, never an error");
+
+        let hits = result
+            .hits
+            .iter()
+            .map(|hit| hit.event_uid.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            !hits.contains(&"evt-a-11"),
+            "a candidate whose exact origin cwd is outside the configured \
+             scope must be dropped: {hits:?}"
+        );
+        assert!(hits.contains(&"evt-c-42"), "{hits:?}");
+    })
+    .await;
+}
+
+/// B3(c). Above `MAX_TURN_SCOPE_UIDS` the ranking pass cannot carry the turn's
+/// uid literal set, so ranking recall degrades to `p.session_id = '…'` and the
+/// TURN is enforced only by the exact Phase 4 re-check against the derived
+/// `turn_seq`.
+///
+/// MUTATION: delete the `if let Some(turn_seq) = turn_seq { … }` re-check in
+/// `search_mcp_event_page_v2`; this fails — an event from turn 2 is served for
+/// a turn-3 request.
+#[tokio::test(flavor = "multi_thread")]
+async fn turn_scope_is_re_checked_exactly_when_the_uid_set_overflows() {
+    scoped(async {
+        let (repo, state) = build_repo_with_options(
+            100,
+            MockOptions {
+                open_v2_reader_ready: Some(true),
+                turn_scope_uid_overflow: true,
+                ..MockOptions::default()
+            },
+        )
+        .await;
+
+        let result = repo
+            .search_mcp_events(SearchMcpEventsQuery {
+                query: "hello world".to_string(),
+                n_hits: Some(5),
+                session_id: Some("sess_c".to_string()),
+                // `evt-c-42` lives in turn 2.
+                turn_seq: Some(3),
+                min_score: Some(0.0),
+                min_should_match: Some(1),
+                ..SearchMcpEventsQuery::default()
+            })
+            .await
+            .expect("turn scope above the uid cap is correct, not an error");
+
+        // The turn EXISTS (the derivation returned uids), so this is zero hits
+        // rather than not-found.
+        assert!(result.scope_exists);
+        assert!(
+            result.hits.is_empty(),
+            "an event outside the requested turn must never be served: {:?}",
+            result
+                .hits
+                .iter()
+                .map(|hit| (hit.event_uid.as_str(), hit.turn_seq))
+                .collect::<Vec<_>>()
+        );
+
+        // …and the ranking statement really did fall back to session recall,
+        // or the re-check above would be unreachable and this test vacuous.
+        let queries = state.queries.lock().expect("queries lock").clone();
+        let ranking = queries
+            .iter()
+            .find(|query| query.contains("term_postings AS (") && query.contains("AS post_version"))
+            .expect("a ranking statement");
+        assert!(ranking.contains("p.session_id = 'sess_c'"), "{ranking}");
+        assert!(
+            !ranking.contains("p.event_uid IN ["),
+            "the uid literal set must be dropped above the cap:\n{ranking}"
+        );
+    })
+    .await;
+}
+
+/// B3(d) / #539. Two genuinely different events that share session, turn, event
+/// type and timestamp are kept apart by the content digest and by nothing else.
+/// v2 dedups BEFORE hydration, so `text_content` is empty on every row at that
+/// point and `mcp_search_rows_are_equivalent`'s empty-digest fallback
+/// (`a.text_content == b.text_content`) would report them identical.
+///
+/// The failure a missing digest produces is therefore a MASS COLLAPSE, not a
+/// missed collapse — which is why it needs its own fixture rather than riding
+/// on the mirror-collapse tests.
+///
+/// MUTATION: set `text_content_digest: String::new()` in
+/// `canonical_candidate_row` (or stop projecting `d.text_digest` in
+/// `build_search_dedup_keys_sql`); this fails with one hit instead of two.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_distinct_events_in_one_turn_are_kept_apart_by_the_dedup_digest() {
+    scoped(async {
+        let (repo, _state) = build_repo_with_options(
+            100,
+            MockOptions {
+                open_v2_reader_ready: Some(true),
+                two_distinct_events_in_one_turn: true,
+                ..MockOptions::default()
+            },
+        )
+        .await;
+
+        let result = repo
+            .search_mcp_events(SearchMcpEventsQuery {
+                query: "hello world".to_string(),
+                n_hits: Some(5),
+                min_score: Some(0.0),
+                min_should_match: Some(1),
+                ..SearchMcpEventsQuery::default()
+            })
+            .await
+            .expect("two distinct events are two hits");
+
+        let mut hits = result
+            .hits
+            .iter()
+            .map(|hit| hit.event_uid.as_str())
+            .collect::<Vec<_>>();
+        hits.sort_unstable();
+        assert_eq!(
+            hits,
+            vec!["evt-c-42", "evt-c-twin"],
+            "two events that differ only in content must not collapse"
+        );
+    })
+    .await;
+}
+
+/// B3(e). The candidate derivation is a SECOND, INDEPENDENT version check: the
+/// locator and the navigation index are maintained by two different
+/// materialized views from the same `events` insert block, so a candidate the
+/// locator authorized at `post_version` that navigation carries at a different
+/// `event_version` is a proven mid-flight row and must be dropped.
+///
+/// MUTATION: delete the `derived.event_version != candidate.post_version`
+/// guard; this fails — the stale candidate is served.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_candidate_navigation_carries_at_another_version_is_dropped() {
+    scoped(async {
+        let (repo, _state) = build_repo_with_options(
+            100,
+            MockOptions {
+                open_v2_reader_ready: Some(true),
+                stale_navigation_version_for_second_candidate: true,
+                ..MockOptions::default()
+            },
+        )
+        .await;
+
+        let result = repo
+            .search_mcp_events(SearchMcpEventsQuery {
+                query: "hello world".to_string(),
+                n_hits: Some(5),
+                min_score: Some(0.0),
+                min_should_match: Some(1),
+                ..SearchMcpEventsQuery::default()
+            })
+            .await
+            .expect("a version-drifted candidate is a drop, never an error");
+
+        let hits = result
+            .hits
+            .iter()
+            .map(|hit| hit.event_uid.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            !hits.contains(&"evt-a-11"),
+            "a candidate navigation carries at another version must be \
+             dropped: {hits:?}"
+        );
+        assert!(hits.contains(&"evt-c-42"), "{hits:?}");
+    })
+    .await;
+}
+
+/// B6. ONE BM25 document population, and it is a property of the STATEMENT.
+///
+/// `search_events` and `search_conversations` have no v1 engine to fall back
+/// to — #597 collapsed them onto the bounded ranking core outright — so they
+/// score the locator-authorized `term_postings` on EVERY backend, ready or not.
+/// Deriving `docs`/`avgdl` from the `open_v2` readiness latch therefore hands
+/// them `search_corpus_stats`'s population (100 docs / avgdl 50.0) while their
+/// `df` still comes from the locator's (80 docs / avgdl 40.0), and
+/// `log(1 + (docs - df + 0.5) / (df + 0.5))` is then computed across two
+/// corpora.
+///
+/// The fixture's two populations diverge in BOTH numbers on purpose; a fixture
+/// where they coincide is satisfied by an implementation that picks either.
+///
+/// MUTATION: restore `if self.canonical_list_path_ready().await { … } else { …
+/// search_corpus_stats … }` in `corpus_stats`; the UNREADY half of this test
+/// fails with docs = 100 / avgdl = 50.0.
+#[tokio::test(flavor = "multi_thread")]
+async fn bounded_search_stats_follow_the_scored_population_not_the_readiness_latch() {
+    scoped(async {
+        for reader_ready in [false, true] {
+            let (repo, _state) = build_repo_with_options(
+                100,
+                MockOptions {
+                    open_v2_reader_ready: Some(reader_ready),
+                    ..MockOptions::default()
+                },
+            )
+            .await;
+
+            let conversations = repo
+                .search_conversations(ConversationSearchQuery {
+                    query: "hello world".to_string(),
+                    limit: Some(10),
+                    min_score: Some(0.0),
+                    min_should_match: Some(1),
+                    from_unix_ms: None,
+                    to_unix_ms: None,
+                    mode: None,
+                    include_tool_events: Some(true),
+                    exclude_codex_mcp: Some(false),
+                })
+                .await
+                .unwrap_or_else(|error| panic!("ready={reader_ready}: {error}"));
+            assert_eq!(
+                conversations.stats.docs, LOCATOR_AUTHORIZED_DOCS,
+                "ready={reader_ready}: conversation search scores the \
+                 locator-authorized population, so it must count it too"
+            );
+            assert_eq!(conversations.stats.avgdl, 40.0, "ready={reader_ready}");
+
+            let events = repo
+                .search_events(SearchEventsQuery {
+                    query: "hello world".to_string(),
+                    limit: Some(10),
+                    min_score: Some(0.0),
+                    min_should_match: Some(1),
+                    ..SearchEventsQuery::default()
+                })
+                .await
+                .unwrap_or_else(|error| panic!("ready={reader_ready}: {error}"));
+            assert_eq!(
+                events.stats.docs, LOCATOR_AUTHORIZED_DOCS,
+                "ready={reader_ready}: so does event search"
+            );
+            assert_eq!(events.stats.avgdl, 40.0, "ready={reader_ready}");
+        }
+    })
+    .await;
+}
+
+/// B6, the other half. The retired v1 MCP ranking statement computes its own
+/// inline `df` over `v_live_search_postings`, which is authorized by document
+/// revision and not by the locator — so it pairs with the DOCUMENT-authorized
+/// population, and the two cache entries must not be served to each other.
+///
+/// MUTATION: drop `population` from `CorpusStatsCacheEntry`'s identity (or make
+/// `corpus_stats` ignore its argument); this fails, because the conversation
+/// search above primes the cache with the locator-authorized numbers and v1
+/// then reports 80/40.0 instead of 100/50.0.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_two_document_populations_do_not_share_a_cache_entry() {
+    scoped(async {
+        let (repo, state) = build_repo_with_options(
+            100,
+            MockOptions {
+                open_v2_reader_ready: Some(false),
+                ..MockOptions::default()
+            },
+        )
+        .await;
+
+        // Prime the corpus-stats cache with the locator-authorized population.
+        let conversations = repo
+            .search_conversations(ConversationSearchQuery {
+                query: "hello world".to_string(),
+                limit: Some(10),
+                min_score: Some(0.0),
+                min_should_match: Some(1),
+                from_unix_ms: None,
+                to_unix_ms: None,
+                mode: None,
+                include_tool_events: Some(true),
+                exclude_codex_mcp: Some(false),
+            })
+            .await
+            .expect("conversation search");
+        assert_eq!(conversations.stats.docs, LOCATOR_AUTHORIZED_DOCS);
+
+        // v1 MCP search must not pick that entry up.
+        let mcp = repo
+            .search_mcp_events(SearchMcpEventsQuery {
+                query: "hello world".to_string(),
+                n_hits: Some(2),
+                min_score: Some(0.0),
+                min_should_match: Some(1),
+                ..SearchMcpEventsQuery::default()
+            })
+            .await
+            .expect("v1 mcp search");
+        assert_eq!(
+            mcp.stats.docs, DOCUMENT_AUTHORIZED_DOCS,
+            "the v1 engine's inline `df` is document-authorized, so its `docs` \
+             must be too"
+        );
+
+        // …and it got there by reading `search_corpus_stats`, inlined into its
+        // own ranking statement, rather than by reusing the other population.
+        let queries = state.queries.lock().expect("queries lock").clone();
+        assert!(
+            queries
+                .iter()
+                .any(|query| query.contains("toUInt8(0) AS row_kind")
+                    && query.contains("search_corpus_stats")),
+            "{queries:?}"
+        );
     })
     .await;
 }

@@ -95,12 +95,32 @@ impl ClickHouseConversationRepository {
     ///
     /// No `FINAL`: `mcp_session_directory` is an `AggregatingMergeTree` and
     /// existence does not depend on merge state.
+    ///
+    /// **The configured project scope is part of existence, not a result
+    /// filter.** v1's `scope_state_sql` filtered its `authorized_sessions` read
+    /// by `origin_cwd` (`search.rs`, `projected_origin_clause("scope_s")`); a
+    /// scoped caller asking about a session outside `cfg.session_scope` got
+    /// `scope_exists = 0` and therefore `not_found`, which is the same answer a
+    /// session id that does not exist at all produces. Dropping the predicate
+    /// turns that into `scope_exists = 1` plus zero hits — a different wire
+    /// answer, and one that discloses the existence of a session the caller is
+    /// not scoped to see.
     pub(super) fn build_search_scope_exists_sql(&self, session_id: &str) -> String {
         let directory = self.table_ref("mcp_session_directory");
         let published = self.published_generations_subquery();
+        let sid = sql_quote(session_id);
+        let Some(roots) = self.scope_root_predicate("scoped.origin_cwd") else {
+            return format!(
+                "SELECT toUInt8(count() > 0) AS scope_exists\nFROM {directory} AS d\nWHERE d.session_id = {sid}\n  AND (d.source_host, d.source_name, d.source_file, d.source_generation) IN {published}\nFORMAT JSONEachRow",
+            );
+        };
+        // `origin_cwd` is `argMinIfMerge(origin_cwd_state)` — an aggregate over
+        // the session's directory rows — so the grouping relation must project
+        // it and the root predicate belongs one level up (the same shape the
+        // recall subquery uses, and the same execution-time failure mode if it
+        // is collapsed).
         format!(
-            "SELECT toUInt8(count() > 0) AS scope_exists\nFROM {directory} AS d\nWHERE d.session_id = {sid}\n  AND (d.source_host, d.source_name, d.source_file, d.source_generation) IN {published}\nFORMAT JSONEachRow",
-            sid = sql_quote(session_id),
+            "SELECT toUInt8(count() > 0) AS scope_exists\nFROM (\n  SELECT\n    d.session_id AS session_id,\n    argMinIfMerge(d.origin_cwd_state) AS origin_cwd\n  FROM {directory} AS d\n  WHERE d.session_id = {sid}\n    AND (d.source_host, d.source_name, d.source_file, d.source_generation) IN {published}\n  GROUP BY d.session_id\n) AS scoped\nWHERE ({roots})\nFORMAT JSONEachRow",
         )
     }
 
@@ -117,6 +137,16 @@ impl ClickHouseConversationRepository {
     ///
     /// An empty result means the turn does not exist (`scope_exists = false`),
     /// which `search_sessions_v1` turns into `not_found`. Content-free.
+    ///
+    /// The configured project scope gates this statement too, and for the same
+    /// reason it gates [`Self::build_search_scope_exists_sql`]: a turn-scoped
+    /// request is the OTHER door into `scope_exists`, and v1 applied
+    /// `projected_origin_clause` to its turn branch as well. The gate here is
+    /// the EXACT origin `cwd` — `argMinIf(n.cwd, …)` over the same session's
+    /// navigation rows, which is the identical authority the Phase 4 per-hit
+    /// re-check uses — so turn existence can never disagree with hit
+    /// visibility. It costs no extra statement and no extra table: the session
+    /// is already the one being scanned.
     pub(super) fn build_search_turn_event_uids_sql(
         &self,
         session_id: &str,
@@ -124,9 +154,19 @@ impl ClickHouseConversationRepository {
     ) -> String {
         let from = self.navigation_live_from();
         let tuple = Self::navigation_sort_tuple("n");
+        let sid = sql_quote(session_id);
+        let (scope_with_sql, scope_where_sql) = match self.scope_root_predicate("session_origin_cwd")
+        {
+            Some(roots) => (
+                format!(
+                    "WITH (\n  SELECT ifNull(argMinIf(n.cwd, tuple(n.event_ts, n.event_uid), n.cwd != ''), '')\n  {from}\n  WHERE n.session_id = {sid}\n) AS session_origin_cwd\n"
+                ),
+                format!("\n  AND ({roots})"),
+            ),
+            None => (String::new(), String::new()),
+        };
         format!(
-            "SELECT event_uid\nFROM (\n  SELECT\n    n.event_uid AS event_uid,\n    if(toUInt32(n.turn_index) > 0, toUInt32(n.turn_index), greatest(toUInt32(1), toUInt32(sum(if(n.is_user_message = 1, 1, 0)) OVER turn_window))) AS turn_seq\n  {from}\n  WHERE n.session_id = {sid}\n  WINDOW turn_window AS (ORDER BY {tuple} ASC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)\n)\nWHERE turn_seq = {turn_seq}\nLIMIT {cap}\nFORMAT JSONEachRow",
-            sid = sql_quote(session_id),
+            "{scope_with_sql}SELECT event_uid\nFROM (\n  SELECT\n    n.event_uid AS event_uid,\n    if(toUInt32(n.turn_index) > 0, toUInt32(n.turn_index), greatest(toUInt32(1), toUInt32(sum(if(n.is_user_message = 1, 1, 0)) OVER turn_window))) AS turn_seq\n  {from}\n  WHERE n.session_id = {sid}\n  WINDOW turn_window AS (ORDER BY {tuple} ASC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)\n)\nWHERE turn_seq = {turn_seq}{scope_where_sql}\nLIMIT {cap}\nFORMAT JSONEachRow",
             cap = MAX_TURN_SCOPE_UIDS + 1,
         )
     }
@@ -147,8 +187,25 @@ impl ClickHouseConversationRepository {
     /// Nothing about the caller's filters enters this fragment. `df` is
     /// `count() OVER (PARTITION BY p.term)` over the version- and
     /// generation-authorized postings, so it is corpus-wide by construction; a
-    /// user predicate pushed in here would silently move every BM25 score.
-    fn bounded_ranking_ctes(
+    /// user predicate pushed in here — into `term_postings` OR into
+    /// `live_locator`, which feeds it — would silently move every BM25 score.
+    ///
+    /// **`session_id` is the POSTING's own physical column, never the
+    /// locator's** (design §1.2, and v1 parity: v1 joined the projected event
+    /// on `e.session_id = p.session_id`). `event_uid` is content-addressed over
+    /// `source_file|source_generation|source_line_no|source_offset|
+    /// record_fingerprint` and deliberately excludes `session_id` (#608), so a
+    /// physical line double-attributed to two sessions yields one uid under
+    /// two session ids. `mcp_event_locator` is `ORDER BY (event_uid,
+    /// source_host)`, so its `ReplacingMergeTree` collapses those two to one
+    /// arbitrary session. Taking `session_id` from the locator would therefore
+    /// both mis-attribute the hit and make `p.session_id = '<requested>'`
+    /// filter on a session the caller never asked about. The locator supplies
+    /// version authority and the fixed source coordinates only — which are
+    /// identical for both attributions, because they are exactly the fields the
+    /// uid is addressed over — and it does not project a session at all, so
+    /// there is none to take by accident.
+    pub(super) fn bounded_ranking_ctes(
         &self,
         terms_array_sql: &str,
         extra_posting_columns: &[&str],
@@ -166,7 +223,6 @@ impl ClickHouseConversationRepository {
       l.event_uid AS event_uid,
       l.source_host AS source_host,
       l.event_version AS event_version,
-      l.session_id AS session_id,
       l.source_file AS source_file,
       l.source_generation AS source_generation,
       l.source_line_no AS source_line_no,
@@ -193,7 +249,7 @@ impl ClickHouseConversationRepository {
       p.actor_role AS actor_role,
       p.name AS name,
       p.phase AS phase,
-{extras}      l.session_id AS session_id,
+{extras}      p.session_id AS session_id,
       l.event_version AS event_version,
       l.source_file AS source_file,
       l.source_generation AS source_generation,
@@ -207,6 +263,34 @@ impl ClickHouseConversationRepository {
      AND l.event_version = p.post_version
     WHERE p.term IN {terms_array_sql}
   )"
+        )
+    }
+
+    /// `docs` / `avgdl` over the SAME document population `df` is counted over
+    /// (issue #597 B6).
+    ///
+    /// The population is stated once: a live document is a `search_documents`
+    /// row that is published-generation-authorized AND carries the live
+    /// canonical `event_version`. `df` gets that from the `live_locator` join
+    /// inside [`Self::bounded_ranking_ctes`]; without the same authorization
+    /// here, `docs` counts MV-lag ghosts that `df` does not, and BM25's IDF is
+    /// computed from two populations at once — `log(1 + (docs - df + 0.5) /
+    /// (df + 0.5))` is only a meaningful quantity when `df` is a subset count
+    /// of `docs`.
+    ///
+    /// Cost: `search_corpus_stats` is ALREADY a full scan of
+    /// `v_live_search_documents`; what is added is a semi-join against one
+    /// fixed-width row per event. It runs at most once per 30 s per
+    /// publication revision (`CORPUS_STATS_CACHE_TTL`, keyed by the
+    /// publication token) and is shared by every search request in that
+    /// window. `count()` / `sum(doc_len)` name no wide column, so the read
+    /// stays content-free.
+    pub(super) fn build_live_corpus_stats_sql(&self) -> String {
+        let documents = self.table_ref("v_live_search_documents");
+        let locator = self.table_ref("mcp_event_locator");
+        let published = self.published_generations_subquery();
+        format!(
+            "SELECT\n  toUInt64(count()) AS docs,\n  toUInt64(ifNull(sum(d.doc_len), 0)) AS total_doc_len\nFROM {documents} AS d\nWHERE (d.source_host, d.event_uid, d.doc_version) IN (\n  SELECT l.source_host, l.event_uid, l.event_version\n  FROM {locator} AS l FINAL\n  WHERE (l.source_host, l.source_name, l.source_file, l.source_generation) IN {published}\n)\nFORMAT JSONEachRow"
         )
     }
 
@@ -481,7 +565,7 @@ FORMAT JSONEachRow"
 SELECT
   p.event_uid AS event_uid,
   p.source_host AS source_host,
-  any(p.session_id) AS session_id,
+  p.session_id AS session_id,
   toUInt64(any(p.event_version)) AS post_version,
   any(p.source_file) AS source_file,
   toUInt32(any(p.source_generation)) AS source_generation,
@@ -499,7 +583,7 @@ SELECT
   toUInt64(count()) AS matched_terms
 FROM term_postings AS p
 WHERE {where_sql}
-GROUP BY p.event_uid, p.source_host
+GROUP BY p.event_uid, p.source_host, p.session_id
 HAVING matched_terms >= {min_should_match} AND raw_score >= {min_score:.6}
 ORDER BY raw_score DESC, sort_time_ms DESC, event_uid ASC, source_host ASC
 LIMIT {limit}
@@ -511,6 +595,27 @@ FORMAT JSONEachRow",
             min_score = params.min_score,
             limit = params.limit,
         ))
+    }
+
+    /// The configured project scope as an `OR`ed root predicate over `column`,
+    /// or `None` when no scope is configured. One authority, so a scope check
+    /// cannot be spelled two different ways in two statements.
+    pub(super) fn scope_root_predicate(&self, column: &str) -> Option<String> {
+        let scope = self.cfg.session_scope.as_ref()?;
+        Some(
+            scope
+                .roots
+                .iter()
+                .map(|root| {
+                    format!(
+                        "{column} = {root} OR startsWith({column}, {prefix})",
+                        root = sql_quote(root),
+                        prefix = sql_quote(&format!("{root}/")),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" OR "),
+        )
     }
 
     /// The configured project scope as a `mcp_session_directory` recall
@@ -530,21 +635,9 @@ FORMAT JSONEachRow",
     /// The outer projection is one column so the relation stays usable as an
     /// `IN` set.
     pub(super) fn search_scope_recall_subquery(&self) -> Option<String> {
-        let scope = self.cfg.session_scope.as_ref()?;
         let directory = self.table_ref("mcp_session_directory");
         let published = self.published_generations_subquery();
-        let roots = scope
-            .roots
-            .iter()
-            .map(|root| {
-                format!(
-                    "scoped.origin_cwd = {root} OR startsWith(scoped.origin_cwd, {prefix})",
-                    root = sql_quote(root),
-                    prefix = sql_quote(&format!("{root}/")),
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(" OR ");
+        let roots = self.scope_root_predicate("scoped.origin_cwd")?;
         Some(format!(
             "(\n    SELECT scoped.session_id\n    FROM (\n      SELECT\n        d.session_id AS session_id,\n        argMinIfMerge(d.origin_cwd_state) AS origin_cwd\n      FROM {directory} AS d\n      WHERE notEmpty(trimBoth(d.session_id))\n        AND (d.source_host, d.source_name, d.source_file, d.source_generation) IN {published}\n      GROUP BY d.session_id\n    ) AS scoped\n    WHERE ({roots})\n  )"
         ))
@@ -570,12 +663,19 @@ FORMAT JSONEachRow",
     /// `origin_cwd` is computed in its own session-grain derived table and
     /// `ANY LEFT JOIN`ed on, because `argMinIf` is an aggregate over the whole
     /// session while the outer rows are per event.
+    ///
+    /// The final filter is a `(session_id, event_uid)` tuple set, not a bare
+    /// uid list: `event_uid` excludes `session_id` from its content address
+    /// (#608), so one uid can legitimately exist under two sessions, and a
+    /// uid-only filter returns BOTH sessions' rows for it. Deriving
+    /// `turn_seq` / `event_order` / `event_ordinal` from the wrong session's
+    /// ordering is exactly the mis-hydration this qualification prevents.
     pub(super) fn build_search_candidate_derivation_sql(
         &self,
         session_ids: &[String],
-        event_uids: &[String],
+        candidates: &[(String, String)],
     ) -> RepoResult<String> {
-        if session_ids.is_empty() || event_uids.is_empty() {
+        if session_ids.is_empty() || candidates.is_empty() {
             return Err(RepoError::invalid_argument(
                 "cannot derive canonical search candidates for an empty candidate set",
             ));
@@ -583,7 +683,7 @@ FORMAT JSONEachRow",
         let from = self.navigation_live_from();
         let tuple = Self::navigation_sort_tuple("n");
         let ids = sql_array_strings(session_ids);
-        let uids = sql_array_strings(event_uids);
+        let uids = Self::sql_session_event_tuples(candidates);
         let event_ts_tuple = "tuple(n.event_ts, n.event_uid)";
         Ok(format!(
             "WITH
@@ -638,7 +738,7 @@ SELECT
 FROM ordinaled
 ANY LEFT JOIN session_cwd
   ON session_cwd.session_id = ordinaled.session_id
-WHERE ordinaled.event_uid IN {uids}
+WHERE (ordinaled.session_id, ordinaled.event_uid) IN ({uids})
 FORMAT JSONEachRow"
         ))
     }
@@ -724,22 +824,27 @@ FORMAT JSONEachRow"
     /// (`session_id, event_ts, …`) that a uid cannot prune. Here `model` rides
     /// the same session- and `event_ts`-bounded scan as the content columns.
     ///
-    /// The uid `IN` list is the exact filter; [`EventTsBounds`] exists only for
-    /// granule pruning and is emitted INSIDE the derived table, above which an
-    /// identical predicate would prune nothing.
+    /// The `(session_id, event_uid)` `IN` set is the exact filter;
+    /// [`EventTsBounds`] exists only for granule pruning and is emitted INSIDE
+    /// the derived table, above which an identical predicate would prune
+    /// nothing. The filter is session-qualified for the same reason the
+    /// candidate derivation is: `moraine.events` is `ORDER BY (session_id, …)`
+    /// and genuinely carries one uid under two sessions when ingest
+    /// double-attributes a physical line (#608), so a uid-only filter hydrates
+    /// a winner from whichever session's row arrives last.
     pub(super) fn build_search_wide_hydration_sql(
         &self,
         session_ids: &[String],
-        event_uids: &[String],
+        winners: &[(String, String)],
         bounds: Option<EventTsBounds>,
     ) -> RepoResult<String> {
-        if session_ids.is_empty() || event_uids.is_empty() {
+        if session_ids.is_empty() || winners.is_empty() {
             return Err(RepoError::invalid_argument(
                 "cannot hydrate canonical search winners for an empty set",
             ));
         }
         let events = self.live_events_source_sessions_bounded(session_ids, bounds);
-        let uid_list = sql_array_strings(event_uids);
+        let uid_list = Self::sql_session_event_tuples(winners);
         let text_content_limit = usize::from(self.cfg.preview_chars).saturating_mul(4);
         let payload_json_limit = usize::from(self.cfg.preview_chars).saturating_mul(8);
         // Exactly the columns the merge consumes, and no others: every column
@@ -749,9 +854,23 @@ FORMAT JSONEachRow"
         // the ranked posting, so the value dedup compared is the value the hit
         // reports.
         Ok(format!(
-            "SELECT\n  e.session_id AS session_id,\n  e.event_uid AS event_uid,\n  e.source_host AS source_host,\n  e.inference_provider AS inference_provider,\n  e.endpoint_kind AS endpoint_kind,\n  e.tool_call_id AS call_id,\n  e.item_id AS item_id,\n  e.model AS model,\n  e.source_ref AS source_ref,\n  leftUTF8(e.text_content, {preview}) AS text_preview,\n  leftUTF8(e.text_content, {text_content_limit}) AS text_content,\n  leftUTF8(e.payload_json, {payload_json_limit}) AS payload_json\nFROM {events} AS e\nWHERE e.event_uid IN {uid_list}\nFORMAT JSONEachRow",
+            "SELECT\n  e.session_id AS session_id,\n  e.event_uid AS event_uid,\n  e.source_host AS source_host,\n  e.inference_provider AS inference_provider,\n  e.endpoint_kind AS endpoint_kind,\n  e.tool_call_id AS call_id,\n  e.item_id AS item_id,\n  e.model AS model,\n  e.source_ref AS source_ref,\n  leftUTF8(e.text_content, {preview}) AS text_preview,\n  leftUTF8(e.text_content, {text_content_limit}) AS text_content,\n  leftUTF8(e.payload_json, {payload_json_limit}) AS payload_json\nFROM {events} AS e\nWHERE (e.session_id, e.event_uid) IN ({uid_list})\nFORMAT JSONEachRow",
             preview = self.cfg.preview_chars,
         ))
+    }
+
+    /// `('sess','uid'),…` — the session-qualified identity set every
+    /// canonical search read is filtered by. See
+    /// [`Self::build_search_candidate_derivation_sql`] for why a bare uid list
+    /// is not a valid identity.
+    fn sql_session_event_tuples(pairs: &[(String, String)]) -> String {
+        pairs
+            .iter()
+            .map(|(session_id, event_uid)| {
+                format!("({}, {})", sql_quote(session_id), sql_quote(event_uid))
+            })
+            .collect::<Vec<_>>()
+            .join(",")
     }
 }
 
@@ -822,6 +941,7 @@ pub(super) struct SearchTurnAggregateRow {
 
 #[derive(Debug, Clone, Deserialize)]
 pub(super) struct SearchWideRow {
+    pub(super) session_id: String,
     pub(super) event_uid: String,
     pub(super) source_host: String,
     pub(super) inference_provider: String,
@@ -973,7 +1093,7 @@ mod tests {
         let types = [McpEventType::AssistantResponse];
         let candidates = [candidate("evt-a", "sess-a")];
         let sessions = vec!["sess-a".to_string()];
-        let uids = vec!["evt-a".to_string()];
+        let uids = vec![("sess-a".to_string(), "evt-a".to_string())];
 
         let statements: Vec<(&str, String)> =
             with_test_publication_snapshot(TestPublicationSnapshot::idle_local(11, 1), async {
@@ -1040,6 +1160,115 @@ mod tests {
         }
     }
 
+    /// The candidate-selection statements touch `moraine.events` not once, let
+    /// alone twice.
+    ///
+    /// v1's ranking statement scanned canonical `events` TWICE before it read a
+    /// single posting: `mcp_search_sessions_source`'s `current_sources`
+    /// `cityHash64(groupArray(tuple(event_uid, event_version)))` over every live
+    /// event of every authorized session, and a second, independent
+    /// `live_session_ids` `GROUP BY session_id` feeding the dirty-session gate.
+    /// Both executed on every request, before term pruning, and both were O(E)
+    /// in TOTAL corpus size — the shape the issue's "hydration remains flat as
+    /// unrelated corpus size grows" exit gate is denominated on.
+    ///
+    /// v2 selects candidates from `search_postings` ⋈ `mcp_event_locator`
+    /// only. `events` is read exactly once per request, by Phase 5, over the
+    /// winners' own sessions and `event_ts` range.
+    ///
+    /// MUTATION: add any `live_events_source()`-derived relation to a
+    /// candidate-selection builder; this fails naming it.
+    #[tokio::test]
+    async fn no_v2_candidate_statement_scans_canonical_events() {
+        let terms = terms();
+        let types = [McpEventType::AssistantResponse];
+        let candidates = [candidate("evt-a", "sess-a")];
+        let sessions = vec!["sess-a".to_string()];
+        let uids = vec![("sess-a".to_string(), "evt-a".to_string())];
+
+        let statements: Vec<(&str, String)> =
+            with_test_publication_snapshot(TestPublicationSnapshot::idle_local(11, 1), async {
+                let repo = scoped_repo(&["/repo"]);
+                vec![
+                    ("scope_exists", repo.build_search_scope_exists_sql("sess-a")),
+                    (
+                        "turn_event_uids",
+                        repo.build_search_turn_event_uids_sql("sess-a", 2),
+                    ),
+                    (
+                        "ranking",
+                        repo.build_search_ranking_sql(&ranking_params(&terms, &types))
+                            .expect("ranking sql"),
+                    ),
+                    (
+                        "events_ranking",
+                        repo.build_search_events_ranking_sql(
+                            &terms,
+                            true,
+                            None,
+                            true,
+                            None,
+                            None,
+                            1,
+                            0.0,
+                            (100, 5_000),
+                            9,
+                        )
+                        .expect("events ranking sql"),
+                    ),
+                    ("term_df", repo.build_term_df_sql(&terms).expect("df sql")),
+                    ("corpus_stats", repo.build_live_corpus_stats_sql()),
+                    (
+                        "candidate_derivation",
+                        repo.build_search_candidate_derivation_sql(&sessions, &uids)
+                            .expect("derivation sql"),
+                    ),
+                    (
+                        "dedup_keys",
+                        repo.build_search_dedup_keys_sql(&candidates)
+                            .expect("dedup sql"),
+                    ),
+                    (
+                        "turn_aggregates",
+                        repo.build_search_turn_aggregates_sql(&sessions),
+                    ),
+                ]
+            })
+            .await;
+
+        assert_eq!(
+            statements.len(),
+            9,
+            "every candidate-selection builder must be covered here"
+        );
+        for (name, sql) in &statements {
+            for forbidden in ["`moraine`.`events`", "v_live_events", "live_events"] {
+                assert!(
+                    !sql.contains(forbidden),
+                    "{name} must not scan canonical events, found `{forbidden}`:\n{sql}"
+                );
+            }
+        }
+
+        // The negative half: Phase 5 DOES read `events`, exactly once, and it
+        // is the only statement that may. Without this the assertion above is
+        // satisfiable by a build that never hydrates anything.
+        let wide = build(repo(), move |repo| {
+            repo.build_search_wide_hydration_sql(
+                &["sess-a".to_string()],
+                &[("sess-a".to_string(), "evt-a".to_string())],
+                None,
+            )
+            .expect("wide sql")
+        })
+        .await;
+        assert_eq!(
+            wide.matches("`moraine`.`events`").count(),
+            1,
+            "winner hydration is the one and only canonical events read:\n{wide}"
+        );
+    }
+
     /// The v1 engine still reads the projection, and MUST keep doing so while
     /// `open_v2.ready = 0`.
     ///
@@ -1079,15 +1308,22 @@ mod tests {
     ///
     /// MUTATION: move any `where_clauses.push(...)` from
     /// `build_search_ranking_sql` into `bounded_ranking_ctes`; this fails.
+    ///
+    /// The gate covers the WHOLE fragment, `live_locator` included, not just
+    /// `term_postings`'s own `WHERE`: `live_locator` FEEDS `term_postings`, so
+    /// a predicate there prunes the df relation exactly as effectively as one a
+    /// line lower, while reading as harmless "authorization".
     #[tokio::test]
     async fn ranking_never_pushes_a_user_filter_into_the_df_cte() {
         let terms = terms();
         let types = [McpEventType::AssistantResponse];
+        let turn_uids = ["evt-turn-a".to_string()];
         let sql = build(scoped_repo(&["/repo"]), move |repo| {
             let mut params = ranking_params(&terms, &types);
             params.session_id = Some("sess-a");
             params.harness = Some("codex");
             params.source_name = Some("codex");
+            params.turn_event_uids = Some(&turn_uids);
             repo.build_search_ranking_sql(&params).expect("ranking sql")
         })
         .await;
@@ -1111,11 +1347,31 @@ mod tests {
             "no user filter may live inside the df CTE, found `{term_postings_where}`"
         );
         // …and every one of those filters really is present, one level down.
+        // Every request-shaped value, anywhere in the fragment - `live_locator`
+        // included. Each of these is a value the caller supplied, so its
+        // presence above the window means `df` is no longer corpus-wide.
+        for leaked in [
+            "sess-a",
+            "codex",
+            "evt-turn-a",
+            "/repo",
+            "argMinIfMerge",
+            "assistant",
+            "mcp_session_directory",
+        ] {
+            assert!(
+                !ctes.contains(leaked),
+                "`{leaked}` is a user filter and must not appear anywhere in \
+                 the df fragment - `live_locator` feeds `term_postings`, so a \
+                 predicate there prunes the df relation just the same:\n{ctes}"
+            );
+        }
         for filter in [
             "p.session_id = 'sess-a'",
             "p.harness = 'codex'",
             "p.source_name = 'codex'",
             "p.source_name != 'codex-mcp'",
+            "p.event_uid IN ['evt-turn-a']",
             "argMinIfMerge(d.origin_cwd_state)",
         ] {
             assert!(
@@ -1208,6 +1464,200 @@ mod tests {
             .starts_with("(\n    SELECT scoped.session_id\n"));
     }
 
+    /// B1 / #608. Every canonical read after ranking is filtered by the
+    /// SESSION-QUALIFIED identity, never by a bare uid list.
+    ///
+    /// `event_uid` is content-addressed over
+    /// `source_file|source_generation|source_line_no|source_offset|
+    /// record_fingerprint` and deliberately excludes `session_id`, so one uid
+    /// legitimately exists under two sessions (19,846 of them on the reference
+    /// host). `mcp_event_navigation` and `moraine.events` both lead their
+    /// primary key with `session_id` and therefore CARRY both rows; a uid-only
+    /// filter returns both and leaves the reader to guess.
+    ///
+    /// MUTATION: emit `WHERE ordinaled.event_uid IN [...]` /
+    /// `WHERE e.event_uid IN [...]`; this fails.
+    #[tokio::test]
+    async fn canonical_search_reads_are_session_qualified() {
+        let sessions = vec!["sess-a".to_string(), "sess-c".to_string()];
+        // ONE uid, TWO sessions — the shape the qualification exists for.
+        let winners = vec![
+            ("sess-c".to_string(), "evt-shared".to_string()),
+            ("sess-a".to_string(), "evt-shared".to_string()),
+        ];
+        let (derivation, wide) =
+            with_test_publication_snapshot(TestPublicationSnapshot::idle_local(11, 1), async {
+                let repo = repo();
+                (
+                    repo.build_search_candidate_derivation_sql(&sessions, &winners)
+                        .expect("derivation sql"),
+                    repo.build_search_wide_hydration_sql(&sessions, &winners, None)
+                        .expect("wide sql"),
+                )
+            })
+            .await;
+
+        assert!(
+            derivation.contains(
+                "WHERE (ordinaled.session_id, ordinaled.event_uid) IN (('sess-c', 'evt-shared'),('sess-a', 'evt-shared'))"
+            ),
+            "the derivation must be filtered by the session-qualified identity:\n{derivation}"
+        );
+        assert!(
+            wide.contains(
+                "WHERE (e.session_id, e.event_uid) IN (('sess-c', 'evt-shared'),('sess-a', 'evt-shared'))"
+            ),
+            "the winner hydration must be filtered by the session-qualified identity:\n{wide}"
+        );
+        for (name, sql) in [("derivation", &derivation), ("wide", &wide)] {
+            assert!(
+                !sql.contains("event_uid IN ["),
+                "{name} must not fall back to a bare uid list:\n{sql}"
+            );
+        }
+    }
+
+    /// B1 / #608, the RANKING half. A hit's `session_id` is the posting's own
+    /// physical column, never the locator's.
+    ///
+    /// `mcp_event_locator` is `ReplacingMergeTree(event_version) ORDER BY
+    /// (event_uid, source_host)` — `session_id` is not in its sort key. A uid
+    /// that ingest attributed to two sessions therefore collapses to ONE
+    /// arbitrary locator row, so reading `session_id` off the locator (a) puts
+    /// one of the two attributions under the other's session and (b) makes
+    /// `p.session_id = '<requested>'` in a session-scoped search filter on a
+    /// session the caller never named. `search_postings.session_id` is a
+    /// per-posting physical column (`sql/004_search_index.sql`), carries both
+    /// attributions, and is what v1 joined on.
+    ///
+    /// The locator projects no session at all, so there is nothing to take by
+    /// accident; the second assertion is what keeps that true.
+    ///
+    /// MUTATION: project `l.session_id AS session_id` in `live_locator` and use
+    /// it in `term_postings`; this fails on both halves.
+    #[tokio::test]
+    async fn ranking_session_id_is_the_postings_own_column_not_the_locators() {
+        let terms = terms();
+        let types = [McpEventType::AssistantResponse];
+        let sql = build(repo(), move |repo| {
+            repo.build_search_ranking_sql(&ranking_params(&terms, &types))
+                .expect("ranking sql")
+        })
+        .await;
+
+        let (locator, term_postings) = sql
+            .split_once("  live_locator AS (")
+            .expect("the ranking statement carries the shared CTEs")
+            .1
+            .split_once("  term_postings AS (")
+            .expect("the ranking statement defines term_postings");
+        assert!(
+            !locator.contains("session_id"),
+            "the locator must not project a session — its ReplacingMergeTree \
+             collapses a double-attributed uid to one arbitrary session:\n{locator}"
+        );
+        assert!(
+            term_postings.contains("p.session_id AS session_id"),
+            "the ranked identity's session must come from the posting's own \
+             physical column:\n{term_postings}"
+        );
+        assert!(
+            !term_postings.contains("l.session_id"),
+            "…and never from the locator:\n{term_postings}"
+        );
+        // The ranked identity is grouped session-qualified, so the two
+        // attributions of one uid stay two candidates rather than collapsing
+        // into an `any(p.session_id)` coin flip.
+        assert!(
+            sql.contains("GROUP BY p.event_uid, p.source_host, p.session_id"),
+            "the ranked identity is (event_uid, source_host, session_id):\n{sql}"
+        );
+        assert!(
+            !sql.contains("any(p.session_id)"),
+            "`any()` over a group that spans two sessions is exactly the \
+             mis-attribution B1 describes:\n{sql}"
+        );
+    }
+
+    /// B2 / §1.3. `scope_exists` decides whether the tool answers `not_found`
+    /// or "exists, zero hits". v1 filtered its `scope_state_sql` by the
+    /// projected `origin_cwd`, so a scoped caller could not tell an
+    /// out-of-scope session from a nonexistent one. The v2 point read must
+    /// enforce the identical predicate, over the directory's
+    /// `argMinIfMerge(origin_cwd_state)` — the same relation and same shape the
+    /// ranking recall filter uses.
+    ///
+    /// MUTATION: return the unscoped `SELECT count() > 0 FROM directory …`
+    /// branch unconditionally; this fails.
+    #[tokio::test]
+    async fn scope_exists_point_read_enforces_the_configured_project_scope() {
+        let (unscoped, scoped) =
+            with_test_publication_snapshot(TestPublicationSnapshot::idle_local(11, 1), async {
+                (
+                    repo().build_search_scope_exists_sql("sess-a"),
+                    scoped_repo(&["/repo"]).build_search_scope_exists_sql("sess-a"),
+                )
+            })
+            .await;
+
+        // An unscoped server emits no scope relation at all.
+        assert!(!unscoped.contains("origin_cwd"), "{unscoped}");
+        assert!(!unscoped.contains("AS scoped"), "{unscoped}");
+
+        assert!(
+            scoped.contains("argMinIfMerge(d.origin_cwd_state) AS origin_cwd"),
+            "the grouping relation must PROJECT the value the filter reads:\n{scoped}"
+        );
+        assert!(
+            scoped.contains(
+                "WHERE (scoped.origin_cwd = '/repo' OR startsWith(scoped.origin_cwd, '/repo/'))"
+            ),
+            "an out-of-scope session must not be disclosed as existing:\n{scoped}"
+        );
+        // The point read stays a point read: the session predicate is still on
+        // the directory scan, which is where the primary key prunes it.
+        assert!(scoped.contains("WHERE d.session_id = 'sess-a'"), "{scoped}");
+        // The aggregate alias is filtered one level up, never in the HAVING of
+        // the statement that defines it (execution-time failure, see
+        // `scope_recall_projects_the_origin_cwd_it_filters`).
+        assert!(!scoped.contains("HAVING"), "{scoped}");
+    }
+
+    /// B2, turn half. A turn-scoped request is the OTHER door into
+    /// `scope_exists`: an empty uid derivation is what `search_sessions_v1`
+    /// turns into `not_found`. v1 applied its origin-scope filter to the turn
+    /// branch too, so this statement must gate on scope as well — and it gates
+    /// on the EXACT navigation `argMinIf(n.cwd, …)`, the same authority the
+    /// per-hit Phase 4 re-check uses, so turn existence cannot disagree with
+    /// hit visibility.
+    ///
+    /// MUTATION: drop the `session_origin_cwd` WITH-scalar or its `AND (…)`;
+    /// this fails.
+    #[tokio::test]
+    async fn turn_scope_derivation_enforces_the_configured_project_scope() {
+        let (unscoped, scoped) =
+            with_test_publication_snapshot(TestPublicationSnapshot::idle_local(11, 1), async {
+                (
+                    repo().build_search_turn_event_uids_sql("sess-a", 2),
+                    scoped_repo(&["/repo"]).build_search_turn_event_uids_sql("sess-a", 2),
+                )
+            })
+            .await;
+
+        assert!(!unscoped.contains("session_origin_cwd"), "{unscoped}");
+        assert!(!unscoped.contains("n.cwd"), "{unscoped}");
+
+        assert!(
+            scoped.contains("argMinIf(n.cwd, tuple(n.event_ts, n.event_uid), n.cwd != '')"),
+            "the turn gate must read the EXACT origin cwd:\n{scoped}"
+        );
+        assert!(scoped.contains(") AS session_origin_cwd"), "{scoped}");
+        assert!(
+            scoped.contains("WHERE turn_seq = 2\n  AND (session_origin_cwd = '/repo' OR startsWith(session_origin_cwd, '/repo/'))"),
+            "an out-of-scope session's turn must derive no uids:\n{scoped}"
+        );
+    }
+
     /// §2.3: the dedup-key read names ONLY fixed-width columns. This is the
     /// property the read-bytes gate is denominated on — a columnar engine reads
     /// exactly what the projection names, so naming `text_content` here would
@@ -1248,7 +1698,7 @@ mod tests {
     #[tokio::test]
     async fn winner_hydration_is_bounded_inside_the_events_derived_table() {
         let sessions = vec!["sess-a".to_string(), "sess-b".to_string()];
-        let uids = vec!["evt-a".to_string()];
+        let uids = vec![("sess-a".to_string(), "evt-a".to_string())];
         let sql = build(repo(), move |repo| {
             repo.build_search_wide_hydration_sql(
                 &sessions,
@@ -1280,8 +1730,9 @@ mod tests {
             "the epoch-sentinel branch must survive, or a malformed-record_ts \
              winner silently disappears from its own hydration:\n{derived}"
         );
-        // The uid list is the exact filter; the bound exists only for pruning.
-        assert!(sql.contains("WHERE e.event_uid IN ['evt-a']"));
+        // The session-qualified identity set is the exact filter; the bound
+        // exists only for pruning.
+        assert!(sql.contains("WHERE (e.session_id, e.event_uid) IN (('sess-a', 'evt-a'))"));
         // Content is truncated, and only the columns the merge consumes appear.
         assert!(sql.contains("leftUTF8(e.text_content, 880) AS text_content"));
         assert!(sql.contains("leftUTF8(e.payload_json, 1760) AS payload_json"));

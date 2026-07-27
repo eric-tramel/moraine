@@ -298,19 +298,21 @@ fn hydration_reads_the_codex_flag_column_and_never_scans_payloads_for_it() {
     );
 }
 
-#[test]
-fn conversation_candidates_aggregate_live_term_frequency_before_scoring() {
+#[tokio::test]
+async fn conversation_candidates_aggregate_live_term_frequency_before_scoring() {
     let client = ClickHouseClient::new(moraine_config::ClickHouseConfig::default())
         .expect("build ClickHouse client");
     let repo = ClickHouseConversationRepository::new(client, RepoConfig::default());
     let terms = vec!["needle".to_string()];
     let idf = HashMap::from([("needle".to_string(), 1.0)]);
 
-    let sql = repo
-        .build_search_conversation_candidates_sql(
+    let sql = with_test_publication_snapshot(TestPublicationSnapshot::idle_local(1, 1), async {
+        repo.build_search_conversation_candidates_sql(
             &terms, &idf, true, false, 1, 20, None, None, None,
         )
-        .expect("build conversation candidate SQL");
+        .expect("build conversation candidate SQL")
+    })
+    .await;
 
     assert!(sql.contains("sum(p.tf) AS tf_sum"));
     assert!(sql.contains("GROUP BY p.session_id, p.term"));
@@ -318,16 +320,16 @@ fn conversation_candidates_aggregate_live_term_frequency_before_scoring() {
     assert!(!sql.contains("log1p(toFloat64(p.tf))"));
 }
 
-#[test]
-fn conversation_candidate_document_filters_only_select_eligible_sessions() {
+#[tokio::test]
+async fn conversation_candidate_document_filters_only_select_eligible_sessions() {
     let client = ClickHouseClient::new(moraine_config::ClickHouseConfig::default())
         .expect("build ClickHouse client");
     let repo = ClickHouseConversationRepository::new(client, RepoConfig::default());
     let terms = vec!["needle".to_string()];
     let idf = HashMap::from([("needle".to_string(), 1.0)]);
 
-    let sql = repo
-        .build_search_conversation_candidates_sql(
+    let sql = with_test_publication_snapshot(TestPublicationSnapshot::idle_local(1, 1), async {
+        repo.build_search_conversation_candidates_sql(
             &terms,
             &idf,
             false,
@@ -338,7 +340,9 @@ fn conversation_candidate_document_filters_only_select_eligible_sessions() {
             Some(2_000),
             None,
         )
-        .expect("build filtered conversation candidate SQL");
+        .expect("build filtered conversation candidate SQL")
+    })
+    .await;
     let (_, after_eligible) = sql
         .split_once("eligible_sessions AS (\n")
         .expect("eligible-session CTE");
@@ -353,9 +357,234 @@ fn conversation_candidate_document_filters_only_select_eligible_sessions() {
     assert!(eligible.contains("toUnixTimestamp64Milli(d.ingested_at) >= 1000"));
     assert!(eligible.contains("toUnixTimestamp64Milli(d.ingested_at) < 2000"));
     assert!(session_terms.contains("ALL INNER JOIN eligible_sessions AS eligible"));
-    assert!(session_terms.contains("WHERE p.term IN q_terms"));
+    // Term membership belongs to the shared ranking CTE, once. A second copy
+    // here is how the two relations start to describe different populations.
+    assert!(!session_terms.contains("p.term IN"));
+    assert!(sql.contains("    WHERE p.term IN ['needle']"));
     assert!(!session_terms.contains("v_live_search_documents"));
     assert!(!session_terms.contains("d.ingested_at"));
+}
+
+/// B5. `fetch_conversation_session_metadata` reads `session_meta` events for
+/// the winner sessions. The session predicate has to be emitted INSIDE the
+/// live-events derived table: `events` leads its primary key with
+/// `session_id`, and the same predicate one level up sits above the
+/// publication join, where it prunes nothing — i.e. a corpus-wide scan of
+/// every `session_meta` event wearing a bounded-looking `WHERE`.
+///
+/// MUTATION: build the source with `live_events_source()`; this fails.
+#[tokio::test]
+async fn conversation_session_metadata_prunes_inside_the_events_derived_table() {
+    let client = ClickHouseClient::new(moraine_config::ClickHouseConfig::default())
+        .expect("build ClickHouse client");
+    let repo = ClickHouseConversationRepository::new(client, RepoConfig::default());
+    let sessions = vec!["sess-a".to_string(), "sess-b".to_string()];
+
+    let sql = with_test_publication_snapshot(TestPublicationSnapshot::idle_local(1, 1), async {
+        repo.build_conversation_session_metadata_sql(&sessions)
+    })
+    .await;
+
+    let derived = sql
+        .split_once("(SELECT e.*")
+        .expect("the metadata read uses the live-events derived table")
+        .1;
+    let derived = &derived[..derived.find(")\nWHERE").expect("terminated derived table")];
+    assert!(
+        derived.contains("e.session_id IN ['sess-a','sess-b']"),
+        "the session IN must be INSIDE the derived table:\n{derived}"
+    );
+}
+
+/// B5. An `ANY LEFT JOIN`ed mode aggregate with no predicate is an unfiltered
+/// `events FINAL … GROUP BY session_id` — a whole-corpus aggregation riding
+/// along with a bounded ranking pass, and one that the issue's "no full
+/// aggregation for a broad query" exit gate is violable through.
+///
+/// MUTATION: swap any of the three `mode_subquery_for_sessions(Some(…))` calls
+/// back to `mode_subquery()`; this fails naming the statement.
+#[tokio::test]
+async fn conversation_search_never_joins_an_unpredicated_mode_aggregate() {
+    let client = ClickHouseClient::new(moraine_config::ClickHouseConfig::default())
+        .expect("build ClickHouse client");
+    let repo = ClickHouseConversationRepository::new(client, RepoConfig::default());
+    let terms = vec!["needle".to_string()];
+    let idf = HashMap::from([("needle".to_string(), 1.0)]);
+    let sessions = vec!["sess-a".to_string()];
+
+    let statements =
+        with_test_publication_snapshot(TestPublicationSnapshot::idle_local(1, 1), async {
+            vec![
+                (
+                    "candidates",
+                    repo.build_search_conversation_candidates_sql(
+                        &terms,
+                        &idf,
+                        true,
+                        false,
+                        1,
+                        20,
+                        None,
+                        None,
+                        Some(ConversationMode::WebSearch),
+                    )
+                    .expect("candidate sql"),
+                    "SELECT session_id FROM eligible_sessions",
+                ),
+                (
+                    "recent_candidates",
+                    repo.build_search_conversation_recent_candidates_sql(
+                        &terms,
+                        &idf,
+                        true,
+                        false,
+                        1,
+                        20,
+                        None,
+                        None,
+                        Some(ConversationMode::WebSearch),
+                    )
+                    .expect("recent candidate sql"),
+                    "SELECT session_id FROM eligible_sessions",
+                ),
+                (
+                    "scoring",
+                    repo.build_search_conversations_sql(
+                        &terms,
+                        &idf,
+                        10.0,
+                        true,
+                        false,
+                        1,
+                        0.0,
+                        20,
+                        None,
+                        None,
+                        Some(ConversationMode::WebSearch),
+                        &sessions,
+                    )
+                    .expect("scoring sql"),
+                    "SELECT arrayJoin(['sess-a']) AS session_id",
+                ),
+            ]
+        })
+        .await;
+
+    assert_eq!(statements.len(), 3, "all three mode joins must be covered");
+    for (name, sql, expected_bound) in statements {
+        let mode = sql
+            .split_once("ANY LEFT JOIN (SELECT\n  session_id,")
+            .unwrap_or_else(|| panic!("{name} joins a mode aggregate:\n{sql}"))
+            .1;
+        let mode = &mode[..mode
+            .find("GROUP BY session_id")
+            .unwrap_or_else(|| panic!("{name} mode aggregate is grouped:\n{sql}"))];
+        assert!(
+            mode.contains(&format!("e.session_id IN ({expected_bound})")),
+            "{name}'s mode aggregate must be bounded to the sessions the query \
+             already selected, and bounded INSIDE the events derived table:\n{mode}"
+        );
+    }
+}
+
+/// B6. ONE BM25 document population. `df` is `count()` over the
+/// locator-authorized `term_postings`; the postings that get SCORED, the
+/// session aggregation and `docs`/`avgdl` must describe the same relation, or
+/// `log(1 + (docs - df + 0.5) / (df + 0.5))` mixes two corpora in one number.
+///
+/// MUTATION: point any conversation statement back at
+/// `v_live_search_postings`, or drop the locator authorization from
+/// `build_live_corpus_stats_sql`; this fails.
+#[tokio::test]
+async fn conversation_search_scores_the_same_population_its_df_is_counted_over() {
+    let client = ClickHouseClient::new(moraine_config::ClickHouseConfig::default())
+        .expect("build ClickHouse client");
+    let repo = ClickHouseConversationRepository::new(client, RepoConfig::default());
+    let terms = vec!["needle".to_string()];
+    let idf = HashMap::from([("needle".to_string(), 1.0)]);
+    let sessions = vec!["sess-a".to_string()];
+
+    let (statements, df_sql, corpus_sql) =
+        with_test_publication_snapshot(TestPublicationSnapshot::idle_local(1, 1), async {
+            (
+                vec![
+                    (
+                        "candidates",
+                        repo.build_search_conversation_candidates_sql(
+                            &terms, &idf, true, false, 1, 20, None, None, None,
+                        )
+                        .expect("candidate sql"),
+                    ),
+                    (
+                        "recent_candidates",
+                        repo.build_search_conversation_recent_candidates_sql(
+                            &terms, &idf, true, false, 1, 20, None, None, None,
+                        )
+                        .expect("recent candidate sql"),
+                    ),
+                    (
+                        "scoring",
+                        repo.build_search_conversations_sql(
+                            &terms, &idf, 10.0, true, false, 1, 0.0, 20, None, None, None,
+                            &sessions,
+                        )
+                        .expect("scoring sql"),
+                    ),
+                ],
+                repo.build_term_df_sql(&terms).expect("df sql"),
+                repo.build_live_corpus_stats_sql(),
+            )
+        })
+        .await;
+
+    // The population-defining halves of the relation `df` is counted over: the
+    // authorized locator, and the join that intersects it with the term-pruned
+    // postings. (The projected column LIST legitimately differs — conversation
+    // search also needs `inference_provider` — but the rows must not.)
+    let locator = df_sql
+        .split_once("  live_locator AS (")
+        .expect("the df statement carries the shared ranking CTEs")
+        .1;
+    let locator = &locator[..locator
+        .find(",\n  term_postings AS (")
+        .expect("df statement defines term_postings")];
+    let join = df_sql
+        .split_once("    FROM `moraine`.`search_postings` AS p FINAL")
+        .expect("df statement scans the postings")
+        .1;
+    let join = &join[..join
+        .find("\nSELECT\n  toString(p.term)")
+        .expect("df statement has a projection")];
+
+    for (name, sql) in statements {
+        assert!(
+            sql.contains(locator),
+            "{name} must authorize the SAME population df is counted over:\n{sql}"
+        );
+        assert!(
+            sql.contains(join),
+            "{name} must intersect it the same way df does:\n{sql}"
+        );
+        assert!(
+            !sql.contains("v_live_search_postings"),
+            "{name} must not fall back to the document-authorized postings \
+             view — that is the second population:\n{sql}"
+        );
+    }
+
+    // …and `docs` / `avgdl` are counted over it too.
+    assert!(
+        corpus_sql.contains("FROM `moraine`.`mcp_event_locator` AS l FINAL"),
+        "corpus stats must carry the same locator authorization:\n{corpus_sql}"
+    );
+    assert!(
+        corpus_sql
+            .contains("WHERE (d.source_host, d.event_uid, d.doc_version) IN (\n  SELECT l.source_host, l.event_uid, l.event_version"),
+        "{corpus_sql}"
+    );
+    // Still content-free: two scalars, no wide column named.
+    assert!(!corpus_sql.contains("text_content"));
+    assert!(!corpus_sql.contains("payload_json"));
 }
 
 #[test]
@@ -382,14 +611,12 @@ fn conversation_scoring_always_emits_a_session_predicate() {
     let client = ClickHouseClient::new(moraine_config::ClickHouseConfig::default())
         .expect("build ClickHouse client");
     let repo = ClickHouseConversationRepository::new(client, RepoConfig::default());
-    let terms = vec!["needle".to_string()];
 
     for (label, sessions) in [
         ("empty", Vec::<String>::new()),
         ("populated", vec!["sess-a".to_string()]),
     ] {
         let (_, filter_sql) = repo.build_conversation_postings_filter_sql(
-            &terms,
             true,
             false,
             None,
@@ -406,7 +633,6 @@ fn conversation_scoring_always_emits_a_session_predicate() {
     // Discovery is the ONE relation allowed no session predicate, and it is
     // bounded by its own LIMIT instead.
     let (_, discovery_sql) = repo.build_conversation_postings_filter_sql(
-        &terms,
         true,
         false,
         None,

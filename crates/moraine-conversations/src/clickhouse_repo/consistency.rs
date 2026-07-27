@@ -681,6 +681,14 @@ impl ClickHouseConversationRepository {
         self.live_events_source_filtered(&inner_predicates)
     }
 
+    /// [`Self::live_events_source_sessions_bounded`] for callers that hold the
+    /// session set as SQL (a subquery or an `arrayJoin` literal) rather than as
+    /// a Rust slice. The predicate still lands INSIDE the derived table, which
+    /// is the only place `events`' `session_id`-leading primary key can use it.
+    pub(super) fn live_events_source_session_subquery(&self, session_ids_sql: &str) -> String {
+        self.live_events_source_filtered(&[format!("e.session_id IN ({session_ids_sql})")])
+    }
+
     /// The published-generation-authorized `events` relation, with every
     /// caller-supplied predicate emitted inside the derived table. An empty
     /// slice reproduces the v1 `live_events_source` SQL byte-for-byte.
@@ -1175,7 +1183,12 @@ mod tests {
                     // remaining publication-token-keyed logical cache, and they
                     // must replace rather than accumulate the same way.
                     repository
-                        .cache_corpus_stats(epoch, epoch * 10, Instant::now())
+                        .cache_corpus_stats(
+                            DocumentPopulation::DocumentAuthorized,
+                            epoch,
+                            epoch * 10,
+                            Instant::now(),
+                        )
                         .await;
                     repository
                         .insert_scoped_session_cache(

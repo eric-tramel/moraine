@@ -16,18 +16,23 @@ impl ClickHouseConversationRepository {
         )
     }
 
+    /// `None` is a WHOLE-CORPUS `events FINAL … GROUP BY session_id`. Every
+    /// caller that can name its sessions must pass them: the predicate is
+    /// emitted INSIDE the live-events derived table, where `events`'
+    /// `session_id`-leading primary key prunes it, instead of above the
+    /// publication join where it prunes nothing (issue-598 C2-R0).
     pub(super) fn mode_subquery_for_sessions(&self, session_ids_sql: Option<&str>) -> String {
-        let events_source = self.live_events_source();
+        let events_source = match session_ids_sql {
+            Some(session_ids_sql) => self.live_events_source_session_subquery(session_ids_sql),
+            None => self.live_events_source(),
+        };
         let mode_aggregate = Self::mode_aggregate_sql();
-        let session_filter = session_ids_sql
-            .map(|session_ids_sql| format!("WHERE session_id IN ({session_ids_sql})\n"))
-            .unwrap_or_default();
         format!(
             "SELECT
   session_id,
   {mode_aggregate} AS mode
 FROM {events_source}
-{session_filter}GROUP BY session_id"
+GROUP BY session_id"
         )
     }
 
