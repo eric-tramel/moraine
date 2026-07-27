@@ -1277,6 +1277,17 @@ fn audit_sample_sessions_sql(db: &str) -> String {
 }
 
 /// The overlap-audit coverage probe for one slice of the sampled sessions.
+///
+/// `loc_present` is scoped by UID, not by session, and that distinction is
+/// load-bearing. `mcp_event_locator` is keyed `(event_uid, source_host)` — one
+/// row per uid — while `event_uid` is content-addressed and excludes
+/// `session_id` (#608), so an ingest double-attribution puts one uid under two
+/// sessions. The locator keeps a single row carrying ONE of those sessions.
+/// Filtering the locator by the sampled session list therefore reports the
+/// other session's event as missing from an index that is not supposed to
+/// carry it per session, and no corpus containing a double-attributed uid can
+/// ever pass. Asking "is this uid in the locator at all" is the question the
+/// reader's uid seek actually depends on; a genuinely absent uid still fails.
 fn audit_coverage_sql(db: &str, session_list: &str, slice: AuditSlice) -> String {
     let dir = slice.order_direction();
     format!(
@@ -1291,7 +1302,9 @@ fn audit_coverage_sql(db: &str, session_list: &str, slice: AuditSlice) -> String
                WHERE session_id IN ({session_list})) AS nav_present,\n\
              event_uid IN (\n\
                SELECT event_uid FROM {db}.mcp_event_locator\n\
-               WHERE session_id IN ({session_list})) AS loc_present\n\
+               WHERE event_uid IN (\n\
+                 SELECT event_uid FROM {db}.mcp_event_navigation\n\
+                 WHERE session_id IN ({session_list}))) AS loc_present\n\
            FROM {db}.events\n\
            WHERE notEmpty(session_id) AND session_id IN ({session_list})\n\
            ORDER BY session_id, event_ts {dir}, source_offset {dir}, source_line_no {dir}, event_uid {dir}\n\
