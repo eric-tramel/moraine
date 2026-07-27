@@ -238,7 +238,9 @@ pub(super) async fn seed_events(clickhouse: &ClickHouseClient, rows: &[Ev]) -> R
     clickhouse
         .insert_json_rows_sync("events", &values)
         .await
-        .context("failed to seed canonical-open fixture events")
+        // `{error:#}` so the ClickHouse message survives: a bare context line
+        // hides which column or value the insert actually rejected.
+        .map_err(|error| anyhow::anyhow!("failed to seed canonical-open fixture events: {error:#}"))
 }
 
 fn admin_budget() -> moraine_config::ValidatedQueryBudget {
