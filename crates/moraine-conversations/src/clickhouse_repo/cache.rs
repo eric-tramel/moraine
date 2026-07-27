@@ -45,9 +45,41 @@ pub(super) const fn analytics_range_index(range: AnalyticsRange) -> usize {
     }
 }
 
+/// Which document population a BM25 score is computed over.
+///
+/// **Issue #597 B6.** `log(1 + (docs - df + 0.5) / (df + 0.5))` is only a
+/// meaningful quantity when `df` is a subset count of `docs`. A statement whose
+/// `df` is drawn from one relation and whose `docs`/`avgdl` are drawn from
+/// another is not "approximately right" — it is two corpora in one number.
+///
+/// So the population is a property of the STATEMENT, and it travels with the
+/// statement. It is deliberately not derived from the `open_v2` readiness
+/// latch: `search_events` and `search_conversations` have no v1 engine to fall
+/// back to — they were collapsed onto the bounded ranking core outright — so on
+/// an unready backend a latch-driven choice hands them `search_corpus_stats`'s
+/// population while their `df` still comes from the locator's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DocumentPopulation {
+    /// `search_documents` rows that are published-generation-authorized AND
+    /// carry the live canonical `event_version` — the `live_locator` join in
+    /// [`ClickHouseConversationRepository::bounded_ranking_ctes`]. Every
+    /// statement built on `term_postings` scores this population, so every
+    /// statement built on `term_postings` takes its `docs`/`avgdl` from here.
+    LocatorAuthorized,
+    /// `v_live_search_documents` — published-generation-authorized only, with
+    /// no per-event version join. The RETIRED v1 MCP ranking statement computes
+    /// its own inline `df` over `v_live_search_postings`, which is authorized
+    /// the same way, so this is the population that pairs with it.
+    DocumentAuthorized,
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct CorpusStatsCacheEntry {
     pub(super) publication_token: String,
+    /// Part of the cache identity, not payload: the two populations produce
+    /// different numbers, and serving one path's entry to the other is the same
+    /// defect as choosing the wrong statement.
+    pub(super) population: DocumentPopulation,
     pub(super) docs: u64,
     pub(super) total_doc_len: u64,
     pub(super) fetched_at: Instant,
@@ -379,27 +411,40 @@ impl ClickHouseConversationRepository {
         );
     }
 
-    pub(super) async fn cached_corpus_stats(&self) -> Option<(u64, u64)> {
+    pub(super) async fn cached_corpus_stats(
+        &self,
+        population: DocumentPopulation,
+    ) -> Option<(u64, u64)> {
         let publication_token = publication_cache_key("corpus-stats")?;
         let now = Instant::now();
         let cache = self.stats_cache.read().await;
         cache.corpus_stats.as_ref().and_then(|entry| {
             (entry.publication_token == publication_token
+                && entry.population == population
                 && now.duration_since(entry.fetched_at) <= CORPUS_STATS_CACHE_TTL)
                 .then_some((entry.docs, entry.total_doc_len))
         })
     }
 
-    pub(super) async fn corpus_stats(&self) -> RepoResult<(u64, u64)> {
+    /// `docs` / `avgdl` for the document population the CALLER's `df` is
+    /// counted over (issue #597 B6). The caller names it because the caller is
+    /// what knows which ranking relation it scored.
+    pub(super) async fn corpus_stats(
+        &self,
+        population: DocumentPopulation,
+    ) -> RepoResult<(u64, u64)> {
         let now = Instant::now();
-        if let Some(stats) = self.cached_corpus_stats().await {
+        if let Some(stats) = self.cached_corpus_stats(population).await {
             return Ok(stats);
         }
 
-        let from_stats_query = format!(
-            "SELECT toUInt64(ifNull(sum(docs), 0)) AS docs, toUInt64(ifNull(sum(total_doc_len), 0)) AS total_doc_len FROM {} FORMAT JSONEachRow",
-            self.table_ref("search_corpus_stats")
-        );
+        let from_stats_query = match population {
+            DocumentPopulation::LocatorAuthorized => self.build_live_corpus_stats_sql(),
+            DocumentPopulation::DocumentAuthorized => format!(
+                "SELECT toUInt64(ifNull(sum(docs), 0)) AS docs, toUInt64(ifNull(sum(total_doc_len), 0)) AS total_doc_len FROM {} FORMAT JSONEachRow",
+                self.table_ref("search_corpus_stats")
+            ),
+        };
 
         let from_stats: Vec<CorpusStatsRow> =
             self.map_backend(self.query_rows(&from_stats_query, None).await)?;
@@ -419,6 +464,7 @@ impl ClickHouseConversationRepository {
             let mut cache = self.stats_cache.write().await;
             cache.corpus_stats = Some(CorpusStatsCacheEntry {
                 publication_token,
+                population,
                 docs: resolved.0,
                 total_doc_len: resolved.1,
                 fetched_at: now,
@@ -429,6 +475,7 @@ impl ClickHouseConversationRepository {
 
     pub(super) async fn cache_corpus_stats(
         &self,
+        population: DocumentPopulation,
         docs: u64,
         total_doc_len: u64,
         fetched_at: Instant,
@@ -437,6 +484,7 @@ impl ClickHouseConversationRepository {
             let mut cache = self.stats_cache.write().await;
             cache.corpus_stats = Some(CorpusStatsCacheEntry {
                 publication_token,
+                population,
                 docs,
                 total_doc_len,
                 fetched_at,

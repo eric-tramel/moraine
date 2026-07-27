@@ -1234,7 +1234,13 @@ FORMAT JSONEachRow",
         unique_fetch_limit: u16,
     ) -> RepoResult<McpSearchPage> {
         let candidate_fetch_size = mcp_candidate_fetch_size(unique_fetch_limit);
-        let corpus_stats = self.cached_corpus_stats().await;
+        // The v1 ranking statement computes its own `df` inline over
+        // `v_live_search_postings`, so its `docs`/`avgdl` come from the
+        // population authorized the same way — and from `search_corpus_stats`
+        // inlined into that very statement when the cache is cold.
+        let corpus_stats = self
+            .cached_corpus_stats(DocumentPopulation::DocumentAuthorized)
+            .await;
         let scanned_corpus_stats = corpus_stats.is_none();
 
         let sql = self.build_search_mcp_events_sql(
@@ -1259,8 +1265,16 @@ FORMAT JSONEachRow",
         let total_doc_len = metadata.total_doc_len;
         let scope_exists = metadata.scope_exists != 0;
         if scanned_corpus_stats {
-            self.cache_corpus_stats(docs, total_doc_len, Instant::now())
-                .await;
+            // What v1 just scanned is `search_corpus_stats`, inlined into its
+            // own ranking statement — the document-authorized population, which
+            // is the one its inline `df` pairs with.
+            self.cache_corpus_stats(
+                DocumentPopulation::DocumentAuthorized,
+                docs,
+                total_doc_len,
+                Instant::now(),
+            )
+            .await;
         }
         if metadata.projection_ready == 0 {
             return Err(RepoError::backend(
@@ -1347,7 +1361,10 @@ FORMAT JSONEachRow",
         min_score: f64,
         unique_fetch_limit: u16,
     ) -> RepoResult<McpSearchPage> {
-        let (docs, total_doc_len) = self.corpus_stats().await?;
+        // Ranking scores `term_postings`, so `docs`/`avgdl` describe it too.
+        let (docs, total_doc_len) = self
+            .corpus_stats(DocumentPopulation::LocatorAuthorized)
+            .await?;
         let empty_page = |scope_exists: bool| McpSearchPage {
             rows: Vec::new(),
             docs,
@@ -1427,26 +1444,46 @@ FORMAT JSONEachRow",
             .collect::<Vec<_>>();
         candidate_session_ids.sort_unstable();
         candidate_session_ids.dedup();
-        let candidate_uids = candidates
+        // Every read after ranking is keyed by the SESSION-QUALIFIED identity.
+        // `event_uid` is content-addressed over the source coordinates and
+        // deliberately excludes `session_id` (#608), so one uid legitimately
+        // exists under two sessions; a `(source_host, event_uid)` key silently
+        // collapses those two candidates into one and hydrates the survivor
+        // against whichever session's row happened to arrive last.
+        let candidate_identities = candidates
             .iter()
-            .map(|candidate| candidate.event_uid.clone())
+            .map(|candidate| (candidate.session_id.clone(), candidate.event_uid.clone()))
             .collect::<Vec<_>>();
 
         // Phase 2 — content-free derivation over the candidate sessions only.
-        let derivation_sql =
-            self.build_search_candidate_derivation_sql(&candidate_session_ids, &candidate_uids)?;
+        let derivation_sql = self
+            .build_search_candidate_derivation_sql(&candidate_session_ids, &candidate_identities)?;
         let derivations: Vec<SearchCandidateDerivationRow> =
             self.map_backend(self.query_rows(&derivation_sql, None).await)?;
         let mut derivation_by_identity = derivations
             .into_iter()
-            .map(|row| ((row.source_host.clone(), row.event_uid.clone()), row))
+            .map(|row| {
+                (
+                    (
+                        row.source_host.clone(),
+                        row.session_id.clone(),
+                        row.event_uid.clone(),
+                    ),
+                    row,
+                )
+            })
             .collect::<HashMap<_, _>>();
 
-        // Phase 3 — the two fixed-width dedup inputs.
+        // Phase 3 — the two fixed-width dedup inputs. `search_documents` is
+        // `ORDER BY (event_uid)`, so a document is per-uid by construction and
+        // its digest/phase are the same values for every session the uid is
+        // attributed to. The map is therefore keyed per document and READ, not
+        // consumed: `remove` would starve the second candidate of a
+        // double-attributed uid and drop it as if it were stale.
         let dedup_sql = self.build_search_dedup_keys_sql(&candidates)?;
         let dedup_rows: Vec<SearchDedupKeyRow> =
             self.map_backend(self.query_rows(&dedup_sql, None).await)?;
-        let mut dedup_by_identity = dedup_rows
+        let dedup_by_document = dedup_rows
             .into_iter()
             .map(|row| ((row.source_host.clone(), row.event_uid.clone()), row))
             .collect::<HashMap<_, _>>();
@@ -1455,16 +1492,24 @@ FORMAT JSONEachRow",
         let scope = self.cfg.session_scope.clone();
         let mut rows = Vec::<SearchMcpEventRow>::with_capacity(candidates.len());
         for candidate in candidates {
-            let identity = (candidate.source_host.clone(), candidate.event_uid.clone());
-            // No live navigation row at the candidate's version: the locator
-            // authorized it, navigation does not carry it at that version, so
-            // it is provably stale. A silent drop, never an error.
+            let identity = (
+                candidate.source_host.clone(),
+                candidate.session_id.clone(),
+                candidate.event_uid.clone(),
+            );
+            // No live navigation row for this SESSION at the candidate's
+            // version: the locator authorized it, navigation does not carry it
+            // at that version, so it is provably stale. A silent drop, never an
+            // error.
             let Some(derived) = derivation_by_identity.remove(&identity) else {
                 continue;
             };
-            if derived.event_version != candidate.post_version
-                || derived.session_id != candidate.session_id
-            {
+            // The second, independent version check. The locator and the
+            // navigation index are maintained by two different materialized
+            // views from the same `events` insert block; a candidate the
+            // locator authorized at `post_version` that navigation carries at a
+            // different `event_version` is a proven mid-flight row.
+            if derived.event_version != candidate.post_version {
                 continue;
             }
             // Project scope is re-checked EXACTLY against the navigation
@@ -1498,10 +1543,16 @@ FORMAT JSONEachRow",
             // b.text_content`) would report every digest-less pair as identical
             // content and collapse unrelated events. There is no digest-less
             // row to reach it with.
-            let Some(dedup) = dedup_by_identity.remove(&identity) else {
+            let Some(dedup) = dedup_by_document
+                .get(&(candidate.source_host.clone(), candidate.event_uid.clone()))
+            else {
                 continue;
             };
-            rows.push(Self::canonical_candidate_row(candidate, derived, dedup));
+            rows.push(Self::canonical_candidate_row(
+                candidate,
+                derived,
+                dedup.clone(),
+            ));
         }
         if rows.is_empty() {
             return Ok(McpSearchPage {
@@ -1643,9 +1694,14 @@ FORMAT JSONEachRow",
             .collect::<Vec<_>>();
         session_ids.sort_unstable();
         session_ids.dedup();
-        let event_uids = rows
+        // Session-qualified, for the same reason the candidate derivation is:
+        // `moraine.events` is `ORDER BY (session_id, …)` and carries one uid
+        // under two sessions whenever ingest double-attributes a physical line
+        // (#608). A uid-only hydration key hydrates a winner from the other
+        // session's row.
+        let winner_identities = rows
             .iter()
-            .map(|row| row.event_uid.clone())
+            .map(|row| (row.session_id.clone(), row.event_uid.clone()))
             .collect::<Vec<_>>();
 
         let totals_sql = self.build_session_totals_batch_sql(&session_ids);
@@ -1699,11 +1755,21 @@ FORMAT JSONEachRow",
         // The wide read's `event_ts` bound is computed from the winners' own
         // canonical timestamps, so it prunes without ever excluding a winner.
         let bounds = Self::search_hydration_bounds(rows);
-        let wide_sql = self.build_search_wide_hydration_sql(&session_ids, &event_uids, bounds)?;
+        let wide_sql =
+            self.build_search_wide_hydration_sql(&session_ids, &winner_identities, bounds)?;
         let wide: Vec<SearchWideRow> = self.map_backend(self.query_rows(&wide_sql, None).await)?;
         let mut wide_by_identity = wide
             .into_iter()
-            .map(|row| ((row.source_host.clone(), row.event_uid.clone()), row))
+            .map(|row| {
+                (
+                    (
+                        row.source_host.clone(),
+                        row.session_id.clone(),
+                        row.event_uid.clone(),
+                    ),
+                    row,
+                )
+            })
             .collect::<HashMap<_, _>>();
 
         for row in rows.iter_mut() {
@@ -1737,9 +1803,11 @@ FORMAT JSONEachRow",
             if let Some((_, completed)) = session_completed.get(&row.session_id) {
                 row.session_completed = *completed;
             }
-            if let Some(wide) =
-                wide_by_identity.remove(&(row.source_host.clone(), row.event_uid.clone()))
-            {
+            if let Some(wide) = wide_by_identity.remove(&(
+                row.source_host.clone(),
+                row.session_id.clone(),
+                row.event_uid.clone(),
+            )) {
                 row.endpoint_kind = wide.endpoint_kind;
                 row.call_id = wide.call_id;
                 row.item_id = wide.item_id;
@@ -2004,10 +2072,39 @@ FORMAT JSONEachRow",
             .unwrap_or_default()
     }
 
+    /// The shared bounded ranking relation, with the extra physical posting
+    /// column conversation search projects.
+    ///
+    /// **Issue #597 B6 — one BM25 document population.** Conversation search
+    /// used to score `v_live_search_postings` (authorized only through
+    /// `search_documents`) while taking its `df` from
+    /// [`Self::bounded_term_df_map`], which counts the locator-authorized
+    /// `term_postings`. Those are two different document populations in one
+    /// score: a posting whose `search_documents` revision is current but whose
+    /// live `event_version` has moved on contributed `tf` to the numerator and
+    /// nothing to `df`. The population is now stated once and used everywhere:
+    ///
+    /// > the live document population is `search_documents` rows that are
+    /// > published-generation-authorized AND carry the live canonical
+    /// > `event_version` — i.e. the `live_locator` join.
+    ///
+    /// `df` (here and in ranking), the scored postings, the session
+    /// aggregation and `docs`/`avgdl` ([`Self::corpus_stats`]) all describe
+    /// exactly that relation.
+    fn conversation_ranking_ctes(&self, terms_array_sql: &str) -> String {
+        self.bounded_ranking_ctes(terms_array_sql, &["inference_provider"])
+    }
+
+    /// Filters for the conversation-search statements, expressed against the
+    /// bounded `term_postings` relation (issue #597 B6): ONE document
+    /// population feeds `df`, the scored postings and the session aggregation.
+    ///
+    /// `p.term IN …` is deliberately absent — the shared ranking CTE owns term
+    /// membership, and duplicating it here is how the two relations start to
+    /// drift.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn build_conversation_postings_filter_sql(
         &self,
-        terms: &[String],
         include_tool_events: bool,
         exclude_codex_mcp: bool,
         from_unix_ms: Option<i64>,
@@ -2015,8 +2112,7 @@ FORMAT JSONEachRow",
         recent_from_unix_ms: Option<i64>,
         session_filter: ConversationSessionFilter<'_>,
     ) -> (String, String) {
-        let terms_array_sql = sql_array_strings(terms);
-        let mut postings_filters = vec![format!("p.term IN {}", terms_array_sql)];
+        let mut postings_filters: Vec<String> = Vec::new();
         let mut document_filters = Vec::new();
 
         if let Some(from_unix_ms) = from_unix_ms {
@@ -2064,15 +2160,23 @@ FORMAT JSONEachRow",
             }
         }
 
+        // The `ingested_at` window is the one predicate `search_postings` cannot
+        // answer. The join does NOT widen the population: postings are derived
+        // from `search_documents`, so every row of `term_postings` has exactly
+        // one document row, and the join is a lookup rather than a filter on
+        // membership.
         let docs_join_sql = if document_filters.is_empty() {
             String::new()
         } else {
             let documents_table = self.table_ref("v_live_search_documents");
             format!(
-                "ANY INNER JOIN {documents_table} AS d\n  ON d.source_host = p.source_host\n AND d.event_uid = p.doc_id"
+                "ANY INNER JOIN {documents_table} AS d\n  ON d.source_host = p.source_host\n AND d.event_uid = p.event_uid"
             )
         };
         postings_filters.extend(document_filters);
+        if postings_filters.is_empty() {
+            postings_filters.push("1".to_string());
+        }
         let filter_sql = format!("WHERE {}", postings_filters.join("\n      AND "));
         (docs_join_sql, filter_sql)
     }
@@ -2096,15 +2200,14 @@ FORMAT JSONEachRow",
             ));
         }
 
-        let postings_table = self.table_ref("v_live_search_postings");
         let terms_array_sql = sql_array_strings(terms);
+        let ranking_ctes = self.conversation_ranking_ctes(&terms_array_sql);
         let idf_vals: Vec<f64> = terms
             .iter()
             .map(|t| *idf_by_term.get(t).unwrap_or(&0.0))
             .collect();
         let idf_array_sql = sql_array_f64(&idf_vals);
         let (docs_join_sql, filter_sql) = self.build_conversation_postings_filter_sql(
-            terms,
             include_tool_events,
             exclude_codex_mcp,
             from_unix_ms,
@@ -2114,7 +2217,12 @@ FORMAT JSONEachRow",
         );
 
         let (mode_join_sql, mode_filter_sql) = if let Some(selected_mode) = mode {
-            let mode_subquery = self.mode_subquery();
+            // Bounded to the sessions this query already selected. An
+            // unpredicated mode aggregate is a whole-corpus
+            // `events FINAL … GROUP BY session_id` riding along with a bounded
+            // ranking pass (issue #597 B5).
+            let mode_subquery =
+                self.mode_subquery_for_sessions(Some("SELECT session_id FROM eligible_sessions"));
             let mode_filter_sql = Self::mode_filter_clause(Some(selected_mode))
                 .map(|clause| format!("AND {clause}"))
                 .unwrap_or_default();
@@ -2128,11 +2236,12 @@ FORMAT JSONEachRow",
 
         Ok(format!(
             "WITH
+{ranking_ctes},
   {terms_array_sql} AS q_terms,
   {idf_array_sql} AS q_idf,
   eligible_sessions AS (
     SELECT DISTINCT p.session_id
-    FROM {postings_table} AS p
+    FROM term_postings AS p
     {docs_join_sql}
     {filter_sql}
   ),
@@ -2141,10 +2250,9 @@ FORMAT JSONEachRow",
       p.session_id AS session_id,
       toString(p.term) AS term,
       sum(p.tf) AS tf_sum
-    FROM {postings_table} AS p
+    FROM term_postings AS p
     ALL INNER JOIN eligible_sessions AS eligible
       ON eligible.session_id = p.session_id
-    WHERE p.term IN q_terms
     GROUP BY p.session_id, p.term
   )
 SELECT
@@ -2165,7 +2273,6 @@ WHERE c.matched_terms >= {min_should_match}
 ORDER BY c.score DESC, c.session_id ASC
 LIMIT {limit}
 FORMAT JSONEachRow",
-            postings_table = postings_table,
             docs_join_sql = docs_join_sql,
             filter_sql = filter_sql,
             mode_join_sql = mode_join_sql,
@@ -2194,8 +2301,8 @@ FORMAT JSONEachRow",
             ));
         }
 
-        let postings_table = self.table_ref("v_live_search_postings");
         let terms_array_sql = sql_array_strings(terms);
+        let ranking_ctes = self.conversation_ranking_ctes(&terms_array_sql);
         let idf_vals: Vec<f64> = terms
             .iter()
             .map(|t| *idf_by_term.get(t).unwrap_or(&0.0))
@@ -2208,7 +2315,6 @@ FORMAT JSONEachRow",
             None => recent_floor,
         };
         let (docs_join_sql, filter_sql) = self.build_conversation_postings_filter_sql(
-            terms,
             include_tool_events,
             exclude_codex_mcp,
             from_unix_ms,
@@ -2218,7 +2324,8 @@ FORMAT JSONEachRow",
         );
 
         let (mode_join_sql, mode_filter_sql) = if let Some(selected_mode) = mode {
-            let mode_subquery = self.mode_subquery();
+            let mode_subquery =
+                self.mode_subquery_for_sessions(Some("SELECT session_id FROM eligible_sessions"));
             let mode_filter_sql = Self::mode_filter_clause(Some(selected_mode))
                 .map(|clause| format!("AND {clause}"))
                 .unwrap_or_default();
@@ -2232,8 +2339,15 @@ FORMAT JSONEachRow",
 
         Ok(format!(
             "WITH
+{ranking_ctes},
   {terms_array_sql} AS q_terms,
-  {idf_array_sql} AS q_idf
+  {idf_array_sql} AS q_idf,
+  eligible_sessions AS (
+    SELECT DISTINCT p.session_id
+    FROM term_postings AS p
+    {docs_join_sql}
+    {filter_sql}
+  )
 SELECT
   c.session_id AS session_id,
   c.score AS score,
@@ -2243,7 +2357,7 @@ FROM (
     p.session_id AS session_id,
     sum(transform(toString(p.term), q_terms, q_idf, 0.0) * log1p(toFloat64(p.tf))) AS score,
     toUInt16(countDistinct(p.term)) AS matched_terms
-  FROM {postings_table} AS p
+  FROM term_postings AS p
   {docs_join_sql}
   {filter_sql}
   GROUP BY p.session_id
@@ -2254,7 +2368,6 @@ WHERE c.matched_terms >= {min_should_match}
 ORDER BY c.score DESC, c.session_id ASC
 LIMIT {limit}
 FORMAT JSONEachRow",
-            postings_table = postings_table,
             docs_join_sql = docs_join_sql,
             filter_sql = filter_sql,
             mode_join_sql = mode_join_sql,
@@ -2377,16 +2490,15 @@ FORMAT JSONEachRow",
             ));
         }
 
-        let postings_table = self.table_ref("v_live_search_postings");
         let session_summary_table = self.table_ref("v_session_summary");
         let terms_array_sql = sql_array_strings(terms);
+        let ranking_ctes = self.conversation_ranking_ctes(&terms_array_sql);
         let idf_vals: Vec<f64> = terms
             .iter()
             .map(|t| *idf_by_term.get(t).unwrap_or(&0.0))
             .collect();
         let idf_array_sql = sql_array_f64(&idf_vals);
         let (docs_join_sql, filter_sql) = self.build_conversation_postings_filter_sql(
-            terms,
             include_tool_events,
             exclude_codex_mcp,
             from_unix_ms,
@@ -2395,7 +2507,11 @@ FORMAT JSONEachRow",
             ConversationSessionFilter::Sessions(candidate_session_ids),
         );
         let (mode_join_sql, mode_filter_sql) = if let Some(selected_mode) = mode {
-            let mode_subquery = self.mode_subquery();
+            let candidate_sessions_sql = format!(
+                "SELECT arrayJoin({}) AS session_id",
+                sql_array_strings(candidate_session_ids)
+            );
+            let mode_subquery = self.mode_subquery_for_sessions(Some(&candidate_sessions_sql));
             let mode_filter_sql = Self::mode_filter_clause(Some(selected_mode))
                 .map(|clause| format!("AND {clause}"))
                 .unwrap_or_default();
@@ -2430,6 +2546,7 @@ FORMAT JSONEachRow",
 
         Ok(format!(
             "WITH
+{ranking_ctes},
   {k1:.6} AS k1,
   {b:.6} AS b,
   greatest({avgdl:.6}, 1.0) AS avgdl,
@@ -2471,8 +2588,8 @@ FROM (
   FROM (
     SELECT
       p.source_host AS source_host,
-      p.doc_id AS event_uid,
-      any(p.session_id) AS session_id,
+      p.event_uid AS event_uid,
+      p.session_id AS session_id,
       any(p.harness) AS harness,
       any(p.inference_provider) AS inference_provider,
       {inner_matched_terms_sql}
@@ -2485,10 +2602,10 @@ FROM (
           (toFloat64(p.tf) + k1 * (1.0 - b + b * (toFloat64(p.doc_len) / avgdl)))
         )
       ) AS event_score
-    FROM {postings_table} AS p
+    FROM term_postings AS p
     {docs_join_sql}
     {filter_sql}
-    GROUP BY p.doc_id, p.source_host
+    GROUP BY p.event_uid, p.source_host, p.session_id
   ) AS e
   GROUP BY e.session_id
 ) AS c
@@ -2500,7 +2617,6 @@ WHERE c.matched_terms >= {min_should_match}
 ORDER BY c.score DESC, c.session_id ASC
 LIMIT {limit}
 FORMAT JSONEachRow",
-            postings_table = postings_table,
             docs_join_sql = docs_join_sql,
             filter_sql = filter_sql,
             outer_matched_terms_sql = outer_matched_terms_sql,
@@ -2782,17 +2898,18 @@ FORMAT JSONEachRow",
             .collect()
     }
 
-    pub(super) async fn fetch_conversation_session_metadata(
-        &self,
-        session_ids: &[String],
-    ) -> RepoResult<HashMap<String, ConversationSessionMetadataRow>> {
-        if session_ids.is_empty() {
-            return Ok(HashMap::new());
-        }
-
-        let events_source = self.live_events_source();
+    /// The winner-session `session_meta` fold.
+    ///
+    /// Bounded INSIDE the live-events derived table: `events` leads its primary
+    /// key with `session_id`, and the same predicate one level up sits above
+    /// the publication join, where it prunes nothing (issue-598 C2-R0) — i.e. a
+    /// corpus-wide scan of every `session_meta` event wearing a bounded-looking
+    /// `WHERE` (issue #597 B5). The outer predicate is kept as the exact
+    /// filter; the inner one is what makes this a point range.
+    pub(super) fn build_conversation_session_metadata_sql(&self, session_ids: &[String]) -> String {
+        let events_source = self.live_events_source_sessions_bounded(session_ids, None);
         let session_ids_sql = sql_array_strings(session_ids);
-        let sql = format!(
+        format!(
             "SELECT
   session_id,
   argMax(harness, event_ts) AS harness,
@@ -2816,7 +2933,18 @@ GROUP BY session_id
 FORMAT JSONEachRow",
             events_source = events_source,
             session_ids_sql = session_ids_sql,
-        );
+        )
+    }
+
+    pub(super) async fn fetch_conversation_session_metadata(
+        &self,
+        session_ids: &[String],
+    ) -> RepoResult<HashMap<String, ConversationSessionMetadataRow>> {
+        if session_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let sql = self.build_conversation_session_metadata_sql(session_ids);
 
         let rows: Vec<ConversationSessionMetadataRow> =
             self.map_backend(self.query_rows(&sql, None).await)?;
@@ -3029,7 +3157,13 @@ FORMAT JSONEachRow",
             .or_else(|| session_ids_ref.map(|ids| ids.join(",")))
             .unwrap_or_default();
 
-        let (docs, total_doc_len) = self.corpus_stats().await?;
+        // `search_events` has no v1 engine: it was collapsed onto the bounded
+        // ranking core outright, so it scores `term_postings` on EVERY backend,
+        // ready or not, and its `docs`/`avgdl` follow the statement rather than
+        // the readiness latch.
+        let (docs, total_doc_len) = self
+            .corpus_stats(DocumentPopulation::LocatorAuthorized)
+            .await?;
         if docs == 0 {
             return Ok(SearchEventsResult {
                 query_id,
@@ -3357,7 +3491,12 @@ FORMAT JSONEachRow",
             .exclude_codex_mcp
             .unwrap_or(self.cfg.default_exclude_codex_mcp);
 
-        let (docs, total_doc_len) = self.corpus_stats().await?;
+        // Same as `search_events`: conversation search scores `term_postings`
+        // unconditionally, so it takes the locator-authorized population
+        // unconditionally.
+        let (docs, total_doc_len) = self
+            .corpus_stats(DocumentPopulation::LocatorAuthorized)
+            .await?;
         if docs == 0 {
             return Ok(ConversationSearchResults {
                 query_id,
