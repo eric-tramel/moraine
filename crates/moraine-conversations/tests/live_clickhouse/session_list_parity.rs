@@ -65,11 +65,16 @@ fn fixture_corpus() -> Vec<Ev> {
         // while the non-omp branch (session_meta only) would not.
         Ev::new("list-omp-explicit", "list-omp-explicit-title", 20)
             .source("omp", "/tmp/omp/ExplicitTask.jsonl")
+            // The omp title signal lives INSIDE payload_json — the derivation
+            // reads JSONExtractString(payload_json, 'type') IN ('title',
+            // 'title_change') (canonical_derivations.rs). `payload_type` is a
+            // constrained domain column (events_payload_type_domain) and
+            // 'title_change' is not in it, so setting it there both misstates
+            // the shape and fails the insert.
             .payload(
                 "unknown",
                 r#"{"type":"title_change","title":"Explicit OMP Title"}"#,
-            )
-            .payload_type("title_change"),
+            ),
         Ev::new("list-omp-explicit", "list-omp-explicit-name", 21)
             .source("omp", "/tmp/omp/ExplicitTask.jsonl")
             .payload("session_meta", r#"{"name":"Later Lower Priority Name"}"#)
