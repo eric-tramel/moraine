@@ -34,7 +34,10 @@ def _document_hydration_rows() -> list[dict]:
 
     return [
         row("evt-c-42", "sess_c", "best event in session c"),
-        row("evt-a-11", "sess_a", "hello world in session a"),
+        # The event search scopes to session_id="sess_c" and expects TWO hits,
+        # so this candidate must be in that session — `passes_search_doc_filters`
+        # correctly drops a hydrated row whose session is outside the scope.
+        row("evt-a-11", "sess_c", "hello world in session c"),
     ]
 
 
@@ -64,7 +67,7 @@ def _tool_hydration_rows() -> list[dict]:
 
     return [
         row("evt-c-42", "sess_c", "best event in session c"),
-        row("evt-a-11", "sess_a", "hello world in session a"),
+        row("evt-a-11", "sess_c", "hello world in session c"),
     ]
 
 
