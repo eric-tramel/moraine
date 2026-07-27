@@ -64,6 +64,13 @@ def _rows_for_query(query: str) -> list[dict]:
     if "FROM `moraine`.`search_corpus_stats`" in query:
         return [{"docs": 100, "total_doc_len": 5000}]
 
+    # #597 computes df from the bounded postings CTE instead of the
+    # precomputed `search_term_stats` table. Without this arm the term map came
+    # back empty, nothing scored, and the smoke test read as "search returns no
+    # hits" rather than "the fixture does not know this query".
+    if "FROM term_postings AS p" in query and "GROUP BY p.term" in query:
+        return [{"term": "hello", "df": 20}, {"term": "world", "df": 10}]
+
     if "FROM `moraine`.`search_term_stats`" in query:
         return [{"term": "hello", "df": 20}, {"term": "world", "df": 10}]
 
@@ -87,12 +94,7 @@ def _rows_for_query(query: str) -> list[dict]:
             },
         ]
 
-    # Match the ranking statement by the relation it reads and its ordering,
-    # not by an aggregation clause. #597 replaced the `GROUP BY p.doc_id` shape
-    # with a bounded postings CTE joined to the live locator, and a matcher
-    # keyed on the old clause silently returned no rows — the smoke test read
-    # as "search returns nothing" rather than "the fixture stopped matching".
-    if "`search_postings`" in query and "ORDER BY score DESC, event_uid ASC" in query:
+    if "GROUP BY p.doc_id" in query and "ORDER BY score DESC, event_uid ASC" in query:
         return [
             {
                 "event_uid": "evt-c-42",
