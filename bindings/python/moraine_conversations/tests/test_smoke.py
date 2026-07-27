@@ -87,7 +87,12 @@ def _rows_for_query(query: str) -> list[dict]:
             },
         ]
 
-    if "GROUP BY p.doc_id" in query and "ORDER BY score DESC, event_uid ASC" in query:
+    # Match the ranking statement by the relation it reads and its ordering,
+    # not by an aggregation clause. #597 replaced the `GROUP BY p.doc_id` shape
+    # with a bounded postings CTE joined to the live locator, and a matcher
+    # keyed on the old clause silently returned no rows — the smoke test read
+    # as "search returns nothing" rather than "the fixture stopped matching".
+    if "`search_postings`" in query and "ORDER BY score DESC, event_uid ASC" in query:
         return [
             {
                 "event_uid": "evt-c-42",
