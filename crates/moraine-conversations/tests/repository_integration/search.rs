@@ -757,38 +757,46 @@ async fn search_events_ranks_once_from_postings_and_reads_no_content() {
         // another.
         assert!(ranking.contains("WHERE l.event_uid IN (\n      SELECT pruned.doc_id"));
 
-        // `search_postings` is read WITHOUT `FINAL` and collapsed explicitly on
-        // a key that CARRIES the attribution: the table's sort key is
-        // `(term, doc_id, source_host)`, so `FINAL` would discard one of a
-        // double-attributed uid's two rows inside the scan (issue #597 C1).
-        assert!(!ranking.contains("`search_postings` AS p FINAL"));
-        assert!(ranking.contains("GROUP BY p.term, p.doc_id, p.source_host, p.session_id"));
+        // `search_postings` is read WITH `FINAL` — the table's own
+        // `ReplacingMergeTree(post_version)` collapse — and never with a
+        // hand-rolled `GROUP BY` over the postings scan. The three ranking
+        // relations are all keyed on `(event_uid, source_host)`, so ranking is
+        // DOCUMENT-grained and there is no per-attribution distinction for a
+        // `GROUP BY` to preserve (issue #597 D1). Keeping the read a streaming
+        // merging read is also what keeps the term-key prune worth having.
+        assert!(ranking.contains("FROM `moraine`.`search_postings` AS p FINAL"));
+        assert!(
+            !ranking.contains("GROUP BY p.term, p.doc_id"),
+            "the postings scan must stay a merging read, not a hash \
+             aggregation: {ranking}"
+        );
 
         // `df` is corpus-wide: computed inside `term_postings`, and NO user
-        // filter may appear there. It counts DISTINCT DOCUMENTS, so it stays a
-        // subset count of `docs` even though the relation under it is
-        // attribution-grain.
+        // filter may appear there. `count()` is an exact document count because
+        // `FINAL` plus the locator equi-join leave at most one row per
+        // `(term, event_uid, source_host)`.
         let (df_cte, projection) = ranking
             .split_once("\nSELECT\n  p.event_uid AS event_uid,")
             .expect("ranking statement has a CTE and a projection");
-        assert!(df_cte.contains(
-            "toUInt64(uniqExact(tuple(p.event_uid, p.source_host)) OVER (PARTITION BY p.term)) AS df"
-        ));
+        assert!(df_cte.contains("toUInt64(count() OVER (PARTITION BY p.term)) AS df"));
         assert_eq!(
             df_cte.matches(" OVER (").count(),
             1,
             "the df window must be the only window in the ranking CTE: {df_cte}"
         );
-        // The postings WHERE is term membership and NOTHING else: the clause
-        // runs straight into the collapse's GROUP BY with no conjunct between.
-        let postings_where = df_cte
+        // The `term_postings` WHERE is term membership and NOTHING else: the
+        // clause runs to the CTE's closing paren with no conjunct after it.
+        // This is an EXACT-form assertion, not a containment check — a
+        // containment check is satisfied by a predicate appended below the term
+        // clause, which is precisely the mutation it has to catch.
+        let term_postings_where = df_cte
             .rsplit_once("    WHERE p.term IN ['hello','world']")
-            .expect("live_postings filters on term membership")
+            .expect("term_postings filters on term membership")
             .1;
         assert_eq!(
-            postings_where.trim_start().lines().next(),
-            Some("GROUP BY p.term, p.doc_id, p.source_host, p.session_id"),
-            "no user filter may live inside the df CTEs, but found `{postings_where}`"
+            term_postings_where.trim(),
+            ")",
+            "no user filter may live inside the df CTE, but found `{term_postings_where}`"
         );
         assert!(projection.contains("WHERE p.payload_type != 'token_count'"));
 
@@ -1802,133 +1810,43 @@ async fn search_mcp_events_semantics_are_identical_on_both_engines() {
     .await;
 }
 
-/// B1 / #608. `event_uid` is content-addressed over
+/// C1 / D1 / #608. A double-attributed uid ranks ONCE, at DOCUMENT grain, and
+/// that is the design rather than a compromise.
+///
+/// `event_uid` is content-addressed over
 /// `source_file|source_generation|source_line_no|source_offset|
-/// record_fingerprint` and deliberately EXCLUDES `session_id`, so one uid
-/// legitimately exists under two sessions — 19,846 of them on the reference
-/// host. Every read after ranking is therefore keyed by
-/// `(source_host, session_id, event_uid)`, and the derivation and hydration
-/// statements filter on that same tuple.
+/// record_fingerprint` and deliberately EXCLUDES `session_id`, so a physical
+/// line that ingest attributed to two sessions is one uid under two session ids
+/// — 19,846 of them on the reference host — and it is ONE DOCUMENT: one file,
+/// one generation, one line, one byte range, one fingerprint. BM25 scores
+/// documents; `df` and `docs` are document counts.
 ///
-/// This is the HYDRATION half. The ranking half — whether both attributions
-/// reach hydration at all — is
-/// [`a_double_attributed_uid_survives_the_ranking_collapse`].
+/// The read model can represent nothing else. `search_documents` is
+/// `ReplacingMergeTree(doc_version) ORDER BY (event_uid, source_host)` and is
+/// the MV source for `search_postings`, which is
+/// `ReplacingMergeTree(post_version) ORDER BY (term, doc_id, source_host)`;
+/// `mcp_event_locator` is `ReplacingMergeTree(event_version) ORDER BY
+/// (event_uid, source_host)`. `session_id` is in none of those sort keys, so a
+/// second attribution is destroyed at MERGE time — not merely when a query says
+/// `FINAL` — and, before any merge runs, the ranking statement's
+/// `l.event_version = p.post_version` join keeps only the revision the locator
+/// authorizes. That locator row is the same authority the `open_v2` exact-event
+/// seek uses, so search and open resolve the uid to the SAME session; a ranking
+/// that returned both would let a user follow a hit into a different session
+/// than the one the hit named.
 ///
-/// MUTATION (any one of these; each fails this test):
-///   * key `derivation_by_identity` on `(source_host, event_uid)` — the two
-///     derivations collapse, one candidate is hydrated against the OTHER
-///     session's turn/order and the other is dropped;
-///   * key `wide_by_identity` on `(source_host, event_uid)` — one winner gets
-///     the other session's `item_id`/`text`;
-///   * `dedup_by_document.remove(...)` instead of `.get(...)` — the second
-///     candidate is starved of its digest and dropped as if it were stale.
+/// The user-visible consequence, stated rather than left to be rediscovered: a
+/// search scoped to the LOSING session of a double-attributed uid does not
+/// return that uid. That is ~1% of the reference corpus, it is the shipping
+/// behaviour on a real server, and it is an INGEST defect owned by #608 — one
+/// of the two session ids is simply wrong. The read model must not mirror it.
 ///
-/// NOT a mutation this test detects: dropping the `(session_id, event_uid)`
-/// tuple from `build_search_candidate_derivation_sql` /
-/// `build_search_wide_hydration_sql`. A uid-only filter returns the SUPERSET
-/// (every candidate session that carries the uid), and the maps above are
-/// keyed by the triple, so the extra rows are ignored and the answer is
-/// unchanged. That tuple's job is bounding the read, and its guard is the
-/// shape test `canonical_search_reads_are_session_qualified`.
+/// MUTATION (a): re-introduce a per-attribution `GROUP BY p.term, p.doc_id,
+/// p.source_host, p.session_id` over the postings scan in
+/// `bounded_ranking_ctes` — fails on the statement-shape assertions.
+/// MUTATION (b): drop `FINAL` from that scan — same.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_uid_attributed_to_two_sessions_hydrates_each_against_its_own_session() {
-    scoped(async {
-        let (repo, _state) = build_repo_with_options(
-            100,
-            MockOptions {
-                open_v2_reader_ready: Some(true),
-                shared_event_uid_across_sessions: true,
-                ..MockOptions::default()
-            },
-        )
-        .await;
-
-        let result = repo
-            .search_mcp_events(SearchMcpEventsQuery {
-                query: "hello world".to_string(),
-                n_hits: Some(5),
-                min_score: Some(0.0),
-                min_should_match: Some(1),
-                ..SearchMcpEventsQuery::default()
-            })
-            .await
-            .expect("a double-attributed uid is two valid hits, not an error");
-
-        let attributions = result
-            .hits
-            .iter()
-            .map(|hit| (hit.session_id.as_str(), hit.event_uid.as_str()))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            result.hits.len(),
-            2,
-            "both attributions must survive: {attributions:?}"
-        );
-        // The premise: ONE uid string, TWO sessions. If the fixture ever stops
-        // being that shape, every assertion below is satisfiable by a
-        // uid-keyed implementation and this test proves nothing.
-        assert!(
-            result.hits.iter().all(|hit| hit.event_uid == "evt-shared"),
-            "the fixture must be one uid under two sessions: {attributions:?}"
-        );
-        let by_session = |session_id: &str| {
-            result
-                .hits
-                .iter()
-                .find(|hit| hit.session_id == session_id)
-                .unwrap_or_else(|| panic!("a hit for {session_id}"))
-        };
-        // Each hit's derived ordering is its OWN session's, not the other's.
-        let c = by_session("sess_c");
-        assert_eq!(c.turn_seq, 2, "sess_c hit derived from the wrong session");
-        assert_eq!(c.event_order, 42);
-        assert_eq!(c.event_ordinal, 3);
-        assert_eq!(c.turn_event_count, 3);
-        assert_eq!(
-            c.item_id.as_deref(),
-            Some("item-evt-shared-c"),
-            "sess_c hit hydrated from the wrong session's row"
-        );
-
-        let a = by_session("sess_a");
-        assert_eq!(a.turn_seq, 1, "sess_a hit derived from the wrong session");
-        assert_eq!(a.event_order, 11);
-        assert_eq!(a.event_ordinal, 1);
-        assert_eq!(a.turn_event_count, 1);
-        assert_eq!(
-            a.item_id.as_deref(),
-            Some("item-evt-shared-a"),
-            "sess_a hit hydrated from the wrong session's row"
-        );
-    })
-    .await;
-}
-
-/// C1 / #608, the RANKING half — the one B1 left open.
-///
-/// `search_postings` physically carries BOTH attributions of a
-/// double-attributed uid: `mv_search_postings` groups by `session_id`
-/// (`sql/032`), so one physical line ingested into two sessions produces two
-/// posting rows per term, identical in `(term, doc_id, source_host)` and
-/// differing only in `session_id`.
-///
-/// The table is `ReplacingMergeTree(post_version) ORDER BY (term, doc_id,
-/// source_host)` and **`session_id` is not in that key**, so `FROM
-/// search_postings FINAL` collapses those two rows to ONE arbitrary
-/// attribution inside the scan — before the locator join, before any filter,
-/// and before the ranked `GROUP BY … p.session_id` could keep them apart. The
-/// hydration guards above cannot see that: they only ever receive one
-/// candidate. The mock models the replacement semantics, so this test observes
-/// the same loss a server would produce.
-///
-/// MUTATION (a): `FROM {postings} AS p FINAL` in `bounded_ranking_ctes` —
-/// fails here with one hit instead of two.
-/// MUTATION (b): drop `p.session_id` from `live_postings`' `GROUP BY` — same.
-///
-/// Both mutations leave every hydration-half assertion green, which is why
-/// this case is its own test rather than a paragraph in the one above.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_double_attributed_uid_survives_the_ranking_collapse() {
+async fn a_double_attributed_uid_ranks_once_at_document_grain() {
     scoped(async {
         let (repo, state) = build_repo_with_options(
             100,
@@ -1949,7 +1867,7 @@ async fn a_double_attributed_uid_survives_the_ranking_collapse() {
                 ..SearchMcpEventsQuery::default()
             })
             .await
-            .expect("a double-attributed uid is two valid hits, not an error");
+            .expect("a double-attributed uid is a valid hit, not an error");
 
         let attributions = result
             .hits
@@ -1958,11 +1876,14 @@ async fn a_double_attributed_uid_survives_the_ranking_collapse() {
             .collect::<Vec<_>>();
         assert_eq!(
             attributions,
-            vec![("sess_c", "evt-shared"), ("sess_a", "evt-shared")],
-            "both attributions must survive the postings collapse"
+            vec![("sess_c", "evt-shared")],
+            "one physical line is one document and ranks once, under the \
+             attribution the locator authorizes"
         );
 
-        // …and the reason they survived, in the statement the server saw.
+        // …and the statement the server saw is the table's own replacement,
+        // not a hand-rolled one that would key the result on a distinction
+        // `search_postings` cannot durably hold.
         let queries = state.queries.lock().expect("queries lock").clone();
         let ranking = queries
             .iter()
@@ -1972,13 +1893,119 @@ async fn a_double_attributed_uid_survives_the_ranking_collapse() {
             })
             .expect("the request issued a bounded ranking pass");
         assert!(
-            !ranking.contains("`search_postings` AS p FINAL"),
-            "`FINAL` collapses on a key that omits `session_id`: {ranking}"
+            ranking.contains("FROM `moraine`.`search_postings` AS p FINAL"),
+            "the postings scan is a merging read on the table's own \
+             ReplacingMergeTree(post_version): {ranking}"
         );
         assert!(
-            ranking.contains("GROUP BY p.term, p.doc_id, p.source_host, p.session_id"),
-            "the postings collapse must carry the attribution: {ranking}"
+            !ranking.contains("GROUP BY p.term, p.doc_id"),
+            "a per-attribution collapse returns a cardinality that depends on \
+             background merge scheduling — non-repeatable search results: \
+             {ranking}"
         );
+        assert!(
+            ranking.contains("AND l.event_version = p.post_version"),
+            "the version join is what closes the pre-merge window: {ranking}"
+        );
+    })
+    .await;
+}
+
+/// B1 / #608, the HYDRATION half — and the reason the post-ranking reads are
+/// keyed on `(source_host, session_id, event_uid)` even though RANKING is
+/// document-grained.
+///
+/// The two sides of the search path have different grains, and that asymmetry
+/// is the whole content of this test. Ranking reads the search index, which is
+/// keyed on `(event_uid, source_host)` and emits ONE candidate per document
+/// (see `a_double_attributed_uid_ranks_once_at_document_grain`). Everything
+/// after ranking reads CANONICAL relations — `moraine.events` and
+/// `mcp_event_navigation` both lead their primary key with `session_id` — which
+/// genuinely carry BOTH attributions of a double-attributed uid. A uid-only map
+/// key therefore lets the OTHER session's derivation and wide row overwrite the
+/// candidate's own, and the hit silently reports the wrong turn, the wrong
+/// ordering and the wrong `item_id`.
+///
+/// The mock reproduces exactly that: the ranking arm serves one candidate
+/// (`sess_c`), and the derivation and wide arms serve the superset — every
+/// session that carries the uid — which is what a real canonical read returns.
+///
+/// MUTATION (either one; each fails this test):
+///   * key `derivation_by_identity` on `(source_host, event_uid)` — the
+///     candidate is hydrated against `sess_a`'s turn/order;
+///   * key `wide_by_identity` on `(source_host, event_uid)` — the candidate
+///     gets `sess_a`'s `item_id`.
+///
+/// NOT a mutation this test detects: dropping the `(session_id, event_uid)`
+/// tuple from `build_search_candidate_derivation_sql` /
+/// `build_search_wide_hydration_sql`. A uid-only filter returns the SUPERSET,
+/// and the maps above are keyed by the triple, so the extra rows are ignored
+/// and the answer is unchanged. That tuple's job is bounding the read, and its
+/// guard is the shape test `canonical_search_reads_are_session_qualified`.
+///
+/// Also NOT detected any more: `dedup_by_document.remove(...)` instead of
+/// `.get(...)`. With document-grained ranking there is at most one candidate
+/// per `(source_host, event_uid)`, so consuming the entry starves nobody.
+/// `.get()` is kept because it is the shape that stays correct if that ever
+/// changes, but it no longer has a behavioural guard and the ledger records
+/// that rather than claiming one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_double_attributed_uid_hydrates_against_the_session_it_ranked_under() {
+    scoped(async {
+        let (repo, _state) = build_repo_with_options(
+            100,
+            MockOptions {
+                open_v2_reader_ready: Some(true),
+                shared_event_uid_across_sessions: true,
+                ..MockOptions::default()
+            },
+        )
+        .await;
+
+        let result = repo
+            .search_mcp_events(SearchMcpEventsQuery {
+                query: "hello world".to_string(),
+                n_hits: Some(5),
+                min_score: Some(0.0),
+                min_should_match: Some(1),
+                ..SearchMcpEventsQuery::default()
+            })
+            .await
+            .expect("a double-attributed uid is a valid hit, not an error");
+
+        let attributions = result
+            .hits
+            .iter()
+            .map(|hit| (hit.session_id.as_str(), hit.event_uid.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            result.hits.len(),
+            1,
+            "ranking is document-grained: {attributions:?}"
+        );
+        let hit = &result.hits[0];
+        // The premise: the uid the hit reports is the SHARED one, and the
+        // session it reports is the ranked attribution. If the fixture ever
+        // stops being one uid under two sessions, every assertion below is
+        // satisfiable by a uid-keyed implementation and this test proves
+        // nothing.
+        assert_eq!(hit.event_uid, "evt-shared", "{attributions:?}");
+        assert_eq!(hit.session_id, "sess_c", "{attributions:?}");
+
+        // Everything derived and hydrated is `sess_c`'s, even though the
+        // canonical reads also returned `sess_a`'s row for this uid.
+        assert_eq!(hit.turn_seq, 2, "hydrated against the wrong session's turn");
+        assert_eq!(hit.event_order, 42);
+        assert_eq!(hit.event_ordinal, 3);
+        assert_eq!(hit.turn_event_count, 3);
+        assert_eq!(
+            hit.item_id.as_deref(),
+            Some("item-evt-shared-c"),
+            "hydrated from the wrong session's row"
+        );
+        // The negative form, so the assertions above cannot pass by coincidence
+        // if the fixture values ever converge.
+        assert_ne!(hit.item_id.as_deref(), Some("item-evt-shared-a"));
     })
     .await;
 }

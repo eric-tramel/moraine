@@ -74,10 +74,13 @@ pub(super) struct CorpusStatsCacheEntry {
 }
 
 /// Issue #597 deleted the second `df` formula and the schema probe that once
-/// lived here. Ranking's `df` is now
-/// `uniqExact(tuple(event_uid, source_host)) OVER (PARTITION BY term)` inside
-/// the one bounded ranking CTE, computed over version- and
-/// generation-authorized postings; the retired `term_df_by_term` cache fed an
+/// lived here. Ranking's `df` is `count() OVER (PARTITION BY term)` inside the
+/// one bounded ranking CTE, computed over version- and generation-authorized
+/// postings. `count()` is exact there, not an approximation: after `FINAL` and
+/// the locator equi-join the relation holds at most one row per
+/// `(term, event_uid, source_host)`, so a distinct-count would return the same
+/// number for O(df) memory instead of an O(1) accumulator. The retired
+/// `term_df_by_term` cache fed an
 /// in-process scorer from `v_live_search_postings`, a DIFFERENT relation whose
 /// value agreed with ranking's only while the live-postings join stayed 1:1.
 /// One df formula ships, over one relation.

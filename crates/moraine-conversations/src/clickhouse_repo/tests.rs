@@ -488,10 +488,10 @@ async fn conversation_search_never_joins_an_unpredicated_mode_aggregate() {
 }
 
 /// B6. ONE BM25 document population for everything the RANKING relation
-/// produces: `df` is `uniqExact(tuple(event_uid, source_host))` over the
-/// locator-authorized `term_postings`, and the postings that get SCORED plus
-/// the session aggregation must describe the same relation, or
-/// `log(1 + (docs - df + 0.5) / (df + 0.5))` mixes two corpora in one number.
+/// produces: `df` is `count()` over the locator-authorized `term_postings`, and
+/// the postings that get SCORED plus the session aggregation must describe the
+/// same relation, or `log(1 + (docs - df + 0.5) / (df + 0.5))` mixes two
+/// corpora in one number.
 ///
 /// `docs`/`avgdl` are the deliberate exception (design §2.6 / OQ-2, correction
 /// C2): they stay `search_corpus_stats`, one cached scalar pair, because a
@@ -543,42 +543,33 @@ async fn conversation_search_scores_the_same_population_its_df_is_counted_over()
         .await;
 
     // The population-defining halves of the relation `df` is counted over: the
-    // authorized locator, the explicit attribution-keyed collapse of the
-    // term-pruned postings, and the join that intersects them. (The projected
-    // column LIST legitimately differs — conversation search also needs
-    // `inference_provider` — but the ROWS must not, so the slices below
+    // authorized locator, and the `FINAL` postings scan joined to it. (The
+    // projected column LIST legitimately differs — conversation search also
+    // needs `inference_provider` — but the ROWS must not, so the slices below
     // deliberately exclude every projection list.)
     let locator = df_sql
         .split_once("  live_locator AS (")
         .expect("the df statement carries the shared ranking CTEs")
         .1;
     let locator = &locator[..locator
-        .find(",\n  live_postings AS (")
-        .expect("df statement defines live_postings")];
-    let collapse = df_sql
-        .split_once("    FROM `moraine`.`search_postings` AS p\n")
-        .expect("df statement scans the postings")
-        .1;
-    let collapse = &collapse[..collapse
-        .find("\n  ),")
-        .expect("live_postings is a terminated CTE")];
-    let join = df_sql
-        .split_once("    FROM live_postings AS p\n")
-        .expect("df statement joins the collapsed postings to the locator")
-        .1;
-    let join = &join[..join
-        .find("\n  )")
-        .expect("term_postings is a terminated CTE")];
+        .find(",\n  term_postings AS (")
+        .expect("df statement defines term_postings")];
+    // The slice INCLUDES the `FROM … FINAL` line rather than splitting on it:
+    // a split anchor is checked against the df statement only, so the postings
+    // source itself would not be part of what the other statements have to
+    // match, and dropping `FINAL` from one of them would go unnoticed.
+    let scan_start = df_sql
+        .find("    FROM `moraine`.`search_postings` AS p FINAL")
+        .expect("df statement scans the postings");
+    let scan_end = df_sql
+        .find("\nSELECT\n  toString(p.term)")
+        .expect("df statement has a projection");
+    let join = &df_sql[scan_start..scan_end];
 
     for (name, sql) in statements {
         assert!(
             sql.contains(locator),
             "{name} must authorize the SAME population df is counted over:\n{sql}"
-        );
-        assert!(
-            sql.contains(collapse),
-            "{name} must collapse the postings the same way df does — the \
-             attribution-keyed group, not `FINAL`:\n{sql}"
         );
         assert!(
             sql.contains(join),
