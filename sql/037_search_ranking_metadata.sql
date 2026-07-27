@@ -1,0 +1,87 @@
+-- Issue #597: fixed-width ranking/dedup metadata on `search_documents`.
+--
+-- The bounded search path (#597 §2.3) needs two content-DERIVED values for the
+-- #539/#565 duplicate collapse — a content digest and the payload `phase` — but
+-- must not decompress `text_content` / `payload_json` to get them. Both become
+-- MATERIALIZED columns so the dedup-key statement reads fixed-width columns for
+-- the request's bounded candidate set instead of wide blobs.
+--
+-- Purely additive: two `ADD COLUMN IF NOT EXISTS` on an existing table. No
+-- TRUNCATE, no view or MV recreation, no reset of any projection state. Re-runs
+-- are no-ops.
+--
+-- **DIGEST DOMAIN — do not narrow it.** `hex(SHA256(text_content))` over the
+-- FULL text is byte-identical to what the v1 hydration statement computed as
+-- `hex(SHA256(mcp_open_events.text_content))`: the projector inserts
+-- `events.text_content` verbatim (`mcp_open_projection.rs` canonical CTE), and
+-- `mv_search_documents_from_events` (`sql/032`) likewise copies it verbatim, so
+-- the two domains are the same bytes. Narrowing this to
+-- `substring(text_content, 1, 65536)` would newly COLLAPSE two events that
+-- differ only past 64 KiB — a silent #539 equivalence change. The migration
+-- content test `migration_037_digests_full_text_content` pins the expression;
+-- if you change it, that test must fail first.
+--
+-- **HARD PREREQUISITE FOR #603.** Both columns are MATERIALIZED, so parts
+-- written before this migration have no stored value and ClickHouse recomputes
+-- them at read time FROM `text_content` / `payload_json`. #603 must run
+-- `ALTER TABLE moraine.search_documents MATERIALIZE COLUMN text_digest,
+-- MATERIALIZE COLUMN payload_phase` across all parts BEFORE it drops either
+-- source column, or every historical digest silently becomes the digest of an
+-- empty string and every historical `payload_phase` becomes ''. Until that
+-- MATERIALIZE runs, reading these columns on old parts costs the same bytes as
+-- reading the source column: the storage win is #603's, the read-path
+-- decoupling is #597's.
+
+-- ---------------------------------------------------------------------------
+-- TARGET LOGICAL STORAGE CONTRACT for `search_documents` (#597 §4).
+--
+-- CONTRACT ONLY. #597 ships no column drop. #603 exclusively owns the race-safe
+-- dual-write/backfill cutover, `MATERIALIZE COLUMN`, physical removal, and byte
+-- reclamation; this block exists so #603 has something to build against and so
+-- a reviewer can check the claim mechanically.
+--
+-- After #597 the live ranking + hydration path reads these columns and NO
+-- others (asserted by `every_v2_search_builder_is_free_of_the_projection` and
+-- `dedup_keys_read_fixed_width_columns_at_the_exact_candidate_version`):
+--
+--   identity / version / authorization : event_uid, source_host, doc_version
+--   ranking metadata                   : doc_len
+--   dedup keys (new here)              : text_digest, payload_phase
+--   generation-authorization join keys : source_name, source_file, source_generation
+--
+-- Retained for POSTINGS MAINTENANCE only, not read by any live query:
+--   text_content  -- `mv_search_postings` tokenizes search_documents.text_content
+--                 -- (sql/032), and `doc_len` is MATERIALIZED from it (sql/004).
+--   payload_json  -- `has_codex_mcp` (sql/009) and now `payload_phase` are
+--                 -- MATERIALIZED from it.
+--
+-- `search_events`' bounded winner hydration still SELECTs truncated
+-- `text_content` / `payload_json` from `v_live_search_documents` for at most
+-- `3 x limit` identities. That is a bounded winner read, not a ranking input;
+-- #603 re-points it at canonical `events` when it drops the columns.
+--
+-- Columns with NO runtime reader at all, confirmed by grep across crates/ and
+-- apps/ (`v_live_search_documents` appears only in search.rs and cache.rs) —
+-- #603 reclamation candidates: token_usage_json, token_usage_buckets,
+-- token_usage_native_units, session_date, compacted_parent_uid, source_line_no,
+-- source_offset, endpoint_kind.
+--
+-- Also dead write amplification for #603: `search_conversation_terms` (sql/010)
+-- + `mv_search_conversation_terms` (sql/032, which aggregates UNAUTHORIZED raw
+-- postings) and `search_term_stats` (sql/032). Both are in
+-- `REQUIRED_SCHEMA_OBJECTS` and must come out in the same change.
+--
+-- `search_postings` gains NOTHING in #597. The spec asked for fixed
+-- source_file / source_generation / scope-key columns on postings; the locator
+-- already carries the first two authoritatively and version-matched, and a
+-- project scope key cannot be derived per row by an MV (origin_cwd is
+-- argMin(cwd) over the whole session). Growing the largest table in the system
+-- for data available on a smaller one is the wrong trade.
+-- ---------------------------------------------------------------------------
+
+ALTER TABLE moraine.search_documents
+  ADD COLUMN IF NOT EXISTS text_digest String MATERIALIZED hex(SHA256(text_content));
+
+ALTER TABLE moraine.search_documents
+  ADD COLUMN IF NOT EXISTS payload_phase LowCardinality(String)
+    MATERIALIZED JSONExtractString(payload_json, 'phase');

@@ -25,7 +25,7 @@ async fn search_mcp_events_distinguishes_unready_and_dirty_projection_snapshots(
                     ScriptedResponse::rows(&["toUInt8(0) AS row_kind"], json!([metadata.clone()]))
                 })
                 .collect();
-            let (repo, state) = build_scripted_repo(responses).await;
+            let (repo, state) = build_scripted_repo_with_readiness(responses, false).await;
 
             let error = repo
                 .search_mcp_events(SearchMcpEventsQuery {
@@ -124,125 +124,6 @@ async fn search_mcp_events_applies_session_origin_scope() {
         assert!(!search_query.contains("'/work/scope_s.origin_cwd/project'"));
         assert!(search_query.contains("p.harness = 'claude-code'"));
         assert!(search_query.contains("p.source_name = 'claude'"));
-    })
-    .await;
-}
-#[tokio::test(flavor = "multi_thread")]
-async fn search_session_metadata_returns_summary_only_matches() {
-    scoped(async {
-        let (repo, state) = build_repo().await;
-
-        let result = repo
-            .search_session_metadata(SessionMetadataSearchQuery {
-                query: "rare summary".to_string(),
-                limit: Some(10),
-                min_score: Some(0.0),
-                min_should_match: Some(1),
-                from_unix_ms: None,
-                to_unix_ms: None,
-                mode: None,
-                session_id: None,
-            })
-            .await
-            .expect("search session metadata");
-
-        assert_eq!(result.query, "rare summary");
-        assert_eq!(result.terms, vec!["rare", "summary"]);
-        assert_eq!(result.stats.requested_limit, 10);
-        assert_eq!(result.stats.effective_limit, 10);
-        assert!(!result.stats.limit_capped);
-        assert_eq!(result.stats.result_count, 1);
-
-        let hit = &result.hits[0];
-        assert_eq!(hit.rank, 1);
-        assert_eq!(hit.session_id, "sess_meta_summary");
-        assert_eq!(hit.first_event_time.as_deref(), Some("2026-01-05 10:00:00"));
-        assert_eq!(hit.first_event_unix_ms, Some(1767607200000_i64));
-        assert_eq!(hit.last_event_time.as_deref(), Some("2026-01-05 10:15:00"));
-        assert_eq!(hit.last_event_unix_ms, Some(1767608100000_i64));
-        assert_eq!(hit.total_turns, Some(4));
-        assert_eq!(hit.total_events, Some(18));
-        assert_eq!(hit.user_messages, Some(5));
-        assert_eq!(hit.assistant_messages, Some(5));
-        assert_eq!(hit.tool_calls, Some(1));
-        assert_eq!(hit.tool_results, Some(1));
-        assert_eq!(hit.mode, Some(ConversationMode::Chat));
-        assert_eq!(hit.harness.as_deref(), Some("codex"));
-        assert_eq!(hit.inference_provider.as_deref(), Some("openai"));
-        assert_eq!(hit.session_slug.as_deref(), Some("rare-summary-session"));
-        assert_eq!(
-            hit.session_summary.as_deref(),
-            Some("Rare summary-only session about metadata discovery.")
-        );
-        assert_eq!(hit.meta_event_uid.as_deref(), Some("meta-rare-1"));
-        assert_eq!(hit.score, 5.0);
-        assert_eq!(hit.matched_terms, 2);
-        assert_eq!(
-            hit.snippet.as_deref(),
-            Some("Rare summary-only session about metadata discovery.")
-        );
-
-        let snapshot_queries = state
-            .publication_snapshot_queries
-            .lock()
-            .expect("publication snapshot query lock");
-        assert_eq!(snapshot_queries.len(), 2);
-        assert!(snapshot_queries[0].contains("moraine:publication_snapshot:capture"));
-        assert!(snapshot_queries[1].contains("moraine:publication_snapshot:revalidate"));
-    })
-    .await;
-}
-#[tokio::test(flavor = "multi_thread")]
-async fn search_session_metadata_applies_time_mode_filters_and_caps_limit() {
-    scoped(async {
-        let (repo, state) = build_repo_with_max_results(5).await;
-
-        let result = ConversationRepository::search_session_metadata(
-            &repo,
-            SessionMetadataSearchQuery {
-                query: "rare summary".to_string(),
-                limit: Some(25),
-                min_score: Some(1.5),
-                min_should_match: Some(2),
-                from_unix_ms: Some(1767600000000_i64),
-                to_unix_ms: Some(1767610000000_i64),
-                mode: Some(ConversationMode::Chat),
-                session_id: Some("sess_meta_summary".to_string()),
-            },
-        )
-        .await
-        .expect("search session metadata");
-
-        assert_eq!(result.stats.requested_limit, 25);
-        assert_eq!(result.stats.effective_limit, 5);
-        assert!(result.stats.limit_capped);
-
-        let queries = state.queries.lock().expect("queries lock").clone();
-        let metadata_search_query = queries
-            .iter()
-            .find(|q| {
-                q.contains("WHERE e.event_kind = 'session_meta'") && q.contains("AS meta_event_uid")
-            })
-            .expect("session metadata search query should be captured");
-
-        assert!(metadata_search_query.contains("meta.matched_terms >= 2"));
-        assert!(metadata_search_query.contains("meta.score >= 1.500000"));
-        assert!(!metadata_search_query.contains("search_postings"));
-        assert!(metadata_search_query
-            .contains("toUnixTimestamp64Milli(s.last_event_time) >= 1767600000000"));
-        assert!(metadata_search_query
-            .contains("toUnixTimestamp64Milli(s.last_event_time) < 1767610000000"));
-        assert!(metadata_search_query.contains("ifNull(m.mode, 'chat') = 'chat'"));
-        assert!(metadata_search_query.contains("meta.session_id = 'sess_meta_summary'"));
-        assert!(metadata_search_query.contains("LIMIT 5"));
-
-        let snapshot_queries = state
-            .publication_snapshot_queries
-            .lock()
-            .expect("publication snapshot query lock");
-        assert_eq!(snapshot_queries.len(), 2);
-        assert!(snapshot_queries[0].contains("moraine:publication_snapshot:capture"));
-        assert!(snapshot_queries[1].contains("moraine:publication_snapshot:revalidate"));
     })
     .await;
 }
@@ -543,15 +424,6 @@ async fn search_events_includes_session_time_bounds() {
         assert_eq!(result.hits[1].first_event_time, "2026-01-01 10:00:00");
         assert_eq!(result.hits[1].last_event_time, "2026-01-01 10:10:00");
         let queries = state.queries.lock().expect("queries lock");
-        let df_query = queries
-            .iter()
-            .find(|query| query.contains("toUInt64(uniqExact") && query.contains(" AS df"))
-            .expect("document-frequency query should be captured");
-        assert!(
-            df_query.contains("uniqExact(tuple(source_host, doc_id))"),
-            "document frequency must use host-qualified document identity: {df_query}"
-        );
-        assert!(!df_query.contains("uniqExact(doc_id)"));
         let bounds_query = queries
             .iter()
             .find(|query| query.contains("FROM `moraine`.`v_session_summary` AS ss"))
@@ -573,6 +445,352 @@ async fn search_events_includes_session_time_bounds() {
     })
     .await;
 }
+/// WI-09, the defect the issue names: "activity in session A must never disable
+/// search in session B".
+///
+/// The v1 engine gates every request on TWO corpus-global scalars —
+/// `projection_ready` and `projection_clean` — and `projection_clean` is
+/// `countIf(dirty.dirty_revision > published.dirty_revision) = 0` over EVERY
+/// live session. One actively-ingesting session therefore returned
+/// `ReadModelChanged` for every other session's search, and
+/// `run_publication_consistent_scoped` retried the whole operation four times
+/// before surfacing `internal_error`.
+///
+/// The v2 engine has no global gate. Validity is proven per row instead, and
+/// twice: by the locator version join during ranking, and by the candidate's
+/// presence at the same `event_version` in live navigation during derivation.
+/// The mock's `dirty_projection_on_first_candidate` makes the projection report
+/// itself dirty; under v1 that is fatal, under v2 it is not even read.
+///
+/// MUTATION: re-introduce either gate into `search_mcp_event_page_v2` and this
+/// fails.
+#[tokio::test(flavor = "multi_thread")]
+async fn v2_search_is_unaffected_by_a_dirty_projection() {
+    scoped(async {
+        let query = || SearchMcpEventsQuery {
+            query: "hello world".to_string(),
+            n_hits: Some(2),
+            min_score: Some(0.0),
+            min_should_match: Some(1),
+            ..SearchMcpEventsQuery::default()
+        };
+
+        // v1, dirty backend: fails closed for everyone, and burns all four
+        // `run_publication_consistent_scoped` attempts doing it.
+        let dirty_metadata = json!({
+            "row_kind": 1_u8,
+            "event_uid": "",
+            "session_id": "",
+            "slot": 0_u8,
+            "generation": 0_u64,
+            "raw_score": 0.0,
+            "matched_terms": 0_u64,
+            "event_unix_ms": 0_i64,
+            "docs": 100_u64,
+            "total_doc_len": 5000_u64,
+            "scope_exists": 1_u8,
+            "projection_ready": 1_u8,
+            "projection_clean": 0_u8
+        });
+        let (v1_repo, v1_state) = build_scripted_repo_with_readiness(
+            (0..4)
+                .map(|_| {
+                    ScriptedResponse::rows(
+                        &["toUInt8(0) AS row_kind"],
+                        json!([dirty_metadata.clone()]),
+                    )
+                })
+                .collect(),
+            false,
+        )
+        .await;
+        let v1_error = v1_repo
+            .search_mcp_events(query())
+            .await
+            .expect_err("the projected-header engine fails closed on a dirty projection");
+        assert_script_consumed(&v1_state, 4);
+        assert!(
+            matches!(v1_error, RepoError::ReadModelChanged),
+            "the v1 behaviour this issue removes must still be reproducible, or \
+             the v2 assertion below proves nothing: {v1_error}"
+        );
+
+        // v2, same dirty backend: serves.
+        let (repo, state) = build_repo_with_options(
+            100,
+            MockOptions {
+                dirty_projection_on_first_candidate: true,
+                open_v2_reader_ready: Some(true),
+                ..MockOptions::default()
+            },
+        )
+        .await;
+        let result = repo
+            .search_mcp_events(query())
+            .await
+            .expect("a dirty projection cannot disable the canonical engine");
+
+        assert_eq!(result.hits.len(), 2);
+        assert_eq!(result.hits[0].event_uid, "evt-c-42");
+        assert_eq!(result.hits[1].event_uid, "evt-a-11");
+        assert!(!result.incomplete_due_to_candidate_budget);
+        assert!(result.scope_exists);
+
+        // Winner-only hydration really did decorate the hits: `model` comes
+        // from the bounded wide read that retired the uid-only `models` CTE,
+        // and the per-turn scalars from the batched turn aggregate.
+        let top = &result.hits[0];
+        assert_eq!(top.model.as_deref(), Some("gpt-5.3-codex"));
+        assert_eq!(top.endpoint_kind.as_deref(), Some("generation"));
+        assert_eq!(top.turn_event_count, 3);
+        assert!(top.turn_completed);
+        assert_eq!(top.turn_terminal_event_uid.as_deref(), Some("evt-c-42"));
+        assert_eq!(top.session_title.as_deref(), Some("Session C title"));
+        assert_eq!(top.session_started_at_unix_ms, Some(1_767_434_400_000));
+
+        // …and `session_completed` is the SESSION's last-turn flag
+        // (`argMax(turn_completed, turn_seq)`, v1's two-level rule), NOT the
+        // hit's own turn. The sess_c hit sits in turn 2, which IS complete,
+        // while the session's last turn (3) is not — so a reader that reports
+        // the hit's own turn as the session's state says `true` here.
+        assert!(top.turn_completed);
+        assert!(
+            !result.hits[0].session_completed,
+            "session_completed must be the session's last-turn flag, not the \
+             matched turn's"
+        );
+        assert!(!result.hits[1].session_completed);
+
+        let queries = state.queries.lock().expect("queries lock").clone();
+        assert!(
+            !queries.is_empty(),
+            "the v2 engine must have issued statements"
+        );
+        for query in &queries {
+            assert!(
+                !query.contains("mcp_open_"),
+                "no v2 search statement may read the projection:\n{query}"
+            );
+        }
+        // The statement budget: 1 ranking + 1 derivation + 1 dedup keys + 4
+        // winner hydration, plus a cold corpus-stats refresh. The retired loop
+        // issued up to 32, and up to 129 across the ReadModelChanged retries.
+        assert!(
+            queries.len() <= 9,
+            "bounded search must stay inside its statement budget, got {}: {queries:?}",
+            queries.len()
+        );
+    })
+    .await;
+}
+
+/// §2.3 / #539. The dedup-key read is a THIRD version check, against
+/// `search_documents` at the candidate's exact `post_version`. Its absence is
+/// NOT "no digest available": it means the document revision that produced the
+/// posting is gone, so the posting is stale.
+///
+/// It also has to be a drop rather than a default, because v2 dedups BEFORE
+/// hydration: `text_content` is empty on every row at that point, so
+/// `mcp_search_rows_are_equivalent`'s empty-digest fallback
+/// (`a.text_content == b.text_content`) would report every digest-less pair as
+/// identical content and collapse unrelated events into one.
+///
+/// MUTATION: replace the `let Some(dedup) = … else { continue }` with a
+/// defaulted empty `SearchDedupKeyRow`; this fails — the stale candidate is
+/// served.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_candidate_without_a_live_document_revision_is_dropped() {
+    scoped(async {
+        let (repo, _state) = build_repo_with_options(
+            100,
+            MockOptions {
+                open_v2_reader_ready: Some(true),
+                omit_dedup_key_for_second_candidate: true,
+                ..MockOptions::default()
+            },
+        )
+        .await;
+
+        let result = repo
+            .search_mcp_events(SearchMcpEventsQuery {
+                query: "hello world".to_string(),
+                n_hits: Some(2),
+                min_score: Some(0.0),
+                min_should_match: Some(1),
+                ..SearchMcpEventsQuery::default()
+            })
+            .await
+            .expect("a stale candidate is a silent drop, never an error");
+
+        assert_eq!(
+            result
+                .hits
+                .iter()
+                .map(|hit| hit.event_uid.as_str())
+                .collect::<Vec<_>>(),
+            vec!["evt-c-42"],
+            "the candidate with no live document revision must not be served"
+        );
+        // Not an error, and not `incomplete` either: the window was not
+        // saturated, so this is the complete answer.
+        assert!(!result.incomplete_due_to_candidate_budget);
+    })
+    .await;
+}
+
+/// F3. `oracle_exact` was the caller-facing door into the unbounded exact
+/// aggregation, and it is REFUSED rather than silently downgraded to the
+/// bounded path: a caller that depended on exact-scan semantics learns the
+/// capability is gone instead of quietly getting different numbers.
+///
+/// MUTATION: delete the `SearchStrategyHint::Exact` guard in
+/// `search_events_impl` and this fails — the request succeeds, and (worse) it
+/// succeeds by running the bounded path under a name that promises otherwise.
+#[tokio::test(flavor = "multi_thread")]
+async fn search_events_refuses_the_retired_exact_oracle_strategy() {
+    scoped(async {
+        let (repo, state) = build_repo().await;
+
+        let error = repo
+            .search_events(SearchEventsQuery {
+                query: "hello world".to_string(),
+                source: Some("integration-test".to_string()),
+                limit: Some(10),
+                session_id: None,
+                session_ids: None,
+                min_score: Some(0.0),
+                min_should_match: Some(1),
+                include_tool_events: Some(true),
+                event_kinds: None,
+                exclude_codex_mcp: Some(false),
+                bypass_cache: Some(true),
+                strategy_hint: Some(SearchStrategyHint::Exact),
+            })
+            .await
+            .expect_err("oracle_exact was retired");
+
+        assert!(
+            matches!(error, RepoError::InvalidArgument(ref message) if message.contains("#597")),
+            "{error}"
+        );
+        // It is refused BEFORE any statement runs, so a retired strategy cannot
+        // spend a corpus scan on its way to the error.
+        assert!(
+            state.queries.lock().expect("queries lock").is_empty(),
+            "the refusal must precede every ClickHouse statement"
+        );
+    })
+    .await;
+}
+
+/// WI-06's contract, asserted on the statements the request actually issued.
+///
+/// Each assertion names the single production edit that breaks it:
+///
+/// * dropping the locator join -> the `l.event_version = p.post_version`
+///   assertion (a `search_documents` version join alone cannot see an event
+///   revision whose document row never landed);
+/// * moving a user filter into `term_postings` -> the `df`-CTE assertion (that
+///   would silently move every BM25 score, because `df` is computed in the same
+///   CTE);
+/// * projecting content in ranking, or restoring the F1 fallback -> the
+///   content-free assertion;
+/// * restoring the refill loop -> the one-ranking-statement count.
+#[tokio::test(flavor = "multi_thread")]
+async fn search_events_ranks_once_from_postings_and_reads_no_content() {
+    scoped(async {
+        let (repo, state) = build_repo().await;
+
+        let result = repo
+            .search_events(SearchEventsQuery {
+                query: "hello world".to_string(),
+                source: Some("integration-test".to_string()),
+                limit: Some(10),
+                session_id: None,
+                session_ids: None,
+                min_score: Some(0.0),
+                min_should_match: Some(1),
+                include_tool_events: Some(true),
+                event_kinds: None,
+                exclude_codex_mcp: Some(false),
+                bypass_cache: Some(true),
+                strategy_hint: None,
+            })
+            .await
+            .expect("search events");
+        assert_eq!(result.hits.len(), 2);
+
+        let queries = state.queries.lock().expect("queries lock").clone();
+        let ranking: Vec<&String> = queries
+            .iter()
+            .filter(|query| query.contains("term_postings AS ("))
+            .collect();
+        assert_eq!(
+            ranking.len(),
+            1,
+            "exactly one bounded ranking pass per request; got {}: {queries:?}",
+            ranking.len()
+        );
+        let ranking = ranking[0];
+
+        // The locator join, on the exact key the spec names.
+        assert!(ranking.contains("FROM `moraine`.`mcp_event_locator` AS l FINAL"));
+        assert!(ranking.contains("AND l.event_version = p.post_version"));
+        // Published generations enter the locator scan as a tuple-IN, never a
+        // join: a join blocks KeyCondition pruning on the locator primary key.
+        assert!(ranking.contains(
+            "AND (l.source_host, l.source_name, l.source_file, l.source_generation) IN (SELECT"
+        ));
+        assert!(!ranking.contains("ALL INNER JOIN (SELECT\n    history.source_host"));
+        // The locator scan is pruned by the query's own posting doc ids. Without
+        // this it is an O(E) index scan -- one whole-corpus scan traded for
+        // another.
+        assert!(ranking.contains("WHERE l.event_uid IN (\n      SELECT pruned.doc_id"));
+
+        // `df` is corpus-wide: computed inside `term_postings`, and NO user
+        // filter may appear there.
+        let (df_cte, projection) = ranking
+            .split_once("\nSELECT\n  p.event_uid AS event_uid,")
+            .expect("ranking statement has a CTE and a projection");
+        assert!(df_cte.contains("toUInt64(count() OVER (PARTITION BY p.term)) AS df"));
+        assert_eq!(
+            df_cte.matches(" OVER (").count(),
+            1,
+            "the df window must be the only window in the ranking CTE: {df_cte}"
+        );
+        // The `term_postings` WHERE is term membership and NOTHING else: the
+        // clause runs to the CTE's closing paren with no conjunct after it.
+        let term_postings_where = df_cte
+            .rsplit_once("    WHERE p.term IN ['hello','world']")
+            .expect("term_postings filters on term membership")
+            .1;
+        assert_eq!(
+            term_postings_where.trim(),
+            ")",
+            "no user filter may live inside the df CTE, but found `{term_postings_where}`"
+        );
+        assert!(projection.contains("WHERE p.payload_type != 'token_count'"));
+
+        // Ranking is content-free, and nothing in the request aggregates the
+        // document view without a bounded identity predicate.
+        for forbidden in ["text_content", "payload_json", "v_live_search_documents"] {
+            assert!(
+                !ranking.contains(forbidden),
+                "bounded ranking must not read `{forbidden}`: {ranking}"
+            );
+        }
+        for query in &queries {
+            if query.contains("`v_live_search_documents`") {
+                assert!(
+                    query.contains("requested_documents AS requested"),
+                    "every document read must be keyed by the ranked identities: {query}"
+                );
+            }
+        }
+    })
+    .await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn search_events_documents_subquery_avoids_self_aliased_aggregates() {
     scoped(async {
@@ -604,9 +822,7 @@ async fn search_events_documents_subquery_avoids_self_aliased_aggregates() {
         // qualify inner column references via an `AS t` table alias.
         let documents_subqueries: Vec<&String> = queries
             .iter()
-            .filter(|q| {
-                q.contains("GROUP BY p.doc_id") || q.contains("FROM (SELECT\n  t.event_uid")
-            })
+            .filter(|q| q.contains("FROM (SELECT\n  t.source_host"))
             .collect();
         assert!(
             !documents_subqueries.is_empty(),
@@ -1151,18 +1367,26 @@ async fn search_mcp_events_deduplicates_before_limit_and_reports_truncation() {
         assert!(result.stats.truncated);
         assert_eq!(result.stats.effective_n_hits, 2);
 
+        assert!(
+            !result.incomplete_due_to_candidate_budget,
+            "a window that was NOT saturated returned the whole ranking; \
+             `truncated` is not `incomplete`"
+        );
+
         let queries = state.queries.lock().expect("queries lock").clone();
-        let first_candidate_query = queries
+        // ONE window of `mcp_candidate_fetch_size(n_hits + 1) = 3 * 3`, no
+        // OFFSET. The retired shape was `LIMIT 3 OFFSET 0` followed by
+        // `LIMIT 3 OFFSET 3`, up to sixteen times.
+        let candidate_queries = queries
             .iter()
-            .find(|query| {
-                query.contains("toUInt8(0) AS row_kind") && query.contains("LIMIT 3 OFFSET 0")
-            })
-            .expect("first bounded candidate page");
+            .filter(|query| query.contains("toUInt8(0) AS row_kind"))
+            .collect::<Vec<_>>();
+        assert_eq!(candidate_queries.len(), 1, "{queries:?}");
+        let first_candidate_query = candidate_queries[0];
+        assert!(first_candidate_query.contains("LIMIT 9"));
+        assert!(!first_candidate_query.contains("OFFSET"));
         assert!(!first_candidate_query.contains("text_content"));
         assert!(!first_candidate_query.contains("SHA256"));
-        assert!(queries.iter().any(|query| {
-            query.contains("toUInt8(0) AS row_kind") && query.contains("LIMIT 3 OFFSET 3")
-        }));
         assert!(queries.iter().any(|query| {
             query.contains("hex(SHA256(projected_events.text_content)) AS text_content_digest")
         }));
@@ -1177,19 +1401,20 @@ async fn search_mcp_events_deduplicates_before_limit_and_reports_truncation() {
     .await;
 }
 
+/// The retired contract was "a projection revision that moves BETWEEN candidate
+/// pages is `ReadModelChanged`". There are no pages to compare any more — which
+/// is the point — so this asserts the property that replaced it: ONE ranking
+/// statement per request, with no `OFFSET`, even when the window is full enough
+/// that the old code would have paged.
+///
+/// MUTATION: restore the offset loop (issue a second ranking statement with
+/// `OFFSET`); the count assertion fails.
 #[tokio::test(flavor = "multi_thread")]
-async fn search_mcp_events_rejects_projection_changes_between_candidate_pages() {
+async fn search_mcp_events_issues_exactly_one_ranking_statement() {
     scoped(async {
-        let (repo, state) = build_repo_with_options(
-            100,
-            MockOptions {
-                change_projection_revision_on_second_search_page: true,
-                ..MockOptions::default()
-            },
-        )
-        .await;
+        let (repo, state) = build_repo().await;
 
-        let error = repo
+        let result = repo
             .search_mcp_events(SearchMcpEventsQuery {
                 query: "hello world".to_string(),
                 n_hits: Some(2),
@@ -1198,13 +1423,24 @@ async fn search_mcp_events_rejects_projection_changes_between_candidate_pages() 
                 ..SearchMcpEventsQuery::default()
             })
             .await
-            .expect_err("candidate paging must reject a changed projection revision");
+            .expect("bounded mcp event search");
+        assert!(!result.incomplete_due_to_candidate_budget);
 
-        assert!(matches!(error, RepoError::ReadModelChanged));
-        let queries = state.queries.lock().expect("queries lock");
-        assert!(queries
+        let queries = state.queries.lock().expect("queries lock").clone();
+        let ranking = queries
             .iter()
-            .any(|query| query.contains("LIMIT 3 OFFSET 3")));
+            .filter(|query| {
+                query.contains("toUInt8(0) AS row_kind") && query.contains("term_postings AS (")
+            })
+            .count();
+        assert_eq!(
+            ranking, 1,
+            "one bounded ranking pass per request: {queries:?}"
+        );
+        assert!(
+            !queries.iter().any(|query| query.contains(" OFFSET ")),
+            "the refill loop's OFFSET paging must not come back: {queries:?}"
+        );
     })
     .await;
 }
@@ -1237,19 +1473,34 @@ async fn search_mcp_events_classifies_hydration_projection_movement() {
     .await;
 }
 
+/// The converted refill-budget test. A saturated candidate window whose members
+/// all collapse now returns the surviving valid hits plus
+/// `incomplete_due_to_candidate_budget`, instead of re-running the whole ranking
+/// statement 16 times and then failing with
+/// `backend("duplicate scan budget exhausted")` -> wire `internal_error`.
+///
+/// MUTATIONS, each of which fails a named assertion here:
+/// * make the marker unconditional (drop the `saturated &&` conjunct) -> the
+///   non-saturated case in `search_mcp_events_issues_exactly_one_ranking_statement`
+///   fails;
+/// * drop the `short` conjunct -> this test's hit count is 1 < 3, so the marker
+///   would still be set, but see `candidate_budget_marker_requires_both_saturation_and_shortfall`
+///   for the unit-level proof of each conjunct;
+/// * restore the loop -> the statement-count assertion fails.
 #[tokio::test(flavor = "multi_thread")]
-async fn search_mcp_events_bounds_duplicate_candidate_pages() {
+async fn search_mcp_events_marks_a_saturated_collapsing_window_incomplete() {
     scoped(async {
         let (repo, state) = build_repo_with_options(
             100,
             MockOptions {
-                repeat_duplicate_search_pages: true,
+                saturate_candidate_window: true,
+                open_v2_reader_ready: Some(false),
                 ..MockOptions::default()
             },
         )
         .await;
 
-        let error = repo
+        let result = repo
             .search_mcp_events(SearchMcpEventsQuery {
                 query: "hello world".to_string(),
                 n_hits: Some(2),
@@ -1258,18 +1509,25 @@ async fn search_mcp_events_bounds_duplicate_candidate_pages() {
                 ..SearchMcpEventsQuery::default()
             })
             .await
-            .expect_err("duplicate paging must stop at the request work budget");
+            .expect("a saturated collapsing window is not an error");
 
         assert!(
-            error.to_string().contains("scan budget exhausted"),
-            "{error}"
+            result.incomplete_due_to_candidate_budget,
+            "a saturated window that dedups short must report the budget marker"
         );
+        // The hits that ARE returned are valid and are a true ranking prefix.
+        assert_eq!(result.hits.len(), 1);
+        assert_eq!(result.hits[0].event_uid, "evt-sat-0");
+
         let queries = state.queries.lock().expect("queries lock");
         let candidate_queries = queries
             .iter()
             .filter(|query| query.contains("toUInt8(0) AS row_kind"))
             .count();
-        assert_eq!(candidate_queries, 16);
+        assert_eq!(
+            candidate_queries, 1,
+            "the 16-page refill loop must not come back"
+        );
     })
     .await;
 }

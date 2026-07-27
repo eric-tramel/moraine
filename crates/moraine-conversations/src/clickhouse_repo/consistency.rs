@@ -649,6 +649,38 @@ impl ClickHouseConversationRepository {
         )])
     }
 
+    /// [`Self::live_events_source_sessions`] with the optional closed
+    /// `event_ts` window of [`Self::live_events_source_bounded`], both emitted
+    /// **inside** the derived table. The K-session form issue-597's winner
+    /// hydration needs: `events` is `ORDER BY (session_id, event_ts, …)`, so
+    /// the session `IN` prunes to K key ranges and the `BETWEEN` prunes each
+    /// range by granule. `None` bounds reproduce
+    /// [`Self::live_events_source_sessions`] byte-for-byte.
+    pub(super) fn live_events_source_sessions_bounded(
+        &self,
+        session_ids: &[String],
+        event_ts_bounds_ms: Option<EventTsBounds>,
+    ) -> String {
+        let mut inner_predicates = vec![format!(
+            "e.session_id IN {}",
+            sql_array_strings(session_ids)
+        )];
+        if let Some(bounds) = event_ts_bounds_ms {
+            match (bounds.range, bounds.include_epoch) {
+                (Some((min_ms, max_ms)), false) => inner_predicates.push(format!(
+                    "e.event_ts BETWEEN fromUnixTimestamp64Milli({min_ms}) AND fromUnixTimestamp64Milli({max_ms})"
+                )),
+                (Some((min_ms, max_ms)), true) => inner_predicates.push(format!(
+                    "(e.event_ts BETWEEN fromUnixTimestamp64Milli({min_ms}) AND fromUnixTimestamp64Milli({max_ms}) OR e.event_ts = fromUnixTimestamp64Milli(0))"
+                )),
+                (None, true) => inner_predicates
+                    .push("e.event_ts = fromUnixTimestamp64Milli(0)".to_string()),
+                (None, false) => {}
+            }
+        }
+        self.live_events_source_filtered(&inner_predicates)
+    }
+
     /// The published-generation-authorized `events` relation, with every
     /// caller-supplied predicate emitted inside the derived table. An empty
     /// slice reproduces the v1 `live_events_source` SQL byte-for-byte.
@@ -1135,16 +1167,15 @@ mod tests {
                 vec![control("idle", epoch, false)],
             );
             final_token = snapshot.token().to_string();
-            let term_values = HashMap::from([("repeat".to_string(), epoch)]);
 
             ACTIVE_PUBLICATION_SNAPSHOT
                 .scope(snapshot, async {
+                    // The term-df cache this used to exercise went out with
+                    // issue #597's second df formula. Corpus stats are the
+                    // remaining publication-token-keyed logical cache, and they
+                    // must replace rather than accumulate the same way.
                     repository
-                        .cache_term_df_values(
-                            vec!["repeat".to_string()],
-                            &term_values,
-                            Instant::now(),
-                        )
+                        .cache_corpus_stats(epoch, epoch * 10, Instant::now())
                         .await;
                     repository
                         .insert_scoped_session_cache(
@@ -1157,11 +1188,15 @@ mod tests {
         }
 
         let stats_cache = repository.stats_cache.read().await;
-        assert_eq!(stats_cache.term_df_by_term.len(), 1);
-        assert_eq!(stats_cache.term_df_by_term["repeat"].df, 63);
+        let corpus_stats = stats_cache
+            .corpus_stats
+            .as_ref()
+            .expect("corpus stats cached");
+        assert_eq!(corpus_stats.docs, 63);
+        assert_eq!(corpus_stats.total_doc_len, 630);
         assert_eq!(
-            stats_cache.term_df_by_term["repeat"].publication_token,
-            final_token
+            corpus_stats.publication_token,
+            format!("{final_token}\u{1f}corpus-stats")
         );
         drop(stats_cache);
 

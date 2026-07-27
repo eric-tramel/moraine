@@ -22,10 +22,12 @@ fn mcp_candidate_metadata(scope_exists: u8, docs: u64) -> serde_json::Value {
 async fn search_mcp_events_result_cache_reuses_repository_across_requests() {
     scoped(async {
         let (repo, state) = build_repo().await;
+        // UNSCOPED. A request carrying `session_id` deliberately neither reads
+        // nor writes this cache (issue #597 §2.7) — see
+        // `session_scoped_mcp_search_never_uses_the_result_cache`.
         let query = SearchMcpEventsQuery {
             query: "hello world".to_string(),
             n_hits: Some(2),
-            session_id: Some("sess_c".to_string()),
             event_types: Some(vec![
                 McpEventType::UserInput,
                 McpEventType::AssistantResponse,
@@ -126,6 +128,57 @@ async fn search_mcp_events_result_cache_reuses_repository_across_requests() {
     .await;
 }
 
+/// Issue #597 §2.7 / WI-08. A session-scoped MCP search is by construction a
+/// self-review of a session that may be writing right now. The 15 s result
+/// cache is namespaced by the publication token, and that token does NOT move
+/// on an append-only tick, so a cached empty answer could be served for up to
+/// 15 s after the matching event landed — well past the spec's p95 <= 2 s
+/// freshness budget.
+///
+/// MUTATION: set `cacheable = true` unconditionally in `search_mcp_events_impl`
+/// and the second scoped request stops issuing statements, failing here.
+#[tokio::test(flavor = "multi_thread")]
+async fn session_scoped_mcp_search_never_uses_the_result_cache() {
+    scoped(async {
+        let (repo, state) = build_repo().await;
+        let scoped_query = SearchMcpEventsQuery {
+            query: "hello world".to_string(),
+            n_hits: Some(2),
+            session_id: Some("sess_a".to_string()),
+            min_score: Some(0.0),
+            min_should_match: Some(1),
+            ..SearchMcpEventsQuery::default()
+        };
+
+        repo.search_mcp_events(scoped_query.clone())
+            .await
+            .expect("first scoped MCP event search");
+        let after_first = state.queries.lock().expect("queries lock").len();
+        assert!(after_first > 0);
+
+        repo.search_mcp_events(scoped_query.clone())
+            .await
+            .expect("second scoped MCP event search");
+        let after_second = state.queries.lock().expect("queries lock").len();
+        assert!(
+            after_second > after_first,
+            "a session-scoped search must re-read the backend, not serve a 15 s snapshot"
+        );
+
+        // Cache WRITE is suppressed too, not just the read: an unscoped request
+        // must not be able to observe a scoped request's result, and a scoped
+        // request must not warm an entry a later scoped request could hit.
+        repo.search_mcp_events(scoped_query)
+            .await
+            .expect("third scoped MCP event search");
+        assert!(
+            state.queries.lock().expect("queries lock").len() > after_second,
+            "a session-scoped search must not warm the result cache either"
+        );
+    })
+    .await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn search_mcp_events_does_not_cache_a_missing_scope() {
     scoped(async {
@@ -139,7 +192,7 @@ async fn search_mcp_events_does_not_cache_a_missing_scope() {
                 json!([mcp_candidate_metadata(1, 100)]),
             ),
         ];
-        let (repo, state) = build_scripted_repo(responses).await;
+        let (repo, state) = build_scripted_repo_with_readiness(responses, false).await;
         let query = SearchMcpEventsQuery {
             query: "newly published session".to_string(),
             session_id: Some("session-new".to_string()),
@@ -181,7 +234,7 @@ async fn analytics_cache_hit_and_distinct_key_are_request_count_proven() {
             json!([]),
             json!([]),
         ));
-        let (repo, state) = build_scripted_repo(responses).await;
+        let (repo, state) = build_scripted_repo_with_readiness(responses, false).await;
         let clone = repo.clone();
 
         let first = repo
@@ -235,7 +288,7 @@ async fn analytics_expired_entry_refills_from_the_repository() {
             json!([]),
             json!([]),
         ));
-        let (repo, state) = build_scripted_repo(responses).await;
+        let (repo, state) = build_scripted_repo_with_readiness(responses, false).await;
 
         let first = repo
             .analytics_series(AnalyticsRange::TwentyFourHours)
@@ -275,7 +328,7 @@ async fn analytics_stage_error_is_not_cached_and_empty_retry_succeeds() {
             ),
         ];
         responses.extend(success);
-        let (repo, state) = build_scripted_repo(responses).await;
+        let (repo, state) = build_scripted_repo_with_readiness(responses, false).await;
 
         let error = repo
             .analytics_series(AnalyticsRange::TwentyFourHours)
@@ -353,7 +406,7 @@ async fn analytics_anchor_decode_and_late_stage_errors_are_not_cached() {
 
         for (stage, mut responses, expected_requests) in scenarios {
             responses.extend(success.clone());
-            let (repo, state) = build_scripted_repo(responses).await;
+            let (repo, state) = build_scripted_repo_with_readiness(responses, false).await;
             repo.analytics_series(AnalyticsRange::TwentyFourHours)
                 .await
                 .expect_err(stage);
@@ -455,7 +508,7 @@ async fn analytics_different_ranges_fill_concurrently() {
             turns(),
             concurrency(),
         ];
-        let (repo, state) = build_scripted_repo(responses).await;
+        let (repo, state) = build_scripted_repo_with_readiness(responses, false).await;
         let repo = Arc::new(repo);
 
         let one_hour_repo = repo.clone();
@@ -521,7 +574,7 @@ async fn analytics_cancelled_fill_releases_slot_and_recovery_is_cached() {
         let release = Arc::new(Notify::new());
         let mut responses = vec![success[0].clone().blocked(reached.clone(), release.clone())];
         responses.extend(success);
-        let (repo, state) = build_scripted_repo(responses).await;
+        let (repo, state) = build_scripted_repo_with_readiness(responses, false).await;
         let repo = Arc::new(repo);
 
         let first_repo = repo.clone();

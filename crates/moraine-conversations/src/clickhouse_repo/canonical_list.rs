@@ -540,13 +540,10 @@ mod tests {
 
     /// No discovery statement may read or gate on the retired projection.
     fn assert_no_projection(sql: &str) {
-        assert!(
-            !sql.contains("mcp_open_"),
-            "discovery statement touched mcp_open_*:\n{sql}"
-        );
-        assert!(
-            !sql.contains("v_session_summary") && !sql.contains("v_conversation_trace"),
-            "discovery statement touched a legacy view chain:\n{sql}"
+        super::super::sql::canonical_assertions::assert_no_projection("discovery statement", sql);
+        super::super::sql::canonical_assertions::assert_no_legacy_view_chain(
+            "discovery statement",
+            sql,
         );
     }
 

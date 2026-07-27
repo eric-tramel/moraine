@@ -16,8 +16,7 @@ use crate::domain::{
     McpSessionListFilter, McpSessionListItem, McpSessionOpen, McpTurnOpen, OpenContext,
     OpenEventRequest, Page, PageRequest, RepoConfig, SearchEventsQuery, SearchEventsResult,
     SearchEventsStats, SearchMcpEventsQuery, SearchMcpEventsResult, SearchMcpEventsStats,
-    SessionEventsQuery, SessionMetadata, SessionMetadataSearchQuery, SessionMetadataSearchResults,
-    SessionMetadataSearchStats, TraceEvent, Turn, TurnListFilter, TurnSummary,
+    SessionEventsQuery, SessionMetadata, TraceEvent, Turn, TurnListFilter, TurnSummary,
 };
 use crate::error::{RepoError, RepoResult};
 use crate::repo::ConversationRepository;
@@ -63,7 +62,6 @@ pub struct InMemoryConversationResponses {
     pub search_events: Option<RepoResult<SearchEventsResult>>,
     pub search_mcp_events: Option<RepoResult<SearchMcpEventsResult>>,
     pub search_conversations: Option<RepoResult<ConversationSearchResults>>,
-    pub search_session_metadata: Option<RepoResult<SessionMetadataSearchResults>>,
     pub file_attention: Option<RepoResult<Vec<FileAttentionTouch>>>,
     pub prewarm_mcp_search_state: Option<RepoResult<()>>,
     pub cancel_query: Option<RepoResult<()>>,
@@ -95,7 +93,6 @@ pub struct InMemoryConversationCalls {
     pub search_events: Vec<SearchEventsQuery>,
     pub search_mcp_events: Vec<SearchMcpEventsQuery>,
     pub search_conversations: Vec<ConversationSearchQuery>,
-    pub search_session_metadata: Vec<SessionMetadataSearchQuery>,
     pub file_attention: Vec<FileAttentionQuery>,
     pub prewarm_mcp_search_state: usize,
     pub cancel_query: Vec<String>,
@@ -183,6 +180,7 @@ impl InMemoryConversationRepository {
             // search is valid; a scoped lookup therefore reports not found.
             scope_exists: query.session_id.is_none(),
             truncated: false,
+            incomplete_due_to_candidate_budget: false,
             stats: SearchMcpEventsStats {
                 docs: 0,
                 avgdl: 0.0,
@@ -214,26 +212,6 @@ impl InMemoryConversationRepository {
                 requested_limit,
                 effective_limit: requested_limit.min(self.config.max_results),
                 limit_capped: requested_limit > self.config.max_results,
-            },
-            hits: Vec::new(),
-        }
-    }
-
-    fn empty_session_metadata_search(
-        &self,
-        query: &SessionMetadataSearchQuery,
-    ) -> SessionMetadataSearchResults {
-        let requested_limit = query.limit.unwrap_or(self.config.max_results).max(1);
-        SessionMetadataSearchResults {
-            query_id: "in-memory".to_string(),
-            query: query.query.clone(),
-            terms: Vec::new(),
-            stats: SessionMetadataSearchStats {
-                requested_limit,
-                effective_limit: requested_limit.min(self.config.max_results),
-                limit_capped: requested_limit > self.config.max_results,
-                result_count: 0,
-                took_ms: 0,
             },
             hits: Vec::new(),
         }
@@ -516,18 +494,6 @@ impl ConversationRepository for InMemoryConversationRepository {
             self,
             search_conversations,
             self.empty_conversation_search(&query)
-        )
-    }
-
-    async fn search_session_metadata(
-        &self,
-        query: SessionMetadataSearchQuery,
-    ) -> RepoResult<SessionMetadataSearchResults> {
-        self.record(|calls| calls.search_session_metadata.push(query.clone()));
-        response_or!(
-            self,
-            search_session_metadata,
-            self.empty_session_metadata_search(&query)
         )
     }
 

@@ -962,6 +962,18 @@ pub struct SearchMcpEventsResult {
     #[serde(default = "default_true")]
     pub scope_exists: bool,
     pub truncated: bool,
+    /// The single ranked candidate window was SATURATED (the ranking pass
+    /// returned exactly the candidate fetch size) AND post-ranking validation
+    /// removed enough of it that fewer than `effective_n_hits` unique hits
+    /// survived.
+    ///
+    /// The hits that ARE returned are valid, correctly ranked, and are a true
+    /// prefix of the full ranking. This is not an error and never becomes one:
+    /// `resource_exhausted` is reserved for a #600 envelope violation, and a
+    /// proven version mismatch is a silent drop, not a failure (issue #597
+    /// §1.6).
+    #[serde(default)]
+    pub incomplete_due_to_candidate_budget: bool,
     pub stats: SearchMcpEventsStats,
     pub hits: Vec<SearchMcpEventHit>,
 }
@@ -1031,68 +1043,6 @@ pub struct ConversationSearchResults {
     pub terms: Vec<String>,
     pub stats: ConversationSearchStats,
     pub hits: Vec<ConversationSearchHit>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct SessionMetadataSearchQuery {
-    pub query: String,
-    #[serde(default)]
-    pub limit: Option<u16>,
-    #[serde(default)]
-    pub min_score: Option<f64>,
-    #[serde(default)]
-    pub min_should_match: Option<u16>,
-    #[serde(default)]
-    pub from_unix_ms: Option<i64>,
-    #[serde(default)]
-    pub to_unix_ms: Option<i64>,
-    #[serde(default)]
-    pub mode: Option<ConversationMode>,
-    #[serde(default)]
-    pub session_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SessionMetadataSearchStats {
-    pub requested_limit: u16,
-    pub effective_limit: u16,
-    pub limit_capped: bool,
-    pub result_count: usize,
-    pub took_ms: u32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SessionMetadataSearchHit {
-    pub rank: usize,
-    pub session_id: String,
-    pub first_event_time: Option<String>,
-    pub first_event_unix_ms: Option<i64>,
-    pub last_event_time: Option<String>,
-    pub last_event_unix_ms: Option<i64>,
-    pub total_turns: Option<u32>,
-    pub total_events: Option<u64>,
-    pub user_messages: Option<u64>,
-    pub assistant_messages: Option<u64>,
-    pub tool_calls: Option<u64>,
-    pub tool_results: Option<u64>,
-    pub mode: Option<ConversationMode>,
-    pub harness: Option<String>,
-    pub inference_provider: Option<String>,
-    pub session_slug: Option<String>,
-    pub session_summary: Option<String>,
-    pub meta_event_uid: Option<String>,
-    pub score: f64,
-    pub matched_terms: u16,
-    pub snippet: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SessionMetadataSearchResults {
-    pub query_id: String,
-    pub query: String,
-    pub terms: Vec<String>,
-    pub stats: SessionMetadataSearchStats,
-    pub hits: Vec<SessionMetadataSearchHit>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

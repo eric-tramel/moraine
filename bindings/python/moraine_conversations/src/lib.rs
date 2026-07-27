@@ -241,6 +241,11 @@ fn parse_mode(raw: Option<&str>) -> PyResult<Option<ConversationMode>> {
     }
 }
 
+/// `oracle_exact` is refused here as well as in the repository (issue #597
+/// §1.5/F3), so the binding reports the retirement at argument-parse time
+/// instead of surfacing a repository `invalid_argument` from deep inside a
+/// search. The variant still exists on the wire enum for deserialization
+/// compatibility; nothing constructs it on an interactive path.
 fn parse_strategy_hint(raw: Option<&str>) -> PyResult<Option<SearchStrategyHint>> {
     let Some(raw) = raw else {
         return Ok(None);
@@ -248,9 +253,11 @@ fn parse_strategy_hint(raw: Option<&str>) -> PyResult<Option<SearchStrategyHint>
 
     match raw {
         "optimized" => Ok(Some(SearchStrategyHint::PreferPerformance)),
-        "oracle_exact" => Ok(Some(SearchStrategyHint::Exact)),
+        "oracle_exact" => Err(PyValueError::new_err(
+            "oracle_exact was retired in #597; interactive search has no exact-scan path. Use search_strategy=\"optimized\"",
+        )),
         _ => Err(PyValueError::new_err(
-            "search_strategy must be one of: optimized, oracle_exact",
+            "search_strategy must be one of: optimized",
         )),
     }
 }

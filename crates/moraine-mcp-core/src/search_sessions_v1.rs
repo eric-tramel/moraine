@@ -164,6 +164,12 @@ fn search_sessions_data_json(
         "result_count": results.len(),
         "limit": args.n_hits,
         "truncated": result.truncated || result.stats.limit_capped,
+        // Issue #597 §1.6. Sibling of `truncated`, and deliberately distinct
+        // from it: `truncated` means "more ranked hits existed than you asked
+        // for", `incomplete` means "the single bounded candidate window was
+        // exhausted before this page could be filled". The hits present are
+        // valid and a true ranking prefix either way; neither is an error.
+        "incomplete": result.incomplete_due_to_candidate_budget,
         "results": results,
     }))
 }
@@ -266,6 +272,12 @@ fn search_warnings(result: &SearchMcpEventsResult) -> Vec<String> {
             result.stats.requested_n_hits, result.stats.effective_n_hits
         ));
     }
+    if result.incomplete_due_to_candidate_budget {
+        warnings.push(format!(
+            "result set is incomplete: the candidate budget was exhausted before {} unique hits were found; narrow the query or reduce n_hits",
+            result.stats.effective_n_hits
+        ));
+    }
     warnings
 }
 
@@ -353,6 +365,71 @@ mod tests {
     use moraine_config::AppConfig;
     use moraine_conversations::{InMemoryConversationRepository, RepoConfig};
     use std::sync::Arc;
+
+    fn search_result(incomplete: bool, limit_capped: bool) -> SearchMcpEventsResult {
+        SearchMcpEventsResult {
+            query_id: "q".to_string(),
+            query: "needle".to_string(),
+            terms: vec!["needle".to_string()],
+            event_types: vec![moraine_conversations::McpEventType::AssistantResponse],
+            scope_exists: true,
+            truncated: false,
+            incomplete_due_to_candidate_budget: incomplete,
+            stats: moraine_conversations::SearchMcpEventsStats {
+                docs: 100,
+                avgdl: 50.0,
+                took_ms: 1,
+                result_count: 1,
+                requested_n_hits: if limit_capped { 50 } else { 3 },
+                effective_n_hits: 3,
+                limit_capped,
+                truncated: false,
+            },
+            hits: Vec::new(),
+        }
+    }
+
+    /// Issue #597 §1.6. The candidate-budget marker reaches the caller on BOTH
+    /// wire surfaces, and it is distinct from `truncated`: a client that only
+    /// reads `truncated` cannot tell a full page from a page the budget cut
+    /// short, and the whole point of the marker is that the shortfall is
+    /// visible rather than silently indistinguishable from "no more matches".
+    ///
+    /// MUTATION: drop either the `data.incomplete` key or the `search_warnings`
+    /// arm; this fails.
+    #[test]
+    fn candidate_budget_shortfall_is_reported_in_data_and_warnings() {
+        let args = CanonicalSearchSessionsArgs {
+            query: "needle".to_string(),
+            n_hits: 3,
+            ..parse_search_sessions_args(json!({ "query": "needle" })).expect("canonical args")
+        };
+
+        let complete = search_result(false, false);
+        let data = search_sessions_data_json(&args, &complete).expect("data json");
+        assert_eq!(data["incomplete"], json!(false));
+        assert_eq!(data["truncated"], json!(false));
+        assert!(search_warnings(&complete).is_empty());
+
+        let incomplete = search_result(true, false);
+        let data = search_sessions_data_json(&args, &incomplete).expect("data json");
+        assert_eq!(data["incomplete"], json!(true));
+        assert_eq!(
+            data["truncated"],
+            json!(false),
+            "`incomplete` must not be smuggled through `truncated`: they mean \
+             different things and a client keying off `truncated` would read a \
+             budget shortfall as `there were more matches`"
+        );
+        let warnings = search_warnings(&incomplete);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("candidate budget was exhausted"));
+        assert!(warnings[0].contains("3 unique hits"));
+
+        // The pre-existing limit-cap warning still fires independently.
+        assert_eq!(search_warnings(&search_result(false, true)).len(), 1);
+        assert_eq!(search_warnings(&search_result(true, true)).len(), 2);
+    }
 
     #[test]
     fn parses_and_canonicalizes_search_sessions_args() {

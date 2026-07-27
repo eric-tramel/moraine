@@ -21,8 +21,7 @@ pub use domain::{
     SearchEventHit, SearchEventKind, SearchEventsQuery, SearchEventsResult, SearchEventsStats,
     SearchMcpEventHit, SearchMcpEventsQuery, SearchMcpEventsResult, SearchMcpEventsStats,
     SearchStrategyHint, SessionEventsDirection, SessionEventsQuery, SessionMetadata,
-    SessionMetadataSearchHit, SessionMetadataSearchQuery, SessionMetadataSearchResults,
-    SessionMetadataSearchStats, SessionOriginScope, TraceEvent, Turn, TurnListFilter, TurnSummary,
+    SessionOriginScope, TraceEvent, Turn, TurnListFilter, TurnSummary,
 };
 pub use domain::{
     AnalyticsConcurrencyPoint, AnalyticsRange, AnalyticsSnapshot, AnalyticsTokenPoint,
