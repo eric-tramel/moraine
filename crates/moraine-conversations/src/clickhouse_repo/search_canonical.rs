@@ -4,8 +4,9 @@
 //! whole issue turns on:
 //!
 //! 1. **One bounded ranking pass.** `search_postings` is scanned by
-//!    `term IN q_terms` (its primary key) and authorized per-row by joining
-//!    migration-036's `mcp_event_locator` on
+//!    `term IN q_terms` (its primary key), collapsed per
+//!    `(term, doc_id, source_host, session_id)` and authorized per-row by
+//!    joining migration-036's `mcp_event_locator` on
 //!    `(doc_id = event_uid, source_host, post_version = event_version)` under
 //!    #602's pinned published generations — *before* `df` or BM25 are computed.
 //!    No `search_documents`, no `mcp_open_*`, no `events` scan participates in
@@ -175,36 +176,73 @@ impl ClickHouseConversationRepository {
     // Phase 1 — ranking.
     // -----------------------------------------------------------------------
 
-    /// The two CTEs every bounded ranking statement is built on — `live_locator`
-    /// and `term_postings` — emitted as a `WITH` fragment so the MCP and event
-    /// search projections share ONE ranking relation and ONE `df` formula.
+    /// The three CTEs every bounded ranking statement is built on —
+    /// `live_locator`, `live_postings` and `term_postings` — emitted as a `WITH`
+    /// fragment so the MCP and event search projections share ONE ranking
+    /// relation and ONE `df` formula.
     ///
     /// `extra_posting_columns` are additional physical `search_postings` columns
     /// a caller's projection needs. They are deliberately opt-in: every column
     /// listed here is decompressed for the whole term scan, so the MCP path
     /// (which takes its wide fields from bounded winner hydration) passes none.
     ///
-    /// Nothing about the caller's filters enters this fragment. `df` is
-    /// `count() OVER (PARTITION BY p.term)` over the version- and
-    /// generation-authorized postings, so it is corpus-wide by construction; a
-    /// user predicate pushed in here — into `term_postings` OR into
-    /// `live_locator`, which feeds it — would silently move every BM25 score.
+    /// Nothing about the caller's filters enters this fragment. `df` is a
+    /// window over the version- and generation-authorized postings, so it is
+    /// corpus-wide by construction; a user predicate pushed in here — into any
+    /// of the three CTEs, since each feeds the next — would silently move every
+    /// BM25 score.
     ///
-    /// **`session_id` is the POSTING's own physical column, never the
-    /// locator's** (design §1.2, and v1 parity: v1 joined the projected event
-    /// on `e.session_id = p.session_id`). `event_uid` is content-addressed over
+    /// # `FINAL` cannot be used on `search_postings` here (issue #597 C1)
+    ///
+    /// `event_uid` is content-addressed over
     /// `source_file|source_generation|source_line_no|source_offset|
-    /// record_fingerprint` and deliberately excludes `session_id` (#608), so a
-    /// physical line double-attributed to two sessions yields one uid under
-    /// two session ids. `mcp_event_locator` is `ORDER BY (event_uid,
-    /// source_host)`, so its `ReplacingMergeTree` collapses those two to one
-    /// arbitrary session. Taking `session_id` from the locator would therefore
-    /// both mis-attribute the hit and make `p.session_id = '<requested>'`
-    /// filter on a session the caller never asked about. The locator supplies
-    /// version authority and the fixed source coordinates only — which are
-    /// identical for both attributions, because they are exactly the fields the
-    /// uid is addressed over — and it does not project a session at all, so
-    /// there is none to take by accident.
+    /// record_fingerprint` and deliberately EXCLUDES `session_id` (#608), so a
+    /// physical line that ingest attributed to two sessions is one uid under two
+    /// session ids — 19,846 of them on the reference host. `mv_search_postings`
+    /// groups by `session_id` (`sql/032`), so `search_postings` physically
+    /// carries both attributions.
+    ///
+    /// `search_postings` is `ReplacingMergeTree(post_version) ORDER BY (term,
+    /// doc_id, source_host)` (`sql/004_search_index.sql`, key widened by
+    /// `sql/032`) — **`session_id` is not in that sort key.** `FINAL` collapses
+    /// on the sort key, so `FROM search_postings FINAL` discards one of the two
+    /// attributions, arbitrarily, INSIDE the postings scan — before the locator
+    /// join, before any filter, and before anything downstream could notice. A
+    /// session-scoped search for the losing session then finds nothing.
+    ///
+    /// `live_postings` therefore performs the `ReplacingMergeTree(post_version)`
+    /// collapse EXPLICITLY, keyed by `(term, doc_id, source_host, session_id)`:
+    /// `max(post_version)` picks the winning revision exactly as `FINAL` would,
+    /// `argMax(…, post_version)` carries that revision's columns, and the
+    /// attribution stays part of the key. It is one hash aggregation over the
+    /// already term-pruned scan — the same rows `FINAL` would have merged.
+    ///
+    /// Putting `session_id` in the table's own `ORDER BY` would be the other
+    /// fix, but `ALTER TABLE … MODIFY ORDER BY` may only add columns introduced
+    /// by an `ADD COLUMN` in the same statement (which is how `sql/032` added
+    /// `source_host`); `session_id` has existed since `sql/004`, so widening the
+    /// key means rebuilding the largest table in the system. That is #603's
+    /// physical cutover, not this issue's.
+    ///
+    /// # `df` counts DOCUMENTS, not attributions
+    ///
+    /// Because `live_postings` is attribution-grain, `count()` would score a
+    /// double-attributed document twice while `docs`
+    /// ([`ClickHouseConversationRepository::corpus_stats`], one row per
+    /// `(event_uid, source_host)`) counts it once — two corpora in one IDF.
+    /// `uniqExact(tuple(event_uid, source_host))` keeps `df` a document count,
+    /// so it stays a subset count of `docs`.
+    ///
+    /// # `session_id` is the POSTING's own physical column, never the locator's
+    ///
+    /// Design §1.2, and v1 parity (v1 joined the projected event on
+    /// `e.session_id = p.session_id`). `mcp_event_locator` is
+    /// `ORDER BY (event_uid, source_host)`, so ITS `ReplacingMergeTree`
+    /// collapses the two attributions the same way. The locator supplies
+    /// version authority and the fixed source coordinates only — identical for
+    /// both attributions, because they are exactly the fields the uid is
+    /// addressed over — and it projects no session at all, so there is none to
+    /// take by accident.
     pub(super) fn bounded_ranking_ctes(
         &self,
         terms_array_sql: &str,
@@ -213,7 +251,11 @@ impl ClickHouseConversationRepository {
         let postings = self.table_ref("search_postings");
         let locator = self.table_ref("mcp_event_locator");
         let published = self.published_generations_subquery();
-        let extras = extra_posting_columns
+        let extra_collapsed = extra_posting_columns
+            .iter()
+            .map(|column| format!("      argMax(p.{column}, p.post_version) AS {column},\n"))
+            .collect::<String>();
+        let extra_projected = extra_posting_columns
             .iter()
             .map(|column| format!("      p.{column} AS {column},\n"))
             .collect::<String>();
@@ -235,10 +277,30 @@ impl ClickHouseConversationRepository {
     )
       AND (l.source_host, l.source_name, l.source_file, l.source_generation) IN {published}
   ),
-  term_postings AS (
+  live_postings AS (
     SELECT
       p.term AS term,
       p.doc_id AS event_uid,
+      p.source_host AS source_host,
+      p.session_id AS session_id,
+      max(p.post_version) AS post_version,
+{extra_collapsed}      argMax(p.tf, p.post_version) AS tf,
+      argMax(p.doc_len, p.post_version) AS doc_len,
+      argMax(p.harness, p.post_version) AS harness,
+      argMax(p.source_name, p.post_version) AS source_name,
+      argMax(p.event_class, p.post_version) AS event_class,
+      argMax(p.payload_type, p.post_version) AS payload_type,
+      argMax(p.actor_role, p.post_version) AS actor_role,
+      argMax(p.name, p.post_version) AS name,
+      argMax(p.phase, p.post_version) AS phase
+    FROM {postings} AS p
+    WHERE p.term IN {terms_array_sql}
+    GROUP BY p.term, p.doc_id, p.source_host, p.session_id
+  ),
+  term_postings AS (
+    SELECT
+      p.term AS term,
+      p.event_uid AS event_uid,
       p.source_host AS source_host,
       p.tf AS tf,
       p.doc_len AS doc_len,
@@ -249,48 +311,19 @@ impl ClickHouseConversationRepository {
       p.actor_role AS actor_role,
       p.name AS name,
       p.phase AS phase,
-{extras}      p.session_id AS session_id,
+{extra_projected}      p.session_id AS session_id,
       l.event_version AS event_version,
       l.source_file AS source_file,
       l.source_generation AS source_generation,
       l.source_line_no AS source_line_no,
       l.sort_time AS sort_time,
-      toUInt64(count() OVER (PARTITION BY p.term)) AS df
-    FROM {postings} AS p FINAL
+      toUInt64(uniqExact(tuple(p.event_uid, p.source_host)) OVER (PARTITION BY p.term)) AS df
+    FROM live_postings AS p
     ALL INNER JOIN live_locator AS l
-      ON l.event_uid = p.doc_id
+      ON l.event_uid = p.event_uid
      AND l.source_host = p.source_host
      AND l.event_version = p.post_version
-    WHERE p.term IN {terms_array_sql}
   )"
-        )
-    }
-
-    /// `docs` / `avgdl` over the SAME document population `df` is counted over
-    /// (issue #597 B6).
-    ///
-    /// The population is stated once: a live document is a `search_documents`
-    /// row that is published-generation-authorized AND carries the live
-    /// canonical `event_version`. `df` gets that from the `live_locator` join
-    /// inside [`Self::bounded_ranking_ctes`]; without the same authorization
-    /// here, `docs` counts MV-lag ghosts that `df` does not, and BM25's IDF is
-    /// computed from two populations at once — `log(1 + (docs - df + 0.5) /
-    /// (df + 0.5))` is only a meaningful quantity when `df` is a subset count
-    /// of `docs`.
-    ///
-    /// Cost: `search_corpus_stats` is ALREADY a full scan of
-    /// `v_live_search_documents`; what is added is a semi-join against one
-    /// fixed-width row per event. It runs at most once per 30 s per
-    /// publication revision (`CORPUS_STATS_CACHE_TTL`, keyed by the
-    /// publication token) and is shared by every search request in that
-    /// window. `count()` / `sum(doc_len)` name no wide column, so the read
-    /// stays content-free.
-    pub(super) fn build_live_corpus_stats_sql(&self) -> String {
-        let documents = self.table_ref("v_live_search_documents");
-        let locator = self.table_ref("mcp_event_locator");
-        let published = self.published_generations_subquery();
-        format!(
-            "SELECT\n  toUInt64(count()) AS docs,\n  toUInt64(ifNull(sum(d.doc_len), 0)) AS total_doc_len\nFROM {documents} AS d\nWHERE (d.source_host, d.event_uid, d.doc_version) IN (\n  SELECT l.source_host, l.event_uid, l.event_version\n  FROM {locator} AS l FINAL\n  WHERE (l.source_host, l.source_name, l.source_file, l.source_generation) IN {published}\n)\nFORMAT JSONEachRow"
         )
     }
 
@@ -298,14 +331,20 @@ impl ClickHouseConversationRepository {
     /// today only conversation search, whose scoring statement aggregates by
     /// session and takes `idf` as an array parameter.
     ///
-    /// `count()` grouped by term over `term_postings` is BY CONSTRUCTION the
-    /// same value as ranking's `count() OVER (PARTITION BY p.term)` on the same
-    /// relation: same rows, same partition, same counting function. That
-    /// identity is the point. The retired `df_map` used a DIFFERENT formula
-    /// (`uniqExact(tuple(source_host, doc_id))`) over a DIFFERENT relation
-    /// (`v_live_search_postings`, authorized only through `search_documents`),
-    /// so the two could diverge silently — and a locator join changes exactly
-    /// the join cardinality that made them agree.
+    /// `uniqExact(tuple(event_uid, source_host))` grouped by term over
+    /// `term_postings` is BY CONSTRUCTION the same value as ranking's
+    /// `uniqExact(tuple(p.event_uid, p.source_host)) OVER (PARTITION BY p.term)`
+    /// on the same relation: same rows, same partition, same function. That
+    /// identity is the point, and it is why both spellings are built from the
+    /// SAME [`Self::bounded_ranking_ctes`] fragment.
+    ///
+    /// It is a DISTINCT document count rather than a row count because
+    /// `live_postings` is attribution-grain: a uid attributed to two sessions
+    /// (#608) contributes two rows per term and exactly one document. The
+    /// retired `df_map` counted `uniqExact` too, but over a DIFFERENT relation
+    /// (`v_live_search_postings`, authorized only through `search_documents`,
+    /// with no live-`event_version` join) — the relation was the divergence,
+    /// and sharing this fragment is what removes it.
     pub(super) fn build_term_df_sql(&self, terms: &[String]) -> RepoResult<String> {
         if terms.is_empty() {
             return Err(RepoError::invalid_argument(
@@ -319,7 +358,7 @@ impl ClickHouseConversationRepository {
 {ranking_ctes}
 SELECT
   toString(p.term) AS term,
-  toUInt64(count()) AS df
+  toUInt64(uniqExact(tuple(p.event_uid, p.source_host))) AS df
 FROM term_postings AS p
 GROUP BY p.term
 FORMAT JSONEachRow"
@@ -484,9 +523,13 @@ FORMAT JSONEachRow"
     /// * **Published generations are a tuple-`IN`, never `ALL INNER JOIN`,** on
     ///   that scan: a join defeats `KeyCondition` pruning (#599's finding,
     ///   `canonical_list.rs`).
-    /// * **`FINAL` on `search_postings` is retained** (RMT(`post_version`)); the
-    ///   locator join then drops any surviving non-current version, because
-    ///   `l.event_version` is the live max maintained directly from `events`.
+    /// * **`search_postings` is read WITHOUT `FINAL`** and collapsed explicitly
+    ///   by `(term, doc_id, source_host, session_id)`, because the table's sort
+    ///   key omits `session_id` and `FINAL` would therefore discard one of a
+    ///   double-attributed uid's two attributions inside the scan (C1; see
+    ///   [`Self::bounded_ranking_ctes`]). The locator join then drops any
+    ///   surviving non-current revision, because `l.event_version` is the live
+    ///   max maintained directly from `events`.
     ///
     /// Why the locator join and not a `search_documents` version join: a
     /// document row whose `doc_version` no longer matches the *live event*
@@ -1217,7 +1260,6 @@ mod tests {
                         .expect("events ranking sql"),
                     ),
                     ("term_df", repo.build_term_df_sql(&terms).expect("df sql")),
-                    ("corpus_stats", repo.build_live_corpus_stats_sql()),
                     (
                         "candidate_derivation",
                         repo.build_search_candidate_derivation_sql(&sessions, &uids)
@@ -1238,7 +1280,7 @@ mod tests {
 
         assert_eq!(
             statements.len(),
-            9,
+            8,
             "every candidate-selection builder must be covered here"
         );
         for (name, sql) in &statements {
@@ -1331,20 +1373,25 @@ mod tests {
         let (ctes, projection) = sql
             .split_once("\nSELECT\n  p.event_uid AS event_uid,")
             .expect("ranking statement has CTEs and a projection");
-        assert!(ctes.contains("toUInt64(count() OVER (PARTITION BY p.term)) AS df"));
+        assert!(ctes.contains(
+            "toUInt64(uniqExact(tuple(p.event_uid, p.source_host)) OVER (PARTITION BY p.term)) AS df"
+        ));
         assert_eq!(
             ctes.matches(" OVER (").count(),
             1,
             "the df window is the only window in the ranking CTEs:\n{ctes}"
         );
-        let term_postings_where = ctes
+        // The postings scan carries term membership and nothing else: the
+        // clause runs straight into the collapse's GROUP BY with no conjunct
+        // between them.
+        let postings_where = ctes
             .rsplit_once("    WHERE p.term IN ['alpha','beta']")
-            .expect("term_postings filters on term membership")
+            .expect("live_postings filters on term membership")
             .1;
         assert_eq!(
-            term_postings_where.trim(),
-            ")",
-            "no user filter may live inside the df CTE, found `{term_postings_where}`"
+            postings_where.trim_start().lines().next(),
+            Some("GROUP BY p.term, p.doc_id, p.source_host, p.session_id"),
+            "no user filter may live inside the df CTEs, found `{postings_where}`"
         );
         // …and every one of those filters really is present, one level down.
         // Every request-shaped value, anywhere in the fragment - `live_locator`
@@ -1545,25 +1592,25 @@ mod tests {
         })
         .await;
 
-        let (locator, term_postings) = sql
+        let (locator, rest) = sql
             .split_once("  live_locator AS (")
             .expect("the ranking statement carries the shared CTEs")
             .1
-            .split_once("  term_postings AS (")
-            .expect("the ranking statement defines term_postings");
+            .split_once(",\n  live_postings AS (")
+            .expect("the ranking statement defines live_postings");
         assert!(
             !locator.contains("session_id"),
             "the locator must not project a session — its ReplacingMergeTree \
              collapses a double-attributed uid to one arbitrary session:\n{locator}"
         );
         assert!(
-            term_postings.contains("p.session_id AS session_id"),
+            rest.contains("p.session_id AS session_id"),
             "the ranked identity's session must come from the posting's own \
-             physical column:\n{term_postings}"
+             physical column:\n{rest}"
         );
         assert!(
-            !term_postings.contains("l.session_id"),
-            "…and never from the locator:\n{term_postings}"
+            !rest.contains("l.session_id"),
+            "…and never from the locator:\n{rest}"
         );
         // The ranked identity is grouped session-qualified, so the two
         // attributions of one uid stay two candidates rather than collapsing
@@ -1577,6 +1624,76 @@ mod tests {
             "`any()` over a group that spans two sessions is exactly the \
              mis-attribution B1 describes:\n{sql}"
         );
+    }
+
+    /// C1 — the OTHER half of B1's ranking story, and the one the first pass
+    /// got wrong.
+    ///
+    /// Taking `session_id` from the posting instead of the locator is
+    /// necessary but not sufficient, because `search_postings` is
+    /// `ReplacingMergeTree(post_version) ORDER BY (term, doc_id, source_host)`
+    /// (`sql/004_search_index.sql`, key widened by `sql/032`) and `session_id`
+    /// is NOT in that key. `FROM search_postings FINAL` therefore collapses a
+    /// double-attributed uid's two postings rows to one arbitrary attribution
+    /// INSIDE the postings scan — before the locator is consulted, before any
+    /// filter, and before the ranked `GROUP BY` above could keep them apart.
+    /// A session-scoped search for the losing session finds nothing.
+    ///
+    /// The fix is to do the `ReplacingMergeTree(post_version)` collapse
+    /// explicitly with the attribution in the key. Every clause below is part
+    /// of that collapse:
+    ///
+    /// MUTATION (a): restore `FROM … search_postings … AS p FINAL` — fails on
+    /// the `FINAL` assertion.
+    /// MUTATION (b): drop `p.session_id` from the `GROUP BY` — fails on the
+    /// collapse-key assertion, and every attribution but one disappears.
+    /// MUTATION (c): replace an `argMax(x, p.post_version)` with `any(x)` —
+    /// fails on the revision-pinning assertion, and a superseded revision's
+    /// `tf`/`doc_len` can win.
+    #[tokio::test]
+    async fn ranking_collapses_postings_per_attribution_never_with_final() {
+        let terms = terms();
+        let types = [McpEventType::AssistantResponse];
+        let sql = build(repo(), move |repo| {
+            repo.build_search_ranking_sql(&ranking_params(&terms, &types))
+                .expect("ranking sql")
+        })
+        .await;
+
+        assert!(
+            !sql.contains("`search_postings` AS p FINAL")
+                && !sql.contains("`search_postings` AS pruned FINAL"),
+            "`FINAL` collapses on (term, doc_id, source_host) — a key that \
+             omits `session_id` — so it discards one of a double-attributed \
+             uid's two attributions inside the scan:\n{sql}"
+        );
+        assert!(
+            sql.contains("    FROM `moraine`.`search_postings` AS p\n    WHERE p.term IN ['alpha','beta']\n    GROUP BY p.term, p.doc_id, p.source_host, p.session_id"),
+            "the collapse must be explicit and keyed by the ATTRIBUTION:\n{sql}"
+        );
+        // The collapse still picks the winning revision, exactly as
+        // ReplacingMergeTree(post_version) would.
+        assert!(sql.contains("      max(p.post_version) AS post_version,"));
+        for column in [
+            "tf",
+            "doc_len",
+            "harness",
+            "source_name",
+            "event_class",
+            "payload_type",
+            "actor_role",
+            "name",
+            "phase",
+        ] {
+            assert!(
+                sql.contains(&format!("argMax(p.{column}, p.post_version) AS {column}")),
+                "`{column}` must come from the winning revision, not an \
+                 arbitrary one:\n{sql}"
+            );
+        }
+        // …and the locator join still pins that revision to the live event
+        // version, which is what makes a superseded posting drop out entirely.
+        assert!(sql.contains("     AND l.event_version = p.post_version"));
     }
 
     /// B2 / §1.3. `scope_exists` decides whether the tool answers `not_found`
@@ -1752,8 +1869,9 @@ mod tests {
     /// §2.6 / risk R10: ONE df formula ships. `build_term_df_sql` must produce
     /// the same value as the ranking window, over the same relation.
     ///
-    /// MUTATION: change either side to `uniqExact(tuple(source_host, doc_id))`
-    /// (the retired `df_map` formula) and the shared-CTE assertion fails.
+    /// MUTATION: change either side to `count()` (which counts ATTRIBUTIONS,
+    /// not documents, now that `live_postings` is attribution-grain) and this
+    /// fails.
     #[tokio::test]
     async fn one_df_formula_ships() {
         let terms = terms();
@@ -1783,9 +1901,17 @@ mod tests {
             "the df statement and the ranking statement must share ONE ranking \
              relation:\n{fragment}"
         );
-        assert!(df.contains("toUInt64(count()) AS df"));
-        assert!(!df.contains("uniqExact"));
-        assert!(ranking.contains("toUInt64(count() OVER (PARTITION BY p.term)) AS df"));
+        // …and ONE function over it: a DISTINCT DOCUMENT count, because
+        // `live_postings` is attribution-grain and `docs` is document-grain.
+        assert!(df.contains("toUInt64(uniqExact(tuple(p.event_uid, p.source_host))) AS df"));
+        assert!(ranking.contains(
+            "toUInt64(uniqExact(tuple(p.event_uid, p.source_host)) OVER (PARTITION BY p.term)) AS df"
+        ));
+        assert!(
+            !df.contains("count()") && !ranking.contains("count() OVER"),
+            "`count()` would score a double-attributed document twice while \
+             `docs` counts it once"
+        );
     }
 
     /// §1.6: the marker is `saturated && short`. Each conjunct is load-bearing

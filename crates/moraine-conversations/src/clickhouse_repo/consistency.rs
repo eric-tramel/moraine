@@ -1183,12 +1183,7 @@ mod tests {
                     // remaining publication-token-keyed logical cache, and they
                     // must replace rather than accumulate the same way.
                     repository
-                        .cache_corpus_stats(
-                            DocumentPopulation::DocumentAuthorized,
-                            epoch,
-                            epoch * 10,
-                            Instant::now(),
-                        )
+                        .cache_corpus_stats(epoch, epoch * 10, Instant::now())
                         .await;
                     repository
                         .insert_scoped_session_cache(

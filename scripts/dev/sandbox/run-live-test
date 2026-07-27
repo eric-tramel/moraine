@@ -53,6 +53,10 @@ Modes:
   list-query-log    Run live_session_list_query_log_clean exactly (#599 WI-07).
   list-bench        Run live_session_list_boundedness_benchmark exactly
                     (#599 WI-07).
+  bounded-search-exec
+                    Run live_bounded_search_statement_execution exactly (#597).
+  bounded-search-attribution
+                    Run live_bounded_search_double_attribution exactly (#597).
 
 Each invocation creates and owns a fresh sandbox, enables destructive tests
 only for the in-container Cargo process, retains a diagnostic log, and tears
@@ -120,6 +124,17 @@ case "$1" in
         ;;
     list-bench)
         test_function="live_session_list_boundedness_benchmark"
+        ;;
+    bounded-search-exec)
+        # Issue #597 C6: every new or rewritten bounded-search statement, run
+        # against a server. A shape test cannot catch an outer reference to a
+        # column the inner derived table fails to project.
+        test_function="live_bounded_search_statement_execution"
+        ;;
+    bounded-search-attribution)
+        # Issue #597 C1: one physical line attributed to two sessions must rank
+        # as two hits, and each session must be able to find its own.
+        test_function="live_bounded_search_double_attribution"
         ;;
     -h|--help)
         usage

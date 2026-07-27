@@ -1234,13 +1234,10 @@ FORMAT JSONEachRow",
         unique_fetch_limit: u16,
     ) -> RepoResult<McpSearchPage> {
         let candidate_fetch_size = mcp_candidate_fetch_size(unique_fetch_limit);
-        // The v1 ranking statement computes its own `df` inline over
-        // `v_live_search_postings`, so its `docs`/`avgdl` come from the
-        // population authorized the same way — and from `search_corpus_stats`
-        // inlined into that very statement when the cache is cold.
-        let corpus_stats = self
-            .cached_corpus_stats(DocumentPopulation::DocumentAuthorized)
-            .await;
+        // v1 inlines `search_corpus_stats` into its own ranking statement when
+        // the cache is cold, and that is the SAME statement every other path
+        // reads its corpus scalars from — one population, one cache slot.
+        let corpus_stats = self.cached_corpus_stats().await;
         let scanned_corpus_stats = corpus_stats.is_none();
 
         let sql = self.build_search_mcp_events_sql(
@@ -1268,13 +1265,8 @@ FORMAT JSONEachRow",
             // What v1 just scanned is `search_corpus_stats`, inlined into its
             // own ranking statement — the document-authorized population, which
             // is the one its inline `df` pairs with.
-            self.cache_corpus_stats(
-                DocumentPopulation::DocumentAuthorized,
-                docs,
-                total_doc_len,
-                Instant::now(),
-            )
-            .await;
+            self.cache_corpus_stats(docs, total_doc_len, Instant::now())
+                .await;
         }
         if metadata.projection_ready == 0 {
             return Err(RepoError::backend(
@@ -1361,10 +1353,7 @@ FORMAT JSONEachRow",
         min_score: f64,
         unique_fetch_limit: u16,
     ) -> RepoResult<McpSearchPage> {
-        // Ranking scores `term_postings`, so `docs`/`avgdl` describe it too.
-        let (docs, total_doc_len) = self
-            .corpus_stats(DocumentPopulation::LocatorAuthorized)
-            .await?;
+        let (docs, total_doc_len) = self.corpus_stats().await?;
         let empty_page = |scope_exists: bool| McpSearchPage {
             rows: Vec::new(),
             docs,
@@ -2088,9 +2077,12 @@ FORMAT JSONEachRow",
     /// > published-generation-authorized AND carry the live canonical
     /// > `event_version` — i.e. the `live_locator` join.
     ///
-    /// `df` (here and in ranking), the scored postings, the session
-    /// aggregation and `docs`/`avgdl` ([`Self::corpus_stats`]) all describe
-    /// exactly that relation.
+    /// `df` (here and in ranking), the scored postings and the session
+    /// aggregation all describe exactly that relation. `docs`/`avgdl`
+    /// ([`Self::corpus_stats`]) deliberately do NOT carry the per-event locator
+    /// join — see `CorpusStatsCacheEntry` for why (design §2.6/OQ-2), and for
+    /// the `greatest(corpus_docs, df)` guard that absorbs the MV-lag window in
+    /// which a term's `df` can exceed `docs`.
     fn conversation_ranking_ctes(&self, terms_array_sql: &str) -> String {
         self.bounded_ranking_ctes(terms_array_sql, &["inference_provider"])
     }
@@ -3157,13 +3149,7 @@ FORMAT JSONEachRow",
             .or_else(|| session_ids_ref.map(|ids| ids.join(",")))
             .unwrap_or_default();
 
-        // `search_events` has no v1 engine: it was collapsed onto the bounded
-        // ranking core outright, so it scores `term_postings` on EVERY backend,
-        // ready or not, and its `docs`/`avgdl` follow the statement rather than
-        // the readiness latch.
-        let (docs, total_doc_len) = self
-            .corpus_stats(DocumentPopulation::LocatorAuthorized)
-            .await?;
+        let (docs, total_doc_len) = self.corpus_stats().await?;
         if docs == 0 {
             return Ok(SearchEventsResult {
                 query_id,
@@ -3491,12 +3477,7 @@ FORMAT JSONEachRow",
             .exclude_codex_mcp
             .unwrap_or(self.cfg.default_exclude_codex_mcp);
 
-        // Same as `search_events`: conversation search scores `term_postings`
-        // unconditionally, so it takes the locator-authorized population
-        // unconditionally.
-        let (docs, total_doc_len) = self
-            .corpus_stats(DocumentPopulation::LocatorAuthorized)
-            .await?;
+        let (docs, total_doc_len) = self.corpus_stats().await?;
         if docs == 0 {
             return Ok(ConversationSearchResults {
                 query_id,

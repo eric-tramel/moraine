@@ -235,25 +235,20 @@ const V2_FIXTURE_EVENTS: [(&str, &str); 10] = [
 /// fixture attributes to both `sess_c` and `sess_a`.
 pub(crate) const SHARED_EVENT_UID: &str = "evt-shared";
 
-// Issue #597 B6 — the two BM25 document populations, deliberately DIVERGENT.
+// Issue #597 §2.6 / correction C2 — ONE BM25 document population.
 //
-// The fixture's story: of the 100 rows in `v_live_search_documents`, 20 are
-// MV-lag ghosts whose `doc_version` no longer matches the live canonical
-// `event_version`, and they carry 1 800 of the 5 000 tokens. The locator join
-// excludes them, so the population `df` is counted over is 80 documents /
-// 3 200 tokens.
+// `docs` / `avgdl` come from `search_corpus_stats` for every search path, v1
+// and v2 alike: `count()` / `sum(doc_len)` over `v_live_search_documents`,
+// i.e. published-generation-authorized document revisions with `doc_len > 0`.
+// The design decided against additionally semi-joining `mcp_event_locator`
+// there (an O(D)x O(E) scan for two scalars, on the interactive path), so
+// there is one statement, one number and one cache slot.
 //
-// Both `docs` AND `avgdl` differ (100/50.0 vs 80/40.0). A fixture where the
-// two coincide is satisfied by an implementation that picks either one, which
-// is exactly the failure mode B6 describes.
-/// `v_live_search_documents`, published-generation-authorized only.
+// The distinctive value exists so that a path silently inventing its own
+// corpus scalars — or reading a second, differently-authorized relation —
+// shows up as a wrong `docs`/`avgdl` rather than as a coincidence.
 pub(crate) const DOCUMENT_AUTHORIZED_DOCS: u64 = 100;
 pub(crate) const DOCUMENT_AUTHORIZED_TOTAL_DOC_LEN: u64 = 5_000;
-/// The same documents, additionally required to carry the live
-/// `event_version` — the `live_locator` join every `term_postings` statement
-/// scores through.
-pub(crate) const LOCATOR_AUTHORIZED_DOCS: u64 = 80;
-pub(crate) const LOCATOR_AUTHORIZED_TOTAL_DOC_LEN: u64 = 3_200;
 
 /// The `(fixture key, reported uid)` pairs a statement asked for, plus the
 /// saturation window. A statement that names the reported uid gets every
@@ -923,7 +918,15 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
         }
 
         // Phase 1: the one bounded ranking pass.
-        if query.contains("term_postings AS (") && query.contains("AS post_version") {
+        //
+        // The signature is the MCP ranking PROJECTION, not `AS post_version` on
+        // its own: `live_postings` projects `max(p.post_version) AS
+        // post_version` for every statement built on the shared ranking CTEs
+        // (issue #597 C1), so a looser match here silently swallows the
+        // `search_events` ranking pass and the term-df read.
+        if query.contains("term_postings AS (")
+            && query.contains("toUInt64(any(p.event_version)) AS post_version")
+        {
             let candidate_as =
                 |fixture_key: &str, reported_uid: &str, raw_score: f64, matched_terms: u64| {
                     let detail = mcp_search_detail_row(fixture_key);
@@ -969,11 +972,29 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
                 // ONE content-addressed uid, TWO sessions (#608). Both rows are
                 // real: `event_uid` is addressed over the source coordinates and
                 // excludes `session_id`, so a physical line ingest attributed to
-                // two sessions produces exactly this.
-                vec![
-                    candidate_as("evt-shared-c", SHARED_EVENT_UID, 12.5, 2),
-                    candidate_as("evt-shared-a", SHARED_EVENT_UID, 7.0, 1),
-                ]
+                // two sessions produces exactly this — TWO `search_postings`
+                // rows per term, identical in `(term, doc_id, source_host)` and
+                // differing only in `session_id`.
+                //
+                // The mock therefore MODELS `search_postings`' replacement
+                // semantics rather than handing the caller both rows for free
+                // (issue #597 C1). The table is
+                // `ReplacingMergeTree(post_version) ORDER BY (term, doc_id,
+                // source_host)` and `session_id` is NOT in that key, so a
+                // statement that leans on `FINAL` — or that collapses without
+                // the attribution in the group — receives ONE arbitrary
+                // attribution, exactly as ClickHouse would serve it. Only the
+                // explicit attribution-keyed collapse sees both.
+                let collapses_per_attribution = !query.contains("`search_postings` AS p FINAL")
+                    && query.contains("GROUP BY p.term, p.doc_id, p.source_host, p.session_id");
+                if collapses_per_attribution {
+                    vec![
+                        candidate_as("evt-shared-c", SHARED_EVENT_UID, 12.5, 2),
+                        candidate_as("evt-shared-a", SHARED_EVENT_UID, 7.0, 1),
+                    ]
+                } else {
+                    vec![candidate_as("evt-shared-c", SHARED_EVENT_UID, 12.5, 2)]
+                }
             } else if state.options.two_distinct_events_in_one_turn {
                 // Same session, same turn, same event type, same timestamp —
                 // DIFFERENT content. The #539 digest is the only thing telling
@@ -1709,24 +1730,6 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
                     {
                         "docs": DOCUMENT_AUTHORIZED_DOCS,
                         "total_doc_len": DOCUMENT_AUTHORIZED_TOTAL_DOC_LEN
-                    }
-                ])),
-            );
-        }
-
-        // Issue #597 B6: the locator-authorized population, and it must NOT
-        // agree with `search_corpus_stats` — a fixture where the two coincide
-        // proves nothing and passes against an implementation that picks the
-        // wrong one. See [`LOCATOR_AUTHORIZED_DOCS`].
-        if query.contains("FROM `moraine`.`mcp_event_locator` AS l FINAL")
-            && query.contains("AS total_doc_len")
-        {
-            return (
-                StatusCode::OK,
-                json_each_row(json!([
-                    {
-                        "docs": LOCATOR_AUTHORIZED_DOCS,
-                        "total_doc_len": LOCATOR_AUTHORIZED_TOTAL_DOC_LEN
                     }
                 ])),
             );

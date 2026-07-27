@@ -487,14 +487,20 @@ async fn conversation_search_never_joins_an_unpredicated_mode_aggregate() {
     }
 }
 
-/// B6. ONE BM25 document population. `df` is `count()` over the
-/// locator-authorized `term_postings`; the postings that get SCORED, the
-/// session aggregation and `docs`/`avgdl` must describe the same relation, or
+/// B6. ONE BM25 document population for everything the RANKING relation
+/// produces: `df` is `uniqExact(tuple(event_uid, source_host))` over the
+/// locator-authorized `term_postings`, and the postings that get SCORED plus
+/// the session aggregation must describe the same relation, or
 /// `log(1 + (docs - df + 0.5) / (df + 0.5))` mixes two corpora in one number.
 ///
+/// `docs`/`avgdl` are the deliberate exception (design §2.6 / OQ-2, correction
+/// C2): they stay `search_corpus_stats`, one cached scalar pair, because a
+/// per-event locator semi-join for two corpus scalars is an O(D)x O(E) scan on
+/// the interactive path. `bm25_sum_expression`'s `greatest(corpus_docs, df)`
+/// absorbs the MV-lag window that separates them.
+///
 /// MUTATION: point any conversation statement back at
-/// `v_live_search_postings`, or drop the locator authorization from
-/// `build_live_corpus_stats_sql`; this fails.
+/// `v_live_search_postings`; this fails.
 #[tokio::test]
 async fn conversation_search_scores_the_same_population_its_df_is_counted_over() {
     let client = ClickHouseClient::new(moraine_config::ClickHouseConfig::default())
@@ -504,7 +510,7 @@ async fn conversation_search_scores_the_same_population_its_df_is_counted_over()
     let idf = HashMap::from([("needle".to_string(), 1.0)]);
     let sessions = vec!["sess-a".to_string()];
 
-    let (statements, df_sql, corpus_sql) =
+    let (statements, df_sql) =
         with_test_publication_snapshot(TestPublicationSnapshot::idle_local(1, 1), async {
             (
                 vec![
@@ -532,34 +538,47 @@ async fn conversation_search_scores_the_same_population_its_df_is_counted_over()
                     ),
                 ],
                 repo.build_term_df_sql(&terms).expect("df sql"),
-                repo.build_live_corpus_stats_sql(),
             )
         })
         .await;
 
     // The population-defining halves of the relation `df` is counted over: the
-    // authorized locator, and the join that intersects it with the term-pruned
-    // postings. (The projected column LIST legitimately differs — conversation
-    // search also needs `inference_provider` — but the rows must not.)
+    // authorized locator, the explicit attribution-keyed collapse of the
+    // term-pruned postings, and the join that intersects them. (The projected
+    // column LIST legitimately differs — conversation search also needs
+    // `inference_provider` — but the ROWS must not, so the slices below
+    // deliberately exclude every projection list.)
     let locator = df_sql
         .split_once("  live_locator AS (")
         .expect("the df statement carries the shared ranking CTEs")
         .1;
     let locator = &locator[..locator
-        .find(",\n  term_postings AS (")
-        .expect("df statement defines term_postings")];
-    let join = df_sql
-        .split_once("    FROM `moraine`.`search_postings` AS p FINAL")
+        .find(",\n  live_postings AS (")
+        .expect("df statement defines live_postings")];
+    let collapse = df_sql
+        .split_once("    FROM `moraine`.`search_postings` AS p\n")
         .expect("df statement scans the postings")
         .1;
+    let collapse = &collapse[..collapse
+        .find("\n  ),")
+        .expect("live_postings is a terminated CTE")];
+    let join = df_sql
+        .split_once("    FROM live_postings AS p\n")
+        .expect("df statement joins the collapsed postings to the locator")
+        .1;
     let join = &join[..join
-        .find("\nSELECT\n  toString(p.term)")
-        .expect("df statement has a projection")];
+        .find("\n  )")
+        .expect("term_postings is a terminated CTE")];
 
     for (name, sql) in statements {
         assert!(
             sql.contains(locator),
             "{name} must authorize the SAME population df is counted over:\n{sql}"
+        );
+        assert!(
+            sql.contains(collapse),
+            "{name} must collapse the postings the same way df does — the \
+             attribution-keyed group, not `FINAL`:\n{sql}"
         );
         assert!(
             sql.contains(join),
@@ -571,20 +590,6 @@ async fn conversation_search_scores_the_same_population_its_df_is_counted_over()
              view — that is the second population:\n{sql}"
         );
     }
-
-    // …and `docs` / `avgdl` are counted over it too.
-    assert!(
-        corpus_sql.contains("FROM `moraine`.`mcp_event_locator` AS l FINAL"),
-        "corpus stats must carry the same locator authorization:\n{corpus_sql}"
-    );
-    assert!(
-        corpus_sql
-            .contains("WHERE (d.source_host, d.event_uid, d.doc_version) IN (\n  SELECT l.source_host, l.event_uid, l.event_version"),
-        "{corpus_sql}"
-    );
-    // Still content-free: two scalars, no wide column named.
-    assert!(!corpus_sql.contains("text_content"));
-    assert!(!corpus_sql.contains("payload_json"));
 }
 
 #[test]

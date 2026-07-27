@@ -21,6 +21,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
+#[path = "live_clickhouse/bounded_search.rs"]
+mod bounded_search;
 #[path = "live_clickhouse/canonical_open_benchmark.rs"]
 mod canonical_open_benchmark;
 #[path = "live_clickhouse/canonical_open_parity.rs"]
@@ -2544,6 +2546,25 @@ async fn live_session_list_query_log_clean() -> Result<()> {
 #[ignore = "requires wrapper-owned live ClickHouse, destructive opt-in, and ~2 GB free"]
 async fn live_session_list_boundedness_benchmark() -> Result<()> {
     with_live_fixture_envelope(session_list_benchmark::boundedness()).await
+}
+
+// Issue #597 exit-gate live tests (plans/597-bounded-search.md §6.3, which
+// makes live EXECUTION a hard rule for this work: a shape test cannot catch an
+// outer reference to a column the inner derived table fails to project, and
+// this epic has shipped that defect twice). The bodies live in
+// live_clickhouse/bounded_search.rs; these root-level wrappers keep the exact
+// `--exact` libtest paths that scripts/dev/sandbox/run-live-test dispatches on.
+
+#[tokio::test]
+#[ignore = "requires wrapper-owned live ClickHouse and destructive opt-in"]
+async fn live_bounded_search_statement_execution() -> Result<()> {
+    with_live_fixture_envelope(bounded_search::statement_execution()).await
+}
+
+#[tokio::test]
+#[ignore = "requires wrapper-owned live ClickHouse and destructive opt-in"]
+async fn live_bounded_search_double_attribution() -> Result<()> {
+    with_live_fixture_envelope(bounded_search::double_attribution()).await
 }
 
 #[cfg(test)]
