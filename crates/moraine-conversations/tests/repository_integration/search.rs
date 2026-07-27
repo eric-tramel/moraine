@@ -757,27 +757,38 @@ async fn search_events_ranks_once_from_postings_and_reads_no_content() {
         // another.
         assert!(ranking.contains("WHERE l.event_uid IN (\n      SELECT pruned.doc_id"));
 
+        // `search_postings` is read WITHOUT `FINAL` and collapsed explicitly on
+        // a key that CARRIES the attribution: the table's sort key is
+        // `(term, doc_id, source_host)`, so `FINAL` would discard one of a
+        // double-attributed uid's two rows inside the scan (issue #597 C1).
+        assert!(!ranking.contains("`search_postings` AS p FINAL"));
+        assert!(ranking.contains("GROUP BY p.term, p.doc_id, p.source_host, p.session_id"));
+
         // `df` is corpus-wide: computed inside `term_postings`, and NO user
-        // filter may appear there.
+        // filter may appear there. It counts DISTINCT DOCUMENTS, so it stays a
+        // subset count of `docs` even though the relation under it is
+        // attribution-grain.
         let (df_cte, projection) = ranking
             .split_once("\nSELECT\n  p.event_uid AS event_uid,")
             .expect("ranking statement has a CTE and a projection");
-        assert!(df_cte.contains("toUInt64(count() OVER (PARTITION BY p.term)) AS df"));
+        assert!(df_cte.contains(
+            "toUInt64(uniqExact(tuple(p.event_uid, p.source_host)) OVER (PARTITION BY p.term)) AS df"
+        ));
         assert_eq!(
             df_cte.matches(" OVER (").count(),
             1,
             "the df window must be the only window in the ranking CTE: {df_cte}"
         );
-        // The `term_postings` WHERE is term membership and NOTHING else: the
-        // clause runs to the CTE's closing paren with no conjunct after it.
-        let term_postings_where = df_cte
+        // The postings WHERE is term membership and NOTHING else: the clause
+        // runs straight into the collapse's GROUP BY with no conjunct between.
+        let postings_where = df_cte
             .rsplit_once("    WHERE p.term IN ['hello','world']")
-            .expect("term_postings filters on term membership")
+            .expect("live_postings filters on term membership")
             .1;
         assert_eq!(
-            term_postings_where.trim(),
-            ")",
-            "no user filter may live inside the df CTE, but found `{term_postings_where}`"
+            postings_where.trim_start().lines().next(),
+            Some("GROUP BY p.term, p.doc_id, p.source_host, p.session_id"),
+            "no user filter may live inside the df CTEs, but found `{postings_where}`"
         );
         assert!(projection.contains("WHERE p.payload_type != 'token_count'"));
 
@@ -789,46 +800,28 @@ async fn search_events_ranks_once_from_postings_and_reads_no_content() {
                 "bounded ranking must not read `{forbidden}`: {ranking}"
             );
         }
-        // Exactly two document reads are legal on this path, and each has to
-        // justify itself:
+        // UNCONDITIONAL (issue #597 C3): every statement that opens the
+        // document corpus is keyed by the ranked identities. There is no
+        // exemption, and adding one is how a corpus-sized document read gets
+        // back onto the interactive path — this assertion was relaxed once, for
+        // exactly that, and the scan it was relaxed for is gone again.
         //
-        //  1. the per-candidate extras read, keyed by the ranked identities;
-        //  2. the corpus-stats scalar pair, which is corpus-wide BY DEFINITION
-        //     — there is no bounded form of "how many documents are there" —
-        //     but is `count()` + `sum(doc_len)` only, names no wide column, and
-        //     is cached for `CORPUS_STATS_CACHE_TTL` per publication token.
-        //
-        // Anything else is the corpus-sized document read this issue exists to
-        // remove, so the fallthrough is a hard failure, not a relaxation.
-        let mut corpus_stats_reads = 0;
+        // Corpus scalars do not appear here at all: `docs`/`avgdl` are read
+        // from `search_corpus_stats`, which is a maintained view, names no
+        // relation in the statement text, and is cached for
+        // `CORPUS_STATS_CACHE_TTL` per publication token.
         for query in &queries {
-            if !query.contains("`v_live_search_documents`")
-                || query.contains("requested_documents AS requested")
-            {
-                continue;
-            }
-            assert!(
-                query.contains("toUInt64(count()) AS docs")
-                    && query.contains("toUInt64(ifNull(sum(d.doc_len), 0)) AS total_doc_len"),
-                "every document read must be keyed by the ranked identities, or \
-                 else be the corpus-stats scalar pair: {query}"
-            );
-            for forbidden in ["text_content", "payload_json"] {
+            if query.contains("`v_live_search_documents`") {
                 assert!(
-                    !query.contains(forbidden),
-                    "the corpus-stats read must stay a content-free scalar pair, \
-                     found `{forbidden}`: {query}"
+                    query.contains("requested_documents AS requested"),
+                    "every document read must be keyed by the ranked identities: {query}"
                 );
             }
-            // …and it counts the population this statement's `df` is counted
-            // over (issue #597 B6), not `search_corpus_stats`'s.
-            assert!(
-                query.contains("FROM `moraine`.`mcp_event_locator` AS l FINAL"),
-                "corpus stats must carry the same locator authorization the \
-                 ranking relation does: {query}"
-            );
-            corpus_stats_reads += 1;
         }
+        let corpus_stats_reads = queries
+            .iter()
+            .filter(|query| query.contains("`moraine`.`search_corpus_stats`"))
+            .count();
         assert_eq!(
             corpus_stats_reads, 1,
             "corpus stats are read at most once per request: {queries:?}"
@@ -1817,6 +1810,10 @@ async fn search_mcp_events_semantics_are_identical_on_both_engines() {
 /// `(source_host, session_id, event_uid)`, and the derivation and hydration
 /// statements filter on that same tuple.
 ///
+/// This is the HYDRATION half. The ranking half — whether both attributions
+/// reach hydration at all — is
+/// [`a_double_attributed_uid_survives_the_ranking_collapse`].
+///
 /// MUTATION (any one of these; each fails this test):
 ///   * key `derivation_by_identity` on `(source_host, event_uid)` — the two
 ///     derivations collapse, one candidate is hydrated against the OTHER
@@ -1824,10 +1821,15 @@ async fn search_mcp_events_semantics_are_identical_on_both_engines() {
 ///   * key `wide_by_identity` on `(source_host, event_uid)` — one winner gets
 ///     the other session's `item_id`/`text`;
 ///   * `dedup_by_document.remove(...)` instead of `.get(...)` — the second
-///     candidate is starved of its digest and dropped as if it were stale;
-///   * drop the `(session_id, event_uid)` tuple from
-///     `build_search_candidate_derivation_sql` or
-///     `build_search_wide_hydration_sql`.
+///     candidate is starved of its digest and dropped as if it were stale.
+///
+/// NOT a mutation this test detects: dropping the `(session_id, event_uid)`
+/// tuple from `build_search_candidate_derivation_sql` /
+/// `build_search_wide_hydration_sql`. A uid-only filter returns the SUPERSET
+/// (every candidate session that carries the uid), and the maps above are
+/// keyed by the triple, so the extra rows are ignored and the answer is
+/// unchanged. That tuple's job is bounding the read, and its guard is the
+/// shape test `canonical_search_reads_are_session_qualified`.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_uid_attributed_to_two_sessions_hydrates_each_against_its_own_session() {
     scoped(async {
@@ -1897,6 +1899,85 @@ async fn a_uid_attributed_to_two_sessions_hydrates_each_against_its_own_session(
             a.item_id.as_deref(),
             Some("item-evt-shared-a"),
             "sess_a hit hydrated from the wrong session's row"
+        );
+    })
+    .await;
+}
+
+/// C1 / #608, the RANKING half — the one B1 left open.
+///
+/// `search_postings` physically carries BOTH attributions of a
+/// double-attributed uid: `mv_search_postings` groups by `session_id`
+/// (`sql/032`), so one physical line ingested into two sessions produces two
+/// posting rows per term, identical in `(term, doc_id, source_host)` and
+/// differing only in `session_id`.
+///
+/// The table is `ReplacingMergeTree(post_version) ORDER BY (term, doc_id,
+/// source_host)` and **`session_id` is not in that key**, so `FROM
+/// search_postings FINAL` collapses those two rows to ONE arbitrary
+/// attribution inside the scan — before the locator join, before any filter,
+/// and before the ranked `GROUP BY … p.session_id` could keep them apart. The
+/// hydration guards above cannot see that: they only ever receive one
+/// candidate. The mock models the replacement semantics, so this test observes
+/// the same loss a server would produce.
+///
+/// MUTATION (a): `FROM {postings} AS p FINAL` in `bounded_ranking_ctes` —
+/// fails here with one hit instead of two.
+/// MUTATION (b): drop `p.session_id` from `live_postings`' `GROUP BY` — same.
+///
+/// Both mutations leave every hydration-half assertion green, which is why
+/// this case is its own test rather than a paragraph in the one above.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_double_attributed_uid_survives_the_ranking_collapse() {
+    scoped(async {
+        let (repo, state) = build_repo_with_options(
+            100,
+            MockOptions {
+                open_v2_reader_ready: Some(true),
+                shared_event_uid_across_sessions: true,
+                ..MockOptions::default()
+            },
+        )
+        .await;
+
+        let result = repo
+            .search_mcp_events(SearchMcpEventsQuery {
+                query: "hello world".to_string(),
+                n_hits: Some(5),
+                min_score: Some(0.0),
+                min_should_match: Some(1),
+                ..SearchMcpEventsQuery::default()
+            })
+            .await
+            .expect("a double-attributed uid is two valid hits, not an error");
+
+        let attributions = result
+            .hits
+            .iter()
+            .map(|hit| (hit.session_id.as_str(), hit.event_uid.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            attributions,
+            vec![("sess_c", "evt-shared"), ("sess_a", "evt-shared")],
+            "both attributions must survive the postings collapse"
+        );
+
+        // …and the reason they survived, in the statement the server saw.
+        let queries = state.queries.lock().expect("queries lock").clone();
+        let ranking = queries
+            .iter()
+            .find(|query| {
+                query.contains("term_postings AS (")
+                    && query.contains("toUInt64(any(p.event_version)) AS post_version")
+            })
+            .expect("the request issued a bounded ranking pass");
+        assert!(
+            !ranking.contains("`search_postings` AS p FINAL"),
+            "`FINAL` collapses on a key that omits `session_id`: {ranking}"
+        );
+        assert!(
+            ranking.contains("GROUP BY p.term, p.doc_id, p.source_host, p.session_id"),
+            "the postings collapse must carry the attribution: {ranking}"
         );
     })
     .await;
@@ -2152,28 +2233,30 @@ async fn a_candidate_navigation_carries_at_another_version_is_dropped() {
     .await;
 }
 
-/// B6. ONE BM25 document population, and it is a property of the STATEMENT.
+/// B6, corrected by C2/C4. ONE BM25 document population, ONE corpus
+/// statement, ONE cache slot — on every backend.
 ///
-/// `search_events` and `search_conversations` have no v1 engine to fall back
-/// to — #597 collapsed them onto the bounded ranking core outright — so they
-/// score the locator-authorized `term_postings` on EVERY backend, ready or not.
-/// Deriving `docs`/`avgdl` from the `open_v2` readiness latch therefore hands
-/// them `search_corpus_stats`'s population (100 docs / avgdl 50.0) while their
-/// `df` still comes from the locator's (80 docs / avgdl 40.0), and
-/// `log(1 + (docs - df + 0.5) / (df + 0.5))` is then computed across two
-/// corpora.
+/// `docs`/`avgdl` come from `search_corpus_stats` for `search_events`,
+/// `search_conversations`, v2 MCP search and v1 MCP search alike. The design
+/// (§2.6, OQ-2) decided against additionally semi-joining `mcp_event_locator`
+/// there: it is an O(D)x O(E) scan for two scalars, on the interactive path,
+/// and it was briefly shipped — that is correction C2. `df` therefore counts a
+/// locator-authorized SUBSET of `docs`, and `bm25_sum_expression`'s
+/// `greatest(corpus_docs, df)` is what absorbs the MV-lag window in which a
+/// term's `df` can transiently exceed `docs`.
 ///
-/// The fixture's two populations diverge in BOTH numbers on purpose; a fixture
-/// where they coincide is satisfied by an implementation that picks either.
+/// Because there is one population there is one cache slot, and a single
+/// `Option` is the correct shape rather than a two-way eviction race (C4).
 ///
-/// MUTATION: restore `if self.canonical_list_path_ready().await { … } else { …
-/// search_corpus_stats … }` in `corpus_stats`; the UNREADY half of this test
-/// fails with docs = 100 / avgdl = 50.0.
+/// MUTATION: reintroduce a second corpus statement (a
+/// `build_live_corpus_stats_sql`, or a readiness-latch branch that reads a
+/// differently-authorized relation); the corpus-relation assertion fails
+/// naming the statement.
 #[tokio::test(flavor = "multi_thread")]
-async fn bounded_search_stats_follow_the_scored_population_not_the_readiness_latch() {
+async fn bounded_search_reads_one_corpus_statement_on_every_backend() {
     scoped(async {
         for reader_ready in [false, true] {
-            let (repo, _state) = build_repo_with_options(
+            let (repo, state) = build_repo_with_options(
                 100,
                 MockOptions {
                     open_v2_reader_ready: Some(reader_ready),
@@ -2197,11 +2280,11 @@ async fn bounded_search_stats_follow_the_scored_population_not_the_readiness_lat
                 .await
                 .unwrap_or_else(|error| panic!("ready={reader_ready}: {error}"));
             assert_eq!(
-                conversations.stats.docs, LOCATOR_AUTHORIZED_DOCS,
-                "ready={reader_ready}: conversation search scores the \
-                 locator-authorized population, so it must count it too"
+                conversations.stats.docs, DOCUMENT_AUTHORIZED_DOCS,
+                "ready={reader_ready}: conversation search takes the one \
+                 corpus-scalar pair"
             );
-            assert_eq!(conversations.stats.avgdl, 40.0, "ready={reader_ready}");
+            assert_eq!(conversations.stats.avgdl, 50.0, "ready={reader_ready}");
 
             let events = repo
                 .search_events(SearchEventsQuery {
@@ -2214,26 +2297,57 @@ async fn bounded_search_stats_follow_the_scored_population_not_the_readiness_lat
                 .await
                 .unwrap_or_else(|error| panic!("ready={reader_ready}: {error}"));
             assert_eq!(
-                events.stats.docs, LOCATOR_AUTHORIZED_DOCS,
+                events.stats.docs, DOCUMENT_AUTHORIZED_DOCS,
                 "ready={reader_ready}: so does event search"
             );
-            assert_eq!(events.stats.avgdl, 40.0, "ready={reader_ready}");
+            assert_eq!(events.stats.avgdl, 50.0, "ready={reader_ready}");
+
+            // …from exactly ONE statement, over exactly ONE relation, shared
+            // by both calls through the publication-token-keyed cache.
+            let queries = state.queries.lock().expect("queries lock").clone();
+            let corpus_reads: Vec<&String> = queries
+                .iter()
+                .filter(|query| query.contains("AS total_doc_len"))
+                .collect();
+            assert_eq!(
+                corpus_reads.len(),
+                1,
+                "ready={reader_ready}: corpus scalars are read once per \
+                 publication revision, not once per call: {queries:?}"
+            );
+            assert!(
+                corpus_reads[0].contains("FROM `moraine`.`search_corpus_stats`"),
+                "ready={reader_ready}: the corpus statement is the maintained \
+                 view, not a second corpus-sized relation: {}",
+                corpus_reads[0]
+            );
+            for query in &queries {
+                assert!(
+                    !(query.contains("AS total_doc_len")
+                        && (query.contains("`mcp_event_locator`")
+                            || query.contains("`v_live_search_documents`"))),
+                    "ready={reader_ready}: corpus scalars must not open a \
+                     second corpus-sized relation on the interactive path: {query}"
+                );
+            }
         }
     })
     .await;
 }
 
-/// B6, the other half. The retired v1 MCP ranking statement computes its own
-/// inline `df` over `v_live_search_postings`, which is authorized by document
-/// revision and not by the locator — so it pairs with the DOCUMENT-authorized
-/// population, and the two cache entries must not be served to each other.
+/// C4, the other half. The corpus-stats cache is a SINGLE slot, and that is
+/// correct precisely because there is one population: the entry conversation
+/// search writes is the entry v1 MCP search reads, so the slot is shared
+/// rather than fought over.
 ///
-/// MUTATION: drop `population` from `CorpusStatsCacheEntry`'s identity (or make
-/// `corpus_stats` ignore its argument); this fails, because the conversation
-/// search above primes the cache with the locator-authorized numbers and v1
-/// then reports 80/40.0 instead of 100/50.0.
+/// The v1 engine inlines `search_corpus_stats` into its own ranking statement
+/// only when the cache is COLD, which is what makes the reuse observable in
+/// the statement text.
+///
+/// MUTATION: give the cache entry a per-caller identity again (or make
+/// `cached_corpus_stats` always miss); v1 re-reads the corpus and this fails.
 #[tokio::test(flavor = "multi_thread")]
-async fn the_two_document_populations_do_not_share_a_cache_entry() {
+async fn the_corpus_stats_cache_slot_is_shared_by_every_search_path() {
     scoped(async {
         let (repo, state) = build_repo_with_options(
             100,
@@ -2244,7 +2358,7 @@ async fn the_two_document_populations_do_not_share_a_cache_entry() {
         )
         .await;
 
-        // Prime the corpus-stats cache with the locator-authorized population.
+        // Prime the slot from the v2 side.
         let conversations = repo
             .search_conversations(ConversationSearchQuery {
                 query: "hello world".to_string(),
@@ -2259,9 +2373,9 @@ async fn the_two_document_populations_do_not_share_a_cache_entry() {
             })
             .await
             .expect("conversation search");
-        assert_eq!(conversations.stats.docs, LOCATOR_AUTHORIZED_DOCS);
+        assert_eq!(conversations.stats.docs, DOCUMENT_AUTHORIZED_DOCS);
 
-        // v1 MCP search must not pick that entry up.
+        // v1 MCP search reads the SAME slot.
         let mcp = repo
             .search_mcp_events(SearchMcpEventsQuery {
                 query: "hello world".to_string(),
@@ -2272,21 +2386,29 @@ async fn the_two_document_populations_do_not_share_a_cache_entry() {
             })
             .await
             .expect("v1 mcp search");
-        assert_eq!(
-            mcp.stats.docs, DOCUMENT_AUTHORIZED_DOCS,
-            "the v1 engine's inline `df` is document-authorized, so its `docs` \
-             must be too"
-        );
+        assert_eq!(mcp.stats.docs, DOCUMENT_AUTHORIZED_DOCS);
 
-        // …and it got there by reading `search_corpus_stats`, inlined into its
-        // own ranking statement, rather than by reusing the other population.
         let queries = state.queries.lock().expect("queries lock").clone();
+        let v1_ranking: Vec<&String> = queries
+            .iter()
+            .filter(|query| {
+                query.contains("toUInt8(0) AS row_kind") && query.contains("term_postings AS (")
+            })
+            .collect();
+        assert_eq!(v1_ranking.len(), 1, "{queries:?}");
         assert!(
+            !v1_ranking[0].contains("search_corpus_stats"),
+            "v1 must reuse the primed slot instead of inlining a second \
+             corpus read: {}",
+            v1_ranking[0]
+        );
+        assert_eq!(
             queries
                 .iter()
-                .any(|query| query.contains("toUInt8(0) AS row_kind")
-                    && query.contains("search_corpus_stats")),
-            "{queries:?}"
+                .filter(|query| query.contains("FROM `moraine`.`search_corpus_stats`"))
+                .count(),
+            1,
+            "one corpus read for both engines: {queries:?}"
         );
     })
     .await;
