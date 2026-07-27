@@ -8,6 +8,86 @@ import pytest
 from moraine_conversations import ConversationClient
 
 
+def _document_hydration_rows() -> list[dict]:
+    """The winner-hydration columns #597 selects for each (source_host, event_uid)."""
+    def row(uid: str, session: str, preview: str) -> dict:
+        return {
+            "source_host": "host-a",
+            "event_uid": uid,
+            "session_id": session,
+            "source_name": "codex",
+            "harness": "codex",
+            "inference_provider": "openai",
+            "event_class": "message",
+            "payload_type": "text",
+            "actor_role": "assistant",
+            "name": "",
+            "phase": "",
+            "payload_phase": "",
+            "source_ref": f"/tmp/{session}.jsonl:1:1",
+            "doc_len": 19,
+            "text_preview": preview,
+            "text_content": preview,
+            "payload_json": "{}",
+            "snippet": preview,
+        }
+
+    return [
+        row("evt-c-42", "sess_c", "best event in session c"),
+        row("evt-a-11", "sess_a", "hello world in session a"),
+    ]
+
+
+def _tool_hydration_rows() -> list[dict]:
+    """Columns the `GROUP BY t.source_host, t.event_uid` hydration selects."""
+    def row(uid: str, session: str, preview: str) -> dict:
+        return {
+            "source_host": "host-a",
+            "event_uid": uid,
+            "session_id": session,
+            "event_time": "2026-01-01 10:10:00",
+            "source_name": "codex",
+            "harness": "codex",
+            "inference_provider": "openai",
+            "event_class": "message",
+            "payload_type": "text",
+            "actor_role": "assistant",
+            "name": "",
+            "phase": "",
+            "source_ref": f"/tmp/{session}.jsonl:1:1",
+            "doc_len": 19,
+            "text_preview": preview,
+            "text_content": preview,
+            "payload_json": "{}",
+            "has_codex_mcp": 0,
+        }
+
+    return [
+        row("evt-c-42", "sess_c", "best event in session c"),
+        row("evt-a-11", "sess_a", "hello world in session a"),
+    ]
+
+
+def _session_meta_rows() -> list[dict]:
+    """Exactly the columns `build_conversation_session_metadata_sql` selects."""
+    return [
+        {
+            "session_id": "sess_c",
+            "harness": "codex",
+            "inference_provider": "openai",
+            "session_slug": "",
+            "session_summary": "",
+        },
+        {
+            "session_id": "sess_a",
+            "harness": "codex",
+            "inference_provider": "openai",
+            "session_slug": "",
+            "session_summary": "",
+        },
+    ]
+
+
 def _conversation_hit_rows() -> list[dict]:
     """Session-grained hits for #597's conversation ranking.
 
@@ -72,6 +152,18 @@ def _rows_for_query(query: str) -> list[dict]:
         if "WHERE s.session_id = 'sess_a'" in query:
             return [_session_rows()[2]]
         return _session_rows()
+
+    # #597 hydrates winners in separate statements keyed on the
+    # (source_host, event_uid) tuple set. Each is matched on its GROUP BY,
+    # which identifies the statement without depending on the CTE body.
+    if "GROUP BY document.source_host, document.event_uid" in query:
+        return _document_hydration_rows()
+
+    if "GROUP BY t.source_host, t.event_uid" in query:
+        return _tool_hydration_rows()
+
+    if "WHERE event_kind = 'session_meta'" in query and "GROUP BY session_id" in query:
+        return _session_meta_rows()
 
     if "FROM `moraine`.`search_corpus_stats`" in query:
         return [{"docs": 100, "total_doc_len": 5000}]
