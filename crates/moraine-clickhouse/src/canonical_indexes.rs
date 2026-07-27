@@ -1134,6 +1134,14 @@ impl ClickHouseClient {
     /// Distinct uids is the invariant the reader actually depends on: the two
     /// indexes must agree on WHICH events exist, not on how many physical rows
     /// encode them. A genuinely missing index row still moves this number.
+    ///
+    /// The comparison is also a SET comparison, not a per-session one, for the
+    /// same reason the coverage probe is uid-scoped: the locator holds one row
+    /// per uid carrying ONE session, so grouping both sides by `session_id`
+    /// makes the other session of a double-attributed uid compare 1 against 0
+    /// and the delta can never reach 0. Measured directly — with per-session
+    /// grouping the #597 attribution gate reported
+    /// `navigation_missing: 0, locator_missing: 0, cardinality_delta: 1`.
     async fn audit_cardinality_delta(&self, session_list: &str) -> Result<i64> {
         let query = Self::audit_cardinality_delta_sql(&self.cfg.database, session_list);
         let rows: Vec<CardinalityRow> = self
@@ -1150,19 +1158,19 @@ impl ClickHouseClient {
     pub(crate) fn audit_cardinality_delta_sql(database: &str, session_list: &str) -> String {
         let db = escape_identifier(database);
         let query = format!(
-            "SELECT toString(sum(abs(nav_count - loc_count))) AS delta\n\
+            "SELECT toString(abs(nav_count - loc_count)) AS delta\n\
              FROM (\n\
-               SELECT session_id, uniqExact(event_uid) AS nav_count\n\
+               SELECT uniqExact(event_uid) AS nav_count\n\
                FROM {db}.mcp_event_navigation FINAL\n\
                WHERE session_id IN ({session_list})\n\
-               GROUP BY session_id\n\
              ) AS n\n\
-             FULL OUTER JOIN (\n\
-               SELECT session_id, uniqExact(event_uid) AS loc_count\n\
+             CROSS JOIN (\n\
+               SELECT uniqExact(event_uid) AS loc_count\n\
                FROM {db}.mcp_event_locator FINAL\n\
-               WHERE session_id IN ({session_list})\n\
-               GROUP BY session_id\n\
-             ) AS l USING (session_id)\n\
+               WHERE event_uid IN (\n\
+                 SELECT event_uid FROM {db}.mcp_event_navigation\n\
+                 WHERE session_id IN ({session_list}))\n\
+             ) AS l\n\
              SETTINGS join_algorithm = 'grace_hash', grace_hash_join_initial_buckets = 32,\n\
                       max_bytes_in_join = {join_bytes}\n\
              FORMAT JSONEachRow",
