@@ -1115,29 +1115,27 @@ impl ClickHouseClient {
         Ok((sessions.len() as u64).saturating_sub(covered))
     }
 
-    /// Summed absolute per-session cardinality delta between navigation and
-    /// locator over the sampled sessions (0 means agreement).
+    /// Summed absolute per-session delta in DISTINCT `event_uid` between
+    /// navigation and locator over the sampled sessions (0 means agreement).
+    ///
+    /// Counting ROWS here was wrong in two independent ways, and the two
+    /// together made the gate unreachable on any real corpus:
+    ///
+    /// * `mcp_event_navigation` keeps one row per generation (its sort key
+    ///   carries `source_generation`) while `mcp_event_locator` keeps one per
+    ///   uid, so a replayed source made the row counts differ permanently even
+    ///   though both indexes agreed on which events exist.
+    /// * `event_uid` is content-addressed and excludes `session_id` (#608), so
+    ///   an ingest double-attribution puts one uid under two sessions.
+    ///   Navigation keeps both rows; the locator collapses them. On the
+    ///   reference host that is 19,846 uids, i.e. a permanent delta of 19,846
+    ///   against a gate that requires exactly 0.
+    ///
+    /// Distinct uids is the invariant the reader actually depends on: the two
+    /// indexes must agree on WHICH events exist, not on how many physical rows
+    /// encode them. A genuinely missing index row still moves this number.
     async fn audit_cardinality_delta(&self, session_list: &str) -> Result<i64> {
-        let db = escape_identifier(&self.cfg.database);
-        let query = format!(
-            "SELECT toString(sum(abs(nav_count - loc_count))) AS delta\n\
-             FROM (\n\
-               SELECT session_id, count() AS nav_count\n\
-               FROM {db}.mcp_event_navigation FINAL\n\
-               WHERE session_id IN ({session_list})\n\
-               GROUP BY session_id\n\
-             ) AS n\n\
-             FULL OUTER JOIN (\n\
-               SELECT session_id, count() AS loc_count\n\
-               FROM {db}.mcp_event_locator FINAL\n\
-               WHERE session_id IN ({session_list})\n\
-               GROUP BY session_id\n\
-             ) AS l USING (session_id)\n\
-             SETTINGS join_algorithm = 'grace_hash', grace_hash_join_initial_buckets = 32,\n\
-                      max_bytes_in_join = {join_bytes}\n\
-             FORMAT JSONEachRow",
-            join_bytes = AUDIT_MAX_BYTES_IN_JOIN,
-        );
+        let query = Self::audit_cardinality_delta_sql(&self.cfg.database, session_list);
         let rows: Vec<CardinalityRow> = self
             .query_json_each_row(&query, Some(&self.cfg.database))
             .await
@@ -1147,6 +1145,30 @@ impl ClickHouseClient {
             .next()
             .and_then(|row| row.delta.parse().ok())
             .unwrap_or(0))
+    }
+
+    pub(crate) fn audit_cardinality_delta_sql(database: &str, session_list: &str) -> String {
+        let db = escape_identifier(database);
+        let query = format!(
+            "SELECT toString(sum(abs(nav_count - loc_count))) AS delta\n\
+             FROM (\n\
+               SELECT session_id, uniqExact(event_uid) AS nav_count\n\
+               FROM {db}.mcp_event_navigation FINAL\n\
+               WHERE session_id IN ({session_list})\n\
+               GROUP BY session_id\n\
+             ) AS n\n\
+             FULL OUTER JOIN (\n\
+               SELECT session_id, uniqExact(event_uid) AS loc_count\n\
+               FROM {db}.mcp_event_locator FINAL\n\
+               WHERE session_id IN ({session_list})\n\
+               GROUP BY session_id\n\
+             ) AS l USING (session_id)\n\
+             SETTINGS join_algorithm = 'grace_hash', grace_hash_join_initial_buckets = 32,\n\
+                      max_bytes_in_join = {join_bytes}\n\
+             FORMAT JSONEachRow",
+            join_bytes = AUDIT_MAX_BYTES_IN_JOIN,
+        );
+        query
     }
 
     async fn persist_audit_outcome(&self, outcome: &CoreIndexAuditOutcome) -> Result<()> {
@@ -1316,6 +1338,36 @@ fn now_unix_millis() -> i64 {
 
 #[cfg(test)]
 mod tests {
+
+    /// The overlap audit must compare DISTINCT uids, never row counts.
+    ///
+    /// MUTATION: change either `uniqExact(event_uid)` back to `count()`; this
+    /// fails. Row counts made the gate unreachable on any real corpus — a
+    /// replayed generation gives navigation more rows than the locator, and an
+    /// ingest double-attribution (one uid under two sessions, 19,846 of them on
+    /// the reference host) gives a permanent nonzero delta against a gate that
+    /// requires exactly 0. Distinct uids is what the reader depends on: the two
+    /// indexes must agree on WHICH events exist.
+    #[test]
+    fn overlap_audit_compares_distinct_uids_not_row_counts() {
+        let sql = ClickHouseClient::audit_cardinality_delta_sql("moraine", "'sess-a'");
+
+        assert_eq!(
+            sql.matches("uniqExact(event_uid)").count(),
+            2,
+            "both sides of the audit must count distinct uids:\n{sql}"
+        );
+        assert!(
+            !sql.contains("count() AS nav_count") && !sql.contains("count() AS loc_count"),
+            "a row-count side makes the gate unreachable on a replayed or \
+             double-attributed corpus:\n{sql}"
+        );
+        assert!(
+            sql.contains("mcp_event_navigation") && sql.contains("mcp_event_locator"),
+            "the audit must still compare the two indexes:\n{sql}"
+        );
+    }
+
     use super::*;
 
     #[test]
