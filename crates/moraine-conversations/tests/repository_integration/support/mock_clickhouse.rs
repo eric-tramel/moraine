@@ -919,11 +919,10 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
 
         // Phase 1: the one bounded ranking pass.
         //
-        // The signature is the MCP ranking PROJECTION, not `AS post_version` on
-        // its own: `live_postings` projects `max(p.post_version) AS
-        // post_version` for every statement built on the shared ranking CTEs
-        // (issue #597 C1), so a looser match here silently swallows the
-        // `search_events` ranking pass and the term-df read.
+        // The signature is the MCP ranking PROJECTION, so this arm cannot
+        // swallow the `search_events` ranking pass or the term-df read — both
+        // are built from the same shared `term_postings` fragment and are
+        // served by their own arms below.
         if query.contains("term_postings AS (")
             && query.contains("toUInt64(any(p.event_version)) AS post_version")
         {
@@ -969,32 +968,38 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
             let includes_tool_call = filter_clause.contains("p.event_class = 'tool_call'");
             let includes_tool_response = filter_clause.contains("p.event_class = 'tool_result'");
             let rows = if state.options.shared_event_uid_across_sessions {
-                // ONE content-addressed uid, TWO sessions (#608). Both rows are
-                // real: `event_uid` is addressed over the source coordinates and
-                // excludes `session_id`, so a physical line ingest attributed to
-                // two sessions produces exactly this — TWO `search_postings`
-                // rows per term, identical in `(term, doc_id, source_host)` and
-                // differing only in `session_id`.
+                // ONE content-addressed uid, TWO sessions (#608) — and the
+                // ranking pass returns exactly ONE row for it, because ranking
+                // is DOCUMENT-grained.
                 //
-                // The mock therefore MODELS `search_postings`' replacement
-                // semantics rather than handing the caller both rows for free
-                // (issue #597 C1). The table is
-                // `ReplacingMergeTree(post_version) ORDER BY (term, doc_id,
-                // source_host)` and `session_id` is NOT in that key, so a
-                // statement that leans on `FINAL` — or that collapses without
-                // the attribution in the group — receives ONE arbitrary
-                // attribution, exactly as ClickHouse would serve it. Only the
-                // explicit attribution-keyed collapse sees both.
-                let collapses_per_attribution = !query.contains("`search_postings` AS p FINAL")
-                    && query.contains("GROUP BY p.term, p.doc_id, p.source_host, p.session_id");
-                if collapses_per_attribution {
-                    vec![
-                        candidate_as("evt-shared-c", SHARED_EVENT_UID, 12.5, 2),
-                        candidate_as("evt-shared-a", SHARED_EVENT_UID, 7.0, 1),
-                    ]
-                } else {
-                    vec![candidate_as("evt-shared-c", SHARED_EVENT_UID, 12.5, 2)]
-                }
+                // Every relation the ranking pass touches is keyed on
+                // `(event_uid, source_host)`: `search_documents` is
+                // `ReplacingMergeTree(doc_version) ORDER BY (event_uid,
+                // source_host)` (and it is the MV SOURCE for postings),
+                // `search_postings` is `ReplacingMergeTree(post_version)
+                // ORDER BY (term, doc_id, source_host)`, `mcp_event_locator` is
+                // `ReplacingMergeTree(event_version) ORDER BY (event_uid,
+                // source_host)`. `session_id` is in none of those sort keys, so
+                // a second attribution is destroyed at merge time; and before
+                // any merge runs, the ranking statement's `l.event_version =
+                // p.post_version` join keeps only the revision the locator
+                // authorizes.
+                //
+                // The mock therefore serves ONE candidate UNCONDITIONALLY. It
+                // does not inspect the statement text to decide (issue #597
+                // D1): a mock that branches on SQL becomes the place a future
+                // change is made to pass.
+                //
+                // `evt-shared-c` is the surviving attribution. `evt-shared-a`
+                // still exists in the CANONICAL relations, and the derivation
+                // and wide handlers below return BOTH sessions' rows for the
+                // uid — `moraine.events` and `mcp_event_navigation` lead their
+                // primary key with `session_id` and genuinely carry both. That
+                // asymmetry is the point: ranking is document-grained, the
+                // reads after it are session-grained, and the hydration maps
+                // must key on `(source_host, session_id, event_uid)` to pick
+                // the row that belongs to the candidate.
+                vec![candidate_as("evt-shared-c", SHARED_EVENT_UID, 12.5, 2)]
             } else if state.options.two_distinct_events_in_one_turn {
                 // Same session, same turn, same event type, same timestamp —
                 // DIFFERENT content. The #539 digest is the only thing telling

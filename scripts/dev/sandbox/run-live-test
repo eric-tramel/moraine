@@ -132,8 +132,10 @@ case "$1" in
         test_function="live_bounded_search_statement_execution"
         ;;
     bounded-search-attribution)
-        # Issue #597 C1: one physical line attributed to two sessions must rank
-        # as two hits, and each session must be able to find its own.
+        # Issue #597 C1: one physical line attributed to two sessions is ONE
+        # document (event_uid is content-addressed and excludes session_id), so
+        # it ranks once. The gate proves attribution happens at HYDRATION —
+        # each session can still find its own copy — not at ranking.
         test_function="live_bounded_search_double_attribution"
         ;;
     -h|--help)

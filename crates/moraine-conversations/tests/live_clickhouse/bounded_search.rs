@@ -27,10 +27,13 @@
 //! results, not just absence of error, so a builder that executes and returns
 //! nothing cannot pass.
 //!
-//! [`double_attribution`] is the C1 gate. It first PROVES the premise on the
-//! server — that `search_postings FINAL` collapses a double-attributed uid to
-//! one row, because `session_id` is not in that table's sort key — and then
-//! proves the ranking pass returns both attributions anyway.
+//! [`double_attribution`] is the document-grain gate (C1, corrected by ledger
+//! D1). It proves on the SERVER that the search read model cannot hold two
+//! attributions of one uid — the locator version join already reduces them to
+//! one before any merge, and `OPTIMIZE … FINAL` leaves one physical row in each
+//! of `search_documents`, `search_postings` and `mcp_event_locator` — and then
+//! that ranking is document-grained end to end: one hit, under the attribution
+//! the locator authorizes, and none under the losing one.
 
 use super::canonical_open_parity::{seed_events, with_owned_live_db, Ev};
 use super::*;
@@ -93,6 +96,13 @@ async fn publish_and_promote(
 #[derive(Debug, Deserialize)]
 struct CountRow {
     value: u64,
+}
+
+/// The session a surviving `search_postings` row names, for the attribution
+/// gate's "which one won" probe.
+#[derive(Debug, Deserialize)]
+struct AttributionRow {
+    session_id: String,
 }
 
 async fn scalar_count(clickhouse: &ClickHouseClient, sql: &str) -> Result<u64> {
@@ -575,6 +585,29 @@ const SHARED_UID: &str = "bs-shared-zephyr-a1";
 /// those fields, which is why one line can carry one uid under two sessions.
 const SHARED_FILE: &str = "/fixtures/bs-shared.jsonl";
 
+/// The LOSING attribution's `event_version`, and the WINNING one's.
+///
+/// Production shape, and it is load-bearing. `event_version` is wall-clock
+/// millis at emit time (`moraine-ingest-core`, `sources/shared.rs`), a single
+/// normalized batch cannot emit one uid twice, and the documented production
+/// shape of a double attribution is a pair ingested ~26 s apart with different
+/// session resolution (#608). Two attributions therefore carry DIFFERENT
+/// versions, and every replacement in the read model —
+/// `search_documents(doc_version)`, `search_postings(post_version)`,
+/// `mcp_event_locator(event_version)` — resolves to the later one.
+///
+/// A fixture that left both at `Ev`'s default `event_version: 1` would model
+/// nothing: equal-version `ReplacingMergeTree` rows are collapsed arbitrarily,
+/// so such a corpus is not merely unrealistic, it is unresolvable.
+const LOSING_VERSION: u64 = 1_700_000_000_000;
+const WINNING_VERSION: u64 = 1_700_000_026_000;
+/// The session the winning attribution names — the one every replacement in the
+/// read model resolves the shared uid to.
+const WINNING_SESSION: &str = "bs-right";
+/// The session the losing attribution names. On a real server this session
+/// cannot find the shared line through search; see [`double_attribution`].
+const LOSING_SESSION: &str = "bs-left";
+
 /// One physical line, two sessions (#608), plus a control session so the
 /// corpus is not degenerate.
 fn attribution_corpus() -> Vec<Ev> {
@@ -582,17 +615,24 @@ fn attribution_corpus() -> Vec<Ev> {
         // Both attributions: identical uid, identical source coordinates
         // (`Ev` derives `source_line_no`/`source_offset` from the seconds
         // argument, so the shared `40` is what makes them the same line),
-        // different session.
-        Ev::new("bs-left", SHARED_UID, 40).source("fixture", SHARED_FILE),
-        Ev::new("bs-right", SHARED_UID, 40).source("fixture", SHARED_FILE),
+        // different session, and — production shape — different
+        // `event_version`, 26 s apart.
+        Ev::new(LOSING_SESSION, SHARED_UID, 40)
+            .source("fixture", SHARED_FILE)
+            .version(LOSING_VERSION),
+        Ev::new(WINNING_SESSION, SHARED_UID, 40)
+            .source("fixture", SHARED_FILE)
+            .version(WINNING_VERSION),
         // Each session also carries a user message so its turn derivation is
         // well formed and the hit lands in turn 1 of its OWN session.
-        Ev::new("bs-left", "bs-left-open-u1", 39)
+        Ev::new(LOSING_SESSION, "bs-left-open-u1", 39)
             .user()
-            .source("fixture", SHARED_FILE),
-        Ev::new("bs-right", "bs-right-open-u1", 39)
+            .source("fixture", SHARED_FILE)
+            .version(LOSING_VERSION),
+        Ev::new(WINNING_SESSION, "bs-right-open-u1", 39)
             .user()
-            .source("fixture", SHARED_FILE),
+            .source("fixture", SHARED_FILE)
+            .version(WINNING_VERSION),
         // Control: a second document containing the term, so `df` is 2 and a
         // corpus of one document cannot make the assertions trivial.
         Ev::new("bs-control", "bs-control-zephyr-a1", 50),
@@ -600,25 +640,46 @@ fn attribution_corpus() -> Vec<Ev> {
     ]
 }
 
-/// **Fails for:** the C1 defect — `FROM search_postings FINAL` (or any collapse
-/// key that omits `session_id`) in the ranking pass.
+/// **Fails for:** ranking that is not document-grained — a per-attribution
+/// collapse over `search_postings`, a weakened locator version join, or a `df`
+/// that stops being an exact document count.
 ///
-/// The gate is in three parts, and the first two are what make the third
-/// meaningful:
+/// This gate replaces the one written for correction C1, which asserted the
+/// opposite contract on a premise that is false (ledger D1). It is in five
+/// parts, and the first four are what make the fifth meaningful:
 ///
-/// 1. **The corpus really is double-attributed.** `search_postings` carries two
-///    rows for `(TERM, SHARED_UID, source_host)` differing only in
-///    `session_id`. If `mv_search_postings` ever stops grouping by session,
-///    this fails and the rest of the gate is known to be vacuous.
-/// 2. **`FINAL` really does collapse them.** `search_postings` is
-///    `ReplacingMergeTree(post_version) ORDER BY (term, doc_id, source_host)`;
-///    the gate asserts on the SERVER that `FINAL` returns one row where the
-///    attribution-keyed group returns two. This is the premise the whole C1
-///    argument rests on, and it is checked rather than asserted in a comment.
-/// 3. **Ranking returns both anyway,** and a session-scoped search finds the
-///    hit under EITHER session — which is the user-visible failure `FINAL`
-///    produces: one of the two sessions searches its own transcript and is
-///    told the line is not there.
+/// 1. **The corpus really is double-attributed.** Canonical `events` is
+///    `ORDER BY (session_id, event_ts, …, event_uid, source_host)` with
+///    `session_id` LEADING, so it is the one relation that durably holds both
+///    attributions. Two rows, one per session, one uid. If ingest ever stops
+///    producing that shape this fails and the rest of the gate is known to be
+///    vacuous.
+/// 2. **The version join alone reduces it to one document, pre-merge.** Reading
+///    `search_postings` WITHOUT `FINAL` and joining `mcp_event_locator FINAL`
+///    on `event_version = post_version` returns ONE row, whether or not a
+///    background merge has run — because the locator holds exactly one row per
+///    `(event_uid, source_host)` at `max(event_version)`, and the losing
+///    attribution's `post_version` is not that value. This is the assertion
+///    that retires the in-query per-attribution collapse: the collapse cannot
+///    recover a row the join is about to drop.
+/// 3. **And the index cannot hold two anyway, durably.** `OPTIMIZE … FINAL`
+///    forces the background merge, and afterwards the PHYSICAL tables hold one
+///    row each: `search_documents` and `mcp_event_locator` are
+///    `ORDER BY (event_uid, source_host)`, `search_postings` is
+///    `ORDER BY (term, doc_id, source_host)`, and `session_id` is in none of
+///    those keys. `ReplacingMergeTree` deduplicates on the sort key at STORAGE
+///    time; a second row is an artifact of unmerged parts, never a state a
+///    query may be built on.
+/// 4. **`df`'s `count()` is exact.** Over `search_postings FINAL` joined to the
+///    locator, `count()` and `uniqExact(tuple(doc_id, source_host))` agree per
+///    term. That equality is the invariant the reverted `df` rests on; the
+///    server is the only place it can be checked.
+/// 5. **Ranking is document-grained end to end.** One hit for the shared uid,
+///    under the WINNING session, and a session-scoped search of that session
+///    finds it. A scoped search of the LOSING session does NOT — stated as the
+///    contract rather than discovered later as a defect. That loss is an INGEST
+///    bug owned by #608 (one of the two session ids is simply wrong); the read
+///    model must not mirror it.
 ///
 /// **UNRUN.** Never executed against a server; run
 /// `scripts/dev/sandbox/run-live-test bounded-search-attribution`.
@@ -633,85 +694,194 @@ pub(super) async fn double_attribution() -> Result<()> {
             seed_events(&clickhouse, &attribution_corpus()).await?;
             publish_and_promote(&clickhouse, &database).await?;
 
-            // --- (1) the fixture premise -----------------------------------
-            let attributions = scalar_count(
+            // --- (1) the fixture premise, in the one relation that keeps it --
+            let canonical = scalar_count(
                 &clickhouse,
                 &format!(
                     "SELECT toUInt64(count()) AS value FROM (
   SELECT session_id
-  FROM search_postings
-  WHERE term = '{TERM}' AND doc_id = '{SHARED_UID}'
-  GROUP BY term, doc_id, source_host, session_id
+  FROM events
+  WHERE event_uid = '{SHARED_UID}'
+  GROUP BY session_id
 ) FORMAT JSONEachRow"
                 ),
             )
             .await?;
-            if attributions != 2 {
+            if canonical != 2 {
                 bail!(
-                    "the fixture must produce TWO posting attributions for one \
-                     uid, got {attributions}; without that this gate proves nothing"
+                    "the fixture must attribute ONE uid to TWO sessions in \
+                     canonical `events`, got {canonical}; without that this \
+                     gate proves nothing"
                 );
             }
 
-            // --- (2) the premise C1 rests on -------------------------------
-            let after_final = scalar_count(
+            // --- (2) the version join closes the pre-merge window ------------
+            //
+            // Deliberately WITHOUT `FINAL` on the postings scan: this is the
+            // count an attribution-keyed collapse would have been reading, and
+            // it is already 1.
+            let joined = scalar_count(
                 &clickhouse,
                 &format!(
                     "SELECT toUInt64(count()) AS value
-FROM (SELECT * FROM search_postings FINAL)
-WHERE term = '{TERM}' AND doc_id = '{SHARED_UID}'
+FROM search_postings AS p
+ALL INNER JOIN (
+  SELECT l.event_uid AS event_uid, l.source_host AS source_host,
+         l.event_version AS event_version
+  FROM mcp_event_locator AS l FINAL
+) AS l
+  ON l.event_uid = p.doc_id
+ AND l.source_host = p.source_host
+ AND l.event_version = p.post_version
+WHERE p.term = '{TERM}' AND p.doc_id = '{SHARED_UID}'
 FORMAT JSONEachRow"
                 ),
             )
             .await?;
-            if after_final != 1 {
+            if joined != 1 {
                 bail!(
-                    "`search_postings FINAL` returned {after_final} rows for a \
-                     double-attributed uid. C1's entire argument is that it \
-                     returns 1 because `session_id` is not in the sort key — if \
-                     that is no longer true, re-derive the fix rather than \
-                     trusting this gate"
+                    "the locator version join must reduce a double-attributed \
+                     uid to ONE posting even before a merge runs, got {joined}; \
+                     if that is no longer true, re-derive the ranking shape \
+                     rather than trusting this gate"
                 );
             }
 
-            // …and the df formula the ranking pass uses is a DOCUMENT count, so
-            // it does not double-count that uid. `count()` over the same
-            // relation would say 2.
-            let df_documents = scalar_count(
-                &clickhouse,
-                &format!(
-                    "SELECT toUInt64(uniqExact(tuple(doc_id, source_host))) AS value
-FROM (
-  SELECT doc_id, source_host
-  FROM search_postings
-  WHERE term = '{TERM}'
-  GROUP BY term, doc_id, source_host, session_id
-) FORMAT JSONEachRow"
+            // …and it kept the LATER attribution, which is the one every other
+            // replacement in the read model resolves to.
+            let winning: Vec<AttributionRow> = clickhouse
+                .query_rows(
+                    &format!(
+                        "SELECT p.session_id AS session_id
+FROM search_postings AS p
+ALL INNER JOIN (
+  SELECT l.event_uid AS event_uid, l.source_host AS source_host,
+         l.event_version AS event_version
+  FROM mcp_event_locator AS l FINAL
+) AS l
+  ON l.event_uid = p.doc_id
+ AND l.source_host = p.source_host
+ AND l.event_version = p.post_version
+WHERE p.term = '{TERM}' AND p.doc_id = '{SHARED_UID}'
+FORMAT JSONEachRow"
+                    ),
+                    None,
+                )
+                .await
+                .context("winning-attribution probe failed")?;
+            match winning.first() {
+                Some(row) if row.session_id == WINNING_SESSION => {}
+                other => bail!(
+                    "the surviving posting must name the later attribution \
+                     ({WINNING_SESSION}); got {other:?}"
                 ),
-            )
-            .await?;
-            let df_attributions = scalar_count(
+            }
+
+            // --- (3) the durable state, after forcing the merge --------------
+            for table in ["search_documents", "search_postings", "mcp_event_locator"] {
+                clickhouse
+                    .request_text(
+                        &format!("OPTIMIZE TABLE `{}`.`{table}` FINAL", database.as_str()),
+                        None,
+                        Some(database.as_str()),
+                        false,
+                        None,
+                    )
+                    .await
+                    .with_context(|| format!("failed to OPTIMIZE {table} FINAL"))?;
+            }
+            for (table, sql) in [
+                (
+                    "search_postings",
+                    format!(
+                        "SELECT toUInt64(count()) AS value FROM search_postings \
+                         WHERE term = '{TERM}' AND doc_id = '{SHARED_UID}' \
+                         FORMAT JSONEachRow"
+                    ),
+                ),
+                (
+                    "search_documents",
+                    format!(
+                        "SELECT toUInt64(count()) AS value FROM search_documents \
+                         WHERE event_uid = '{SHARED_UID}' FORMAT JSONEachRow"
+                    ),
+                ),
+                (
+                    "mcp_event_locator",
+                    format!(
+                        "SELECT toUInt64(count()) AS value FROM mcp_event_locator \
+                         WHERE event_uid = '{SHARED_UID}' FORMAT JSONEachRow"
+                    ),
+                ),
+            ] {
+                let physical = scalar_count(&clickhouse, &sql).await?;
+                if physical != 1 {
+                    bail!(
+                        "`{table}` holds {physical} physical rows for a \
+                         double-attributed uid after OPTIMIZE FINAL. The whole \
+                         document-grain argument is that it holds 1, because \
+                         `session_id` is not in its sort key — if that is no \
+                         longer true, re-derive the design rather than \
+                         trusting this gate"
+                    );
+                }
+            }
+
+            // --- (4) `df`'s count() is an exact document count ---------------
+            let df_rows = scalar_count(
                 &clickhouse,
                 &format!(
                     "SELECT toUInt64(count()) AS value
-FROM (
-  SELECT doc_id, source_host
-  FROM search_postings
-  WHERE term = '{TERM}'
-  GROUP BY term, doc_id, source_host, session_id
-) FORMAT JSONEachRow"
+FROM (SELECT * FROM search_postings FINAL) AS p
+ALL INNER JOIN (
+  SELECT l.event_uid AS event_uid, l.source_host AS source_host,
+         l.event_version AS event_version
+  FROM mcp_event_locator AS l FINAL
+) AS l
+  ON l.event_uid = p.doc_id
+ AND l.source_host = p.source_host
+ AND l.event_version = p.post_version
+WHERE p.term = '{TERM}'
+FORMAT JSONEachRow"
                 ),
             )
             .await?;
-            if df_documents != 2 || df_attributions != 3 {
+            let df_documents = scalar_count(
+                &clickhouse,
+                &format!(
+                    "SELECT toUInt64(uniqExact(tuple(p.doc_id, p.source_host))) AS value
+FROM (SELECT * FROM search_postings FINAL) AS p
+ALL INNER JOIN (
+  SELECT l.event_uid AS event_uid, l.source_host AS source_host,
+         l.event_version AS event_version
+  FROM mcp_event_locator AS l FINAL
+) AS l
+  ON l.event_uid = p.doc_id
+ AND l.source_host = p.source_host
+ AND l.event_version = p.post_version
+WHERE p.term = '{TERM}'
+FORMAT JSONEachRow"
+                ),
+            )
+            .await?;
+            if df_rows != df_documents {
                 bail!(
-                    "the fixture must separate the two df formulas (documents \
-                     {df_documents}, attributions {df_attributions}); a corpus \
-                     where they agree cannot show which one ships"
+                    "`count()` ({df_rows}) and \
+                     `uniqExact(tuple(doc_id, source_host))` ({df_documents}) \
+                     must agree on the ranking relation — that equality is the \
+                     only reason `df` may use the O(1) accumulator"
+                );
+            }
+            if df_documents != 2 {
+                bail!(
+                    "the corpus must hold TWO live documents containing the \
+                     term (the shared line and the control), got \
+                     {df_documents}; a one-document corpus makes the equality \
+                     above trivial"
                 );
             }
 
-            // --- (3) the ranking pass ---------------------------------------
+            // --- (5) the ranking pass ---------------------------------------
             let repo = repository(&clickhouse, None);
             if !repo.canonical_reader_ready().await {
                 bail!("the canonical path must be selected before this gate can mean anything");
@@ -725,45 +895,65 @@ FROM (
             .scope(repo.search_mcp_events(mcp_query(TERM)))
             .await
             .map_err(|error| anyhow!("unscoped attribution search failed: {error:#}"))?;
-            let shared: BTreeSet<&str> = unscoped
+            let shared: Vec<&str> = unscoped
                 .hits
                 .iter()
                 .filter(|hit| hit.event_uid == SHARED_UID)
                 .map(|hit| hit.session_id.as_str())
                 .collect();
-            if shared != BTreeSet::from(["bs-left", "bs-right"]) {
+            if shared != vec![WINNING_SESSION] {
                 bail!(
-                    "one uid attributed to two sessions must rank as TWO hits, \
-                     one per session; got {shared:?}"
+                    "one physical line is ONE document and must rank ONCE, \
+                     under the attribution the locator authorizes \
+                     ({WINNING_SESSION}); got {shared:?}"
                 );
             }
 
-            // The user-visible half: each session can find its own line.
-            for session in ["bs-left", "bs-right"] {
-                let scoped_hit = QueryEnvelope::new(
-                    &format!("issue597-attribution-{session}"),
-                    QueryClass::Interactive,
-                    &default_interactive_budget(),
-                )
-                .scope(repo.search_mcp_events(SearchMcpEventsQuery {
-                    session_id: Some(session.to_string()),
-                    ..mcp_query(TERM)
-                }))
-                .await
-                .map_err(|error| {
-                    anyhow!("{session}-scoped attribution search failed: {error:#}")
-                })?;
-                if !scoped_hit
-                    .hits
-                    .iter()
-                    .any(|hit| hit.event_uid == SHARED_UID && hit.session_id == session)
-                {
-                    bail!(
-                        "a session-scoped search of {session} must find the line \
-                         attributed to it; this is exactly what `FINAL` on \
-                         `search_postings` takes away from one of the two sessions"
-                    );
-                }
+            // The winning session finds its own line…
+            let scoped_hit = QueryEnvelope::new(
+                "issue597-attribution-winning",
+                QueryClass::Interactive,
+                &default_interactive_budget(),
+            )
+            .scope(repo.search_mcp_events(SearchMcpEventsQuery {
+                session_id: Some(WINNING_SESSION.to_string()),
+                ..mcp_query(TERM)
+            }))
+            .await
+            .map_err(|error| anyhow!("{WINNING_SESSION}-scoped search failed: {error:#}"))?;
+            if !scoped_hit
+                .hits
+                .iter()
+                .any(|hit| hit.event_uid == SHARED_UID && hit.session_id == WINNING_SESSION)
+            {
+                bail!("a session-scoped search of {WINNING_SESSION} must find the line it owns");
+            }
+
+            // …and the losing session does not. This is the CONTRACT, not a
+            // regression: the read model is document-grained, one of the two
+            // session ids is an ingest defect (#608), and mirroring it in the
+            // index would fork `df`/`docs` into two corpora over one physical
+            // line and let search resolve the uid to a different session than
+            // `open` does. ~1% of the reference corpus is affected.
+            let losing = QueryEnvelope::new(
+                "issue597-attribution-losing",
+                QueryClass::Interactive,
+                &default_interactive_budget(),
+            )
+            .scope(repo.search_mcp_events(SearchMcpEventsQuery {
+                session_id: Some(LOSING_SESSION.to_string()),
+                ..mcp_query(TERM)
+            }))
+            .await
+            .map_err(|error| anyhow!("{LOSING_SESSION}-scoped search failed: {error:#}"))?;
+            if losing.hits.iter().any(|hit| hit.event_uid == SHARED_UID) {
+                bail!(
+                    "a scoped search of the LOSING attribution returned the \
+                     shared uid. That would mean the index is holding two \
+                     attributions of one document — re-derive the design (and \
+                     `df`, which assumes it does not) rather than relaxing \
+                     this assertion"
+                );
             }
 
             Ok(())

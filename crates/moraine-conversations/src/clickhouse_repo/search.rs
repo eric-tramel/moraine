@@ -1467,8 +1467,11 @@ FORMAT JSONEachRow",
         // `ORDER BY (event_uid)`, so a document is per-uid by construction and
         // its digest/phase are the same values for every session the uid is
         // attributed to. The map is therefore keyed per document and READ, not
-        // consumed: `remove` would starve the second candidate of a
-        // double-attributed uid and drop it as if it were stale.
+        // consumed — `remove` would make the lookup order-dependent if a uid
+        // ever reached this point more than once. Ranking is document-grained
+        // (see `bounded_ranking_ctes`), so today it does not; keeping the read
+        // non-consuming means that stays a property of ranking rather than a
+        // silent dependency of this code.
         let dedup_sql = self.build_search_dedup_keys_sql(&candidates)?;
         let dedup_rows: Vec<SearchDedupKeyRow> =
             self.map_backend(self.query_rows(&dedup_sql, None).await)?;
