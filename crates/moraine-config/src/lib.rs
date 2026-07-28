@@ -2021,6 +2021,20 @@ where
     let sanitized_content = sanitize_clickhouse_environment_references(&content, &references)?;
     let mut cfg: AppConfig = parse_config_toml(&sanitized_content)?;
 
+    // The struct-level parse cannot tell an explicit `[clickhouse]` block
+    // from its serde default, so the both-declared ambiguity is detected on
+    // the raw TOML document before any environment values are resolved.
+    if raw.get("clickhouse").is_some()
+        && raw
+            .get("backends")
+            .and_then(|backends| backends.get(DEFAULT_BACKEND_NAME))
+            .is_some()
+    {
+        return Err(anyhow::anyhow!(
+            "config declares both [clickhouse] and [backends.default]; they are aliases for the same backend — keep exactly one"
+        ));
+    }
+
     for reference in references {
         let value = lookup(&reference.variable).map_err(|error| {
             anyhow::Error::new(ClickHouseEnvironmentUnavailable {
@@ -2038,19 +2052,6 @@ where
         assign_clickhouse_environment_value(&mut cfg, reference, value);
     }
 
-    // The struct-level parse cannot tell an explicit `[clickhouse]` block
-    // from its serde default, so the both-declared ambiguity is detected on
-    // the raw TOML document instead.
-    if raw.get("clickhouse").is_some()
-        && raw
-            .get("backends")
-            .and_then(|backends| backends.get(DEFAULT_BACKEND_NAME))
-            .is_some()
-    {
-        return Err(anyhow::anyhow!(
-            "config declares both [clickhouse] and [backends.default]; they are aliases for the same backend — keep exactly one"
-        ));
-    }
     normalize_backend_bind(&mut cfg, &raw);
     validate_non_loopback_backend_upgrade(&cfg, &raw)?;
     normalize_backend_start_on_up(&mut cfg, &raw);
@@ -4653,6 +4654,34 @@ url = "http://10.0.0.1:8123"
         assert!(
             format!("{err:#}").contains("both [clickhouse] and [backends.default]"),
             "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn clickhouse_alias_conflict_precedes_environment_lookup() {
+        let path = write_temp_config(
+            r#"
+[clickhouse]
+password = { env = "MORAINE_TEST_AMBIGUOUS_CLICKHOUSE_PASSWORD" }
+
+[backends.default]
+url = "http://10.0.0.1:8123"
+"#,
+            "backends-ambiguous-environment-default",
+        );
+        let lookup_count = std::cell::Cell::new(0);
+        let error = load_config_with_policy_and_lookup(&path, None, ConfigOrigin::Explicit, |_| {
+            lookup_count.set(lookup_count.get() + 1);
+            Err(std::env::VarError::NotPresent)
+        })
+        .expect_err("declaring both aliases should fail before environment lookup");
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(lookup_count.get(), 0, "alias conflict must precede lookup");
+        assert!(!is_clickhouse_environment_unavailable_error(&error));
+        assert!(
+            format!("{error:#}").contains("both [clickhouse] and [backends.default]"),
+            "unexpected error: {error:#}"
         );
     }
 
