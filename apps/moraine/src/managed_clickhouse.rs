@@ -1745,6 +1745,77 @@ pub(crate) fn cmd_clickhouse_uninstall(paths: &RuntimePaths) -> Result<String> {
 mod tests {
     use super::*;
     use moraine_config::AppConfig;
+
+    /// The server config template must be well-formed XML.
+    ///
+    /// `CLICKHOUSE_TEMPLATE` is rendered as the whole server config, so a
+    /// malformed template does not degrade anything — the server refuses to
+    /// start, the supervisor exhausts its five replacements, and the stack is
+    /// dead. Nothing else in the suite parses this file, which is how #603's
+    /// WI-08 comment shipped a `--` inside an XML comment (illegal per the
+    /// spec, `SAXParseException: Invalid token`) with every unit test green;
+    /// only `e2e-stack` caught it, and only by launching a real server.
+    ///
+    /// This checks the two properties a hand-edited XML file actually loses:
+    /// balanced tags, and no `--` inside a comment. The second is the one that
+    /// bites, because prose about command-line flags is exactly what belongs
+    /// in a config comment.
+    ///
+    /// MUTATION: put `--config-file` back into any comment in
+    /// `config/clickhouse.xml` and this fails.
+    #[test]
+    fn the_clickhouse_config_template_is_well_formed_xml() {
+        let mut rest = CLICKHOUSE_TEMPLATE;
+        while let Some(open) = rest.find("<!--") {
+            let after = &rest[open + 4..];
+            let close = after.find("-->").expect(
+                "an unterminated XML comment in config/clickhouse.xml: the server refuses to \
+                 start and the supervisor exhausts its replacements",
+            );
+            let body = &after[..close];
+            assert!(
+                !body.contains("--"),
+                "config/clickhouse.xml has a comment containing `--`, which XML forbids; \
+                 ClickHouse fails with `SAXParseException: Invalid token` and never starts. \
+                 Offending comment body: {body:?}"
+            );
+            rest = &after[close + 3..];
+        }
+
+        let mut depth = 0i32;
+        let mut scan = CLICKHOUSE_TEMPLATE;
+        while let Some(lt) = scan.find('<') {
+            let tail = &scan[lt..];
+            if tail.starts_with("<!--") {
+                let close = tail[4..]
+                    .find("-->")
+                    .expect("comment termination checked above");
+                scan = &tail[4 + close + 3..];
+                continue;
+            }
+            if tail.starts_with("<?") {
+                let close = tail.find("?>").expect("an unterminated XML declaration");
+                scan = &tail[close + 2..];
+                continue;
+            }
+            let close = tail.find('>').expect("an unterminated XML tag");
+            let inner = &tail[1..close];
+            if inner.starts_with('/') {
+                depth -= 1;
+            } else if !inner.ends_with('/') {
+                depth += 1;
+            }
+            assert!(
+                depth >= 0,
+                "config/clickhouse.xml closes a tag it never opened"
+            );
+            scan = &tail[close + 1..];
+        }
+        assert_eq!(
+            depth, 0,
+            "config/clickhouse.xml leaves {depth} tag(s) unclosed; the server would refuse to start"
+        );
+    }
     use std::net::{SocketAddr, TcpListener, TcpStream};
     use std::sync::{
         atomic::{AtomicBool, Ordering},

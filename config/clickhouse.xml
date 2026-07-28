@@ -36,8 +36,9 @@
 
   <!-- System-log retention (issue #603 WI-08).
 
-       This file is rendered as the WHOLE server config and launched with
-       `--config-file`, so ClickHouse's packaged `config.xml` — which ships
+       This file is rendered as the WHOLE server config and launched with an
+       explicit config-file flag, so ClickHouse's packaged `config.xml` — which
+       ships
        `<ttl>event_date + INTERVAL 30 DAY DELETE</ttl>` on each of these
        sections — is never loaded, and these tables had no retention of any
        kind. Verified empirically on the reference host (ClickHouse 25.12.5.44,
