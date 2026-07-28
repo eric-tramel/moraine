@@ -13,8 +13,9 @@ async fn main() -> Result<()> {
         .init();
 
     let args = cli::parse_args();
-    let config = moraine_config::load_config(&args.config_path)
-        .with_context(|| format!("failed to load config {}", args.config_path.display()))?;
+    let config_display = args.config_path.display().to_string();
+    let (_, config) = moraine_config::load_resolved_config(args.config_path)
+        .with_context(|| format!("failed to load config {config_display}"))?;
 
     moraine_ingest_core::run_ingestor(config).await
 }

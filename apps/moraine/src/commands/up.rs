@@ -1,7 +1,7 @@
 use anyhow::Result;
 use dialoguer::console::Style;
 use moraine_clickhouse::MigrationProgress;
-use moraine_config::AppConfig;
+use moraine_config::{AppConfig, LoadedConfigPath};
 use std::future::Future;
 use std::io::Write;
 use std::process::ExitCode;
@@ -452,7 +452,7 @@ impl<W: Write> StartupProgress<W> {
 
 pub(super) async fn handle_args(
     output: &CliOutput,
-    config_path: &std::path::Path,
+    config_path: &LoadedConfigPath,
     cfg: &AppConfig,
     args: &UpArgs,
 ) -> Result<ExitCode> {
@@ -476,7 +476,7 @@ pub(super) async fn handle_args(
 }
 
 async fn start_selected_services<W: Write>(
-    config_path: &std::path::Path,
+    config_path: &LoadedConfigPath,
     cfg: &AppConfig,
     paths: &RuntimePaths,
     services_to_start: Vec<Service>,

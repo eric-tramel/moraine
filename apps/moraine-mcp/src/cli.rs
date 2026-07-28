@@ -1,4 +1,5 @@
 use anyhow::{anyhow, bail, Result};
+use moraine_config::ResolvedConfigPath;
 use std::path::PathBuf;
 
 /// How this `moraine-mcp` process should run.
@@ -15,7 +16,7 @@ pub enum ServeMode {
 
 #[derive(Debug, Clone)]
 pub struct CliArgs {
-    pub config_path: PathBuf,
+    pub config_path: ResolvedConfigPath,
     pub serve_mode: ServeMode,
     /// Optional `--socket <path>` override for the central socket path,
     /// otherwise taken from `mcp.central_socket_path` in config.
@@ -173,6 +174,7 @@ pub fn parse_args() -> Result<CliArgs> {
 #[cfg(test)]
 mod tests {
     use super::{parse_args_from, ServeMode};
+    use moraine_config::ConfigOrigin;
     use std::path::PathBuf;
 
     #[test]
@@ -187,7 +189,8 @@ mod tests {
         let parsed =
             parse_args_from(vec!["--config".to_string(), "/tmp/mcp.toml".to_string()].into_iter())
                 .expect("valid config path should parse");
-        assert_eq!(parsed.config_path, PathBuf::from("/tmp/mcp.toml"));
+        assert_eq!(parsed.config_path.display().to_string(), "/tmp/mcp.toml");
+        assert_eq!(parsed.config_path.origin(), ConfigOrigin::Explicit);
     }
 
     #[test]
@@ -236,7 +239,8 @@ mod tests {
         )
         .expect("launcher equals forms should parse");
 
-        assert_eq!(parsed.config_path, PathBuf::from("/tmp/mcp.toml"));
+        assert_eq!(parsed.config_path.display().to_string(), "/tmp/mcp.toml");
+        assert_eq!(parsed.config_path.origin(), ConfigOrigin::Explicit);
         assert_eq!(parsed.serve_mode, ServeMode::Socket);
         assert_eq!(
             parsed.socket_override,

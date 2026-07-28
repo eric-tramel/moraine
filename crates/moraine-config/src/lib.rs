@@ -145,7 +145,7 @@ pub enum ClickHouseRequestCompression {
     Gzip,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClickHouseConfig {
     #[serde(default = "default_ch_url")]
@@ -171,6 +171,64 @@ pub struct ClickHouseConfig {
     /// itself); false means unknown server-side versions are a hard error.
     #[serde(default = "default_false")]
     pub allow_newer_server: bool,
+}
+
+const CLICKHOUSE_ENVIRONMENT_NOT_SET_MARKER: &str = "referenced by ClickHouse config is not set";
+const CLICKHOUSE_ENVIRONMENT_NOT_UNICODE_MARKER: &str =
+    "referenced by ClickHouse config is not valid Unicode";
+
+#[derive(Debug)]
+enum ClickHouseEnvironmentUnavailableKind {
+    NotPresent,
+    NotUnicode,
+}
+
+#[derive(Debug)]
+struct ClickHouseEnvironmentUnavailable {
+    variable: String,
+    kind: ClickHouseEnvironmentUnavailableKind,
+}
+
+impl fmt::Display for ClickHouseEnvironmentUnavailable {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let marker = match self.kind {
+            ClickHouseEnvironmentUnavailableKind::NotPresent => {
+                CLICKHOUSE_ENVIRONMENT_NOT_SET_MARKER
+            }
+            ClickHouseEnvironmentUnavailableKind::NotUnicode => {
+                CLICKHOUSE_ENVIRONMENT_NOT_UNICODE_MARKER
+            }
+        };
+        write!(
+            formatter,
+            "environment variable `{}` {marker}",
+            self.variable
+        )
+    }
+}
+
+impl std::error::Error for ClickHouseEnvironmentUnavailable {}
+
+/// Returns true when config loading reports that a referenced ClickHouse
+/// environment value was unavailable to the current process.
+///
+/// Callers such as setup can distinguish this transient condition from
+/// malformed TOML and must not offer destructive config repair for it.
+pub fn is_clickhouse_environment_unavailable_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<ClickHouseEnvironmentUnavailable>()
+            .is_some()
+    })
+}
+
+fn is_valid_environment_variable_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    (first == b'_' || first.is_ascii_alphabetic())
+        && bytes.all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
 }
 
 /// Reserved name of the backend that the `[clickhouse]` block aliases. The
@@ -321,7 +379,7 @@ pub struct Bm25Config {
     pub max_query_terms: usize,
 }
 
-const REDACTED_AUTH_TOKEN: &str = "[REDACTED]";
+const REDACTED_SECRET: &str = "[REDACTED]";
 
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -481,8 +539,24 @@ impl fmt::Debug for BackendConfig {
             .field("bind", &self.bind)
             .field(
                 "auth_token",
-                &self.auth_token.as_ref().map(|_| REDACTED_AUTH_TOKEN),
+                &self.auth_token.as_ref().map(|_| REDACTED_SECRET),
             )
+            .finish()
+    }
+}
+
+impl fmt::Debug for ClickHouseConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClickHouseConfig")
+            .field("url", &self.url)
+            .field("database", &self.database)
+            .field("username", &self.username)
+            .field("password", &REDACTED_SECRET)
+            .field("timeout_seconds", &self.timeout_seconds)
+            .field("request_compression", &self.request_compression)
+            .field("async_insert", &self.async_insert)
+            .field("wait_for_async_insert", &self.wait_for_async_insert)
+            .field("allow_newer_server", &self.allow_newer_server)
             .finish()
     }
 }
@@ -1203,91 +1277,170 @@ fn repo_default_config_path() -> PathBuf {
 }
 
 const DEFAULT_CONFIG_ENV_KEYS: &[&str] = &["MORAINE_DEFAULT_CONFIG"];
+const PROPAGATED_CONFIG_ORIGIN_ENV: &str = "MORAINE_INTERNAL_CONFIG_ORIGIN";
+const PROPAGATED_HOME_ORIGIN: &str = "home";
+const PROPAGATED_IMPLICIT_REPO_ORIGIN: &str = "implicit-repo-fallback";
 
-fn resolve_config_path_with_overrides(
+/// Describes why Moraine selected a configuration file.
+///
+/// Environment-backed ClickHouse values are trusted only when the user selected
+/// the config explicitly or when it is the user-owned home config. A repository
+/// file found solely because it exists in the launch directory is untrusted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigOrigin {
+    Explicit,
+    Home,
+    ImplicitRepoFallback,
+}
+
+/// A selected configuration path whose trust provenance has not been discarded.
+///
+/// The path is intentionally private and this type does not implement
+/// `AsRef<Path>`: automatically resolved configs must be consumed by
+/// [`load_resolved_config`] so their origin participates in loading policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedConfigPath {
+    path: PathBuf,
+    origin: ConfigOrigin,
+}
+
+/// A config path that has already been loaded under its selection policy.
+///
+/// Runtime launchers retain this value so child processes can reload the same
+/// path without accidentally upgrading an implicit repository fallback to an
+/// explicit, trusted selection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadedConfigPath {
+    path: PathBuf,
+    origin: ConfigOrigin,
+}
+
+impl LoadedConfigPath {
+    pub fn as_path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn origin(&self) -> ConfigOrigin {
+        self.origin
+    }
+
+    pub fn display(&self) -> std::path::Display<'_> {
+        self.path.display()
+    }
+
+    /// Environment marker for a child that reloads this already-selected path.
+    /// Explicit selections need no marker because `--config` is explicit by
+    /// default. Home and implicit-repository origins are preserved exactly.
+    pub fn child_origin_environment(&self) -> Option<(&'static str, &'static str)> {
+        let value = match self.origin {
+            ConfigOrigin::Explicit => return None,
+            ConfigOrigin::Home => PROPAGATED_HOME_ORIGIN,
+            ConfigOrigin::ImplicitRepoFallback => PROPAGATED_IMPLICIT_REPO_ORIGIN,
+        };
+        Some((PROPAGATED_CONFIG_ORIGIN_ENV, value))
+    }
+}
+
+impl ResolvedConfigPath {
+    fn new(path: PathBuf, origin: ConfigOrigin) -> Self {
+        Self { path, origin }
+    }
+
+    pub fn origin(&self) -> ConfigOrigin {
+        self.origin
+    }
+
+    pub fn display(&self) -> std::path::Display<'_> {
+        self.path.display()
+    }
+}
+
+fn resolve_config_path_with_overrides<Env, Exists>(
     raw_path: Option<PathBuf>,
     env_keys: &[&str],
     home_path: Option<PathBuf>,
     default_env_keys: &[&str],
     repo_default: PathBuf,
-) -> PathBuf {
+    read_env: Env,
+    path_exists: Exists,
+) -> ResolvedConfigPath
+where
+    Env: Fn(&str) -> Option<String>,
+    Exists: Fn(&Path) -> bool,
+{
     if let Some(path) = raw_path {
-        return path;
+        let origin = match read_env(PROPAGATED_CONFIG_ORIGIN_ENV).as_deref() {
+            Some(PROPAGATED_HOME_ORIGIN) => ConfigOrigin::Home,
+            Some(PROPAGATED_IMPLICIT_REPO_ORIGIN) => ConfigOrigin::ImplicitRepoFallback,
+            _ => ConfigOrigin::Explicit,
+        };
+        return ResolvedConfigPath::new(path, origin);
     }
 
     for key in env_keys {
-        if let Ok(value) = std::env::var(key) {
+        if let Some(value) = read_env(key) {
             let trimmed = value.trim();
             if !trimmed.is_empty() {
-                return PathBuf::from(trimmed);
+                return ResolvedConfigPath::new(PathBuf::from(trimmed), ConfigOrigin::Explicit);
             }
         }
     }
 
-    if let Some(path) = home_path {
-        if path.exists() {
-            return path;
+    if let Some(path) = home_path.as_ref() {
+        if path_exists(path) {
+            return ResolvedConfigPath::new(path.clone(), ConfigOrigin::Home);
         }
     }
 
     for key in default_env_keys {
-        if let Ok(value) = std::env::var(key) {
+        if let Some(value) = read_env(key) {
             let trimmed = value.trim();
             if trimmed.is_empty() {
                 continue;
             }
             let candidate = PathBuf::from(trimmed);
-            if candidate.exists() {
-                return candidate;
+            if path_exists(&candidate) {
+                return ResolvedConfigPath::new(candidate, ConfigOrigin::Explicit);
             }
         }
     }
 
-    if repo_default.exists() {
-        return repo_default;
+    if path_exists(&repo_default) {
+        return ResolvedConfigPath::new(repo_default, ConfigOrigin::ImplicitRepoFallback);
     }
 
-    home_config_path().unwrap_or(repo_default)
+    match home_path {
+        Some(path) => ResolvedConfigPath::new(path, ConfigOrigin::Home),
+        None => ResolvedConfigPath::new(repo_default, ConfigOrigin::ImplicitRepoFallback),
+    }
 }
 
-pub fn resolve_config_path(raw_path: Option<PathBuf>) -> PathBuf {
+fn resolve_config_path_for(raw_path: Option<PathBuf>, env_keys: &[&str]) -> ResolvedConfigPath {
     resolve_config_path_with_overrides(
         raw_path,
-        &["MORAINE_CONFIG"],
+        env_keys,
         home_config_path(),
         DEFAULT_CONFIG_ENV_KEYS,
         repo_default_config_path(),
+        |key| std::env::var(key).ok(),
+        Path::exists,
     )
 }
 
-pub fn resolve_mcp_config_path(raw_path: Option<PathBuf>) -> PathBuf {
-    resolve_config_path_with_overrides(
-        raw_path,
-        &["MORAINE_MCP_CONFIG", "MORAINE_CONFIG"],
-        home_config_path(),
-        DEFAULT_CONFIG_ENV_KEYS,
-        repo_default_config_path(),
-    )
+pub fn resolve_config_path(raw_path: Option<PathBuf>) -> ResolvedConfigPath {
+    resolve_config_path_for(raw_path, &["MORAINE_CONFIG"])
 }
 
-pub fn resolve_monitor_config_path(raw_path: Option<PathBuf>) -> PathBuf {
-    resolve_config_path_with_overrides(
-        raw_path,
-        &["MORAINE_MONITOR_CONFIG", "MORAINE_CONFIG"],
-        home_config_path(),
-        DEFAULT_CONFIG_ENV_KEYS,
-        repo_default_config_path(),
-    )
+pub fn resolve_mcp_config_path(raw_path: Option<PathBuf>) -> ResolvedConfigPath {
+    resolve_config_path_for(raw_path, &["MORAINE_MCP_CONFIG", "MORAINE_CONFIG"])
 }
 
-pub fn resolve_ingest_config_path(raw_path: Option<PathBuf>) -> PathBuf {
-    resolve_config_path_with_overrides(
-        raw_path,
-        &["MORAINE_INGEST_CONFIG", "MORAINE_CONFIG"],
-        home_config_path(),
-        DEFAULT_CONFIG_ENV_KEYS,
-        repo_default_config_path(),
-    )
+pub fn resolve_monitor_config_path(raw_path: Option<PathBuf>) -> ResolvedConfigPath {
+    resolve_config_path_for(raw_path, &["MORAINE_MONITOR_CONFIG", "MORAINE_CONFIG"])
+}
+
+pub fn resolve_ingest_config_path(raw_path: Option<PathBuf>) -> ResolvedConfigPath {
+    resolve_config_path_for(raw_path, &["MORAINE_INGEST_CONFIG", "MORAINE_CONFIG"])
 }
 
 fn resolve_runtime_subdir(root: &str, value: &str) -> String {
@@ -1640,14 +1793,254 @@ fn parse_config_toml<T: DeserializeOwned>(content: &str) -> Result<T> {
     })
 }
 
-fn load_config_with_home_path(path: &Path, home_path: Option<PathBuf>) -> Result<AppConfig> {
+#[derive(Debug, Clone, Copy)]
+enum ClickHouseStringField {
+    Url,
+    Database,
+    Username,
+    Password,
+}
+
+impl ClickHouseStringField {
+    fn key(self) -> &'static str {
+        match self {
+            Self::Url => "url",
+            Self::Database => "database",
+            Self::Username => "username",
+            Self::Password => "password",
+        }
+    }
+
+    fn assign(self, config: &mut ClickHouseConfig, value: String) {
+        match self {
+            Self::Url => config.url = value,
+            Self::Database => config.database = value,
+            Self::Username => config.username = value,
+            Self::Password => config.password = value,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum ClickHouseConfigTarget {
+    ClickHouse,
+    Backend(String),
+}
+
+impl ClickHouseConfigTarget {
+    fn label(&self) -> String {
+        match self {
+            Self::ClickHouse => "clickhouse".to_string(),
+            Self::Backend(name) => format!("backends.{name}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ClickHouseEnvironmentReference {
+    target: ClickHouseConfigTarget,
+    field: ClickHouseStringField,
+    variable: String,
+    span: std::ops::Range<usize>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ClickHouseEnvironmentFields {
+    url: Option<toml::Spanned<toml::Value>>,
+    database: Option<toml::Spanned<toml::Value>>,
+    username: Option<toml::Spanned<toml::Value>>,
+    password: Option<toml::Spanned<toml::Value>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ClickHouseEnvironmentDocument {
+    clickhouse: Option<ClickHouseEnvironmentFields>,
+    #[serde(default)]
+    backends: BTreeMap<String, ClickHouseEnvironmentFields>,
+}
+
+fn environment_reference(value: &toml::Value) -> Result<Option<String>> {
+    let toml::Value::Table(reference) = value else {
+        return Ok(None);
+    };
+    if reference.len() != 1 || !reference.contains_key("env") {
+        return Err(anyhow::anyhow!(
+            "ClickHouse string values must be a string or `{{ env = \"VARIABLE_NAME\" }}`"
+        ));
+    }
+    let Some(toml::Value::String(variable)) = reference.get("env") else {
+        return Err(anyhow::anyhow!(
+            "ClickHouse environment reference `env` must be a string"
+        ));
+    };
+    if !is_valid_environment_variable_name(variable) {
+        return Err(anyhow::anyhow!(
+            "invalid ClickHouse environment variable name `{variable}`; expected [A-Za-z_][A-Za-z0-9_]*"
+        ));
+    }
+    Ok(Some(variable.clone()))
+}
+
+fn collect_environment_references_from_section(
+    section: ClickHouseEnvironmentFields,
+    target: ClickHouseConfigTarget,
+    references: &mut Vec<ClickHouseEnvironmentReference>,
+) -> Result<()> {
+    for (field, value) in [
+        (ClickHouseStringField::Url, section.url),
+        (ClickHouseStringField::Database, section.database),
+        (ClickHouseStringField::Username, section.username),
+        (ClickHouseStringField::Password, section.password),
+    ] {
+        let Some(value) = value else {
+            continue;
+        };
+        let span = value.span();
+        let Some(variable) = environment_reference(value.get_ref())? else {
+            continue;
+        };
+        references.push(ClickHouseEnvironmentReference {
+            target: target.clone(),
+            field,
+            variable,
+            span,
+        });
+    }
+    Ok(())
+}
+
+fn collect_clickhouse_environment_references(
+    content: &str,
+) -> Result<Vec<ClickHouseEnvironmentReference>> {
+    let document: ClickHouseEnvironmentDocument = parse_config_toml(content)?;
+    let mut references = Vec::new();
+    if let Some(clickhouse) = document.clickhouse {
+        collect_environment_references_from_section(
+            clickhouse,
+            ClickHouseConfigTarget::ClickHouse,
+            &mut references,
+        )?;
+    }
+
+    for (name, backend) in document.backends {
+        collect_environment_references_from_section(
+            backend,
+            ClickHouseConfigTarget::Backend(name.clone()),
+            &mut references,
+        )?;
+    }
+    Ok(references)
+}
+
+fn sanitize_clickhouse_environment_references(
+    content: &str,
+    references: &[ClickHouseEnvironmentReference],
+) -> Result<String> {
+    let mut sanitized = content.to_string();
+    let mut spans = references
+        .iter()
+        .map(|reference| reference.span.clone())
+        .collect::<Vec<_>>();
+    spans.sort_by_key(|span| std::cmp::Reverse(span.start));
+
+    for span in spans {
+        let original = content.get(span.clone()).ok_or_else(|| {
+            anyhow::anyhow!("internal error: ClickHouse environment reference span is invalid")
+        })?;
+        if original.len() < 2 || !original.is_ascii() {
+            return Err(anyhow::anyhow!(
+                "internal error: ClickHouse environment reference span is not ASCII"
+            ));
+        }
+        let mut replacement = vec![b' '; original.len()];
+        replacement[0] = b'"';
+        replacement[1] = b'"';
+        for (index, byte) in original.bytes().enumerate().skip(2) {
+            if matches!(byte, b'\r' | b'\n') {
+                replacement[index] = byte;
+            }
+        }
+        sanitized.replace_range(
+            span,
+            std::str::from_utf8(&replacement)
+                .expect("ASCII environment placeholder must be valid UTF-8"),
+        );
+    }
+
+    Ok(sanitized)
+}
+
+fn assign_clickhouse_environment_value(
+    config: &mut AppConfig,
+    reference: ClickHouseEnvironmentReference,
+    value: String,
+) {
+    let target = match &reference.target {
+        ClickHouseConfigTarget::ClickHouse => &mut config.clickhouse,
+        ClickHouseConfigTarget::Backend(name) => config
+            .backends
+            .get_mut(name)
+            .expect("validated ClickHouse backend must survive config parsing"),
+    };
+    reference.field.assign(target, value);
+}
+
+fn lookup_clickhouse_environment_value(
+    variable: &str,
+) -> std::result::Result<String, std::env::VarError> {
+    std::env::var(variable)
+}
+
+fn load_config_with_policy_and_lookup<Lookup>(
+    path: &Path,
+    home_path: Option<PathBuf>,
+    origin: ConfigOrigin,
+    lookup: Lookup,
+) -> Result<AppConfig>
+where
+    Lookup: Fn(&str) -> std::result::Result<String, std::env::VarError>,
+{
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read config {}", path.display()))?;
-    let mut cfg: AppConfig = parse_config_toml(&content)?;
+    let raw: toml::Value = parse_config_toml(&content)?;
+    let references = collect_clickhouse_environment_references(&content)?;
+    if origin == ConfigOrigin::ImplicitRepoFallback {
+        if let Some(reference) = references.first() {
+            return Err(anyhow::anyhow!(
+                "environment-backed ClickHouse value [{}].{} is not allowed in implicitly discovered repository config {}; select this file explicitly with `--config ./config/moraine.toml` or `MORAINE_CONFIG=./config/moraine.toml`",
+                reference.target.label(),
+                reference.field.key(),
+                path.display()
+            ));
+        }
+    }
+
+    // Replace each reference with an equal-length empty string before the
+    // typed parse. The original byte offsets and newlines stay intact, so
+    // errors point to the user's file without any resolved value in memory.
+    let sanitized_content = sanitize_clickhouse_environment_references(&content, &references)?;
+    let mut cfg: AppConfig = parse_config_toml(&sanitized_content)?;
+
+    for reference in references {
+        let value = lookup(&reference.variable).map_err(|error| {
+            anyhow::Error::new(ClickHouseEnvironmentUnavailable {
+                variable: reference.variable.clone(),
+                kind: match error {
+                    std::env::VarError::NotPresent => {
+                        ClickHouseEnvironmentUnavailableKind::NotPresent
+                    }
+                    std::env::VarError::NotUnicode(_) => {
+                        ClickHouseEnvironmentUnavailableKind::NotUnicode
+                    }
+                },
+            })
+        })?;
+        assign_clickhouse_environment_value(&mut cfg, reference, value);
+    }
+
     // The struct-level parse cannot tell an explicit `[clickhouse]` block
     // from its serde default, so the both-declared ambiguity is detected on
     // the raw TOML document instead.
-    let raw: toml::Value = parse_config_toml(&content)?;
     if raw.get("clickhouse").is_some()
         && raw
             .get("backends")
@@ -1672,6 +2065,32 @@ fn load_config_with_home_path(path: &Path, home_path: Option<PathBuf>) -> Result
     normalize_config(cfg)
 }
 
+fn load_config_with_home_path(path: &Path, home_path: Option<PathBuf>) -> Result<AppConfig> {
+    load_config_with_policy_and_lookup(
+        path,
+        home_path,
+        ConfigOrigin::Explicit,
+        lookup_clickhouse_environment_value,
+    )
+}
+
+/// Loads a config selected by an automatic resolver while enforcing the trust
+/// policy attached to that selection. The resolved value is consumed so its
+/// provenance cannot be discarded before loading.
+pub fn load_resolved_config(resolved: ResolvedConfigPath) -> Result<(LoadedConfigPath, AppConfig)> {
+    let ResolvedConfigPath { path, origin } = resolved;
+    let config = load_config_with_policy_and_lookup(
+        &path,
+        home_config_path(),
+        origin,
+        lookup_clickhouse_environment_value,
+    )?;
+    Ok((LoadedConfigPath { path, origin }, config))
+}
+
+/// Loads a path the caller selected explicitly. Automatic config discovery
+/// must use [`load_resolved_config`] instead so repository fallback policy is
+/// retained.
 pub fn load_config(path: impl AsRef<Path>) -> Result<AppConfig> {
     load_config_with_home_path(path.as_ref(), home_config_path())
 }
@@ -2176,8 +2595,16 @@ ruleset = "custom"
             Some(PathBuf::from("/tmp/home.toml")),
             &[],
             PathBuf::from("/tmp/repo.toml"),
+            |key| {
+                assert_eq!(key, PROPAGATED_CONFIG_ORIGIN_ENV);
+                None
+            },
+            |_| panic!("explicit CLI path must not probe fallback paths"),
         );
-        assert_eq!(chosen, PathBuf::from("/tmp/cli.toml"));
+        assert_eq!(
+            chosen,
+            ResolvedConfigPath::new(PathBuf::from("/tmp/cli.toml"), ConfigOrigin::Explicit)
+        );
     }
 
     #[test]
@@ -2206,25 +2633,24 @@ ruleset = "custom"
 
     #[test]
     fn resolve_order_prefers_env_over_home_and_repo() {
-        let env_key = "MORAINE_CONFIG_TEST_KEY";
-        std::env::set_var(env_key, "/tmp/from-env.toml");
-
         let chosen = resolve_config_path_with_overrides(
             None,
-            &[env_key],
+            &["MORAINE_CONFIG_TEST_KEY"],
             Some(PathBuf::from("/tmp/from-home.toml")),
             &[],
             PathBuf::from("/tmp/from-repo.toml"),
+            |key| (key == "MORAINE_CONFIG_TEST_KEY").then(|| "/tmp/from-env.toml".to_string()),
+            |_| panic!("environment override must not probe fallback paths"),
         );
-
-        std::env::remove_var(env_key);
-        assert_eq!(chosen, PathBuf::from("/tmp/from-env.toml"));
+        assert_eq!(
+            chosen,
+            ResolvedConfigPath::new(PathBuf::from("/tmp/from-env.toml"), ConfigOrigin::Explicit)
+        );
     }
 
     #[test]
     fn resolve_order_uses_repo_when_home_missing() {
-        let repo_default = std::env::temp_dir().join("moraine-config-repo-default.toml");
-        std::fs::write(&repo_default, "x=1").expect("write temp repo default");
+        let repo_default = PathBuf::from("/workspace/config/moraine.toml");
 
         let chosen = resolve_config_path_with_overrides(
             None,
@@ -2232,113 +2658,100 @@ ruleset = "custom"
             Some(PathBuf::from("/tmp/definitely-missing-home.toml")),
             &[],
             repo_default.clone(),
+            |_| None,
+            |path| path == repo_default,
         );
-
-        std::fs::remove_file(&repo_default).ok();
-        assert_eq!(chosen, repo_default);
+        assert_eq!(
+            chosen,
+            ResolvedConfigPath::new(repo_default, ConfigOrigin::ImplicitRepoFallback)
+        );
     }
 
     #[test]
     fn default_env_used_when_home_missing_and_path_exists() {
-        let default_path = std::env::temp_dir().join(format!(
-            "moraine-default-config-{}-{}.toml",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
-        std::fs::write(&default_path, "x=1").expect("write default");
-        let env_key = "MORAINE_DEFAULT_CONFIG_TEST_EXISTS";
-        std::env::set_var(env_key, default_path.to_string_lossy().to_string());
+        let default_path = PathBuf::from("/tmp/default.toml");
 
         let chosen = resolve_config_path_with_overrides(
             None,
             &["MORAINE_CONFIG_TEST_DOES_NOT_EXIST"],
             Some(PathBuf::from("/tmp/definitely-missing-home.toml")),
-            &[env_key],
+            &["MORAINE_DEFAULT_CONFIG_TEST_EXISTS"],
             PathBuf::from("/tmp/definitely-missing-repo-default.toml"),
+            |key| {
+                (key == "MORAINE_DEFAULT_CONFIG_TEST_EXISTS")
+                    .then(|| "/tmp/default.toml".to_string())
+            },
+            |path| path == default_path,
         );
-
-        std::env::remove_var(env_key);
-        std::fs::remove_file(&default_path).ok();
-        assert_eq!(chosen, default_path);
+        assert_eq!(
+            chosen,
+            ResolvedConfigPath::new(default_path, ConfigOrigin::Explicit)
+        );
     }
 
     #[test]
     fn default_env_skipped_when_path_missing() {
-        let repo_default = std::env::temp_dir().join(format!(
-            "moraine-default-repo-{}-{}.toml",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
-        std::fs::write(&repo_default, "x=1").expect("write repo default");
-        let env_key = "MORAINE_DEFAULT_CONFIG_TEST_MISSING";
-        std::env::set_var(env_key, "/tmp/definitely-missing-default.toml");
+        let repo_default = PathBuf::from("/workspace/config/moraine.toml");
 
         let chosen = resolve_config_path_with_overrides(
             None,
             &["MORAINE_CONFIG_TEST_DOES_NOT_EXIST"],
             Some(PathBuf::from("/tmp/definitely-missing-home.toml")),
-            &[env_key],
+            &["MORAINE_DEFAULT_CONFIG_TEST_MISSING"],
             repo_default.clone(),
+            |key| {
+                (key == "MORAINE_DEFAULT_CONFIG_TEST_MISSING")
+                    .then(|| "/tmp/definitely-missing-default.toml".to_string())
+            },
+            |path| path == repo_default,
         );
-
-        std::env::remove_var(env_key);
-        std::fs::remove_file(&repo_default).ok();
-        assert_eq!(chosen, repo_default);
+        assert_eq!(
+            chosen,
+            ResolvedConfigPath::new(repo_default, ConfigOrigin::ImplicitRepoFallback)
+        );
     }
 
     #[test]
     fn default_env_does_not_override_home_when_home_exists() {
-        let home_path = std::env::temp_dir().join(format!(
-            "moraine-default-home-{}-{}.toml",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
-        let default_path = std::env::temp_dir().join(format!(
-            "moraine-default-lower-{}-{}.toml",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
-        std::fs::write(&home_path, "x=1").expect("write home");
-        std::fs::write(&default_path, "x=1").expect("write default");
-        let env_key = "MORAINE_DEFAULT_CONFIG_TEST_NOT_HIGHER";
-        std::env::set_var(env_key, default_path.to_string_lossy().to_string());
+        let home_path = PathBuf::from("/home/test/.moraine/config.toml");
 
         let chosen = resolve_config_path_with_overrides(
             None,
             &["MORAINE_CONFIG_TEST_DOES_NOT_EXIST"],
             Some(home_path.clone()),
-            &[env_key],
+            &["MORAINE_DEFAULT_CONFIG_TEST_NOT_HIGHER"],
             PathBuf::from("/tmp/definitely-missing-repo-default.toml"),
+            |key| {
+                (key == "MORAINE_DEFAULT_CONFIG_TEST_NOT_HIGHER")
+                    .then(|| "/tmp/default.toml".to_string())
+            },
+            |path| path == home_path,
         );
-
-        std::env::remove_var(env_key);
-        std::fs::remove_file(&home_path).ok();
-        std::fs::remove_file(&default_path).ok();
-        assert_eq!(chosen, home_path);
+        assert_eq!(
+            chosen,
+            ResolvedConfigPath::new(home_path, ConfigOrigin::Home)
+        );
     }
 
     #[test]
     fn mcp_config_env_has_priority_over_generic_env() {
-        std::env::set_var("MORAINE_MCP_CONFIG", "/tmp/mcp.toml");
-        std::env::set_var("MORAINE_CONFIG", "/tmp/generic.toml");
-
-        let chosen = resolve_mcp_config_path(None);
-
-        std::env::remove_var("MORAINE_MCP_CONFIG");
-        std::env::remove_var("MORAINE_CONFIG");
-        assert_eq!(chosen, PathBuf::from("/tmp/mcp.toml"));
+        let chosen = resolve_config_path_with_overrides(
+            None,
+            &["MORAINE_MCP_CONFIG", "MORAINE_CONFIG"],
+            Some(PathBuf::from("/tmp/home.toml")),
+            DEFAULT_CONFIG_ENV_KEYS,
+            PathBuf::from("/tmp/repo.toml"),
+            |key| match key {
+                "MORAINE_MCP_CONFIG" => Some("/tmp/mcp.toml".to_string()),
+                "MORAINE_CONFIG" => Some("/tmp/generic.toml".to_string()),
+                _ => None,
+            },
+            |_| panic!("service-specific override must not probe fallback paths"),
+        );
+        assert_eq!(
+            chosen,
+            ResolvedConfigPath::new(PathBuf::from("/tmp/mcp.toml"), ConfigOrigin::Explicit)
+        );
     }
 
     #[test]
@@ -2421,6 +2834,382 @@ request_compression = "brotli"
         assert!(
             format!("{err:#}").contains("unknown variant `brotli`"),
             "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn clickhouse_literal_string_values_remain_compatible() {
+        const PASSWORD: &str = "literal-clickhouse-test-password";
+        let path = write_temp_config(
+            &format!(
+                r#"
+[clickhouse]
+url = "https://clickhouse.example.test:8443"
+database = "moraine_team"
+username = "svc-moraine"
+password = "{PASSWORD}"
+"#
+            ),
+            "clickhouse-literal-strings",
+        );
+        let cfg = load_config(&path).expect("literal ClickHouse strings should load");
+        std::fs::remove_file(path).ok();
+
+        assert_eq!(cfg.clickhouse.url, "https://clickhouse.example.test:8443");
+        assert_eq!(cfg.clickhouse.database, "moraine_team");
+        assert_eq!(cfg.clickhouse.username, "svc-moraine");
+        assert_eq!(cfg.clickhouse.password, PASSWORD);
+    }
+
+    #[test]
+    fn clickhouse_environment_references_resolve_for_default_and_named_backends() {
+        const DEFAULT_PASSWORD: &str = "  exact default environment password  ";
+        const TEAM_PASSWORD: &str = "exact-team-environment-password";
+        let path = write_temp_config(
+            r#"
+[clickhouse]
+url = { env = "MORAINE_TEST_DEFAULT_CLICKHOUSE_URL" }
+database = { env = "MORAINE_TEST_DEFAULT_CLICKHOUSE_DATABASE" }
+username = { env = "MORAINE_TEST_DEFAULT_CLICKHOUSE_USERNAME" }
+password = { env = "MORAINE_TEST_DEFAULT_CLICKHOUSE_PASSWORD" }
+
+[backends.team-ch]
+url = { env = "MORAINE_TEST_TEAM_CLICKHOUSE_URL" }
+database = { env = "MORAINE_TEST_TEAM_CLICKHOUSE_DATABASE" }
+username = { env = "MORAINE_TEST_TEAM_CLICKHOUSE_USERNAME" }
+password = { env = "MORAINE_TEST_TEAM_CLICKHOUSE_PASSWORD" }
+"#,
+            "clickhouse-environment-references",
+        );
+        let cfg =
+            load_config_with_policy_and_lookup(&path, None, ConfigOrigin::Explicit, |variable| {
+                let value = match variable {
+                    "MORAINE_TEST_DEFAULT_CLICKHOUSE_URL" => "https://default.example.test:8443",
+                    "MORAINE_TEST_DEFAULT_CLICKHOUSE_DATABASE" => "moraine_default",
+                    "MORAINE_TEST_DEFAULT_CLICKHOUSE_USERNAME" => "default-service-user",
+                    "MORAINE_TEST_DEFAULT_CLICKHOUSE_PASSWORD" => DEFAULT_PASSWORD,
+                    "MORAINE_TEST_TEAM_CLICKHOUSE_URL" => "https://team.example.test:8443",
+                    "MORAINE_TEST_TEAM_CLICKHOUSE_DATABASE" => "moraine_team",
+                    "MORAINE_TEST_TEAM_CLICKHOUSE_USERNAME" => "team-service-user",
+                    "MORAINE_TEST_TEAM_CLICKHOUSE_PASSWORD" => TEAM_PASSWORD,
+                    other => panic!("unexpected environment lookup: {other}"),
+                };
+                Ok(value.to_string())
+            })
+            .expect("environment references should load");
+        std::fs::remove_file(path).ok();
+
+        assert_eq!(cfg.clickhouse.url, "https://default.example.test:8443");
+        assert_eq!(cfg.clickhouse.database, "moraine_default");
+        assert_eq!(cfg.clickhouse.username, "default-service-user");
+        assert_eq!(cfg.clickhouse.password, DEFAULT_PASSWORD);
+        assert_eq!(
+            cfg.backends[DEFAULT_BACKEND_NAME].password,
+            DEFAULT_PASSWORD
+        );
+
+        let team = &cfg.backends["team-ch"];
+        assert_eq!(team.url, "https://team.example.test:8443");
+        assert_eq!(team.database, "moraine_team");
+        assert_eq!(team.username, "team-service-user");
+        assert_eq!(team.password, TEAM_PASSWORD);
+
+        let debug = format!("{cfg:?}");
+        assert!(!debug.contains(DEFAULT_PASSWORD));
+        assert!(!debug.contains(TEAM_PASSWORD));
+        assert!(debug.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn clickhouse_environment_references_resolve_for_backends_default_and_empty_values() {
+        const EMPTY_VARIABLE: &str = "MORAINE_TEST_DEFAULT_CLICKHOUSE_EMPTY_DATABASE";
+        const PASSWORD_VARIABLE: &str = "MORAINE_TEST_BACKENDS_DEFAULT_CLICKHOUSE_PASSWORD";
+        const PASSWORD: &str = "backends-default-environment-password";
+        let path = write_temp_config(
+            &format!(
+                r#"
+[backends.default]
+url = "https://default.example.test:8443"
+database = {{ env = "{EMPTY_VARIABLE}" }}
+username = "default-service-user"
+password = {{ env = "{PASSWORD_VARIABLE}" }}
+"#
+            ),
+            "clickhouse-environment-backends-default-empty",
+        );
+        let cfg =
+            load_config_with_policy_and_lookup(&path, None, ConfigOrigin::Explicit, |variable| {
+                match variable {
+                    EMPTY_VARIABLE => Ok(String::new()),
+                    PASSWORD_VARIABLE => Ok(PASSWORD.to_string()),
+                    other => panic!("unexpected environment lookup: {other}"),
+                }
+            })
+            .expect("[backends.default] environment references should load");
+        std::fs::remove_file(path).ok();
+
+        assert!(cfg.clickhouse.database.is_empty());
+        assert_eq!(cfg.clickhouse.password, PASSWORD);
+        assert!(cfg.backends[DEFAULT_BACKEND_NAME].database.is_empty());
+        assert_eq!(cfg.backends[DEFAULT_BACKEND_NAME].password, PASSWORD);
+    }
+
+    #[test]
+    fn clickhouse_environment_reference_fails_when_variable_is_missing() {
+        const VARIABLE: &str = "MORAINE_TEST_CLICKHOUSE_MISSING_VALUE";
+        let path = write_temp_config(
+            &format!(
+                r#"
+[clickhouse]
+password = {{ env = "{VARIABLE}" }}
+"#
+            ),
+            "clickhouse-environment-missing",
+        );
+        let error =
+            load_config_with_policy_and_lookup(&path, None, ConfigOrigin::Explicit, |variable| {
+                assert_eq!(variable, VARIABLE);
+                Err(std::env::VarError::NotPresent)
+            })
+            .expect_err("missing environment variable must fail");
+        std::fs::remove_file(path).ok();
+        assert!(is_clickhouse_environment_unavailable_error(&error));
+        let rendered = format!("{error:#}");
+
+        assert!(rendered.contains(VARIABLE), "unexpected error: {rendered}");
+        assert!(
+            rendered.contains("is not set"),
+            "unexpected error: {rendered}"
+        );
+    }
+
+    #[test]
+    fn clickhouse_config_errors_do_not_expose_resolved_environment_values() {
+        const VARIABLE: &str = "MORAINE_TEST_CLICKHOUSE_ERROR_SECRET";
+        const SECRET: &str = "resolved-environment-error-secret";
+        let lookup_count = std::cell::Cell::new(0);
+        let path = write_temp_config(
+            &format!(
+                r#"
+[clickhouse]
+password = {{ env = "{VARIABLE}" }}
+
+[backend]
+bind = 8080
+"#
+            ),
+            "clickhouse-environment-neighbor-error",
+        );
+        let error = load_config_with_policy_and_lookup(&path, None, ConfigOrigin::Explicit, |_| {
+            lookup_count.set(lookup_count.get() + 1);
+            Ok(SECRET.to_string())
+        })
+        .expect_err("neighboring malformed config must fail");
+        std::fs::remove_file(path).ok();
+        assert_eq!(lookup_count.get(), 0, "parse errors must precede lookup");
+
+        for rendered in [format!("{error:#}"), format!("{error:?}")] {
+            assert!(
+                !rendered.contains(SECRET),
+                "config error leaked resolved environment value: {rendered}"
+            );
+            assert!(rendered.contains("failed to parse TOML config"));
+            assert!(rendered.contains("at line 6, column 8"));
+        }
+    }
+
+    #[test]
+    fn implicit_repo_environment_references_are_rejected_before_lookup() {
+        const SENTINEL: &str = "must-never-be-read-from-the-environment";
+        let path = write_temp_config(
+            r#"
+[clickhouse]
+password = { env = "MORAINE_TEST_IMPLICIT_SECRET" }
+
+[backends.team]
+url = { env = "MORAINE_TEST_IMPLICIT_URL" }
+"#,
+            "implicit-clickhouse-environment-reference",
+        );
+        let lookup_count = std::cell::Cell::new(0);
+        let error = load_config_with_policy_and_lookup(
+            &path,
+            None,
+            ConfigOrigin::ImplicitRepoFallback,
+            |_| {
+                lookup_count.set(lookup_count.get() + 1);
+                Ok(SENTINEL.to_string())
+            },
+        )
+        .expect_err("implicit repository config must reject environment references");
+        std::fs::remove_file(path).ok();
+
+        assert_eq!(
+            lookup_count.get(),
+            0,
+            "implicit rejection must precede lookup"
+        );
+        for rendered in [format!("{error:#}"), format!("{error:?}")] {
+            assert!(rendered.contains("implicitly discovered repository config"));
+            assert!(rendered.contains("--config"));
+            assert!(rendered.contains("MORAINE_CONFIG"));
+            assert!(!rendered.contains(SENTINEL));
+        }
+    }
+
+    #[test]
+    fn child_reload_preserves_implicit_repo_origin_after_file_swap() {
+        const SENTINEL: &str = "child-must-not-read-this-secret";
+        let path = write_temp_config(
+            "[clickhouse]\npassword = \"literal\"\n",
+            "implicit-child-reload",
+        );
+        let parent = ResolvedConfigPath::new(path.clone(), ConfigOrigin::ImplicitRepoFallback);
+        let (loaded, _) = load_resolved_config(parent).expect("parent config should load");
+        let marker = loaded
+            .child_origin_environment()
+            .expect("implicit origin must be propagated");
+        assert_eq!(marker.0, PROPAGATED_CONFIG_ORIGIN_ENV);
+        assert_eq!(marker.1, PROPAGATED_IMPLICIT_REPO_ORIGIN);
+
+        std::fs::write(
+            &path,
+            "[clickhouse]\npassword = { env = \"MORAINE_TEST_CHILD_SECRET\" }\n",
+        )
+        .expect("swap config before child reload");
+        let child = resolve_config_path_with_overrides(
+            Some(path.clone()),
+            &["MORAINE_CONFIG"],
+            None,
+            &[],
+            PathBuf::from("config/moraine.toml"),
+            |key| (key == marker.0).then(|| marker.1.to_string()),
+            |_| panic!("propagated child path must not probe fallbacks"),
+        );
+        assert_eq!(child.origin(), ConfigOrigin::ImplicitRepoFallback);
+
+        let lookup_count = std::cell::Cell::new(0);
+        let error = load_config_with_policy_and_lookup(&path, None, child.origin(), |_| {
+            lookup_count.set(lookup_count.get() + 1);
+            Ok(SENTINEL.to_string())
+        })
+        .expect_err("child reload must retain implicit policy");
+        std::fs::remove_file(path).ok();
+
+        assert_eq!(lookup_count.get(), 0);
+        for rendered in [format!("{error:#}"), format!("{error:?}")] {
+            assert!(!rendered.contains(SENTINEL));
+            assert!(rendered.contains("implicitly discovered repository config"));
+        }
+    }
+
+    #[test]
+    fn same_repo_path_is_trusted_when_explicit_or_home_selected() {
+        const PASSWORD: &str = "trusted-selection-secret";
+        let path = write_temp_config(
+            r#"
+[clickhouse]
+password = { env = "MORAINE_TEST_TRUSTED_SECRET" }
+"#,
+            "trusted-clickhouse-environment-reference",
+        );
+
+        for origin in [ConfigOrigin::Explicit, ConfigOrigin::Home] {
+            let cfg = load_config_with_policy_and_lookup(&path, None, origin, |variable| {
+                assert_eq!(variable, "MORAINE_TEST_TRUSTED_SECRET");
+                Ok(PASSWORD.to_string())
+            })
+            .expect("trusted selection should resolve environment references");
+            assert_eq!(cfg.clickhouse.password, PASSWORD);
+        }
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn implicit_repo_literal_clickhouse_values_remain_compatible() {
+        let path = write_temp_config(
+            r#"
+[clickhouse]
+password = "literal-password"
+"#,
+            "implicit-literal-clickhouse-value",
+        );
+        let cfg = load_config_with_policy_and_lookup(
+            &path,
+            None,
+            ConfigOrigin::ImplicitRepoFallback,
+            |_| panic!("literal config must not perform environment lookup"),
+        )
+        .expect("literal implicit repository config should load");
+        std::fs::remove_file(path).ok();
+        assert_eq!(cfg.clickhouse.password, "literal-password");
+    }
+
+    #[test]
+    fn app_config_deserialization_never_resolves_environment_references() {
+        let error = toml::from_str::<AppConfig>(
+            r#"
+[clickhouse]
+password = { env = "MORAINE_TEST_DIRECT_SERDE_SECRET" }
+"#,
+        )
+        .expect_err("plain serde must not resolve environment references");
+        assert!(error.to_string().contains("expected a string"));
+    }
+
+    #[test]
+    fn clickhouse_environment_reference_rejects_malformed_forms() {
+        for (label, value) in [
+            ("empty", r#"{ env = "" }"#),
+            ("invalid-name", r#"{ env = "NOT A VARIABLE" }"#),
+            ("wrong-type", r#"{ env = 7 }"#),
+            ("unknown-key", r#"{ env = "VALID_NAME", extra = "no" }"#),
+            ("not-string-or-table", "7"),
+        ] {
+            let path = write_temp_config(
+                &format!("[clickhouse]\npassword = {value}\n"),
+                &format!("clickhouse-environment-malformed-{label}"),
+            );
+            let error = load_config(&path).expect_err("malformed environment reference must fail");
+            std::fs::remove_file(path).ok();
+            assert!(!is_clickhouse_environment_unavailable_error(&error));
+            let rendered = format!("{error:#}");
+
+            assert!(
+                rendered.contains("ClickHouse") || rendered.contains("failed to parse TOML config"),
+                "case `{label}` returned an unexpected error: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn clickhouse_environment_reference_rejects_non_unicode_values() {
+        const VARIABLE: &str = "MORAINE_TEST_CLICKHOUSE_NON_UNICODE_VALUE";
+        let path = write_temp_config(
+            &format!(
+                r#"
+[clickhouse]
+password = {{ env = "{VARIABLE}" }}
+"#
+            ),
+            "clickhouse-environment-non-unicode",
+        );
+        let error =
+            load_config_with_policy_and_lookup(&path, None, ConfigOrigin::Home, |variable| {
+                assert_eq!(variable, VARIABLE);
+                Err(std::env::VarError::NotUnicode(std::ffi::OsString::from(
+                    "synthetic-non-unicode-value",
+                )))
+            })
+            .expect_err("non-Unicode environment value must fail");
+        std::fs::remove_file(path).ok();
+        assert!(is_clickhouse_environment_unavailable_error(&error));
+        let rendered = format!("{error:#}");
+
+        assert!(rendered.contains(VARIABLE), "unexpected error: {rendered}");
+        assert!(
+            rendered.contains("not valid Unicode"),
+            "unexpected error: {rendered}"
         );
     }
 
@@ -2598,8 +3387,42 @@ auth_token = "  exact token value  "
     }
 
     #[test]
+    fn clickhouse_debug_redacts_password_and_shows_non_secret_fields() {
+        const PASSWORD: &str = "unique-clickhouse-debug-password";
+        let clickhouse = ClickHouseConfig {
+            url: "https://clickhouse.example.test:8443".to_string(),
+            database: "moraine_team".to_string(),
+            username: "svc-moraine".to_string(),
+            password: PASSWORD.to_string(),
+            ..ClickHouseConfig::default()
+        };
+
+        let debug = format!("{clickhouse:?}");
+        assert!(debug.contains("https://clickhouse.example.test:8443"));
+        assert!(debug.contains("moraine_team"));
+        assert!(debug.contains("svc-moraine"));
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains(PASSWORD));
+        let pretty_debug = format!("{clickhouse:#?}");
+        assert!(pretty_debug.contains("[REDACTED]"));
+        assert!(!pretty_debug.contains(PASSWORD));
+    }
+
+    #[test]
     fn app_config_debug_uses_redacted_backend_debug() {
         let mut cfg = AppConfig::default();
+        cfg.clickhouse.password = "app-config-clickhouse-password".to_string();
+        cfg.backends
+            .get_mut(DEFAULT_BACKEND_NAME)
+            .expect("default ClickHouse backend")
+            .password = "app-config-default-backend-password".to_string();
+        cfg.backends.insert(
+            "team-ch".to_string(),
+            ClickHouseConfig {
+                password: "app-config-team-backend-password".to_string(),
+                ..ClickHouseConfig::default()
+            },
+        );
         cfg.backend.start_on_up = true;
         cfg.backend.bind = "192.0.2.10".to_string();
         cfg.backend.auth_token = Some("app-config-secret-token".to_string());
@@ -2609,9 +3432,15 @@ auth_token = "  exact token value  "
             r#"backend: BackendConfig { start_on_up: true, bind: "192.0.2.10", auth_token: Some("[REDACTED]") }"#
         ));
         assert!(!debug.contains("app-config-secret-token"));
+        assert!(!debug.contains("app-config-clickhouse-password"));
+        assert!(!debug.contains("app-config-default-backend-password"));
+        assert!(!debug.contains("app-config-team-backend-password"));
         let pretty_debug = format!("{cfg:#?}");
         assert!(pretty_debug.contains("[REDACTED]"));
         assert!(!pretty_debug.contains("app-config-secret-token"));
+        assert!(!pretty_debug.contains("app-config-clickhouse-password"));
+        assert!(!pretty_debug.contains("app-config-default-backend-password"));
+        assert!(!pretty_debug.contains("app-config-team-backend-password"));
     }
 
     #[test]

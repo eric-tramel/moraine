@@ -12,6 +12,11 @@ members = [
   "apps/moraine-monitor",
   "apps/moraine",
 ]
+exclude = [
+  "moraine-monitor/backend",
+  "rust/codex-mcp",
+  "rust/ingestor",
+]
 
 [workspace.package]
 edition = "2021"

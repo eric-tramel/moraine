@@ -37,8 +37,9 @@ fn main() -> Result<()> {
         cli::usage();
         return Ok(());
     }
-    let mut cfg = moraine_config::load_config(&args.config_path)
-        .with_context(|| format!("failed to load config {}", args.config_path.display()))?;
+    let config_display = args.config_path.display().to_string();
+    let (_, mut cfg) = moraine_config::load_resolved_config(args.config_path)
+        .with_context(|| format!("failed to load config {config_display}"))?;
 
     // An explicit --socket overrides the configured central socket path, so the
     // daemon and its clients can be pointed at the same path from the launcher.
