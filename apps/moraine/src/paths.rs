@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use moraine_config::AppConfig;
+use moraine_config::{AppConfig, LoadedConfigPath};
 use std::fs;
 use std::path::PathBuf;
 
@@ -48,9 +48,9 @@ pub(crate) fn ensure_runtime_dirs(paths: &RuntimePaths) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn load_cfg(raw_config: Option<PathBuf>) -> Result<(PathBuf, AppConfig)> {
-    let config_path = moraine_config::resolve_config_path(raw_config);
-    let cfg = moraine_config::load_config(&config_path)
-        .with_context(|| format!("failed to load config {}", config_path.display()))?;
-    Ok((config_path, cfg))
+pub(crate) fn load_cfg(raw_config: Option<PathBuf>) -> Result<(LoadedConfigPath, AppConfig)> {
+    let resolved = moraine_config::resolve_config_path(raw_config);
+    let display = resolved.display().to_string();
+    moraine_config::load_resolved_config(resolved)
+        .with_context(|| format!("failed to load config {display}"))
 }

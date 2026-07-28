@@ -1081,8 +1081,9 @@ async fn main() -> Result<()> {
         .init();
 
     let config_path = resolve_config_path(parse_config_flag());
-    let cfg = load_config(&config_path)
-        .with_context(|| format!("failed to load config {}", config_path.display()))?;
+    let config_display = config_path.display().to_string();
+    let (_, cfg) = load_config(config_path)
+        .with_context(|| format!("failed to load config {config_display}"))?;
 
     let ch = ClickHouseClient::new(cfg.clickhouse.clone())?;
     ch.ping().await.context("clickhouse ping failed")?;

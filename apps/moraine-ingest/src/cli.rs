@@ -1,8 +1,9 @@
+use moraine_config::ResolvedConfigPath;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
 pub struct CliArgs {
-    pub config_path: PathBuf,
+    pub config_path: ResolvedConfigPath,
 }
 
 enum ParseOutcome {
@@ -61,7 +62,7 @@ pub fn parse_args() -> CliArgs {
 #[cfg(test)]
 mod tests {
     use super::{parse_args_impl, ParseOutcome};
-    use std::path::PathBuf;
+    use moraine_config::ConfigOrigin;
 
     #[test]
     fn parse_args_rejects_config_without_value() {
@@ -81,7 +82,8 @@ mod tests {
             panic!("expected parsed args");
         };
 
-        assert_eq!(args.config_path, PathBuf::from("custom.toml"));
+        assert_eq!(args.config_path.display().to_string(), "custom.toml");
+        assert_eq!(args.config_path.origin(), ConfigOrigin::Explicit);
     }
 
     #[test]

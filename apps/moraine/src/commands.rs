@@ -180,10 +180,20 @@ async fn run_service(global_config: Option<PathBuf>, run: RunArgs) -> Result<Exi
     }
 
     let binary = require_service_binary(run.service, &paths)?;
-    let args = service_args_with_defaults(run.service, &config_path, &cfg, &paths, &passthrough);
+    let args = service_args_with_defaults(
+        run.service,
+        config_path.as_path(),
+        &cfg,
+        &paths,
+        &passthrough,
+    );
 
-    let status = std::process::Command::new(binary)
-        .args(args)
+    let mut command = std::process::Command::new(binary);
+    command.args(args);
+    if let Some((key, value)) = config_path.child_origin_environment() {
+        command.env(key, value);
+    }
+    let status = command
         .status()
         .map_err(anyhow::Error::from)
         .with_context(|| format!("failed to run {}", run.service.name()))?;

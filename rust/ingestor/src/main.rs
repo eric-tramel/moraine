@@ -4,36 +4,25 @@ mod ingestor;
 mod model;
 mod normalize;
 
-use crate::config::load_config;
+use crate::config::{load_config, resolve_config_path};
 use crate::ingestor::run_ingestor;
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 
-fn parse_config_path() -> PathBuf {
+fn parse_config_path() -> Option<PathBuf> {
     let mut args = std::env::args().skip(1);
-    let mut config_path = default_config_path();
+    let mut config_path = None;
 
     while let Some(arg) = args.next() {
         if arg == "--config" {
             if let Some(value) = args.next() {
-                config_path = PathBuf::from(value);
+                config_path = Some(PathBuf::from(value));
             }
         }
     }
 
     config_path
-}
-
-fn default_config_path() -> PathBuf {
-    if let Some(home) = std::env::var_os("HOME") {
-        let path = PathBuf::from(home).join(".moraine").join("config.toml");
-        if path.exists() {
-            return path;
-        }
-    }
-
-    PathBuf::from("config/moraine.toml")
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -45,9 +34,10 @@ async fn main() -> Result<()> {
         .with_target(false)
         .init();
 
-    let config_path = parse_config_path();
-    let config = load_config(&config_path)
-        .with_context(|| format!("failed to load config {}", config_path.display()))?;
+    let config_path = resolve_config_path(parse_config_path());
+    let config_display = config_path.display().to_string();
+    let (_, config) = load_config(config_path)
+        .with_context(|| format!("failed to load config {config_display}"))?;
 
     run_ingestor(config).await
 }

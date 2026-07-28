@@ -1,6 +1,6 @@
 use anyhow::{anyhow, bail, Context, Result};
 use moraine_clickhouse::ClickHouseClient;
-use moraine_config::AppConfig;
+use moraine_config::{AppConfig, LoadedConfigPath};
 use reqwest::{Client, Url};
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -1419,7 +1419,7 @@ where
 }
 
 pub(crate) async fn start_clickhouse_with_progress<F>(
-    config_path: &Path,
+    config_path: &LoadedConfigPath,
     cfg: &AppConfig,
     paths: &RuntimePaths,
     mut on_progress: F,
@@ -1481,21 +1481,24 @@ where
         RollingLogPolicy::clickhouse_supervisor(),
     )?);
     let launcher = std::env::current_exe().context("failed to resolve current moraine binary")?;
-    let mut supervisor = TokioCommand::new(&launcher)
+    let mut supervisor = TokioCommand::new(&launcher);
+    supervisor
         .arg("--config")
-        .arg(config_path)
+        .arg(config_path.as_path())
         .arg("clickhouse")
         .arg("supervise")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .with_context(|| {
-            format!(
-                "failed to start ClickHouse supervisor {}",
-                launcher.display()
-            )
-        })?;
+        .stderr(Stdio::null());
+    if let Some((key, value)) = config_path.child_origin_environment() {
+        supervisor.env(key, value);
+    }
+    let mut supervisor = supervisor.spawn().with_context(|| {
+        format!(
+            "failed to start ClickHouse supervisor {}",
+            launcher.display()
+        )
+    })?;
     let supervisor_pid = supervisor
         .id()
         .ok_or_else(|| anyhow!("ClickHouse supervisor did not expose a process id"))?;
@@ -1923,6 +1926,15 @@ mod tests {
         cfg.runtime.healthcheck_interval_ms = 100;
         cfg.runtime.clickhouse_auto_install = false;
         cfg
+    }
+
+    fn loaded_config_path(path: &Path) -> LoadedConfigPath {
+        fs::write(path, "").expect("write test config");
+        moraine_config::load_resolved_config(moraine_config::resolve_config_path(Some(
+            path.to_path_buf(),
+        )))
+        .expect("load explicit test config")
+        .0
     }
 
     #[tokio::test]
@@ -2558,6 +2570,11 @@ mod tests {
         let cfg = test_config(&root, ping.url());
         let paths = crate::paths::runtime_paths(&cfg);
         let config_path = root.join("config.toml");
+        fs::write(&config_path, "").expect("write config");
+        let (config_path, _) = moraine_config::load_resolved_config(
+            moraine_config::resolve_config_path(Some(config_path)),
+        )
+        .expect("load explicit config selection");
 
         let outcome = start_clickhouse_with_progress(&config_path, &cfg, &paths, |_| {})
             .await
@@ -2584,7 +2601,8 @@ mod tests {
         let launcher_pid = pid_path(&paths, Service::ClickHouse);
         write_pid(&launcher_pid, sentinel_pid).expect("sentinel pid file");
 
-        let err = start_clickhouse_with_progress(&root.join("config.toml"), &cfg, &paths, |_| {})
+        let config_path = loaded_config_path(&root.join("config.toml"));
+        let err = start_clickhouse_with_progress(&config_path, &cfg, &paths, |_| {})
             .await
             .expect_err("unhealthy sentinel should fail readiness");
 

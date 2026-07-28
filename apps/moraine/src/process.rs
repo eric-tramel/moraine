@@ -1,5 +1,5 @@
 use anyhow::{bail, Context, Result};
-use moraine_config::AppConfig;
+use moraine_config::{AppConfig, LoadedConfigPath};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -787,7 +787,7 @@ pub(crate) fn service_args_with_defaults(
 
 pub(crate) fn start_background_service(
     service: Service,
-    cfg_path: &Path,
+    cfg_path: &LoadedConfigPath,
     cfg: &AppConfig,
     paths: &RuntimePaths,
     extra_args: &[String],
@@ -848,10 +848,14 @@ pub(crate) fn start_background_service(
         .try_clone()
         .with_context(|| format!("failed to clone {} log", service.name()))?;
 
-    let args = service_args_with_defaults(service, cfg_path, cfg, paths, extra_args);
+    let args = service_args_with_defaults(service, cfg_path.as_path(), cfg, paths, extra_args);
 
-    let child = Command::new(&binary)
-        .args(args)
+    let mut command = Command::new(&binary);
+    command.args(args);
+    if let Some((key, value)) = cfg_path.child_origin_environment() {
+        command.env(key, value);
+    }
+    let child = command
         // Background services never read stdin; closing it avoids inheriting the
         // launcher's terminal or pipe descriptors.
         .stdin(Stdio::null())
@@ -920,6 +924,15 @@ mod tests {
     fn write_file(path: &Path) {
         fs::create_dir_all(path.parent().expect("parent")).expect("create parent");
         fs::write(path, b"#!/bin/sh\n").expect("write file");
+    }
+
+    fn loaded_config_path(path: &Path) -> LoadedConfigPath {
+        fs::write(path, "").expect("write test config");
+        moraine_config::load_resolved_config(moraine_config::resolve_config_path(Some(
+            path.to_path_buf(),
+        )))
+        .expect("load explicit test config")
+        .0
     }
 
     #[test]
@@ -1394,14 +1407,9 @@ mod tests {
         cfg.runtime.service_bin_dir = root.join("bin").display().to_string();
         let paths = crate::paths::runtime_paths(&cfg);
 
-        let err = start_background_service(
-            Service::Backend,
-            &root.join("config.toml"),
-            &cfg,
-            &paths,
-            &[],
-        )
-        .expect_err("partial endpoint pair must not be accepted as a complete backend");
+        let config_path = loaded_config_path(&root.join("config.toml"));
+        let err = start_background_service(Service::Backend, &config_path, &cfg, &paths, &[])
+            .expect_err("partial endpoint pair must not be accepted as a complete backend");
         assert!(err.to_string().contains("only part of its endpoint pair"));
 
         let _ = fs::remove_dir_all(root);
@@ -1443,14 +1451,9 @@ mod tests {
         cfg.runtime.service_bin_dir = root.join("bin").display().to_string();
         let paths = crate::paths::runtime_paths(&cfg);
 
-        let err = start_background_service(
-            Service::Backend,
-            &root.join("config.toml"),
-            &cfg,
-            &paths,
-            &[],
-        )
-        .expect_err("unmanaged endpoint pair must not satisfy the backend topology");
+        let config_path = loaded_config_path(&root.join("config.toml"));
+        let err = start_background_service(Service::Backend, &config_path, &cfg, &paths, &[])
+            .expect_err("unmanaged endpoint pair must not satisfy the backend topology");
         http_probe.join().expect("HTTP probe responder");
 
         let message = err.to_string();
