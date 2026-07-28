@@ -1786,11 +1786,9 @@ mod tests {
         let mut scan = CLICKHOUSE_TEMPLATE;
         while let Some(lt) = scan.find('<') {
             let tail = &scan[lt..];
-            if tail.starts_with("<!--") {
-                let close = tail[4..]
-                    .find("-->")
-                    .expect("comment termination checked above");
-                scan = &tail[4 + close + 3..];
+            if let Some(body) = tail.strip_prefix("<!--") {
+                let close = body.find("-->").expect("comment termination checked above");
+                scan = &body[close + 3..];
                 continue;
             }
             if tail.starts_with("<?") {
