@@ -18,9 +18,11 @@ use tracing::{debug, warn};
 use url::Origin;
 
 use super::{
-    hash_str, open_read_only, sqlite_data_version, stat_fingerprint, truncate_chars_local,
-    StatFingerprint, SyntheticRecord, VolatilePollMap, ERROR_KIND_MIXED_SNAPSHOT, ERROR_KIND_OPEN,
-    ERROR_KIND_SCAN, ERROR_KIND_SCHEMA, ERROR_KIND_TOO_LARGE, SCAN_PAGE_MAX_BYTES, SCAN_PAGE_SIZE,
+    hash_str, open_read_only, record_scan_failure, record_scan_ledger, sqlite_data_version,
+    stat_fingerprint, take_payload_nullable_string, take_payload_required_string,
+    take_payload_text, truncate_chars_local, ScanLedger, StatFingerprint, SyntheticRecord,
+    VolatilePollMap, ERROR_KIND_MIXED_SNAPSHOT, ERROR_KIND_OPEN, ERROR_KIND_SCAN,
+    ERROR_KIND_SCHEMA, ERROR_KIND_TOO_LARGE, SCAN_PAGE_MAX_BYTES, SCAN_PAGE_SIZE,
 };
 
 const NAC_CURSOR_VERSION: u32 = 1;
@@ -210,6 +212,11 @@ pub(crate) async fn process_nac_sqlite_db(
     let generation_changed = had_committed && checkpoint.source_inode != inode;
     let exclusions_changed =
         had_committed && committed_state.project_exclusions_hash != current_exclusions_hash;
+    // The `replaying` disjunct resumes a replay a crash interrupted between
+    // `BeginReplay` and `FinalizeReplay`; the `error` disjunct cannot cover it,
+    // because a crash never wrote a block reason. Width note at the Cursor
+    // site; `a_crash_interrupted_nac_replay_resumes_from_its_replaying_status`
+    // fails if it goes.
     let retry_blocked_replay = checkpoint.status == "replaying"
         || (checkpoint.status == "error" && !checkpoint.block_reason.is_empty());
     let starts_replacement = generation_changed || exclusions_changed;
@@ -240,15 +247,39 @@ pub(crate) async fn process_nac_sqlite_db(
         .last_offset
         .checked_add(1)
         .context("nac_sqlite poll sequence exhausted")?;
+    // A NAC database stuck in `retry_blocked_replay` previously re-scanned the
+    // whole store and re-sent `BeginReplay` on every tick with zero throttle,
+    // because the volatile check was skipped during replay. Throttle *before*
+    // the durable barrier so the barrier always has a scan behind it
+    // (issue #601 §2.1(2), §2.5); a genuine replacement bumped the generation
+    // above and is never throttled.
+    if retry_blocked_replay
+        && !starts_replacement
+        && !poll_state.failure_retry_due(&cp_key, source_generation)
+    {
+        return Ok(());
+    }
     if replacement_replay {
         super::begin_database_replay(&sink_tx, &checkpoint, scan_boundary, &policy_fingerprint)
             .await?;
     }
+    // §2.5's `|| !failure_retry_due` disjunct is absent and **must stay absent
+    // while the contention clock lives in `failure_retry_due`** — WI-04 must
+    // not add it. It is no longer outcome-redundant with `should_skip_poll`'s
+    // failure arm below: §3.2's contention exemption keeps that clock out of
+    // `should_skip_poll` on purpose, so after a mixed-snapshot rejection
+    // `failure_retry_due` is false for up to 60 s while `should_skip_poll`
+    // stays false. The disjunct would skip ordinary polls of an actively
+    // written NAC store for that whole window — the §6 prompt-visibility
+    // regression the exemption exists to prevent. A pre-`should_skip_poll`
+    // throttle for the sweep slice must read the fault ladder alone.
+    // `an_ordinary_poll_of_a_contended_nac_store_is_not_throttled` fails if it
+    // is added. See `plans/601-delta-sqlite.md` §7 WI-10.
     if !starts_replacement
         && !retry_blocked_replay
         && scan_state.stat == current_stat
-        && scan_state.last_error.is_empty()
         && scan_state.schema_fingerprint != 0
+        && scan_state.last_error.is_empty()
     {
         return Ok(());
     }
@@ -260,18 +291,22 @@ pub(crate) async fn process_nac_sqlite_db(
     let scan_path = source_file.clone();
     let scan_source_name = work.source_name.clone();
     let prior_scan_state = scan_state.clone();
-    let mut outcome = tokio::task::spawn_blocking(move || {
-        scan_nac_database(
+    let (mut outcome, ledger) = tokio::task::spawn_blocking(move || {
+        let mut ledger = ScanLedger::default();
+        let outcome = scan_nac_database(
             &scan_path,
             &scan_source_name,
             source_generation,
             inode,
             current_stat,
             &prior_scan_state,
-        )
+            &mut ledger,
+        );
+        (outcome, ledger)
     })
     .await
     .context("nac_sqlite scan task panicked")?;
+    record_scan_ledger(metrics, &ledger);
 
     let oversized_row = match &mut outcome {
         NacScanOutcome::Scanned { records, .. } => {
@@ -458,7 +493,7 @@ pub(crate) async fn process_nac_sqlite_db(
                         ..final_checkpoint
                     };
                     super::block_database_replay(&sink_tx, &blocked_checkpoint, reason).await?;
-                    poll_state.clear(&cp_key);
+                    poll_state.record_blocked_replay(&cp_key, source_generation);
                     return Ok(());
                 }
                 let active_checkpoint = Checkpoint {
@@ -479,18 +514,24 @@ pub(crate) async fn process_nac_sqlite_db(
             poll_state.clear(&cp_key);
             if emitted > 0 {
                 debug!(
-                    "{}:{} nac_sqlite emitted {} changed records ({} relevant rows)",
-                    work.source_name, source_file, emitted, relevant_rows
+                    "{}:{} nac_sqlite emitted {} changed records ({} relevant rows, \
+                     {} payload rows, {} payload bytes)",
+                    work.source_name,
+                    source_file,
+                    emitted,
+                    relevant_rows,
+                    ledger.payload_rows,
+                    ledger.payload_bytes
                 );
             }
-            let _ = metrics;
             Ok(())
         }
         NacScanOutcome::Failed {
             error_kind,
             error_text,
         } => {
-            poll_state.record_failed_scan(&cp_key);
+            record_scan_failure(metrics);
+            poll_state.record_scan_failure_outcome(&cp_key, source_generation, error_kind);
             if !replacement_replay && committed_state.last_error == error_kind {
                 return Ok(());
             }
@@ -553,6 +594,9 @@ pub(crate) async fn process_nac_sqlite_db(
     }
 }
 
+/// The caller owns `ledger` so that every early return — including each
+/// failure arm — still reports the bytes this scan had already paid for.
+#[allow(clippy::too_many_arguments)]
 fn scan_nac_database(
     db_path: &str,
     source_name: &str,
@@ -560,6 +604,7 @@ fn scan_nac_database(
     expected_inode: u64,
     pre_scan_stat: StatFingerprint,
     prior: &NacState,
+    ledger: &mut ScanLedger,
 ) -> NacScanOutcome {
     let connection = match open_read_only(db_path) {
         Ok(connection) => connection,
@@ -593,7 +638,7 @@ fn scan_nac_database(
     // fingerprint would misclassify every scan as concurrent writer churn on
     // platforms where SQLite removes the sidecars after the last close.
     let opened_stat = stat_fingerprint(db_path).unwrap_or(pre_scan_stat);
-    let schema = match inspect_schema(&connection) {
+    let schema = match inspect_schema(&connection, ledger) {
         Ok(schema) => schema,
         Err(error_text) => {
             return NacScanOutcome::Failed {
@@ -618,6 +663,7 @@ fn scan_nac_database(
         source_generation,
         &schema,
         prior,
+        ledger,
     );
     let (records, mut state, relevant_rows) = match result {
         Ok(value) => value,
@@ -643,7 +689,12 @@ fn scan_nac_database(
             }
         }
     };
-    if data_version_before != data_version_after || stat_fingerprint(db_path) != Some(opened_stat) {
+    if super::snapshot_is_mixed(
+        db_path,
+        data_version_before,
+        data_version_after,
+        opened_stat,
+    ) {
         return NacScanOutcome::Failed {
             error_kind: ERROR_KIND_MIXED_SNAPSHOT,
             error_text:
@@ -674,20 +725,18 @@ struct NacSchema {
     fingerprint: u64,
 }
 
-fn inspect_schema(connection: &Connection) -> std::result::Result<NacSchema, String> {
+fn inspect_schema(
+    connection: &Connection,
+    ledger: &mut ScanLedger,
+) -> std::result::Result<NacSchema, String> {
     let mut material = String::new();
     let mut session_columns = BTreeSet::new();
     for (table, required) in [
         ("sessions", REQUIRED_SESSION_COLUMNS),
         ("episodes", REQUIRED_EPISODE_COLUMNS),
     ] {
-        let sql: Option<String> = connection
-            .query_row(
-                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
-                params![table],
-                |row| row.get(0),
-            )
-            .map_err(|exc| match exc {
+        let sql =
+            super::schema_sql_for_table(connection, table, ledger).map_err(|exc| match exc {
                 rusqlite::Error::QueryReturnedNoRows => {
                     format!("required table {table} is missing")
                 }
@@ -695,7 +744,10 @@ fn inspect_schema(connection: &Connection) -> std::result::Result<NacSchema, Str
             })?;
         material.push_str(&sql.unwrap_or_default());
         material.push('\n');
-        let columns = table_columns(connection, table).map_err(|exc| exc.to_string())?;
+        let columns: BTreeSet<String> = super::table_column_names(connection, table, ledger)
+            .map_err(|exc| format!("{exc:#}"))?
+            .into_iter()
+            .collect();
         for column in required {
             if !columns.contains(*column) {
                 return Err(format!("table {table} is missing required column {column}"));
@@ -709,16 +761,6 @@ fn inspect_schema(connection: &Connection) -> std::result::Result<NacSchema, Str
         session_columns,
         fingerprint: hash_str(&material),
     })
-}
-
-fn table_columns(connection: &Connection, table: &str) -> Result<BTreeSet<String>> {
-    let mut stmt = connection
-        .prepare(&format!("PRAGMA table_info({table})"))
-        .with_context(|| format!("failed to inspect {table} columns"))?;
-    let columns = stmt
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<std::result::Result<BTreeSet<_>, _>>()?;
-    Ok(columns)
 }
 
 #[derive(Debug)]
@@ -739,6 +781,7 @@ impl From<rusqlite::Error> for NacScanError {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn scan_nac_rows(
     connection: &Connection,
     db_path: &str,
@@ -746,6 +789,7 @@ fn scan_nac_rows(
     source_generation: u32,
     schema: &NacSchema,
     prior: &NacState,
+    ledger: &mut ScanLedger,
 ) -> std::result::Result<(Vec<SyntheticRecord>, NacState, u64), NacScanError> {
     let canonical_db = std::fs::canonicalize(db_path)
         .unwrap_or_else(|_| std::path::PathBuf::from(db_path))
@@ -773,7 +817,7 @@ fn scan_nac_rows(
         let mut rows = stmt.query(params![&last_session_id, SCAN_PAGE_SIZE as i64])?;
         let mut page_rows = 0usize;
         while let Some(row) = rows.next()? {
-            let session = read_session_row(row, &schema.session_columns)?;
+            let session = read_session_row(row, &schema.session_columns, ledger)?;
             page_rows += 1;
             total_rows = total_rows.saturating_add(1);
             if total_rows > MAX_NAC_SESSIONS {
@@ -854,18 +898,32 @@ fn scan_nac_rows(
         let mut rows = stmt.query(params![last_episode_id, SCAN_PAGE_SIZE as i64])?;
         let mut page_rows = 0usize;
         while let Some(row) = rows.next()? {
+            // This projection includes `content`, so the whole episode row is
+            // charged on the payload axis where SQLite hands it over. The row
+            // charge lands **before** the oversize check, matching
+            // `read_session_row`: SQLite had already decoded every column to
+            // evaluate `estimated_bytes`, so a ceiling arm reporting zero rows
+            // would contradict the ledger's headline guarantee. Bytes are
+            // still not charged from `estimated_bytes` — the guarded
+            // projection hands Rust NULL for an oversized row, and the ledger
+            // reports what was materialized, not what SQLite touched.
             let id: i64 = row.get(0)?;
+            ledger.charge_payload_row();
             let row_bytes = checked_row_bytes(row.get(6)?, "NAC episode", id)?;
             if row_bytes > SCAN_PAGE_MAX_BYTES {
                 return Err(NacScanError::TooLarge(format!(
                     "NAC episode {id} is {row_bytes} bytes, exceeding the {SCAN_PAGE_MAX_BYTES} byte row ceiling"
                 )));
             }
-            let thread_name: String = row.get(1)?;
-            let raw_session_id: String = row.get(2)?;
-            let action: String = row.get(3)?;
-            let content: String = row.get(4)?;
-            let created_at_raw: String = row.get(5)?;
+            // Every one of these is NOT NULL in the live `episodes` schema and
+            // load-bearing downstream (thread/session identity, the action tag
+            // the record type is derived from, the payload, the timestamp), so
+            // a NULL fails the scan rather than materializing as `""`.
+            let thread_name = take_payload_required_string(ledger, row, 1)?;
+            let raw_session_id = take_payload_required_string(ledger, row, 2)?;
+            let action = take_payload_required_string(ledger, row, 3)?;
+            let content = take_payload_required_string(ledger, row, 4)?;
+            let created_at_raw = take_payload_required_string(ledger, row, 5)?;
             page_rows += 1;
             total_rows = total_rows.saturating_add(1);
             if total_rows > MAX_NAC_SESSIONS.saturating_add(MAX_NAC_EPISODES) {
@@ -934,6 +992,7 @@ fn scan_nac_rows(
         }
     }
 
+    ledger.rows_emitted = records.len() as u64;
     Ok((records, next_state, total_rows))
 }
 
@@ -1007,30 +1066,44 @@ fn session_projection(columns: &BTreeSet<String>) -> String {
     .join(", ")
 }
 
+/// Reads one session row. The projection includes `messages_json`, so every
+/// variable-length column it materializes is charged on the payload axis —
+/// deliberately *not* from the projection's own `estimated_bytes` expression,
+/// which SQLite computes over the pre-guard column values and which therefore
+/// reports bytes that were never handed to Rust for an oversized row.
 fn read_session_row(
     row: &rusqlite::Row<'_>,
     columns: &BTreeSet<String>,
+    ledger: &mut ScanLedger,
 ) -> std::result::Result<NacSessionRow, NacScanError> {
+    ledger.charge_payload_row();
     let estimated_bytes = checked_row_bytes(row.get(15)?, "NAC session row", 0)?;
     if estimated_bytes > SCAN_PAGE_MAX_BYTES {
         return Err(NacScanError::TooLarge(format!(
             "NAC session row is {estimated_bytes} bytes, exceeding the {SCAN_PAGE_MAX_BYTES} byte row ceiling"
         )));
     }
-    let raw_session_id: String = row.get(0)?;
-    let cwd: String = row.get(1)?;
-    let model: String = row.get(2)?;
-    let base_url = sanitize_base_url(&row.get::<_, String>(3)?);
-    let backend = row.get::<_, Option<String>>(4)?.unwrap_or_default();
-    let reasoning_effort = row.get::<_, Option<String>>(5)?.unwrap_or_default();
-    let sandbox_raw: Option<String> = row.get(6)?;
-    let messages_raw: String = row.get(7)?;
+    // NOT NULL in the live `sessions` schema; a NULL is schema drift and must
+    // fail the scan. `session_id` and `created_at`/`updated_at` below feed
+    // logical-ID and timestamp derivation directly (§6), so absorbing a NULL
+    // here would mint records keyed on the empty string.
+    let raw_session_id = take_payload_required_string(ledger, row, 0)?;
+    let cwd = take_payload_required_string(ledger, row, 1)?;
+    let model = take_payload_required_string(ledger, row, 2)?;
+    let base_url = sanitize_base_url(&take_payload_required_string(ledger, row, 3)?);
+    // `backend` and `reasoning_effort` are the two columns that genuinely
+    // tolerate NULL: they are absent on older stores and the empty string is
+    // the documented default (this is what the pre-ledger code did too).
+    let backend = take_payload_nullable_string(ledger, row, 4)?;
+    let reasoning_effort = take_payload_nullable_string(ledger, row, 5)?;
+    let sandbox_raw = take_payload_text(ledger, row, 6)?;
+    let messages_raw = take_payload_required_string(ledger, row, 7)?;
     let last_response_duration_ms = row.get::<_, Option<i64>>(8)?.map(|v| v.max(0) as u64);
     let previous_response_duration_ms = row.get::<_, Option<i64>>(9)?.map(|v| v.max(0) as u64);
-    let durations_raw: Option<String> = row.get(10)?;
-    let usages_raw: Option<String> = row.get(11)?;
-    let created_at: String = row.get(12)?;
-    let updated_at: String = row.get(13)?;
+    let durations_raw = take_payload_text(ledger, row, 10)?;
+    let usages_raw = take_payload_text(ledger, row, 11)?;
+    let created_at = take_payload_required_string(ledger, row, 12)?;
+    let updated_at = take_payload_required_string(ledger, row, 13)?;
     let remote: Option<i64> = row.get(14)?;
     let parse_json = |label: &str, raw: Option<&str>, default: Value| {
         let Some(raw) = raw.filter(|raw| !raw.trim().is_empty()) else {
@@ -1672,6 +1745,7 @@ fn enforce_record_limit(records: usize) -> std::result::Result<(), NacScanError>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::WorkTrigger;
     use std::path::Path;
 
     async fn drive_nac_poll(
@@ -1680,7 +1754,25 @@ mod tests {
         checkpoints: &Arc<RwLock<HashMap<String, Checkpoint>>>,
         poll_state: &VolatilePollMap,
     ) -> (Vec<RowBatch>, Vec<crate::CheckpointTransition>) {
-        let metrics = Arc::new(Metrics::default());
+        drive_nac_poll_with_metrics(
+            config,
+            work,
+            checkpoints,
+            poll_state,
+            &Arc::new(Metrics::default()),
+        )
+        .await
+    }
+
+    /// Shares one `Metrics` across several polls so a test can count the scans
+    /// that actually ran rather than the errors that were reported.
+    async fn drive_nac_poll_with_metrics(
+        config: &AppConfig,
+        work: &WorkItem,
+        checkpoints: &Arc<RwLock<HashMap<String, Checkpoint>>>,
+        poll_state: &VolatilePollMap,
+        metrics: &Arc<Metrics>,
+    ) -> (Vec<RowBatch>, Vec<crate::CheckpointTransition>) {
         let (sink_tx, mut sink_rx) = mpsc::channel(8);
         let process = process_nac_sqlite_db(
             config,
@@ -1688,7 +1780,7 @@ mod tests {
             checkpoints.clone(),
             poll_state,
             sink_tx,
-            &metrics,
+            metrics,
         );
         tokio::pin!(process);
         let mut batches = Vec::new();
@@ -1744,6 +1836,317 @@ mod tests {
         (batches, transitions)
     }
 
+    /// Issue #601 §2.5. `record_blocked_replay` exists to stop
+    /// `clear(); record_failed_scan();` from pinning a blocked replay at the
+    /// 15 s floor forever, and it is guarded at its implementation — but NAC's
+    /// **call site** was not. `blocked_replay_backs_off_instead_of_resending_the_barrier`
+    /// reaches the `Failed` arm (an unreadable file), never
+    /// `record_blocked_replay`, so inserting a `poll_state.clear()` before
+    /// nac.rs's call left the suite green.
+    ///
+    /// This drives the other block path: the scan *succeeds*, and a record
+    /// fails `normalize_record`, which is deterministic and content-driven and
+    /// therefore recurs on every retry — exactly the shape a flat floor turns
+    /// into a full re-read of the whole store every 15 s indefinitely.
+    ///
+    /// Fails for: `clear`ing volatile state before `record_blocked_replay`, or
+    /// dropping the call entirely.
+    #[tokio::test]
+    async fn a_normalization_blocked_nac_replay_climbs_the_failure_ladder() {
+        let path = fixture_db();
+        let source_file = path.to_string_lossy().to_string();
+        // `normalize_record` rejects an unregistered harness outright, so every
+        // synthesized record fails and a replacement replay blocks durably.
+        let work = WorkItem {
+            source_name: "nac-block-ladder".to_string(),
+            harness: "not-a-registered-harness".to_string(),
+            format: moraine_config::SourceFormat::NacSqlite,
+            source_glob: source_file.clone(),
+            path: source_file.clone(),
+            trigger: WorkTrigger::Watcher,
+        };
+        let cp_key = checkpoint_key(&work.source_name, &work.path);
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let poll_state = VolatilePollMap::new();
+        let metrics = Arc::new(Metrics::default());
+
+        let config = AppConfig::default();
+        drive_nac_poll_with_metrics(&config, &work, &checkpoints, &poll_state, &metrics).await;
+        assert!(checkpoints.read().await.contains_key(&cp_key));
+
+        // Changing the exclusion set starts a replacement replay that cannot
+        // finish, because nothing normalizes.
+        let mut replaying = AppConfig::default();
+        replaying.ingest.exclude_project_dirs = vec!["/no/such/dir/**".to_string()];
+        let block_poll = |config: AppConfig| {
+            let work = work.clone();
+            let checkpoints = checkpoints.clone();
+            let poll_state = poll_state.clone();
+            let metrics = metrics.clone();
+            async move {
+                let (_, transitions) = drive_nac_poll_with_metrics(
+                    &config,
+                    &work,
+                    &checkpoints,
+                    &poll_state,
+                    &metrics,
+                )
+                .await;
+                transitions
+                    .iter()
+                    .any(|transition| transition.checkpoint.status == "error")
+            }
+        };
+
+        assert!(
+            block_poll(replaying.clone()).await,
+            "the replacement replay must block durably"
+        );
+        assert_eq!(
+            poll_state.consecutive_failed_scans(&cp_key),
+            1,
+            "entering the blocked state starts the ladder"
+        );
+
+        // Inside the first 15 s window the retry is suppressed entirely.
+        assert!(!block_poll(replaying.clone()).await, "throttled");
+
+        // 16 s later the window has expired and the ladder must climb to 2 —
+        // a 30 s window, not another 15 s one.
+        poll_state.age_for_tests(&cp_key, std::time::Duration::from_secs(16));
+        assert!(block_poll(replaying.clone()).await);
+        assert_eq!(
+            poll_state.consecutive_failed_scans(&cp_key),
+            2,
+            "a repeat block must extend the streak, not restart it — a \
+             `clear()` before `record_blocked_replay` pins it at 1"
+        );
+
+        // This is the probe a reset-to-1 bug fails: pinned at the floor, the
+        // retry would be due and would run.
+        poll_state.age_for_tests(&cp_key, std::time::Duration::from_secs(16));
+        assert!(
+            !block_poll(replaying).await,
+            "the second window is 30 s; a blocked replay must not re-read the \
+             whole store every 15 s forever"
+        );
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(format!("{}-wal", path.display())).ok();
+        std::fs::remove_file(format!("{}-shm", path.display())).ok();
+    }
+
+    /// Issue #601 §2.5/§3.2. NAC's `Failed` arm must route through
+    /// `record_scan_failure_outcome`, not straight into the fault ladder:
+    /// mixed-snapshot means the store was being written while the scan read
+    /// it, and a 15 s → 15 min suppression of an active NAC store is the §6
+    /// prompt-visibility regression the exemption exists to prevent. The
+    /// contention clock still has to move, because it is what throttles a
+    /// contended replay's durable barrier.
+    ///
+    /// Fails for: calling `record_failed_scan` directly from the `Failed` arm,
+    /// or dropping the classification entirely.
+    #[tokio::test]
+    async fn a_contended_nac_scan_moves_the_contention_clock_not_the_fault_ladder() {
+        let path = fixture_db();
+        let source_file = path.to_string_lossy().to_string();
+        let work = WorkItem {
+            source_name: "nac-contention".to_string(),
+            harness: "nac".to_string(),
+            format: moraine_config::SourceFormat::NacSqlite,
+            source_glob: source_file.clone(),
+            path: source_file.clone(),
+            trigger: WorkTrigger::Watcher,
+        };
+        let cp_key = checkpoint_key(&work.source_name, &work.path);
+        let config = AppConfig::default();
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let poll_state = VolatilePollMap::new();
+        let metrics = Arc::new(Metrics::default());
+
+        super::super::contention_injection::arm(&source_file, 1);
+        drive_nac_poll_with_metrics(&config, &work, &checkpoints, &poll_state, &metrics).await;
+        assert_eq!(
+            metrics
+                .sqlite_scan_failures_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the armed scan must actually reach the mixed-snapshot arm"
+        );
+        assert_eq!(
+            poll_state.consecutive_failed_scans(&cp_key),
+            0,
+            "contention must not climb NAC's fault ladder"
+        );
+        assert_eq!(
+            poll_state.consecutive_contended_scans(&cp_key),
+            1,
+            "…but it must leave the clock that throttles the replay barrier"
+        );
+
+        super::super::contention_injection::disarm(&source_file);
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(format!("{}-wal", path.display())).ok();
+        std::fs::remove_file(format!("{}-shm", path.display())).ok();
+    }
+
+    /// Issue #601 §3.2/§6 — NAC's half of the call-site guard. The classifier
+    /// test above proves the clock *moves*; this proves the clock does not
+    /// reach ordinary polls.
+    ///
+    /// §2.5's `|| !failure_retry_due` disjunct on the cheap short-circuit was
+    /// outcome-redundant with `should_skip_poll` until §3.2 put the contention
+    /// clock inside `failure_retry_due` and deliberately left it out of
+    /// `should_skip_poll`. Adding it now would stop scanning an actively
+    /// written NAC store for up to 60 s — the prompt-visibility regression the
+    /// exemption exists to prevent. A NAC store is contended precisely while a
+    /// worker is writing episodes into it.
+    ///
+    /// The end-to-end delivery half of this rule is
+    /// `an_ordinary_poll_of_a_contended_database_is_not_throttled` on the
+    /// Cursor adapter; this one pins the throttle at NAC's own call site.
+    ///
+    /// Fails for: adding `|| !poll_state.failure_retry_due(..)` to the cheap
+    /// short-circuit (the second scan never runs), or moving the contention
+    /// clock into `should_skip_poll`.
+    #[tokio::test]
+    async fn an_ordinary_poll_of_a_contended_nac_store_is_not_throttled() {
+        let path = fixture_db();
+        let source_file = path.to_string_lossy().to_string();
+        let work = WorkItem {
+            source_name: "nac-contended-ordinary".to_string(),
+            harness: "nac".to_string(),
+            format: moraine_config::SourceFormat::NacSqlite,
+            source_glob: source_file.clone(),
+            path: source_file.clone(),
+            trigger: WorkTrigger::Watcher,
+        };
+        let cp_key = checkpoint_key(&work.source_name, &work.path);
+        let config = AppConfig::default();
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let poll_state = VolatilePollMap::new();
+        let metrics = Arc::new(Metrics::default());
+
+        // Cold poll commits a checkpoint over the fixture.
+        let (cold, _) =
+            drive_nac_poll_with_metrics(&config, &work, &checkpoints, &poll_state, &metrics).await;
+        assert!(!cold.is_empty(), "the cold poll emits the fixture");
+
+        // A worker is writing episodes, so the next two scans lose the bracket.
+        super::super::contention_injection::arm(&source_file, 2);
+        append_worker_episode(&path, "contended follow-up one", "2026-07-18 12:18:00");
+        drive_nac_poll_with_metrics(&config, &work, &checkpoints, &poll_state, &metrics).await;
+        assert_eq!(poll_state.consecutive_contended_scans(&cp_key), 1);
+        assert_eq!(
+            poll_state.consecutive_failed_scans(&cp_key),
+            0,
+            "contention is not a fault (§3.2)"
+        );
+
+        // The very next tick, far inside the contention window the barrier is
+        // now serving, must still read the store.
+        append_worker_episode(&path, "contended follow-up two", "2026-07-18 12:18:01");
+        drive_nac_poll_with_metrics(&config, &work, &checkpoints, &poll_state, &metrics).await;
+        assert_eq!(
+            poll_state.consecutive_contended_scans(&cp_key),
+            2,
+            "an ordinary poll of a contended NAC store must not be throttled — \
+             the second scan has to run at the ordinary poll cadence"
+        );
+        assert_eq!(
+            metrics
+                .sqlite_scan_failures_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "…and must reach the scan, not return before it"
+        );
+
+        super::super::contention_injection::disarm(&source_file);
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(format!("{}-wal", path.display())).ok();
+        std::fs::remove_file(format!("{}-shm", path.display())).ok();
+    }
+
+    /// Issue #601 §2.1(2) — NAC's half of the `retry_blocked_replay` narrowing
+    /// width. See the Cursor twin
+    /// `a_crash_interrupted_replay_resumes_from_its_replaying_status` for the
+    /// argument: `replaying` with no error status and no block reason is what a
+    /// crash between `BeginReplay` and `FinalizeReplay` leaves, and the `error`
+    /// disjunct cannot cover it.
+    ///
+    /// **[DIVERGENT FIXTURE]** the stat is unchanged since the cold poll, which
+    /// is what a crashed replay looks like and what makes the two behaviours
+    /// diverge: with the disjunct the cursor is reset and the scan runs,
+    /// without it NAC's cheap short-circuit returns on the unchanged stat.
+    ///
+    /// Fails for: dropping the `checkpoint.status == "replaying"` disjunct.
+    #[tokio::test]
+    async fn a_crash_interrupted_nac_replay_resumes_from_its_replaying_status() {
+        let path = fixture_db();
+        let source_file = path.to_string_lossy().to_string();
+        let work = WorkItem {
+            source_name: "nac-replaying-resume".to_string(),
+            harness: "nac".to_string(),
+            format: moraine_config::SourceFormat::NacSqlite,
+            source_glob: source_file.clone(),
+            path: source_file.clone(),
+            trigger: WorkTrigger::Watcher,
+        };
+        let cp_key = checkpoint_key(&work.source_name, &work.path);
+        let config = AppConfig::default();
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let poll_state = VolatilePollMap::new();
+
+        let (cold, _) = drive_nac_poll(&config, &work, &checkpoints, &poll_state).await;
+        assert!(!cold.is_empty(), "the cold poll emits the fixture");
+
+        {
+            let mut map = checkpoints.write().await;
+            let checkpoint = map
+                .get_mut(&cp_key)
+                .expect("the cold poll commits a checkpoint");
+            checkpoint.status = "replaying".to_string();
+            checkpoint.block_reason.clear();
+            checkpoint.final_scan_complete = false;
+        }
+
+        drive_nac_poll(&config, &work, &checkpoints, &poll_state).await;
+
+        let after = checkpoints
+            .read()
+            .await
+            .get(&cp_key)
+            .cloned()
+            .expect("the checkpoint survives the retry");
+        assert_eq!(
+            after.status, "active",
+            "an interrupted replay must resume and finish, not be relabelled"
+        );
+        assert!(
+            after.final_scan_complete,
+            "a resumed replay finalizes; without the `replaying` disjunct the \
+             poll returns on the unchanged stat and the source is stuck"
+        );
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(format!("{}-wal", path.display())).ok();
+        std::fs::remove_file(format!("{}-shm", path.display())).ok();
+    }
+
+    /// Appends one worker episode, exactly as a live NAC writer would, so a
+    /// poll sees a changed stat fingerprint rather than the unchanged-file
+    /// short-circuit.
+    fn append_worker_episode(path: &Path, content: &str, created_at: &str) {
+        let connection = Connection::open(path).expect("open NAC fixture for append");
+        connection
+            .execute(
+                "INSERT INTO episodes (thread_name, session_id, action, content, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params!["worker-a", "session-local", "inspect", content, created_at],
+            )
+            .expect("append worker episode");
+    }
+
     #[test]
     fn normalizes_both_nac_timestamp_precisions() {
         assert_eq!(
@@ -1794,6 +2197,156 @@ mod tests {
         assert!(projection.contains("COALESCE(host_id, '') AS BLOB"));
     }
 
+    /// Issue #601 §3.2/§6. The `ScanLedger` refactor replaced
+    /// `row.get::<_, String>(..)` with a helper that did
+    /// `row.get::<Option<String>>(..).unwrap_or_default()` on every text column
+    /// at once, which silently turned a NULL in a schema-required column from a
+    /// failed scan into `""`. §3.2 wants schema drift **surfaced, not
+    /// absorbed**: an empty `session_id` flows straight into logical-ID
+    /// derivation and an empty `created_at`/`updated_at` into timestamp
+    /// derivation (§6 "stable logical IDs"), so the record is not merely
+    /// lossy — it is misattributed.
+    ///
+    /// Drives every column of the session projection that was strict before the
+    /// refactor, and both columns that deliberately were not.
+    ///
+    /// Fails for: reading any of the seven required columns through
+    /// `take_payload_nullable_string`, or making `backend`/`reasoning_effort`
+    /// strict (older stores genuinely lack them).
+    #[test]
+    fn a_null_in_a_required_session_column_fails_the_scan() {
+        // Positional, matching `session_projection`'s output order.
+        let baseline = [
+            "'ses-null-probe'",      // 0  session_id      required
+            "'/work/moraine'",       // 1  cwd             required
+            "'glm-5.2'",             // 2  model           required
+            "'https://api.example'", // 3  base_url        required
+            "'zai-coding-plan'",     // 4  backend         nullable
+            "'high'",                // 5  reasoning_effort nullable
+            "NULL",                  // 6  sandbox_json    nullable
+            "'[]'",                  // 7  messages_json   required
+            "NULL",                  // 8  last_response_duration_ms
+            "NULL",                  // 9  previous_response_duration_ms
+            "NULL",                  // 10 response_durations_json
+            "NULL",                  // 11 token_usages_json
+            "'2026-05-08 02:04:37'", // 12 created_at      required
+            "'2026-05-08 02:04:38'", // 13 updated_at      required
+            "0",                     // 14 is_remote
+            "64",                    // 15 estimated_bytes
+        ];
+        let columns: BTreeSet<String> = ["host_id"].into_iter().map(str::to_string).collect();
+        let connection = Connection::open_in_memory().expect("in-memory probe database");
+        let read = |values: &[&str]| {
+            let sql = format!("SELECT {}", values.join(", "));
+            connection.query_row(&sql, [], |row| {
+                let mut ledger = ScanLedger::default();
+                Ok(read_session_row(row, &columns, &mut ledger).map(|_| ()))
+            })
+        };
+
+        read(&baseline)
+            .expect("probe query")
+            .expect("the baseline row must read cleanly");
+
+        for (index, name) in [
+            (0, "session_id"),
+            (1, "cwd"),
+            (2, "model"),
+            (3, "base_url"),
+            (7, "messages_json"),
+            (12, "created_at"),
+            (13, "updated_at"),
+        ] {
+            let mut values = baseline;
+            values[index] = "NULL";
+            let outcome = read(&values).expect("probe query");
+            let error = outcome
+                .err()
+                .unwrap_or_else(|| panic!("a NULL {name} must fail the scan, not become \"\""));
+            let NacScanError::Scan(error) = error else {
+                panic!("a NULL {name} is schema drift, not an oversized row");
+            };
+            assert!(
+                format!("{error:#}").contains("Invalid column type"),
+                "a NULL {name} must surface as a column-type error; got {error:#}"
+            );
+        }
+
+        for (index, name) in [(4, "backend"), (5, "reasoning_effort")] {
+            let mut values = baseline;
+            values[index] = "NULL";
+            read(&values).expect("probe query").unwrap_or_else(|_| {
+                panic!("{name} is absent on older stores and must tolerate NULL")
+            });
+        }
+    }
+
+    /// Issue #601 §3.2. Same rule for the episode loop, which reads five
+    /// NOT NULL columns and is the other half of what the ledger refactor
+    /// loosened. Driven through a real scan because the loop is inline in
+    /// `scan_nac_database`.
+    ///
+    /// The fixture's `episodes` table is rebuilt without its NOT NULL
+    /// constraints so the NULL can be inserted at all — the column *set* is
+    /// unchanged, which is what the adapter's schema check looks at.
+    ///
+    /// Fails for: reading `thread_name`/`session_id`/`action`/`content`/
+    /// `created_at` through `take_payload_nullable_string`.
+    #[test]
+    fn a_null_in_a_required_episode_column_fails_the_scan() {
+        let path = fixture_db();
+        {
+            let connection = Connection::open(&path).expect("open fixture for schema relaxation");
+            connection
+                .execute_batch(
+                    r#"
+                    ALTER TABLE episodes RENAME TO episodes_strict;
+                    CREATE TABLE episodes (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        thread_name TEXT,
+                        session_id TEXT,
+                        action TEXT,
+                        content TEXT,
+                        created_at TEXT
+                    );
+                    INSERT INTO episodes SELECT * FROM episodes_strict;
+                    DROP TABLE episodes_strict;
+                    UPDATE episodes SET content = NULL
+                      WHERE id = (SELECT MIN(id) FROM episodes);
+                    "#,
+                )
+                .expect("relax episodes schema and null a required column");
+        }
+
+        let stat = stat_fingerprint(path.to_str().expect("UTF-8 fixture path"))
+            .expect("fixture stat fingerprint");
+        let metadata = std::fs::metadata(&path).expect("fixture metadata");
+        let inode = source_inode_for_file(path.to_str().expect("UTF-8 fixture path"), &metadata);
+        let mut ledger = ScanLedger::default();
+        let outcome = scan_nac_database(
+            path.to_str().expect("UTF-8 fixture path"),
+            "nac-null-episode",
+            1,
+            inode,
+            stat,
+            &NacState::default(),
+            &mut ledger,
+        );
+        match outcome {
+            NacScanOutcome::Failed { error_text, .. } => assert!(
+                error_text.contains("Invalid column type"),
+                "a NULL episode column must surface as a column-type error; got {error_text}"
+            ),
+            NacScanOutcome::Scanned { .. } => {
+                panic!("a NULL in a NOT NULL episode column must fail the scan, not become \"\"")
+            }
+        }
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(format!("{}-wal", path.display())).ok();
+        std::fs::remove_file(format!("{}-shm", path.display())).ok();
+    }
+
     #[test]
     fn base_url_persistence_omits_credentials_paths_and_queries() {
         assert_eq!(
@@ -1824,10 +2377,19 @@ mod tests {
     }
 
     fn scan_fixture(path: &Path, prior: &NacState) -> (Vec<SyntheticRecord>, NacState, u64) {
+        let (records, state, relevant_rows, _) = scan_fixture_with_ledger(path, prior);
+        (records, state, relevant_rows)
+    }
+
+    fn scan_fixture_with_ledger(
+        path: &Path,
+        prior: &NacState,
+    ) -> (Vec<SyntheticRecord>, NacState, u64, ScanLedger) {
         let stat = stat_fingerprint(path.to_str().expect("UTF-8 fixture path"))
             .expect("fixture stat fingerprint");
         let metadata = std::fs::metadata(path).expect("fixture metadata");
         let inode = source_inode_for_file(path.to_str().expect("UTF-8 fixture path"), &metadata);
+        let mut ledger = ScanLedger::default();
         match scan_nac_database(
             path.to_str().expect("UTF-8 fixture path"),
             "nac-fixture",
@@ -1835,13 +2397,14 @@ mod tests {
             inode,
             stat,
             prior,
+            &mut ledger,
         ) {
             NacScanOutcome::Scanned {
                 records,
                 state,
                 relevant_rows,
                 ..
-            } => (records, state, relevant_rows),
+            } => (records, state, relevant_rows, ledger),
             NacScanOutcome::Failed {
                 error_kind,
                 error_text,
@@ -1868,6 +2431,228 @@ mod tests {
             updated_at: "2026-07-18 12:00:00.000000000".to_string(),
             estimated_bytes: 0,
         }
+    }
+
+    /// Issue #601 §2.0. The ledger is **caller-owned** exactly so that a scan
+    /// which reads and then fails is still charged for what it read — the
+    /// stated guarantee being "a scan that reads 48 MB and then loses the
+    /// mixed-snapshot race is charged". Nothing asserted it: every NAC ledger
+    /// test destructured `Scanned` and panicked otherwise, and the one test
+    /// that does reach a failure arm
+    /// (`scanner_rejects_a_database_replaced_before_open`) throws the ledger
+    /// away with `&mut ScanLedger::default()`.
+    ///
+    /// **[DIVERGENT FIXTURE]** the failing session sorts *last* by
+    /// `session_id`, so the scan has already paid for real rows before it
+    /// fails; a fixture whose only session fails would report zero bytes for an
+    /// honest reason and prove nothing.
+    ///
+    /// Fails for: resetting or rebuilding the ledger on any
+    /// `scan_nac_database` failure arm.
+    #[test]
+    fn a_failed_nac_scan_still_reports_the_bytes_it_had_already_read() {
+        let path = fixture_db();
+        let connection = Connection::open(&path).expect("open fixture");
+        // A row that reads fine and then fails to parse: `read_session_row`
+        // charges every column it materialized before it validates the JSON.
+        connection
+            .execute(
+                "INSERT INTO sessions (session_id, cwd, model, base_url, backend, \
+                 reasoning_effort, sandbox_json, messages_json, response_durations_json, \
+                 token_usages_json, created_at, updated_at) \
+                 VALUES ('zzz-broken-json', '/tmp', 'm', '', '', '', NULL, ?1, NULL, NULL, \
+                 '2026-07-18 12:00:00', '2026-07-18 12:00:00')",
+                ["this is not json at all"],
+            )
+            .expect("insert unparseable session");
+        drop(connection);
+
+        let stat = stat_fingerprint(path.to_str().expect("UTF-8 path")).expect("fixture stat");
+        let metadata = std::fs::metadata(&path).expect("fixture metadata");
+        let inode = source_inode_for_file(path.to_str().expect("UTF-8 path"), &metadata);
+        let mut ledger = ScanLedger::default();
+        let outcome = scan_nac_database(
+            path.to_str().expect("UTF-8 path"),
+            "nac-fixture",
+            1,
+            inode,
+            stat,
+            &NacState::default(),
+            &mut ledger,
+        );
+        let NacScanOutcome::Failed { error_kind, .. } = outcome else {
+            panic!("an unparseable messages_json must fail the scan");
+        };
+        assert_eq!(error_kind, ERROR_KIND_SCAN);
+        assert!(
+            ledger.payload_rows > 1,
+            "the sessions read before the failure are still charged; got {}",
+            ledger.payload_rows
+        );
+        assert!(
+            ledger.payload_bytes > 0,
+            "a failed scan must still report the bytes it paid for"
+        );
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(format!("{}-wal", path.display())).ok();
+        std::fs::remove_file(format!("{}-shm", path.display())).ok();
+    }
+
+    /// Issue #601 §2.0, the episode arm. `read_session_row` charges its row
+    /// *before* the oversize check; the episode loop charged it *after*, so the
+    /// `TooLarge` arm reported zero rows and zero bytes for a row SQLite had
+    /// already fully decoded to compute `estimated_bytes` — contradicting the
+    /// headline guarantee on the very ceiling the ledger is meant to denominate.
+    ///
+    /// **[DIVERGENT FIXTURE]** the oversized episode is not the first row read,
+    /// so the byte axis is non-zero for reasons independent of the row charge,
+    /// and the two axes stay distinguishable.
+    ///
+    /// Fails for: moving the episode `charge_payload_row` back below the
+    /// ceiling check.
+    #[test]
+    fn an_oversized_episode_still_charges_the_row_it_decoded() {
+        let path = fixture_db();
+        let connection = Connection::open(&path).expect("open fixture");
+        // One byte past the row ceiling, computed the way the scan computes it.
+        let oversized = "e".repeat(SCAN_PAGE_MAX_BYTES + 1);
+        connection
+            .execute(
+                "INSERT INTO episodes (thread_name, session_id, action, content, created_at) \
+                 VALUES ('zzz-oversized-thread', 'session-local', 'run', ?1, \
+                 '2026-07-18 12:30:00')",
+                [&oversized],
+            )
+            .expect("insert oversized episode");
+        drop(connection);
+
+        let stat = stat_fingerprint(path.to_str().expect("UTF-8 path")).expect("fixture stat");
+        let metadata = std::fs::metadata(&path).expect("fixture metadata");
+        let inode = source_inode_for_file(path.to_str().expect("UTF-8 path"), &metadata);
+        let mut ledger = ScanLedger::default();
+        let outcome = scan_nac_database(
+            path.to_str().expect("UTF-8 path"),
+            "nac-fixture",
+            1,
+            inode,
+            stat,
+            &NacState::default(),
+            &mut ledger,
+        );
+        let NacScanOutcome::Failed { error_kind, .. } = outcome else {
+            panic!("an episode past the row ceiling must fail the scan");
+        };
+        assert_eq!(error_kind, ERROR_KIND_TOO_LARGE);
+
+        // Every session, every earlier episode, **and** the rejected episode.
+        let expected_rows = {
+            let connection = Connection::open(&path).expect("reopen fixture for counting");
+            let sessions: i64 = connection
+                .query_row("SELECT count(*) FROM sessions", [], |row| row.get(0))
+                .expect("count sessions");
+            let episodes: i64 = connection
+                .query_row("SELECT count(*) FROM episodes", [], |row| row.get(0))
+                .expect("count episodes");
+            (sessions + episodes) as u64
+        };
+        assert_eq!(
+            ledger.payload_rows, expected_rows,
+            "the rejected episode was decoded in full to evaluate its size, so \
+             the ceiling arm must charge it like any other row"
+        );
+        assert!(
+            ledger.payload_bytes > 0,
+            "and the rows read before it are still charged"
+        );
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(format!("{}-wal", path.display())).ok();
+        std::fs::remove_file(format!("{}-shm", path.display())).ok();
+    }
+
+    /// Issue #601 §2.0 / WI-01, NAC arm. **[DIVERGENT FIXTURE]** the second
+    /// scan carries the first scan's cursor, so it emits nothing while reading
+    /// exactly the same bytes — a ledger charged at the emit site reports zero
+    /// there, and a ledger charged only on the changed branch reports zero too.
+    ///
+    /// Fails for: charging from emitted records, charging only changed rows,
+    /// or dropping the row/byte charge from `read_session_row` or the episode
+    /// loop.
+    #[test]
+    fn nac_ledger_charges_payload_bytes_at_the_read_site() {
+        let path = fixture_db();
+        let connection = Connection::open(&path).expect("open fixture for counting");
+        let sessions: i64 = connection
+            .query_row("SELECT count(*) FROM sessions", [], |row| row.get(0))
+            .expect("count sessions");
+        let episodes: i64 = connection
+            .query_row("SELECT count(*) FROM episodes", [], |row| row.get(0))
+            .expect("count episodes");
+        let messages_bytes: i64 = connection
+            .query_row(
+                "SELECT coalesce(sum(length(CAST(messages_json AS BLOB))), 0) FROM sessions",
+                [],
+                |row| row.get(0),
+            )
+            .expect("sum messages bytes");
+        drop(connection);
+
+        let (records, state, _, ledger) = scan_fixture_with_ledger(&path, &NacState::default());
+        assert!(!records.is_empty(), "the cold scan must emit something");
+        assert_eq!(
+            ledger.payload_rows,
+            (sessions + episodes) as u64,
+            "every session and episode row is a payload read"
+        );
+        assert_eq!(ledger.rows_emitted, records.len() as u64);
+        assert!(
+            ledger.payload_bytes > messages_bytes as u64,
+            "payload bytes must cover messages_json plus the other materialized \
+             columns; got {} against {messages_bytes} of messages alone",
+            ledger.payload_bytes
+        );
+        // Schema validation is the only charged census read today; §3.2's
+        // `updated_at` fast path adds NAC's own. The payload read must not be
+        // miscounted as one.
+        let schema_census = {
+            let connection =
+                super::open_read_only(&path.to_string_lossy()).expect("reopen for schema census");
+            crate::sqlite_poll::expected_schema_census(&connection, &["sessions", "episodes"])
+        };
+        assert!(schema_census.census_rows > 0);
+        assert_eq!(ledger.census_rows, schema_census.census_rows);
+        assert_eq!(ledger.census_bytes, schema_census.census_bytes);
+
+        let (second_records, second_state, _, second) = scan_fixture_with_ledger(&path, &state);
+        assert!(
+            second_records.is_empty(),
+            "the warm scan must emit nothing, or the divergence is not exercised"
+        );
+        assert_eq!(second.rows_emitted, 0);
+        assert_eq!(
+            second.payload_rows, sessions as u64,
+            "every session is still re-read on an unchanged store; only episodes \
+             are spared, by the existing append-only `episode_high_water`"
+        );
+        assert!(
+            second.payload_bytes >= messages_bytes as u64,
+            "a scan that emits nothing still pays for every session it read"
+        );
+
+        let (third_records, _, _, third) = scan_fixture_with_ledger(&path, &second_state);
+        assert!(third_records.is_empty());
+        assert_eq!(third.rows_emitted, 0);
+        assert_eq!(
+            third.payload_bytes, second.payload_bytes,
+            "two consecutive scans that emit nothing must charge identical, \
+             non-zero bytes — an emit-site ledger reports zero for both"
+        );
+        assert_eq!(third.payload_rows, second.payload_rows);
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(format!("{}-wal", path.display())).ok();
+        std::fs::remove_file(format!("{}-shm", path.display())).ok();
     }
 
     #[test]
@@ -1993,6 +2778,7 @@ mod tests {
             format: moraine_config::SourceFormat::NacSqlite,
             source_glob: source_file.clone(),
             path: source_file.clone(),
+            trigger: WorkTrigger::Watcher,
         };
         let checkpoints = Arc::new(RwLock::new(HashMap::new()));
         let poll_state = VolatilePollMap::new();
@@ -2034,6 +2820,7 @@ mod tests {
                 inode ^ 1,
                 stat,
                 &NacState::default(),
+                &mut ScanLedger::default(),
             ),
             NacScanOutcome::Failed {
                 error_kind: ERROR_KIND_MIXED_SNAPSHOT,
@@ -2055,6 +2842,7 @@ mod tests {
             format: moraine_config::SourceFormat::NacSqlite,
             source_glob: source_file.clone(),
             path: source_file.clone(),
+            trigger: WorkTrigger::Watcher,
         };
         let config = AppConfig::default();
         let checkpoints = Arc::new(RwLock::new(HashMap::new()));
@@ -2098,6 +2886,120 @@ mod tests {
         std::fs::remove_file(format!("{}-shm", path.display())).ok();
     }
 
+    /// Issue #601 §2.5, the NAC-specific aggravation: the volatile check was
+    /// skipped entirely during replay (`!replacement_replay && should_skip_poll`),
+    /// so a store stuck in `retry_blocked_replay` re-scanned the whole database
+    /// **and re-sent a durable `BeginReplay` barrier** on every tick, forever.
+    ///
+    /// The throttle has to sit *before* the barrier: gating only the scan would
+    /// leave a barrier with nothing behind it, which is the failure mode
+    /// §2.1(2) warns about.
+    ///
+    /// Denominated on durable transitions emitted and on observed scans — not
+    /// on `ingest_errors` rows, which the `last_error` marker already
+    /// suppresses.
+    #[tokio::test]
+    async fn blocked_replay_backs_off_instead_of_resending_the_barrier() {
+        let path = fixture_db();
+        let source_file = path.to_string_lossy().to_string();
+        let work = WorkItem {
+            source_name: "nac-fixture".to_string(),
+            harness: "nac".to_string(),
+            format: moraine_config::SourceFormat::NacSqlite,
+            source_glob: source_file.clone(),
+            path: source_file.clone(),
+            trigger: WorkTrigger::Watcher,
+        };
+        let config = AppConfig::default();
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let poll_state = VolatilePollMap::new();
+        let metrics = Arc::new(Metrics::default());
+        drive_nac_poll_with_metrics(&config, &work, &checkpoints, &poll_state, &metrics).await;
+        // The cold poll's ledger must reach the shared counters: `Metrics` is
+        // how every observation below is denominated, and a `record_scan_ledger`
+        // that folds nothing would make all of them unfailable.
+        assert!(
+            metrics
+                .sqlite_poll_payload_rows_total
+                .load(std::sync::atomic::Ordering::Relaxed)
+                > 0,
+            "the NAC scan's ledger must be folded into the shared metrics"
+        );
+
+        // Replace the store in place so the next poll starts a replacement
+        // replay that cannot succeed, leaving the checkpoint durably blocked.
+        let replacement = path.with_extension("replacement");
+        std::fs::write(&replacement, b"not a sqlite database").expect("write invalid replacement");
+        std::fs::remove_file(&path).expect("remove fixture database");
+        std::fs::rename(&replacement, &path).expect("install invalid replacement");
+        let (_, blocking) =
+            drive_nac_poll_with_metrics(&config, &work, &checkpoints, &poll_state, &metrics).await;
+        assert_eq!(blocking.len(), 2, "begin then durable block");
+        let failures_after_block = metrics
+            .sqlite_scan_failures_total
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(failures_after_block, 1);
+
+        let cp_key = checkpoint_key(&work.source_name, &work.path);
+        assert_eq!(
+            poll_state.consecutive_failed_scans(&cp_key),
+            1,
+            "the block starts the failure ladder"
+        );
+
+        let scan_failures = || {
+            metrics
+                .sqlite_scan_failures_total
+                .load(std::sync::atomic::Ordering::Relaxed)
+        };
+
+        // Ten ticks inside the first 15 s window: nothing runs.
+        let mut retry_transitions = 0usize;
+        for _ in 0..10 {
+            let (_, transitions) =
+                drive_nac_poll_with_metrics(&config, &work, &checkpoints, &poll_state, &metrics)
+                    .await;
+            retry_transitions += transitions.len();
+        }
+        assert_eq!(
+            retry_transitions, 0,
+            "a durably blocked replay must not re-send BeginReplay on every tick"
+        );
+        assert_eq!(
+            scan_failures(),
+            failures_after_block,
+            "and must not re-run the failing scan either"
+        );
+
+        // Ten ticks inside one window cannot distinguish a flat 15 s floor from
+        // an exponential ladder, which is what let the floor-pinning reset ship.
+        // Backdating the clock does: after the first retry the window is 30 s,
+        // so a further 16 s must **not** be enough.
+        poll_state.age_for_tests(&cp_key, std::time::Duration::from_secs(16));
+        let (_, retried) =
+            drive_nac_poll_with_metrics(&config, &work, &checkpoints, &poll_state, &metrics).await;
+        assert_eq!(retried.len(), 2, "the due retry re-sends begin then block");
+        assert_eq!(scan_failures(), failures_after_block + 1);
+        assert_eq!(
+            poll_state.consecutive_failed_scans(&cp_key),
+            2,
+            "a repeat failure extends the ladder"
+        );
+
+        poll_state.age_for_tests(&cp_key, std::time::Duration::from_secs(16));
+        let (_, throttled) =
+            drive_nac_poll_with_metrics(&config, &work, &checkpoints, &poll_state, &metrics).await;
+        assert!(
+            throttled.is_empty(),
+            "the second window is 30 s; 16 s of elapsed time is not yet due"
+        );
+        assert_eq!(scan_failures(), failures_after_block + 1);
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(format!("{}-wal", path.display())).ok();
+        std::fs::remove_file(format!("{}-shm", path.display())).ok();
+    }
+
     #[tokio::test]
     async fn oversized_normalized_rows_fail_before_any_payload_is_sent() {
         let path = fixture_db();
@@ -2133,21 +3035,52 @@ mod tests {
             format: moraine_config::SourceFormat::NacSqlite,
             source_glob: source_file.clone(),
             path: source_file,
+            trigger: WorkTrigger::Watcher,
         };
-        let (sink_tx, mut sink_rx) = mpsc::channel(2);
-        process_nac_sqlite_db(
-            &AppConfig::default(),
-            &work,
-            Arc::new(RwLock::new(HashMap::new())),
-            &VolatilePollMap::new(),
-            sink_tx,
-            &Arc::new(Metrics::default()),
-        )
-        .await
-        .expect("oversized scan reports an ingest error");
-        let SinkMessage::Batch(batch) = sink_rx.recv().await.expect("oversized failure batch")
-        else {
-            panic!("expected oversized failure batch");
+        // **Known hazard, gate G1d (§3.2).** The mixed-snapshot bracket's second
+        // disjunct compares full `StatFingerprint`s including `shm_len` /
+        // `shm_mtime_ns`, so it can reject a scan when `data_version` is
+        // unchanged — no commit happened at all, only sidecar churn. Under a
+        // loaded host (running the whole suite in parallel, or alongside the
+        // Cursor mixed-snapshot reproducer) this poll therefore sometimes
+        // reports `sqlite_mixed_snapshot` instead of the ceiling it is about.
+        // That is not noise and it is not this test's bug: it is exactly the
+        // rejection G1d exists to characterize.
+        //
+        // A mixed-snapshot rejection means "retry without advancing the
+        // cursor", so the test does what production does — retries — and
+        // requires the ceiling to be reported within a bounded number of
+        // attempts. Attributing it this way keeps the assertion sharp instead
+        // of loosening it to "either error kind is fine".
+        let mut rejections = 0usize;
+        let batch = loop {
+            let (sink_tx, mut sink_rx) = mpsc::channel(2);
+            process_nac_sqlite_db(
+                &AppConfig::default(),
+                &work,
+                Arc::new(RwLock::new(HashMap::new())),
+                &VolatilePollMap::new(),
+                sink_tx,
+                &Arc::new(Metrics::default()),
+            )
+            .await
+            .expect("oversized scan reports an ingest error");
+            let SinkMessage::Batch(batch) = sink_rx.recv().await.expect("oversized failure batch")
+            else {
+                panic!("expected oversized failure batch");
+            };
+            if batch.error_rows.first().map(|row| &row["error_kind"])
+                == Some(&Value::from(ERROR_KIND_MIXED_SNAPSHOT))
+            {
+                rejections += 1;
+                assert!(
+                    rejections < 20,
+                    "20 consecutive mixed-snapshot rejections against a database \
+                     nothing is writing is the G1d hazard escalating, not a flake"
+                );
+                continue;
+            }
+            break batch;
         };
         assert!(batch.raw_rows.is_empty());
         assert!(batch.event_rows.is_empty());

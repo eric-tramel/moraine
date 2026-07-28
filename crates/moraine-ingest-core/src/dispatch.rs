@@ -5,7 +5,7 @@ use crate::sources::claude_code::cowork_session_path;
 use crate::sources::kiro_cli::{load_kiro_session_metadata, KiroSessionMetadata};
 use crate::sources::shared::{format_record_ts, infer_vendor_from_base_url, parse_record_ts};
 use crate::sqlite_poll::VolatilePollMap;
-use crate::{DispatchState, Metrics, SinkMessage, WorkItem};
+use crate::{DispatchState, Metrics, SinkMessage, WorkItem, WorkTrigger};
 use anyhow::{Context, Result};
 use moraine_config::{is_workflow_journal_path, map_tracked_path, AppConfig, SourceFormat};
 use serde::{Deserialize, Serialize};
@@ -857,8 +857,60 @@ pub(crate) fn spawn_debounce_task(
             tokio::select! {
                 maybe_work = rx.recv() => {
                     match maybe_work {
-                        Some(work) => {
-                            pending.insert(work.key(), (work, Instant::now()));
+                        Some(mut work) => {
+                            let key = work.key();
+                            // **This window is watcher-only.** Its receiver is
+                            // `watch_path_rx`, and the only sender is
+                            // `spawn_watcher_threads`, which funnels every
+                            // event through `WorkItem::watcher` — the crate's
+                            // single `WorkTrigger::Watcher` literal. Reconcile
+                            // ticks and startup backfill bypass the debounce
+                            // and call `enqueue_work` directly, so no reconcile
+                            // tick can ever be merged away *here*.
+                            //
+                            // That is what makes `reconcile_owed` have exactly
+                            // **one** creator, `enqueue_work`'s incoming-
+                            // `Reconcile` path, which is the whole reachability
+                            // argument `complete_work` rests on. An earlier
+                            // revision also owed from this window; that path
+                            // could not fire in production and only its own
+                            // synthetic test drove it, so it is gone rather
+                            // than left as a second, untestable creator.
+                            //
+                            // The assertion below is the invariant, not a
+                            // comment about it: route a `Reconcile` producer
+                            // into this channel and the merge would silently
+                            // discard the tick, so such a change has to bring
+                            // a ledger entry with it.
+                            debug_assert_eq!(
+                                work.trigger,
+                                WorkTrigger::Watcher,
+                                "the debounce window is fed only by the watcher \
+                                 threads; a {:?} producer here would have its \
+                                 trigger merged away with nothing recording it",
+                                work.trigger
+                            );
+                            // Coalescing keeps the least reconciliation-
+                            // eligible trigger (§2.4): merging never *raises*
+                            // the cost of an item already queued behind a
+                            // debounce window. `key()` excludes the trigger, so
+                            // the two items still merge into one poll.
+                            //
+                            // Under the invariant asserted above this merge is
+                            // **inert** — every item in this window carries
+                            // `Watcher`, and `Watcher.merge(Watcher)` is
+                            // `Watcher` — so no test can distinguish it from
+                            // the bare `insert` below and none tries to. It is
+                            // kept because the alternative is not "no merge"
+                            // but last-writer-wins, which for a future mixed
+                            // producer would let the *later* event raise the
+                            // cost of a queued poll. Deleting it is safe today
+                            // and wrong the moment the assert above starts
+                            // earning its keep.
+                            if let Some((queued, _)) = pending.get(&key) {
+                                work.trigger = work.trigger.merge(queued.trigger);
+                            }
+                            pending.insert(key, (work, Instant::now()));
                         }
                         None => break,
                     }
@@ -894,6 +946,67 @@ pub(crate) fn spawn_debounce_task(
     })
 }
 
+/// Re-arm a merged-away reconcile tick onto a poll that is about to start,
+/// and settle the debt in the same step.
+///
+/// **This is a disclosed deviation from §2.4.** That section says the dirty
+/// re-enqueue "preserves the original trigger and must never upgrade it to
+/// `Reconcile`"; this function is called from that re-enqueue and does exactly
+/// that upgrade. The deviation is deliberate — §2.4's other bullet makes every
+/// reconcile tick that lands on a busy key merge away, and on a continuously
+/// written database that is *every* tick, so obeying both bullets literally
+/// makes the §4 complete-sweep interval unbounded on the source with the most
+/// history to sweep. What is preserved is the narrower rule the upgrade
+/// actually depends on: no item that has already been handed to a poll is ever
+/// upgraded. Both bullets are restated for WI-10 in
+/// `plans/601-delta-sqlite.md`; the plan text is the thing that must change,
+/// not this comment.
+///
+/// Draining here is what makes the debt settle: the poll that carries the tick
+/// is the poll that pays for it. It is also the **only** remover of a
+/// `reconcile_owed` entry, so "does not arm" and "does not drain" have to stay
+/// the same decision — see the `Startup` refusal below.
+///
+/// `Startup` — and **only** `Startup` — is refused. `WorkTrigger`'s own doc says
+/// startup is the worst moment to add a broad scan, and `merge` encodes that by
+/// keeping `Startup` over `Reconcile`; this function is the one place in the
+/// dispatcher that overrides `merge`'s ranking, so it must not override it
+/// *here* as well. The debt is left standing rather than spent: a poll that does
+/// not carry the tick has not paid for it, and the key's next watcher or
+/// reconcile poll will.
+///
+/// The refusal's **width** matters as much as its existence, and the two are
+/// separately guarded. Widening it by one token — refusing everything that is
+/// not `Watcher` — still refuses every `Startup` poll, so the refusal's own
+/// guard stays green; what it silently drops is the settlement of a standing
+/// debt onto a `Reconcile` carrier, which is a reachable steady state (a tick
+/// owed in the pending window, its poll completing empty, and the next reconcile
+/// firing finding the key idle). The debt would then survive that firing and be
+/// spent by an ordinary watcher event instead, so a filesystem event pays a
+/// sweep slice nothing bought — the §2.4 inversion — and on a path that never
+/// sees another watcher event it never leaves the ledger at all. That direction
+/// is pinned by
+/// `a_standing_debt_is_settled_by_a_reconcile_poll_not_only_a_watcher_one`.
+///
+/// Reachability: no production `Startup` item can hold a debt today. The two
+/// `tee.rs` startup-poll sites call `process_file` directly and never
+/// touch the dispatcher, and `run_ingestor`'s backfill enumerates each path
+/// exactly once — so reaching this refusal needs a path that acquired an unpaid
+/// tick and then went fully idle inside the startup window, before backfill's
+/// round-robin got to it. That race is not structurally impossible (the
+/// reconcile task is spawned before the backfill loop and `tokio::time::interval`
+/// fires immediately), just vanishingly narrow. WI-04 is what makes the branch
+/// worth pinning: it gives the upgrade a cost, and a `Startup` item paying it
+/// is the exact thing §2.4 forbids.
+fn arm_owed_reconcile(state: &mut DispatchState, key: &str, work: &mut WorkItem) {
+    if work.trigger == WorkTrigger::Startup {
+        return;
+    }
+    if state.reconcile_owed.remove(key) {
+        work.trigger = WorkTrigger::Reconcile;
+    }
+}
+
 pub(crate) async fn enqueue_work(
     work: WorkItem,
     process_tx: &mpsc::Sender<WorkItem>,
@@ -904,15 +1017,144 @@ pub(crate) async fn enqueue_work(
         return;
     }
 
+    let mut work = work;
     let key = work.key();
+    let incoming_trigger = work.trigger;
     let mut should_send = false;
     {
         let mut state = dispatch.lock().expect("dispatch mutex poisoned");
-        state.item_by_key.insert(key.clone(), work.clone());
+        // `item_by_key` is what `complete_work`'s dirty re-enqueue replays, so
+        // overwriting it wholesale would let a reconcile tick arriving during
+        // an inflight watcher poll upgrade that poll's trigger. Merge instead:
+        // the trigger can be downgraded to `Watcher`, never upgraded (§2.4).
+        if let Some(queued) = state.item_by_key.get(&key) {
+            work.trigger = work.trigger.merge(queued.trigger);
+        }
         if state.inflight.contains(&key) {
+            state.item_by_key.insert(key.clone(), work.clone());
             state.dirty.insert(key.clone());
         } else if state.pending.insert(key.clone()) {
+            // This send starts the poll, so an owed tick may ride it.
+            arm_owed_reconcile(&mut state, &key, &mut work);
+            state.item_by_key.insert(key.clone(), work.clone());
             should_send = true;
+        } else {
+            state.item_by_key.insert(key.clone(), work.clone());
+        }
+
+        // The debt ledger's **only** creator, and — since `complete_work` no
+        // longer prunes — the only thing that bounds the map at all.
+        //
+        // There is no `remove` to pair with it, and the reason is not "the
+        // debt is always already drained by here": settling is
+        // `arm_owed_reconcile`'s job *alone*, and on the `should_send` paths it
+        // has already made the call. For a `Watcher` or `Reconcile` carrier it
+        // drained; for a `Startup` carrier it deliberately did **not**, and that
+        // entry has to stand. A `remove` here would be redundant in the first
+        // case and would destroy a live tick in the second.
+        //
+        // `carried` is "this call handed the tick to a poll", which is exactly
+        // `should_send`. It is not also worth testing `work.trigger ==
+        // Reconcile`: for a dispatching call the trigger it sends is the trigger
+        // it arrived with, unless `arm_owed_reconcile` raised it to `Reconcile`.
+        // `should_send` is only set where `pending.insert` returned true and the
+        // key was not `inflight`, so the merge above found no `item_by_key`
+        // entry — every insert site (this block and `complete_work`'s dirty
+        // re-enqueue) leaves its key in `pending ∪ inflight ∪ dirty` under this
+        // same lock, and the sole `remove` runs only when the key is in none of
+        // them, so a key absent from `pending` and `inflight` is absent from the
+        // map. The `debug_assert` below is where that invariant is stated in
+        // executable form; a future change that lets a stale entry survive trips
+        // it rather than silently under-owing.
+        //
+        // What remains is bounded in both directions by mutation:
+        //
+        //   * `carried = true` (never owe) is an **under-owe**: a tick landing
+        //     on a busy key is treated as paid and silently dropped — two ticks
+        //     straddling one queued poll become one. Guarded from beneath by
+        //     `two_reconcile_ticks_straddling_one_queued_poll_buy_two_polls`.
+        //   * `carried = false` (always owe) is an **over-owe**: every
+        //     dispatched sweep tick is also recorded, so a single sweep leaves a
+        //     standing debt on every idle path it touched. Because nothing
+        //     prunes, those debts are permanent and upgrade every later watcher
+        //     poll of every path to `Reconcile` — strictly worse than a per-key
+        //     latch. Guarded from above by
+        //     `a_reconcile_sweep_over_idle_paths_leaves_no_standing_debt`.
+        //
+        // `incoming_trigger == Reconcile` needs its **width** pinned too, and at
+        // both neighbours rather than only at `Reconcile`. Each one-token
+        // widening has its own guard, and each guard was checked by running it
+        // against its own mutation rather than by reading the suite:
+        //
+        //   * `!= Watcher` lets a startup backfill enqueue mint a debt that some
+        //     later watcher poll then spends — the §2.4 inversion
+        //     `arm_owed_reconcile` refuses from the other side. Held by
+        //     `a_startup_poll_landing_on_a_queued_poll_owes_nothing`, which
+        //     fails under it on its own.
+        //   * `!= Startup` lets every watcher event landing on a busy key mint
+        //     one, so watcher churn alone manufactures sweep eligibility. Held
+        //     by `one_reconcile_tick_buys_exactly_one_reconcile_eligible_poll`,
+        //     the *only* test in the crate that fails under it.
+        //
+        // An earlier revision of this comment named
+        // `debounce_coalesces_a_watcher_burst_into_one_watcher_poll` for the
+        // second. It cannot bound that width and never could: the debounce
+        // coalesces the burst into a single `enqueue_work` call against an idle
+        // key, so `pending.insert` returns true, `carried` is true, and this owe
+        // branch is unreachable whatever the filter admits. Run alone under
+        // `!= Startup` it passes.
+        //
+        // A debt is deliberately **not** created by observing that a queued
+        // item's trigger got downgraded: `item_by_key`'s entry describes a poll
+        // that is already pending or inflight, so re-owing on its downgrade is
+        // re-owing a tick that was already paid. That is a latch —
+        // `complete_work` arms `Reconcile` into `item_by_key`, the next watcher
+        // event downgrades it and re-owes, `complete_work` re-arms — and it
+        // makes *every* poll of a churning key sweep-eligible at the 50 ms
+        // watcher cadence, which inverts §2.4 in the expensive direction on
+        // precisely the busiest database.
+        //
+        // Nothing is lost by dropping that case: a queued `Reconcile` in
+        // `item_by_key` was itself an incoming tick once, and at that moment it
+        // was either dispatched (paid) or recorded here (owed).
+        //
+        // **The two failure directions are not symmetric, and this assertion is
+        // deliberately the weaker kind.** The `work.trigger == Reconcile`
+        // conjunct that used to sit alongside `should_send` was dead under the
+        // invariant, so dropping it changed no outcome — but it failed *safely*:
+        // if the invariant ever broke it would have over-owed, which is bounded
+        // and self-correcting (one extra reconcile-eligible poll, spent on the
+        // next completion). Bare `carried = should_send` fails the other way; a
+        // break silently under-owes, and a lost tick is exactly the §0/§4
+        // coverage failure the whole D1a analysis exists to prevent.
+        //
+        // It stays a `debug_assert!` even so. A hard `assert!` here panics with
+        // the dispatch mutex held, poisoning it and killing every subsequent
+        // poll for every source — trading a bounded, one-tick coverage loss for
+        // a total ingest outage. The invariant is structural (it is about which
+        // insert sites can leave an entry in `item_by_key`), so any change that
+        // could break it is a code change, and code changes run the suite in
+        // debug where this does fire.
+        debug_assert!(
+            !should_send
+                || incoming_trigger != WorkTrigger::Reconcile
+                || work.trigger == WorkTrigger::Reconcile,
+            "a dispatching call cannot have merged away the tick it arrived \
+             with: `should_send` implies no `item_by_key` entry existed"
+        );
+        //
+        // This `insert` **coalesces** on purpose. `reconcile_owed` is a set, so
+        // several ticks landing on a key that stays pending/inflight/dirty
+        // throughout collapse to one debt and are settled by one sweep slice. A
+        // slice covers everything accumulated since the last one, so the debt
+        // is a flag ("this key owes a sweep") rather than an amount of work,
+        // and §4's complete-sweep interval is bounded by how often the key
+        // polls at all — which coalescing does not change. The declaration-site
+        // doc on `DispatchState::reconcile_owed` carries the full argument;
+        // `reconcile_ticks_landing_on_one_queued_poll_coalesce` pins it.
+        let carried = should_send;
+        if incoming_trigger == WorkTrigger::Reconcile && !carried {
+            state.reconcile_owed.insert(key.clone());
         }
     }
 
@@ -927,12 +1169,72 @@ pub(crate) fn complete_work(key: &str, dispatch: &Arc<Mutex<DispatchState>>) -> 
 
     if state.dirty.remove(key) {
         if state.pending.insert(key.to_string()) {
-            return state.item_by_key.get(key).cloned();
+            let mut item = state.item_by_key.get(key).cloned()?;
+            // The poll that was inflight has finished; this re-enqueue starts
+            // a new one, so it is the first moment an owed reconcile tick can
+            // be honoured without upgrading work already in flight.
+            arm_owed_reconcile(&mut state, key, &mut item);
+            state.item_by_key.insert(key.to_string(), item.clone());
+            return Some(item);
         }
         return None;
     }
 
     if !state.pending.contains(key) && !state.inflight.contains(key) && !state.dirty.contains(key) {
+        // The key has left the dispatcher entirely, so its queued item goes.
+        //
+        // `reconcile_owed` deliberately does **not** follow it out, and this is
+        // not tidiness deferred: pruning the debt here destroys a live
+        // reconcile tick on every firing. The ledger has exactly one production
+        // creator — `enqueue_work`'s incoming-`Reconcile` path — and that path
+        // splits on the key's state:
+        //
+        //   * key **inflight** with a `Watcher` or `Reconcile` item: `dirty` is
+        //     set, so `complete_work` takes the dirty branch above and
+        //     `arm_owed_reconcile` settles the debt onto the re-enqueued poll.
+        //     This branch is never reached.
+        //   * key **inflight** with a `Startup` item: `dirty` is set and the
+        //     dirty branch still runs, but `arm_owed_reconcile` **refuses** to
+        //     upgrade `Startup` (D1c) and leaves the debt standing by design.
+        //     The re-enqueued poll can then complete with nothing dirty behind
+        //     it and arrive *here* holding an unpaid tick, exactly like the
+        //     pending case. D1c added this case after the two-case split above
+        //     was written; it does not weaken the conclusion, it is a third way
+        //     to reach this point with a live debt.
+        //   * key **pending**: the item is already queued for a worker and
+        //     `dirty` is *not* set, so the debt is recorded against a poll that
+        //     still carries `Watcher`. The window is wide — the processor loop
+        //     parks on `sem.acquire_owned()` before draining the next item, so
+        //     a saturated worker pool holds keys in `pending` indefinitely.
+        //     No poll picks that tick up, and when the queued poll finishes
+        //     with nothing dirty behind it, control arrives *here* with the
+        //     debt unpaid.
+        //
+        // So every reachable prune deletes a tick a reconcile firing created
+        // milliseconds earlier — the §0/§4 coverage guarantee failing on
+        // exactly the source with the most history to sweep. A *paid* debt is
+        // already gone by the time this runs (`arm_owed_reconcile` drains on
+        // use), so there is no reachable state in which a prune here collects
+        // anything but a live tick.
+        //
+        // Retention costs one `String` per *indebted* path, and the bound is
+        // worth stating exactly rather than rounding to "the tracked-path set".
+        // For a path that stays tracked the entry is transient: the next
+        // reconcile firing enumerates it and `arm_owed_reconcile` drains the
+        // debt onto that poll. For a path that leaves tracking while holding an
+        // unpaid debt — deleted, rotated out of the glob — nothing enumerates
+        // it again, so its entry persists for the lifetime of the process and
+        // is cleared only by restart. That is the honest bound: one `String`
+        // per such path, unbounded in time but not in rate, against a ledger
+        // whose sole creator fires once per `reconcile_interval_seconds`.
+        //
+        // Since this prune went, `enqueue_work`'s settle/owe condition is the
+        // only thing bounding the map; it is guarded from both directions by
+        // `a_reconcile_sweep_over_idle_paths_leaves_no_standing_debt` (above)
+        // and `two_reconcile_ticks_straddling_one_queued_poll_buy_two_polls`
+        // (beneath). Removing *this* prune is what
+        // `a_tick_landing_on_a_queued_poll_survives_that_polls_completion`
+        // pins, in the pending window that no other test reaches.
         state.item_by_key.remove(key);
     }
 
@@ -2103,15 +2405,15 @@ mod tests {
     use super::{
         complete_work, compose_hermes_model, enqueue_work, enrich_claude_model_latency,
         jsonl_policy_fingerprint, jsonl_source_line_byte_limit, process_file,
-        process_session_json_file, run_work_item, source_inode_for_file, work_item_is_ingestable,
-        work_path_is_canonical, SessionCursor, CLICKHOUSE_JSON_OBJECT_BYTE_LIMIT,
-        ERROR_KIND_NORMALIZED_ROW_TOO_LARGE, ERROR_KIND_SOURCE_LINE_TOO_LARGE,
-        JSONL_PUBLICATION_PROTOCOL_VERSION, SESSION_JSON_GENERATION, SESSION_JSON_INODE,
-        SOURCE_NORMALIZATION_RULES_VERSION,
+        process_session_json_file, run_work_item, source_inode_for_file, spawn_debounce_task,
+        work_item_is_ingestable, work_path_is_canonical, SessionCursor,
+        CLICKHOUSE_JSON_OBJECT_BYTE_LIMIT, ERROR_KIND_NORMALIZED_ROW_TOO_LARGE,
+        ERROR_KIND_SOURCE_LINE_TOO_LARGE, JSONL_PUBLICATION_PROTOCOL_VERSION,
+        SESSION_JSON_GENERATION, SESSION_JSON_INODE, SOURCE_NORMALIZATION_RULES_VERSION,
     };
     use crate::model::{Checkpoint, CheckpointLifecycle};
     use crate::sqlite_poll::VolatilePollMap;
-    use crate::{DispatchState, Metrics, SinkMessage, WorkItem};
+    use crate::{DispatchState, Metrics, SinkMessage, WorkItem, WorkTrigger};
     use moraine_config::SourceFormat;
     use serde_json::{json, Value};
     use sha2::{Digest, Sha256};
@@ -2132,6 +2434,7 @@ mod tests {
             format: SourceFormat::Jsonl,
             source_glob: String::new(),
             path: path.to_string(),
+            trigger: WorkTrigger::Watcher,
         }
     }
 
@@ -2355,6 +2658,7 @@ mod tests {
             format: SourceFormat::Jsonl,
             source_glob: String::new(),
             path: path.to_string_lossy().to_string(),
+            trigger: WorkTrigger::Watcher,
         };
         let checkpoints = Arc::new(RwLock::new(HashMap::<String, Checkpoint>::new()));
         if let Some(resume_from) = resume_from {
@@ -2490,6 +2794,7 @@ mod tests {
             format: SourceFormat::Jsonl,
             source_glob: String::new(),
             path: path.to_string_lossy().to_string(),
+            trigger: WorkTrigger::Watcher,
         };
         let checkpoints = Arc::new(RwLock::new(HashMap::<String, Checkpoint>::new()));
         let metrics = Arc::new(Metrics::default());
@@ -2629,6 +2934,7 @@ mod tests {
             format: SourceFormat::Jsonl,
             source_glob: String::new(),
             path: path.to_string_lossy().to_string(),
+            trigger: WorkTrigger::Watcher,
         };
         let checkpoints = Arc::new(RwLock::new(HashMap::<String, Checkpoint>::new()));
         let metrics = Arc::new(Metrics::default());
@@ -2765,6 +3071,7 @@ mod tests {
             format: SourceFormat::Jsonl,
             source_glob: String::new(),
             path: "/tmp/rollout.jsonl".to_string(),
+            trigger: WorkTrigger::Watcher,
         };
 
         let mut exclusions = config.ingest.exclude_project_dirs.clone();
@@ -2817,6 +3124,7 @@ mod tests {
             format: SourceFormat::Jsonl,
             source_glob: String::new(),
             path: path.to_string_lossy().to_string(),
+            trigger: WorkTrigger::Watcher,
         };
         let key = work.key();
 
@@ -2885,6 +3193,7 @@ mod tests {
             format: SourceFormat::Jsonl,
             source_glob: String::new(),
             path: "/tmp/x.jsonl".to_string(),
+            trigger: WorkTrigger::Watcher,
         };
         assert!(work_path_is_canonical(&jsonl));
 
@@ -2894,11 +3203,13 @@ mod tests {
             format: SourceFormat::SessionJson,
             source_glob: String::new(),
             path: "/tmp/session_x.json".to_string(),
+            trigger: WorkTrigger::Watcher,
         };
         assert!(work_path_is_canonical(&session));
         // session_json format must NOT pick up .jsonl files
         let wrong = WorkItem {
             path: "/tmp/x.jsonl".to_string(),
+            trigger: WorkTrigger::Watcher,
             ..session.clone()
         };
         assert!(!work_path_is_canonical(&wrong));
@@ -2909,12 +3220,14 @@ mod tests {
             format: SourceFormat::CursorSqlite,
             source_glob: String::new(),
             path: "/tmp/User/state.vscdb".to_string(),
+            trigger: WorkTrigger::Watcher,
         };
         assert!(work_path_is_canonical(&sqlite));
         // Sidecars are canonicalized upstream; a sidecar path reaching the
         // dispatcher directly is dropped rather than processed.
         let sidecar = WorkItem {
             path: "/tmp/User/state.vscdb-wal".to_string(),
+            trigger: WorkTrigger::Watcher,
             ..sqlite.clone()
         };
         assert!(!work_path_is_canonical(&sidecar));
@@ -2929,6 +3242,7 @@ mod tests {
             format: SourceFormat::Infer,
             source_glob: String::new(),
             path: "/tmp/unresolved.jsonl".to_string(),
+            trigger: WorkTrigger::Watcher,
         };
         let checkpoints = Arc::new(RwLock::new(HashMap::new()));
         let metrics = Arc::new(Metrics::default());
@@ -2959,6 +3273,7 @@ mod tests {
             format: SourceFormat::Jsonl,
             source_glob: String::new(),
             path: path.to_string(),
+            trigger: WorkTrigger::Watcher,
         };
         let proj = "/Users/x/.claude/projects/-Users-x-src-moraine";
         let sid = "7e74512d-612b-4406-ae5e-069e73d7f2dc";
@@ -2990,6 +3305,7 @@ mod tests {
             format: SourceFormat::Jsonl,
             source_glob: String::new(),
             path: format!("{proj}/{sid}/subagents/workflows/wf_x/journal.jsonl"),
+            trigger: WorkTrigger::Watcher,
         };
         assert!(work_item_is_ingestable(&codex_journal));
     }
@@ -3003,6 +3319,7 @@ mod tests {
             format: SourceFormat::Jsonl,
             source_glob: String::new(),
             path,
+            trigger: WorkTrigger::Watcher,
         };
         assert!(work_item_is_ingestable(&cowork(format!(
             "{root}/.claude/projects/-sessions-demo/aaaaaaaa-1111-4333-8444-555555555555.jsonl"
@@ -3034,6 +3351,7 @@ mod tests {
             format: SourceFormat::Jsonl,
             source_glob: String::new(),
             path: format!("{proj}/{sid}/subagents/workflows/wf_12dc2994-7e9/journal.jsonl"),
+            trigger: WorkTrigger::Watcher,
         };
 
         enqueue_work(journal.clone(), &process_tx, &dispatch, &metrics).await;
@@ -3055,6 +3373,7 @@ mod tests {
         // A real session transcript from the same source is forwarded.
         let session = WorkItem {
             path: format!("{proj}/{sid}.jsonl"),
+            trigger: WorkTrigger::Watcher,
             ..journal.clone()
         };
         enqueue_work(session.clone(), &process_tx, &dispatch, &metrics).await;
@@ -3063,6 +3382,1172 @@ mod tests {
             .expect("real session transcript must be forwarded");
         assert_eq!(forwarded.key(), session.key());
         assert_eq!(metrics.queue_depth.load(Ordering::Relaxed), 1);
+    }
+
+    /// Issue #601 §2.4 / WI-03. Trigger provenance exists so a reconciliation
+    /// sweep can be attached to reconcile ticks only; every merge point must
+    /// therefore be able to *downgrade* a trigger and never upgrade one.
+    #[test]
+    fn trigger_merge_keeps_the_least_reconciliation_eligible_trigger() {
+        use WorkTrigger::{Reconcile, Startup, Watcher};
+        assert_eq!(Watcher.merge(Reconcile), Watcher);
+        assert_eq!(Reconcile.merge(Watcher), Watcher);
+        assert_eq!(Startup.merge(Reconcile), Startup);
+        assert_eq!(Reconcile.merge(Startup), Startup);
+        assert_eq!(Watcher.merge(Startup), Watcher);
+        assert_eq!(Reconcile.merge(Reconcile), Reconcile);
+    }
+
+    /// `work.key()` must not carry the trigger: if it did, a watcher event and
+    /// a reconcile tick for the same file would occupy two queue slots and the
+    /// debounce would stop coalescing anything.
+    ///
+    /// Fails for: adding the trigger to `WorkItem::key`.
+    #[test]
+    fn work_key_excludes_the_trigger() {
+        let watcher = sample_work("/tmp/trigger-key.jsonl");
+        let reconcile = WorkItem {
+            trigger: WorkTrigger::Reconcile,
+            ..watcher.clone()
+        };
+        assert_eq!(
+            watcher.key(),
+            reconcile.key(),
+            "the trigger is not part of the coalescing identity"
+        );
+    }
+
+    /// A reconcile tick that lands while a watcher poll is inflight must not
+    /// upgrade that poll — a burst must never retroactively become expensive —
+    /// but it must not be *lost* either. `item_by_key` holds a key while it is
+    /// pending, inflight or dirty, so on a continuously written database almost
+    /// every reconcile tick lands on an occupied key; discarding them starves
+    /// the sweep on exactly the source with the most history to sweep.
+    ///
+    /// So the inflight item stays `Watcher`, and the *next* poll — the dirty
+    /// re-enqueue, which has not started yet — carries the owed tick.
+    ///
+    /// Fails for: dropping `reconcile_owed` (the re-enqueue comes back as
+    /// `Watcher` and the tick is gone), or arming it on the inflight item.
+    #[tokio::test]
+    async fn a_reconcile_tick_landing_on_an_inflight_poll_survives_to_the_next_one() {
+        let dispatch = Arc::new(Mutex::new(DispatchState::default()));
+        let metrics = Arc::new(Metrics::default());
+        let (process_tx, mut process_rx) = mpsc::channel::<WorkItem>(8);
+
+        let proj = "/Users/x/.claude/projects/-Users-x-src-moraine";
+        let sid = "7e74512d-612b-4406-ae5e-069e73d7f2dc";
+        let watcher = WorkItem {
+            source_name: "claude".to_string(),
+            harness: "claude-code".to_string(),
+            format: SourceFormat::Jsonl,
+            source_glob: String::new(),
+            path: format!("{proj}/{sid}.jsonl"),
+            trigger: WorkTrigger::Watcher,
+        };
+        let key = watcher.key();
+
+        enqueue_work(watcher.clone(), &process_tx, &dispatch, &metrics).await;
+        let dispatched = process_rx.try_recv().expect("watcher item is forwarded");
+        assert_eq!(dispatched.trigger, WorkTrigger::Watcher);
+        {
+            let mut state = dispatch.lock().expect("dispatch mutex poisoned");
+            state.pending.remove(&key);
+            state.inflight.insert(key.clone());
+        }
+
+        // A reconcile tick arrives mid-poll and only marks the item dirty.
+        let reconcile = WorkItem {
+            trigger: WorkTrigger::Reconcile,
+            ..watcher.clone()
+        };
+        enqueue_work(reconcile, &process_tx, &dispatch, &metrics).await;
+        assert!(
+            process_rx.try_recv().is_err(),
+            "an inflight key is marked dirty, not re-sent"
+        );
+        assert_eq!(
+            dispatch
+                .lock()
+                .expect("dispatch mutex poisoned")
+                .item_by_key
+                .get(&key)
+                .map(|item| item.trigger),
+            Some(WorkTrigger::Watcher),
+            "the inflight poll is never upgraded mid-flight"
+        );
+
+        let rescheduled = complete_work(&key, &dispatch).expect("dirty item is re-enqueued");
+        assert_eq!(
+            rescheduled.trigger,
+            WorkTrigger::Reconcile,
+            "the swallowed reconcile tick rides the next poll instead of being lost"
+        );
+
+        // And it is drained on use: the tick buys one reconcile-eligible poll,
+        // not a permanent upgrade of the key.
+        {
+            let mut state = dispatch.lock().expect("dispatch mutex poisoned");
+            assert!(state.reconcile_owed.is_empty());
+            state.pending.remove(&key);
+            state.inflight.insert(key.clone());
+            state.dirty.insert(key.clone());
+        }
+        let next = complete_work(&key, &dispatch).expect("second dirty re-enqueue");
+        assert_eq!(
+            next.trigger,
+            WorkTrigger::Reconcile,
+            "item_by_key carries the armed trigger forward; nothing re-arms it"
+        );
+        assert!(dispatch
+            .lock()
+            .expect("dispatch mutex poisoned")
+            .reconcile_owed
+            .is_empty());
+    }
+
+    /// Issue #601 §0/§4 — the **lower** bound on `reconcile_owed`. The sweep is
+    /// the only mechanism guaranteeing coverage, and §4 promises a *finite*
+    /// maximum complete-sweep interval. A key under continuous watcher churn is
+    /// pending, inflight or dirty essentially all the time, so if every
+    /// reconcile tick that lands there is discarded the interval on the busiest
+    /// database is unbounded.
+    ///
+    /// Drive 20 churn cycles with one reconcile tick each and assert every tick
+    /// produces exactly one reconcile-eligible poll, within one cycle of
+    /// arriving.
+    ///
+    /// **This test cannot see an over-owing bug**, and saying so is the point:
+    /// it feeds one tick per cycle, so a correct ledger and one that latches
+    /// permanently sweep-eligible both produce 20. The upper bound is
+    /// `one_reconcile_tick_buys_exactly_one_reconcile_eligible_poll`, and
+    /// neither guard is sufficient alone.
+    ///
+    /// Fails for: discarding the merged-away tick (zero reconcile-eligible
+    /// polls in 20 cycles).
+    #[tokio::test]
+    async fn continuous_watcher_churn_still_yields_reconcile_eligible_polls() {
+        let dispatch = Arc::new(Mutex::new(DispatchState::default()));
+        let metrics = Arc::new(Metrics::default());
+        let (process_tx, mut process_rx) = mpsc::channel::<WorkItem>(64);
+
+        let proj = "/Users/x/.claude/projects/-Users-x-src-moraine";
+        let sid = "7e74512d-612b-4406-ae5e-069e73d7f2dc";
+        let watcher = WorkItem {
+            source_name: "claude".to_string(),
+            harness: "claude-code".to_string(),
+            format: SourceFormat::Jsonl,
+            source_glob: String::new(),
+            path: format!("{proj}/{sid}.jsonl"),
+            trigger: WorkTrigger::Watcher,
+        };
+        let reconcile = WorkItem {
+            trigger: WorkTrigger::Reconcile,
+            ..watcher.clone()
+        };
+        let key = watcher.key();
+
+        const CYCLES: usize = 20;
+        let mut reconcile_eligible = 0usize;
+        let mut polls = 0usize;
+
+        enqueue_work(watcher.clone(), &process_tx, &dispatch, &metrics).await;
+        let mut next = process_rx.try_recv().ok();
+        while let Some(item) = next.take() {
+            polls += 1;
+            if item.trigger == WorkTrigger::Reconcile {
+                reconcile_eligible += 1;
+            }
+            {
+                let mut state = dispatch.lock().expect("dispatch mutex poisoned");
+                state.pending.remove(&key);
+                state.inflight.insert(key.clone());
+            }
+            if polls <= CYCLES {
+                // The database is written continuously, so the key is busy for
+                // the whole poll and a reconcile tick lands on top of it.
+                enqueue_work(watcher.clone(), &process_tx, &dispatch, &metrics).await;
+                enqueue_work(reconcile.clone(), &process_tx, &dispatch, &metrics).await;
+            }
+            next = complete_work(&key, &dispatch);
+        }
+
+        assert_eq!(
+            polls,
+            CYCLES + 1,
+            "each cycle must reschedule exactly one poll"
+        );
+        assert_eq!(
+            reconcile_eligible, CYCLES,
+            "every reconcile tick that landed on a busy key must still buy one \
+             reconcile-eligible poll; got {reconcile_eligible} in {polls} polls"
+        );
+    }
+
+    /// Issue #601 §2.4 — the **upper** bound on `reconcile_owed`, and the half
+    /// that a lower-bound-only guard let through.
+    ///
+    /// `reconcile_owed` is a debt ledger: one reconcile tick buys one
+    /// reconcile-eligible poll, no more. The failure this pins is not "the tick
+    /// was lost" but "the tick never stops being spent": `complete_work` arms
+    /// `Reconcile` into `item_by_key`, the next watcher event merges it back
+    /// down to `Watcher`, and a ledger that owes on *that* downgrade re-creates
+    /// the debt the arming just settled. `complete_work` re-arms, and the key
+    /// is permanently sweep-eligible — at the 50 ms watcher-debounce cadence
+    /// instead of once per `reconcile_interval_seconds`. That inverts §2.4 in
+    /// the expensive direction on the busiest database, which is the one with
+    /// the most history to sweep and the largest slice cost (§0, WI-04).
+    ///
+    /// One tick on the first cycle, then twenty cycles of pure watcher churn.
+    ///
+    /// Fails for: owing a debt because a stored item's trigger was downgraded
+    /// (21 polls, 20 of them reconcile-eligible, where the answer is 1).
+    #[tokio::test]
+    async fn one_reconcile_tick_buys_exactly_one_reconcile_eligible_poll() {
+        let dispatch = Arc::new(Mutex::new(DispatchState::default()));
+        let metrics = Arc::new(Metrics::default());
+        let (process_tx, mut process_rx) = mpsc::channel::<WorkItem>(64);
+
+        let proj = "/Users/x/.claude/projects/-Users-x-src-moraine";
+        let sid = "7e74512d-612b-4406-ae5e-069e73d7f2dc";
+        let watcher = WorkItem {
+            source_name: "claude".to_string(),
+            harness: "claude-code".to_string(),
+            format: SourceFormat::Jsonl,
+            source_glob: String::new(),
+            path: format!("{proj}/{sid}.jsonl"),
+            trigger: WorkTrigger::Watcher,
+        };
+        let reconcile = WorkItem {
+            trigger: WorkTrigger::Reconcile,
+            ..watcher.clone()
+        };
+        let key = watcher.key();
+
+        const CYCLES: usize = 20;
+        let mut reconcile_eligible = 0usize;
+        let mut polls = 0usize;
+
+        enqueue_work(watcher.clone(), &process_tx, &dispatch, &metrics).await;
+        let mut next = process_rx.try_recv().ok();
+        while let Some(item) = next.take() {
+            polls += 1;
+            if item.trigger == WorkTrigger::Reconcile {
+                reconcile_eligible += 1;
+            }
+            {
+                let mut state = dispatch.lock().expect("dispatch mutex poisoned");
+                state.pending.remove(&key);
+                state.inflight.insert(key.clone());
+            }
+            if polls <= CYCLES {
+                enqueue_work(watcher.clone(), &process_tx, &dispatch, &metrics).await;
+                // Exactly one reconcile tick, on the first cycle. Everything
+                // after this is a watcher event on a busy key.
+                if polls == 1 {
+                    enqueue_work(reconcile.clone(), &process_tx, &dispatch, &metrics).await;
+                }
+            }
+            next = complete_work(&key, &dispatch);
+        }
+
+        assert_eq!(
+            polls,
+            CYCLES + 1,
+            "each cycle must reschedule exactly one poll"
+        );
+        assert_eq!(
+            reconcile_eligible, 1,
+            "one reconcile tick must buy exactly one reconcile-eligible poll; \
+             got {reconcile_eligible} in {polls} polls, which means watcher \
+             churn alone is manufacturing sweep eligibility"
+        );
+        assert!(
+            dispatch
+                .lock()
+                .expect("dispatch mutex poisoned")
+                .reconcile_owed
+                .is_empty(),
+            "and the ledger must be settled, not carrying a standing debt"
+        );
+    }
+
+    /// Issue #601 §0/§4 — the **pending window**, which neither existing bound
+    /// exercises: `continuous_watcher_churn_still_yields_reconcile_eligible_polls`
+    /// and `one_reconcile_tick_buys_exactly_one_reconcile_eligible_poll` both
+    /// move the key to `inflight` before the tick arrives, so both take
+    /// `enqueue_work`'s dirty branch. Production has a third state.
+    ///
+    /// A debounced watcher poll is dispatched, so the key sits in `pending` —
+    /// handed to `process_tx` but not yet inflight. The processor loop parks on
+    /// `sem.acquire_owned()` before draining the next item, so a saturated
+    /// worker pool holds keys there indefinitely. A reconcile tick bypasses the
+    /// debounce entirely (`spawn_reconcile_task` calls `enqueue_work` directly),
+    /// lands on the pending key, and takes the third branch: the debt is
+    /// recorded and `dirty` is **not** set. The queued item still carries
+    /// `Watcher`, so no sweep slice rides it, and when it completes there is
+    /// nothing dirty behind it — the key leaves the dispatcher with the tick
+    /// still unpaid.
+    ///
+    /// The tick must survive that, because nothing else in the system will ever
+    /// re-issue it: `spawn_reconcile_task` fires once per
+    /// `reconcile_interval_seconds` and does not remember what it dispatched.
+    ///
+    /// Direction bounded: **lower**, and that half is this test's whole
+    /// contribution. It is the only guard on the pending window — the debt must
+    /// outlive the dispatcher entry — and no other test reaches that window.
+    ///
+    /// The trailing upper-bound half (the revived debt is spent once, not
+    /// latched) is kept for readability but claims nothing new: for any
+    /// single-site mutation it is redundant with
+    /// `one_reconcile_tick_buys_exactly_one_reconcile_eligible_poll` and
+    /// `a_reconcile_tick_landing_on_an_inflight_poll_survives_to_the_next_one`,
+    /// both of which drain through `arm_owed_reconcile` too. It bites only if
+    /// the ledger stops settling in *both* places at once.
+    ///
+    /// Fails for: pruning `reconcile_owed` when a key leaves the dispatcher
+    /// (the debt is destroyed before any poll can carry it); dropping
+    /// `item_by_key`'s prune along with it; or a ledger that never settles, in
+    /// which case the revived poll's drain assertion goes.
+    #[tokio::test]
+    async fn a_tick_landing_on_a_queued_poll_survives_that_polls_completion() {
+        let dispatch = Arc::new(Mutex::new(DispatchState::default()));
+        let metrics = Arc::new(Metrics::default());
+        let (process_tx, mut process_rx) = mpsc::channel::<WorkItem>(8);
+
+        let proj = "/Users/x/.claude/projects/-Users-x-src-moraine";
+        let sid = "7e74512d-612b-4406-ae5e-069e73d7f2dc";
+        let watcher = WorkItem {
+            source_name: "claude".to_string(),
+            harness: "claude-code".to_string(),
+            format: SourceFormat::Jsonl,
+            source_glob: String::new(),
+            path: format!("{proj}/{sid}.jsonl"),
+            trigger: WorkTrigger::Watcher,
+        };
+        let reconcile = WorkItem {
+            trigger: WorkTrigger::Reconcile,
+            ..watcher.clone()
+        };
+        let key = watcher.key();
+
+        // The debounce dispatches a watcher poll. It is queued, not inflight:
+        // the worker pool is saturated, so nothing has drained it yet.
+        enqueue_work(watcher.clone(), &process_tx, &dispatch, &metrics).await;
+        let queued = process_rx.try_recv().expect("watcher item is forwarded");
+        assert_eq!(queued.trigger, WorkTrigger::Watcher);
+        assert!(
+            dispatch
+                .lock()
+                .expect("dispatch mutex poisoned")
+                .pending
+                .contains(&key),
+            "the dispatched item is pending until the processor drains it"
+        );
+
+        // The reconcile tick lands on the pending key.
+        enqueue_work(reconcile, &process_tx, &dispatch, &metrics).await;
+        assert!(
+            process_rx.try_recv().is_err(),
+            "a key already pending is not queued a second time"
+        );
+        {
+            let state = dispatch.lock().expect("dispatch mutex poisoned");
+            assert_eq!(
+                state.item_by_key.get(&key).map(|item| item.trigger),
+                Some(WorkTrigger::Watcher),
+                "the queued poll is not upgraded — it has already been sent"
+            );
+            assert!(!state.dirty.contains(&key), "a pending key is not dirtied");
+            assert!(
+                state.reconcile_owed.contains(&key),
+                "so the tick has to be owed instead"
+            );
+        }
+
+        // The worker finally picks the queued item up and runs it. It carries
+        // `Watcher`, so no sweep slice attaches — the tick is still unpaid.
+        {
+            let mut state = dispatch.lock().expect("dispatch mutex poisoned");
+            state.pending.remove(&key);
+            state.inflight.insert(key.clone());
+        }
+        assert!(
+            complete_work(&key, &dispatch).is_none(),
+            "nothing was written during the poll, so there is no re-enqueue"
+        );
+        {
+            let state = dispatch.lock().expect("dispatch mutex poisoned");
+            assert!(
+                !state.item_by_key.contains_key(&key),
+                "the key has left the dispatcher, so its queued item goes"
+            );
+            assert!(
+                state.reconcile_owed.contains(&key),
+                "but the unpaid tick must not go with it — no poll ever carried \
+                 it, and nothing re-issues a reconcile firing"
+            );
+        }
+
+        // The writer comes back. The next poll of that key honours the debt.
+        enqueue_work(watcher.clone(), &process_tx, &dispatch, &metrics).await;
+        let revived = process_rx.try_recv().expect("the key polls again");
+        assert_eq!(
+            revived.trigger,
+            WorkTrigger::Reconcile,
+            "the surviving tick rides the next poll of the key it belongs to"
+        );
+        assert!(
+            dispatch
+                .lock()
+                .expect("dispatch mutex poisoned")
+                .reconcile_owed
+                .is_empty(),
+            "and is drained on use"
+        );
+
+        // Upper bound: one tick, one reconcile-eligible poll. The cycle after
+        // it is ordinary watcher work again.
+        {
+            let mut state = dispatch.lock().expect("dispatch mutex poisoned");
+            state.pending.remove(&key);
+            state.inflight.insert(key.clone());
+        }
+        assert!(complete_work(&key, &dispatch).is_none());
+        enqueue_work(watcher, &process_tx, &dispatch, &metrics).await;
+        let after = process_rx.try_recv().expect("the key polls once more");
+        assert_eq!(
+            after.trigger,
+            WorkTrigger::Watcher,
+            "a surviving debt must be spent once, not latch the key sweep-eligible"
+        );
+        assert!(dispatch
+            .lock()
+            .expect("dispatch mutex poisoned")
+            .reconcile_owed
+            .is_empty());
+    }
+
+    /// Issue #601 §2.4 — `reconcile_owed` is a **set**, and several ticks
+    /// landing on one key that never leaves the pending window between them
+    /// therefore buy one sweep-eligible poll, not one each.
+    ///
+    /// This is a deliberate design choice and the type is where it is made, so
+    /// it gets a guard rather than a comment. A sweep slice covers everything
+    /// accumulated since the previous slice, so the debt is a flag and not an
+    /// amount of work: N flags on one key would buy N identical sweeps of a key
+    /// that needed one, and §4's complete-sweep interval is bounded by the poll
+    /// rate either way.
+    ///
+    /// It is not covered by
+    /// `two_reconcile_ticks_straddling_one_queued_poll_buy_two_polls`, which
+    /// looks adjacent but is the opposite case: its first tick is *dispatched*,
+    /// so only one tick is ever owed and a counting ledger and a set answer
+    /// identically. Nor by
+    /// `a_tick_landing_on_a_queued_poll_survives_that_polls_completion`, which
+    /// lands exactly one tick on the pending window.
+    ///
+    /// Fails for: replacing `HashSet<String>` with a per-key count (the second
+    /// poll after the debt is spent comes back `Reconcile`).
+    #[tokio::test]
+    async fn reconcile_ticks_landing_on_one_queued_poll_coalesce() {
+        let dispatch = Arc::new(Mutex::new(DispatchState::default()));
+        let metrics = Arc::new(Metrics::default());
+        let (process_tx, mut process_rx) = mpsc::channel::<WorkItem>(8);
+
+        let proj = "/Users/x/.claude/projects/-Users-x-src-moraine";
+        let sid = "1a5b0c93-3f77-4d2e-9b1c-0d2f6a8e4471";
+        let watcher = WorkItem {
+            source_name: "claude".to_string(),
+            harness: "claude-code".to_string(),
+            format: SourceFormat::Jsonl,
+            source_glob: String::new(),
+            path: format!("{proj}/{sid}.jsonl"),
+            trigger: WorkTrigger::Watcher,
+        };
+        let reconcile = WorkItem {
+            trigger: WorkTrigger::Reconcile,
+            ..watcher.clone()
+        };
+        let key = watcher.key();
+
+        // A watcher poll is dispatched and parks in `pending`: the worker pool
+        // is saturated, so nothing drains it. Two reconcile firings land inside
+        // that one window.
+        enqueue_work(watcher.clone(), &process_tx, &dispatch, &metrics).await;
+        process_rx.try_recv().expect("watcher item is forwarded");
+        enqueue_work(reconcile.clone(), &process_tx, &dispatch, &metrics).await;
+        enqueue_work(reconcile, &process_tx, &dispatch, &metrics).await;
+        assert!(
+            process_rx.try_recv().is_err(),
+            "a key already pending is not queued again"
+        );
+        assert_eq!(
+            dispatch
+                .lock()
+                .expect("dispatch mutex poisoned")
+                .reconcile_owed
+                .len(),
+            1,
+            "two ticks inside one pending window are one debt, not two"
+        );
+
+        // The worker runs the queued watcher poll; the debt is still unpaid.
+        {
+            let mut state = dispatch.lock().expect("dispatch mutex poisoned");
+            state.pending.remove(&key);
+            state.inflight.insert(key.clone());
+        }
+        assert!(complete_work(&key, &dispatch).is_none());
+
+        // The next poll of the key carries the sweep…
+        enqueue_work(watcher.clone(), &process_tx, &dispatch, &metrics).await;
+        assert_eq!(
+            process_rx.try_recv().expect("the key polls again").trigger,
+            WorkTrigger::Reconcile,
+            "the coalesced debt is settled by the next poll"
+        );
+
+        // …and the poll after it is ordinary watcher work. A counting ledger
+        // would make this one `Reconcile` too.
+        {
+            let mut state = dispatch.lock().expect("dispatch mutex poisoned");
+            state.pending.remove(&key);
+            state.inflight.insert(key.clone());
+        }
+        assert!(complete_work(&key, &dispatch).is_none());
+        enqueue_work(watcher, &process_tx, &dispatch, &metrics).await;
+        assert_eq!(
+            process_rx
+                .try_recv()
+                .expect("the key polls once more")
+                .trigger,
+            WorkTrigger::Watcher,
+            "one sweep slice covers everything both ticks would have swept, so \
+             the second tick must not buy a second sweep"
+        );
+        assert!(dispatch
+            .lock()
+            .expect("dispatch mutex poisoned")
+            .reconcile_owed
+            .is_empty());
+    }
+
+    /// Build `count` distinct canonical Claude Code session paths. Distinct
+    /// paths mean distinct `work.key()`s, which is what makes a fleet-wide
+    /// ledger assertion possible.
+    fn sweep_fleet(count: usize) -> Vec<WorkItem> {
+        let proj = "/Users/x/.claude/projects/-Users-x-src-moraine";
+        (0..count)
+            .map(|index| WorkItem {
+                source_name: "claude".to_string(),
+                harness: "claude-code".to_string(),
+                format: SourceFormat::Jsonl,
+                source_glob: String::new(),
+                path: format!("{proj}/7e74512d-612b-4406-ae5e-{index:012}.jsonl"),
+                trigger: WorkTrigger::Watcher,
+            })
+            .collect()
+    }
+
+    /// Issue #601 §2.4 — the **upper** bound on `enqueue_work`'s settle/owe
+    /// condition, which since `complete_work` stopped pruning is the only thing
+    /// bounding `reconcile_owed` at all.
+    ///
+    /// The ordinary case for a reconcile firing is the one this pins: the sweep
+    /// enumerates the whole tracked-path set, and most of those paths are idle,
+    /// so most ticks are handed straight to a poll. Such a tick is *paid on
+    /// dispatch* and must leave no entry behind. Recording it anyway looks
+    /// harmless one key at a time, but a firing touches every path, and with no
+    /// reaper left the debts are permanent: the ledger grows to the full
+    /// tracked-path set and every subsequent watcher poll of every path is
+    /// upgraded to `Reconcile`, attaching a sweep slice to every filesystem
+    /// event forever. That is worse than a per-key latch, and it is invisible to
+    /// the existing bounds — they all drive one key.
+    ///
+    /// So: one sweep over 50 idle paths, then a watcher event on each after it
+    /// has gone idle again.
+    ///
+    /// Not the only test that can *detect* over-owing —
+    /// `two_reconcile_ticks_straddling_one_queued_poll_buy_two_polls` asserts an
+    /// empty ledger after its first carried tick and trips on the same
+    /// single-site mutation. What is unique here is that this test *also* pins
+    /// the **consequence**: it is the only place a debt the sweep should never
+    /// have recorded is shown upgrading an ordinary watcher poll, on every path
+    /// at once, and that closing assertion fails independently of the mid-way
+    /// one. Note the order, though — the mid-way ledger-size assertion runs
+    /// first, so under a single-site over-owe mutation its message is the one a
+    /// developer actually sees; the closing assertion is what that message
+    /// *means*.
+    ///
+    /// Dispatch order is deliberately not asserted. The sweep's coverage claim
+    /// is about which paths are polled, not the sequence they arrive in, and
+    /// WI-04 is free to batch, dedup or reorder sweep dispatch; pinning the
+    /// order here would fail that work for a reason unrelated to
+    /// `reconcile_owed`.
+    ///
+    /// Fails for: owing on every incoming `Reconcile` regardless of whether the
+    /// dispatch carried it — 50 standing debts, and 50 watcher polls that come
+    /// back `Reconcile`.
+    #[tokio::test]
+    async fn a_reconcile_sweep_over_idle_paths_leaves_no_standing_debt() {
+        const PATHS: usize = 50;
+
+        let dispatch = Arc::new(Mutex::new(DispatchState::default()));
+        let metrics = Arc::new(Metrics::default());
+        let (process_tx, mut process_rx) = mpsc::channel::<WorkItem>(PATHS * 2);
+        let fleet = sweep_fleet(PATHS);
+
+        // One reconcile firing. Every path is idle, so every tick is handed
+        // straight to a poll.
+        for item in &fleet {
+            let tick = WorkItem {
+                trigger: WorkTrigger::Reconcile,
+                ..item.clone()
+            };
+            enqueue_work(tick, &process_tx, &dispatch, &metrics).await;
+        }
+        let mut swept_paths = std::collections::HashSet::new();
+        for _ in &fleet {
+            let swept = process_rx.try_recv().expect("every idle path is swept");
+            assert_eq!(swept.trigger, WorkTrigger::Reconcile);
+            swept_paths.insert(swept.path);
+        }
+        assert_eq!(
+            swept_paths,
+            fleet.iter().map(|item| item.path.clone()).collect(),
+            "the sweep covers every idle path exactly once, in whatever order"
+        );
+
+        {
+            let state = dispatch.lock().expect("dispatch mutex poisoned");
+            let owed = state.reconcile_owed.len();
+            assert_eq!(
+                owed, 0,
+                "a tick a dispatch carried is paid; {owed} of {PATHS} swept \
+                 paths are carrying a standing debt, and nothing prunes it"
+            );
+        }
+
+        // Each swept poll runs and finishes with nothing behind it, so every
+        // key leaves the dispatcher.
+        for item in &fleet {
+            let key = item.key();
+            {
+                let mut state = dispatch.lock().expect("dispatch mutex poisoned");
+                state.pending.remove(&key);
+                state.inflight.insert(key.clone());
+            }
+            assert!(complete_work(&key, &dispatch).is_none());
+        }
+
+        // The writers come back. Ordinary watcher work must stay ordinary
+        // watcher work: no standing debt means no sweep slice on a filesystem
+        // event.
+        for item in &fleet {
+            enqueue_work(item.clone(), &process_tx, &dispatch, &metrics).await;
+        }
+        let mut upgraded = 0usize;
+        for _ in 0..PATHS {
+            let polled = process_rx.try_recv().expect("every path polls again");
+            if polled.trigger == WorkTrigger::Reconcile {
+                upgraded += 1;
+            }
+        }
+        assert_eq!(
+            upgraded, 0,
+            "{upgraded} of {PATHS} watcher polls were upgraded to Reconcile by a \
+             debt the sweep should never have recorded; a sweep slice on every \
+             watcher event on every path is the cost"
+        );
+    }
+
+    /// Issue #601 §0/§4 — the **lower** bound on `enqueue_work`'s settle/owe
+    /// condition, and the half that its `should_send` conjunct carries alone.
+    ///
+    /// Two reconcile firings can straddle one queued poll. The first tick finds
+    /// the path idle and is dispatched, so `item_by_key` now reads `Reconcile`;
+    /// the worker pool is saturated, so that poll sits in `pending` rather than
+    /// running. The second tick lands on top of it. Its merged trigger is
+    /// `Reconcile` — inherited from the queued item, not carried by this call —
+    /// and a settle condition that inspects the trigger without also requiring
+    /// that *this* call dispatched it reads the second tick as already paid and
+    /// discards it. One firing's worth of sweep coverage vanishes, and nothing
+    /// re-issues it: `spawn_reconcile_task` does not remember what it
+    /// dispatched.
+    ///
+    /// Two ticks must therefore buy two reconcile-eligible polls.
+    ///
+    /// Direction bounded: **lower**, by the closing assertion — the second tick
+    /// must survive. The mid-way assertion that the *first* tick left an empty
+    /// ledger is an incidental upper-bound check on the same condition, and is
+    /// deliberately kept: it is what makes this test trip on an over-owing
+    /// mutation too, so neither conjunct can be moved without something here
+    /// going red.
+    ///
+    /// Fails for: dropping the `should_send` conjunct from the settle condition
+    /// (the second tick takes the settled path and the revived poll comes back
+    /// `Watcher`); or owing on every incoming `Reconcile` (the first tick's
+    /// carried dispatch leaves a debt behind).
+    #[tokio::test]
+    async fn two_reconcile_ticks_straddling_one_queued_poll_buy_two_polls() {
+        let dispatch = Arc::new(Mutex::new(DispatchState::default()));
+        let metrics = Arc::new(Metrics::default());
+        let (process_tx, mut process_rx) = mpsc::channel::<WorkItem>(8);
+
+        let watcher = sweep_fleet(1).remove(0);
+        let reconcile = WorkItem {
+            trigger: WorkTrigger::Reconcile,
+            ..watcher.clone()
+        };
+        let key = watcher.key();
+
+        // First firing: the path is idle, so the tick rides the poll it starts.
+        enqueue_work(reconcile.clone(), &process_tx, &dispatch, &metrics).await;
+        let first = process_rx.try_recv().expect("an idle path is swept");
+        assert_eq!(first.trigger, WorkTrigger::Reconcile);
+        {
+            let state = dispatch.lock().expect("dispatch mutex poisoned");
+            assert!(state.pending.contains(&key), "queued, not yet inflight");
+            assert!(
+                state.reconcile_owed.is_empty(),
+                "the dispatch carried it, so nothing is owed"
+            );
+        }
+
+        // Second firing, while the first poll is still queued. The stored item
+        // reads `Reconcile`, but this call handed nothing to a poll.
+        enqueue_work(reconcile, &process_tx, &dispatch, &metrics).await;
+        assert!(
+            process_rx.try_recv().is_err(),
+            "a key already pending is not queued a second time"
+        );
+        assert!(
+            dispatch
+                .lock()
+                .expect("dispatch mutex poisoned")
+                .reconcile_owed
+                .contains(&key),
+            "an incoming tick this call did not dispatch is owed, whatever the \
+             queued item's trigger happens to read"
+        );
+
+        // The queued poll runs and finishes with nothing behind it.
+        {
+            let mut state = dispatch.lock().expect("dispatch mutex poisoned");
+            state.pending.remove(&key);
+            state.inflight.insert(key.clone());
+        }
+        assert!(complete_work(&key, &dispatch).is_none());
+
+        // The second firing's tick is still owed, and the next poll carries it.
+        enqueue_work(watcher, &process_tx, &dispatch, &metrics).await;
+        let second = process_rx.try_recv().expect("the key polls again");
+        assert_eq!(
+            second.trigger,
+            WorkTrigger::Reconcile,
+            "two reconcile firings must buy two reconcile-eligible polls; the \
+             second tick was swallowed by the first tick's queued poll"
+        );
+        assert!(dispatch
+            .lock()
+            .expect("dispatch mutex poisoned")
+            .reconcile_owed
+            .is_empty());
+    }
+
+    /// `arm_owed_reconcile` is the only place in the dispatcher that upgrades a
+    /// trigger, so it is also the only place that can contradict
+    /// `WorkTrigger::merge`. `merge` keeps `Startup` over `Reconcile` because
+    /// `Startup`'s own doc says startup is the worst moment to add a broad
+    /// scan; the arming path must agree.
+    ///
+    /// Direction bounded: **upper**, on which polls may become sweep-eligible —
+    /// a `Startup` poll may not. And the debt is not spent by the refusal:
+    /// refusing to carry a tick is not paying it, so the ledger keeps the entry
+    /// for the key's next ordinary poll. That second assertion is what keeps
+    /// the refusal from silently becoming a *lower*-bound violation.
+    ///
+    /// It does **not** bound the refusal's *width*: this test drives only a
+    /// `Startup` carrier, so a predicate that refused every non-`Watcher`
+    /// carrier would satisfy it. That direction is
+    /// `a_standing_debt_is_settled_by_a_reconcile_poll_not_only_a_watcher_one`,
+    /// immediately below; the pair is what makes the condition exactly
+    /// `== Startup` and not merely "at least `Startup`".
+    ///
+    /// No production `Startup` item can hold a debt today (`arm_owed_reconcile`
+    /// carries the reachability argument), which is exactly why this is a test
+    /// rather than a comment: WI-04 gives the upgrade a real cost, and an
+    /// unpinned branch is one a later change may flip without noticing.
+    ///
+    /// Fails for: dropping the `Startup` refusal (the backfill poll comes back
+    /// `Reconcile`), or refusing while still draining the ledger (the tick is
+    /// destroyed and the following watcher poll comes back `Watcher`).
+    ///
+    /// It also trips if `complete_work`'s deleted second reaper is reinstated,
+    /// because parking a debt on an *idle* key is only reachable through the
+    /// pending window. That is a side effect of the setup, not a claim: the
+    /// prune itself is guarded by
+    /// `a_tick_landing_on_a_queued_poll_survives_that_polls_completion`.
+    #[tokio::test]
+    async fn an_owed_tick_neither_upgrades_a_startup_poll_nor_is_spent_by_it() {
+        let dispatch = Arc::new(Mutex::new(DispatchState::default()));
+        let metrics = Arc::new(Metrics::default());
+        let (process_tx, mut process_rx) = mpsc::channel::<WorkItem>(8);
+
+        let watcher = sweep_fleet(1).remove(0);
+        let key = watcher.key();
+        let startup = WorkItem {
+            trigger: WorkTrigger::Startup,
+            ..watcher.clone()
+        };
+
+        // Park an unpaid tick on an otherwise idle key: a reconcile tick lands
+        // on a queued watcher poll, which then completes with nothing behind it.
+        enqueue_work(watcher.clone(), &process_tx, &dispatch, &metrics).await;
+        process_rx.try_recv().expect("watcher item is forwarded");
+        enqueue_work(
+            WorkItem {
+                trigger: WorkTrigger::Reconcile,
+                ..watcher.clone()
+            },
+            &process_tx,
+            &dispatch,
+            &metrics,
+        )
+        .await;
+        {
+            let mut state = dispatch.lock().expect("dispatch mutex poisoned");
+            assert!(state.reconcile_owed.contains(&key), "the tick is owed");
+            state.pending.remove(&key);
+            state.inflight.insert(key.clone());
+        }
+        assert!(complete_work(&key, &dispatch).is_none());
+
+        // The startup backfill reaches the path. It must not pay sweep cost.
+        enqueue_work(startup, &process_tx, &dispatch, &metrics).await;
+        let backfill = process_rx.try_recv().expect("the startup poll is sent");
+        assert_eq!(
+            backfill.trigger,
+            WorkTrigger::Startup,
+            "startup is the worst moment to add a broad scan, and merge already \
+             says so; the arming path must not override it"
+        );
+        assert!(
+            dispatch
+                .lock()
+                .expect("dispatch mutex poisoned")
+                .reconcile_owed
+                .contains(&key),
+            "and refusing to carry the tick is not paying it — the debt stands"
+        );
+
+        // The key's next ordinary poll settles it.
+        {
+            let mut state = dispatch.lock().expect("dispatch mutex poisoned");
+            state.pending.remove(&key);
+            state.inflight.insert(key.clone());
+        }
+        assert!(complete_work(&key, &dispatch).is_none());
+        enqueue_work(watcher, &process_tx, &dispatch, &metrics).await;
+        let after = process_rx.try_recv().expect("the key polls again");
+        assert_eq!(
+            after.trigger,
+            WorkTrigger::Reconcile,
+            "the tick the startup poll declined to carry rides the next one"
+        );
+        assert!(dispatch
+            .lock()
+            .expect("dispatch mutex poisoned")
+            .reconcile_owed
+            .is_empty());
+    }
+
+    /// Issue #601 §2.4 — the **width** of `arm_owed_reconcile`'s refusal, the
+    /// direction its own guard cannot see.
+    ///
+    /// `an_owed_tick_neither_upgrades_a_startup_poll_nor_is_spent_by_it` bounds
+    /// the refusal from both of the usual sides — it must fire for `Startup`,
+    /// and firing must not also spend the debt — but it drives only a `Startup`
+    /// carrier. Widening the condition by one token, from `== Startup` to
+    /// `!= Watcher`, therefore leaves it green, along with every other test in
+    /// the suite. What that widening actually removes is the settlement of a
+    /// standing debt onto a `Reconcile` carrier, and that is an ordinary steady
+    /// state rather than a corner:
+    ///
+    ///   1. a reconcile tick lands on a `pending` key and is owed — the window
+    ///      `a_tick_landing_on_a_queued_poll_survives_that_polls_completion`
+    ///      models;
+    ///   2. that poll completes with nothing behind it, so the key leaves the
+    ///      dispatcher with the debt standing;
+    ///   3. the *next* reconcile firing, one `reconcile_interval_seconds`
+    ///      later, finds the key idle — and its carrier is already `Reconcile`.
+    ///      That poll is the natural place to settle the debt, and this is the
+    ///      step the widened predicate skips.
+    ///
+    /// Skipping it costs twice. The debt survives a firing that should have
+    /// cleared it, so the next ordinary watcher event spends it instead and a
+    /// filesystem event pays for a sweep slice nothing bought — precisely the
+    /// inversion `one_reconcile_tick_buys_exactly_one_reconcile_eligible_poll`
+    /// exists to prevent. And on a path that never sees another watcher event —
+    /// an archived session, a rotated log — no reconcile poll will ever clear
+    /// the entry either, so it is a permanent leak, which the retention
+    /// argument in `complete_work` does not cover: that argument assumes a
+    /// tracked path's next reconcile firing drains its debt.
+    ///
+    /// Direction bounded: **width**. Narrowing the refusal is covered by the
+    /// test above (dropping it makes a `Startup` poll sweep-eligible);
+    /// widening it by one token is covered here and, at the time of writing,
+    /// nowhere else in the suite.
+    ///
+    /// Fails for: refusing to settle on any carrier other than `Watcher` — the
+    /// debt survives step 3 and is spent by the following watcher poll instead.
+    #[tokio::test]
+    async fn a_standing_debt_is_settled_by_a_reconcile_poll_not_only_a_watcher_one() {
+        let dispatch = Arc::new(Mutex::new(DispatchState::default()));
+        let metrics = Arc::new(Metrics::default());
+        let (process_tx, mut process_rx) = mpsc::channel::<WorkItem>(8);
+
+        let watcher = sweep_fleet(1).remove(0);
+        let key = watcher.key();
+        let tick = WorkItem {
+            trigger: WorkTrigger::Reconcile,
+            ..watcher.clone()
+        };
+
+        // Step 1-2: a tick lands on a queued watcher poll and is owed; the poll
+        // completes with nothing behind it, so the key leaves the dispatcher
+        // with the debt standing.
+        enqueue_work(watcher.clone(), &process_tx, &dispatch, &metrics).await;
+        process_rx.try_recv().expect("watcher item is forwarded");
+        enqueue_work(tick.clone(), &process_tx, &dispatch, &metrics).await;
+        {
+            let mut state = dispatch.lock().expect("dispatch mutex poisoned");
+            assert!(
+                state.reconcile_owed.contains(&key),
+                "a tick landing on a pending poll is owed"
+            );
+            state.pending.remove(&key);
+            state.inflight.insert(key.clone());
+        }
+        assert!(complete_work(&key, &dispatch).is_none());
+
+        // Step 3: the next reconcile firing finds the key idle. The poll it
+        // starts already carries `Reconcile`, and it is that poll — not some
+        // later watcher event — that settles the standing debt.
+        enqueue_work(tick, &process_tx, &dispatch, &metrics).await;
+        let swept = process_rx.try_recv().expect("the idle key is swept");
+        assert_eq!(swept.trigger, WorkTrigger::Reconcile);
+        assert!(
+            dispatch
+                .lock()
+                .expect("dispatch mutex poisoned")
+                .reconcile_owed
+                .is_empty(),
+            "a reconcile poll settles a standing debt just as a watcher poll \
+             does; refusing to settle on anything but a `Watcher` carrier \
+             leaves the debt to be spent by a filesystem event instead"
+        );
+
+        // Consequence: with the debt already settled, the key's next ordinary
+        // watcher poll is ordinary watcher work. If step 3 had skipped the
+        // settlement this is where the sweep slice would attach.
+        {
+            let mut state = dispatch.lock().expect("dispatch mutex poisoned");
+            state.pending.remove(&key);
+            state.inflight.insert(key.clone());
+        }
+        assert!(complete_work(&key, &dispatch).is_none());
+        enqueue_work(watcher, &process_tx, &dispatch, &metrics).await;
+        let after = process_rx.try_recv().expect("the key polls again");
+        assert_eq!(
+            after.trigger,
+            WorkTrigger::Watcher,
+            "a debt a reconcile poll already paid must not be spent a second \
+             time by a filesystem event"
+        );
+    }
+
+    /// Issue #601 §2.4 — the **width** of the settle/owe condition's *incoming*
+    /// filter, the sibling hole to the one above and found the same way.
+    ///
+    /// `incoming_trigger == Reconcile` names one variant of three, so its
+    /// extent needs pinning at both neighbours, not just at `Reconcile`.
+    /// `debounce_coalesces_a_watcher_burst_into_one_watcher_poll` already
+    /// covers `Watcher` ("watcher churn must not manufacture a reconcile
+    /// debt"); this covers `Startup`, and without it widening the filter by one
+    /// token to `!= Watcher` leaves the whole suite green.
+    ///
+    /// The widened form would let a startup backfill enqueue *create* a debt,
+    /// which is the same §2.4 inversion `arm_owed_reconcile` refuses in the
+    /// other direction — there a `Startup` poll may not *carry* a tick; here a
+    /// `Startup` event may not *mint* one. Refusing only the first while
+    /// permitting the second is strictly worse than permitting both, because
+    /// the minted debt is then spent by some later watcher poll: a filesystem
+    /// event pays sweep cost that a startup event bought.
+    ///
+    /// And it is far more reachable than the carrier case. `run_ingestor`
+    /// spawns the watcher threads *before* the backfill loop, so during startup
+    /// a path can have a queued watcher poll at the moment backfill enumerates
+    /// it — an ordinary race on any harness that is writing while moraine
+    /// starts, not the narrow window `arm_owed_reconcile`'s reachability note
+    /// describes.
+    ///
+    /// Direction bounded: **width**, at the `Startup` neighbour. `Reconcile`
+    /// itself is bounded by the owe path's own lower/upper guards
+    /// (`two_reconcile_ticks_straddling_one_queued_poll_buy_two_polls` and
+    /// `a_reconcile_sweep_over_idle_paths_leaves_no_standing_debt`).
+    ///
+    /// Fails for: owing on any incoming trigger that is not `Watcher` — the
+    /// startup enqueue mints a debt and the following watcher poll spends it.
+    #[tokio::test]
+    async fn a_startup_poll_landing_on_a_queued_poll_owes_nothing() {
+        let dispatch = Arc::new(Mutex::new(DispatchState::default()));
+        let metrics = Arc::new(Metrics::default());
+        let (process_tx, mut process_rx) = mpsc::channel::<WorkItem>(8);
+
+        let watcher = sweep_fleet(1).remove(0);
+        let key = watcher.key();
+        let startup = WorkItem {
+            trigger: WorkTrigger::Startup,
+            ..watcher.clone()
+        };
+
+        // A watcher poll is queued for a path the startup backfill has not
+        // reached yet.
+        enqueue_work(watcher.clone(), &process_tx, &dispatch, &metrics).await;
+        let queued = process_rx.try_recv().expect("watcher item is forwarded");
+        assert_eq!(queued.trigger, WorkTrigger::Watcher);
+
+        // Backfill reaches it. The key is already pending, so nothing is
+        // dispatched — and a startup event is not a reconcile tick, so there is
+        // nothing to remember either.
+        enqueue_work(startup, &process_tx, &dispatch, &metrics).await;
+        assert!(
+            process_rx.try_recv().is_err(),
+            "a key already pending is not queued a second time"
+        );
+        assert!(
+            dispatch
+                .lock()
+                .expect("dispatch mutex poisoned")
+                .reconcile_owed
+                .is_empty(),
+            "startup backfill must not manufacture a reconcile debt; only a \
+             reconcile tick may put an entry in the ledger"
+        );
+
+        // Consequence: the key's next poll is ordinary watcher work. This is
+        // where a minted debt would attach its sweep slice.
+        {
+            let mut state = dispatch.lock().expect("dispatch mutex poisoned");
+            state.pending.remove(&key);
+            state.inflight.insert(key.clone());
+        }
+        assert!(complete_work(&key, &dispatch).is_none());
+        enqueue_work(watcher, &process_tx, &dispatch, &metrics).await;
+        let after = process_rx.try_recv().expect("the key polls again");
+        assert_eq!(
+            after.trigger,
+            WorkTrigger::Watcher,
+            "a filesystem event must not pay for a sweep slice that a startup \
+             event bought"
+        );
+    }
+
+    /// The debounce window coalesces by `work.key()`, so a watcher burst on one
+    /// session file becomes **one** poll rather than one poll per event.
+    ///
+    /// Only watcher events are fed, because only watcher events reach this
+    /// window in production: its receiver is `watch_path_rx` and its only
+    /// sender is `spawn_watcher_threads`. The earlier version of this test drove
+    /// `Reconcile` through it to exercise a debt-owing branch that no producer
+    /// could reach; that branch is deleted, and asserting on synthetic input is
+    /// how it survived being dead. `spawn_debounce_task` now `debug_assert`s the
+    /// invariant, so a future `Reconcile` producer trips there instead.
+    ///
+    /// The coalesced poll must stay `Watcher` and the ledger must stay empty:
+    /// watcher churn alone never manufactures sweep eligibility that no
+    /// reconcile tick paid for (the §2.4 upper bound, at the debounce).
+    ///
+    /// Fails for: a window that never drains its ready items (nothing is
+    /// dispatched at all), or owing a debt from this window again — the owed
+    /// tick is armed onto the very poll the burst dispatches, so it comes back
+    /// `Reconcile` and watcher churn has bought itself a sweep slice.
+    ///
+    /// It does **not** falsify the debounce's choice of coalescing key: keying
+    /// the window per-event still yields one poll, because `enqueue_work`'s
+    /// `pending` set dedupes by `work.key()` underneath it (verified by
+    /// mutation — the burst stays one entry). The single-entry assertion is
+    /// therefore a statement about the pair, not about this map alone.
+    ///
+    /// It also does **not** bound the *width* of `enqueue_work`'s settle/owe
+    /// filter, and an earlier revision of that filter's comment claimed it did.
+    /// The burst coalesces into one `enqueue_work` call against an idle key, so
+    /// `pending.insert` returns true, `carried` is true, and the owe branch is
+    /// unreachable regardless of which triggers the filter admits: widening it
+    /// to `incoming_trigger != WorkTrigger::Startup` leaves this test green
+    /// (run alone under that mutation: 1 passed, 0 failed).
+    /// `one_reconcile_tick_buys_exactly_one_reconcile_eligible_poll` is what
+    /// catches that.
+    #[tokio::test]
+    async fn debounce_coalesces_a_watcher_burst_into_one_watcher_poll() {
+        let proj = "/Users/x/.claude/projects/-Users-x-src-moraine";
+        let sid = "7e74512d-612b-4406-ae5e-069e73d7f2dc";
+        let base = WorkItem {
+            source_name: "claude".to_string(),
+            harness: "claude-code".to_string(),
+            format: SourceFormat::Jsonl,
+            source_glob: String::new(),
+            path: format!("{proj}/{sid}.jsonl"),
+            trigger: WorkTrigger::Watcher,
+        };
+
+        let mut config = moraine_config::AppConfig::default();
+        config.ingest.debounce_ms = 10;
+        let dispatch = Arc::new(Mutex::new(DispatchState::default()));
+        let metrics = Arc::new(Metrics::default());
+        let (debounce_tx, debounce_rx) = mpsc::unbounded_channel::<WorkItem>();
+        let (process_tx, mut process_rx) = mpsc::channel::<WorkItem>(8);
+        let task = spawn_debounce_task(
+            config,
+            debounce_rx,
+            process_tx,
+            dispatch.clone(),
+            metrics.clone(),
+        );
+
+        for _ in 0..4 {
+            debounce_tx
+                .send(base.clone())
+                .expect("watcher event reaches the debounce");
+        }
+
+        let dispatched = timeout(Duration::from_secs(2), process_rx.recv())
+            .await
+            .expect("debounce must emit within the window")
+            .expect("debounce channel stays open");
+        assert_eq!(
+            dispatched.trigger,
+            WorkTrigger::Watcher,
+            "a burst of watcher events dispatches as watcher work"
+        );
+        assert!(
+            timeout(Duration::from_millis(100), process_rx.recv())
+                .await
+                .is_err(),
+            "the burst must coalesce into one queue entry"
+        );
+        assert!(
+            dispatch
+                .lock()
+                .expect("dispatch mutex poisoned")
+                .reconcile_owed
+                .is_empty(),
+            "watcher churn must not manufacture a reconcile debt"
+        );
+        drop(debounce_tx);
+        task.abort();
     }
 
     #[test]
@@ -3234,6 +4719,7 @@ mod tests {
             format: SourceFormat::KiroSession,
             source_glob: String::new(),
             path: path.to_string_lossy().to_string(),
+            trigger: WorkTrigger::Watcher,
         }
     }
 
@@ -3731,6 +5217,7 @@ mod tests {
                 format: SourceFormat::Jsonl,
                 source_glob: String::new(),
                 path: path.to_string_lossy().to_string(),
+                trigger: WorkTrigger::Watcher,
             };
             process_file(
                 &config,
@@ -3929,6 +5416,7 @@ mod tests {
             format: SourceFormat::Jsonl,
             source_glob: String::new(),
             path: path.to_string_lossy().to_string(),
+            trigger: WorkTrigger::Watcher,
         };
 
         process_file(
@@ -3990,6 +5478,7 @@ mod tests {
             format: SourceFormat::Jsonl,
             source_glob: String::new(),
             path: path.to_string_lossy().to_string(),
+            trigger: WorkTrigger::Watcher,
         };
 
         process_file(
@@ -4045,6 +5534,7 @@ mod tests {
             format: SourceFormat::Jsonl,
             source_glob: String::new(),
             path: source_file,
+            trigger: WorkTrigger::Watcher,
         };
 
         process_file(
@@ -4117,6 +5607,7 @@ mod tests {
             format: SourceFormat::Jsonl,
             source_glob: String::new(),
             path: source_file.clone(),
+            trigger: WorkTrigger::Watcher,
         };
 
         // Simulate a restart that already ingested the session header: the
@@ -4213,6 +5704,7 @@ mod tests {
             format: SourceFormat::Jsonl,
             source_glob: String::new(),
             path: source_file,
+            trigger: WorkTrigger::Watcher,
         };
         let config = moraine_config::AppConfig::default();
         let checkpoints = Arc::new(RwLock::new(HashMap::<String, Checkpoint>::new()));
@@ -4298,6 +5790,7 @@ mod tests {
             format: SourceFormat::Jsonl,
             source_glob: String::new(),
             path: source_file,
+            trigger: WorkTrigger::Watcher,
         };
 
         process_file(
@@ -4367,6 +5860,7 @@ mod tests {
             format: SourceFormat::Jsonl,
             source_glob: String::new(),
             path: source_file,
+            trigger: WorkTrigger::Watcher,
         };
 
         process_file(
@@ -4457,6 +5951,7 @@ mod tests {
             format: SourceFormat::Jsonl,
             source_glob: String::new(),
             path: source_file.clone(),
+            trigger: WorkTrigger::Watcher,
         };
 
         process_file(
@@ -4618,6 +6113,7 @@ mod tests {
             format: SourceFormat::Jsonl,
             source_glob: String::new(),
             path: source_file.clone(),
+            trigger: WorkTrigger::Watcher,
         };
 
         process_file(
@@ -4731,6 +6227,7 @@ mod tests {
             format: SourceFormat::SessionJson,
             source_glob: String::new(),
             path: source_file.clone(),
+            trigger: WorkTrigger::Watcher,
         };
 
         process_session_json_file(
@@ -4847,6 +6344,7 @@ mod tests {
             format: SourceFormat::SessionJson,
             source_glob: String::new(),
             path: source_file.clone(),
+            trigger: WorkTrigger::Watcher,
         };
 
         process_session_json_file(

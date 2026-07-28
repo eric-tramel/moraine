@@ -1,6 +1,7 @@
 use super::*;
 use crate::checkpoint::checkpoint_key;
 use crate::model::{Checkpoint, RowBatch};
+use crate::WorkTrigger;
 use moraine_config::SourceFormat;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -93,6 +94,16 @@ fn create_opencode_db(path: &PathBuf) -> Connection {
                   time_created integer NOT NULL,
                   time_updated integer NOT NULL
                 );
+                -- Verbatim from a live `~/.local/share/opencode/opencode.db`.
+                -- Without them every scan the unit tests measure is a full
+                -- table scan, so any cost budget calibrated here would be
+                -- calibrated against a plan production never runs
+                -- (issue #601 §1.2). Asserted by
+                -- `opencode_fixture_uses_the_production_event_index`.
+                CREATE UNIQUE INDEX `event_aggregate_seq_idx`
+                  ON `event` (`aggregate_id`,`seq`);
+                CREATE INDEX `event_aggregate_type_seq_idx`
+                  ON `event` (`aggregate_id`,`type`,`seq`);
                 "#,
         )
         .expect("create opencode tables");
@@ -490,6 +501,7 @@ fn opencode_sqlite_work(path: &Path) -> WorkItem {
         format: SourceFormat::OpenCodeSqlite,
         source_glob: String::new(),
         path: path.to_string_lossy().to_string(),
+        trigger: WorkTrigger::Watcher,
     }
 }
 
@@ -515,7 +527,25 @@ async fn drive_opencode_poll(
     checkpoints: &Arc<RwLock<HashMap<String, Checkpoint>>>,
     poll_state: &VolatilePollMap,
 ) -> Vec<RowBatch> {
-    let metrics = Arc::new(Metrics::default());
+    drive_opencode_poll_with_metrics(
+        config,
+        work,
+        checkpoints,
+        poll_state,
+        &Arc::new(Metrics::default()),
+    )
+    .await
+}
+
+/// Shares one `Metrics` across several polls so a test can observe what a poll
+/// actually read (`sqlite_poll_*_total`) rather than only what it emitted.
+async fn drive_opencode_poll_with_metrics(
+    config: &moraine_config::AppConfig,
+    work: &WorkItem,
+    checkpoints: &Arc<RwLock<HashMap<String, Checkpoint>>>,
+    poll_state: &VolatilePollMap,
+    metrics: &Arc<Metrics>,
+) -> Vec<RowBatch> {
     let (sink_tx, mut sink_rx) = mpsc::channel::<SinkMessage>(64);
     let process = process_opencode_sqlite_db(
         config,
@@ -523,7 +553,7 @@ async fn drive_opencode_poll(
         checkpoints.clone(),
         poll_state,
         sink_tx,
-        &metrics,
+        metrics,
     );
     tokio::pin!(process);
     let mut batches = Vec::new();
@@ -572,6 +602,278 @@ async fn drive_opencode_poll(
         checkpoints.write().await.insert(key, cp);
     }
     batches
+}
+
+/// Runs one poll, acknowledging every barrier, and reports whether it emitted
+/// a `BlockReplay`. Unlike `drive_opencode_poll_with_metrics` it persists the
+/// checkpoint a barrier carried, which is the only way a *blocked* replay's
+/// state reaches the next poll.
+async fn drive_opencode_block_poll(
+    config: &moraine_config::AppConfig,
+    work: &WorkItem,
+    checkpoints: &Arc<RwLock<HashMap<String, Checkpoint>>>,
+    poll_state: &VolatilePollMap,
+    metrics: &Arc<Metrics>,
+) -> bool {
+    let (sink_tx, mut sink_rx) = mpsc::channel::<SinkMessage>(64);
+    let process = process_opencode_sqlite_db(
+        config,
+        work,
+        checkpoints.clone(),
+        poll_state,
+        sink_tx,
+        metrics,
+    );
+    tokio::pin!(process);
+    let mut batches = Vec::new();
+    let mut committed = None;
+    let mut blocked = false;
+    loop {
+        tokio::select! {
+            result = &mut process => {
+                result.expect("opencode_sqlite replay poll should succeed");
+                break;
+            }
+            message = sink_rx.recv() => match message.expect("opencode test sink remains open") {
+                SinkMessage::Batch(batch) => batches.push(batch),
+                SinkMessage::BlockReplay { transition, ack } => {
+                    blocked = true;
+                    committed = Some(transition.checkpoint.clone());
+                    let _ = ack.send(Ok(crate::publication::ReplayBarrierAck {
+                        checkpoint_revision: 1,
+                        operation_id: transition.checkpoint.operation_id,
+                    }));
+                }
+                SinkMessage::BeginReplay { transition, ack }
+                | SinkMessage::MirrorCaughtUp { transition, ack } => {
+                    committed = Some(transition.checkpoint.clone());
+                    let _ = ack.send(Ok(crate::publication::ReplayBarrierAck {
+                        checkpoint_revision: 1,
+                        operation_id: transition.checkpoint.operation_id,
+                    }));
+                }
+                SinkMessage::FinalizeReplay { transition, ack } => {
+                    committed = Some(transition.checkpoint.clone());
+                    let _ = ack.send(Ok(
+                        crate::publication::FinalizeReplayOutcome::Published(
+                            crate::publication::PublicationAck {
+                                checkpoint_revision: 2,
+                                publication_revision: 1,
+                                already_published: false,
+                            },
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+    while let Ok(message) = sink_rx.try_recv() {
+        if let SinkMessage::Batch(batch) = message {
+            batches.push(batch);
+        }
+    }
+    if let Some(cp) = committed.or_else(|| batches.last().and_then(|b| b.checkpoint.clone())) {
+        let key = checkpoint_key(&cp.source_name, &cp.source_file);
+        checkpoints.write().await.insert(key, cp);
+    }
+    blocked
+}
+
+/// Issue #601 §2.5. The OpenCode half of the `record_blocked_replay` call-site
+/// gap: `record_blocked_replay` is guarded at its implementation, and Cursor's
+/// call site is guarded by `blocked_replay_retries_climb_the_failure_ladder`,
+/// but inserting a `poll_state.clear()` before opencode.rs's call passed the
+/// whole suite. A `clear` there restarts the streak on every retry, which pins
+/// the path at the 15 s floor and re-reads the entire event history — plus a
+/// durable `BeginReplay`/`BlockReplay` pair — every 15 s indefinitely, because
+/// the trigger (a record failing `normalize_record`) is deterministic.
+///
+/// Fails for: `clear`ing volatile state before `record_blocked_replay`, or
+/// dropping the call entirely.
+#[tokio::test]
+async fn a_normalization_blocked_opencode_replay_climbs_the_failure_ladder() {
+    let path = unique_opencode_db_path("block-ladder");
+    let _db = seed_opencode_db(&path);
+    // `normalize_record` rejects an unregistered harness outright, so every
+    // synthesized record fails and a replacement replay blocks durably.
+    let work = WorkItem {
+        harness: "not-a-registered-harness".to_string(),
+        ..opencode_sqlite_work(&path)
+    };
+    let cp_key = checkpoint_key(&work.source_name, &work.path);
+    let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+    let poll_state = VolatilePollMap::new();
+    let metrics = Arc::new(Metrics::default());
+
+    let config = moraine_config::AppConfig::default();
+    drive_opencode_poll_with_metrics(&config, &work, &checkpoints, &poll_state, &metrics).await;
+    assert!(checkpoints.read().await.contains_key(&cp_key));
+
+    // Changing the exclusion set starts a replacement replay that cannot
+    // finish, because nothing normalizes.
+    let mut replaying = moraine_config::AppConfig::default();
+    replaying.ingest.exclude_project_dirs = vec!["/no/such/dir/**".to_string()];
+    let block_poll = |config: moraine_config::AppConfig| {
+        let work = work.clone();
+        let checkpoints = checkpoints.clone();
+        let poll_state = poll_state.clone();
+        let metrics = metrics.clone();
+        async move {
+            drive_opencode_block_poll(&config, &work, &checkpoints, &poll_state, &metrics).await
+        }
+    };
+
+    assert!(
+        block_poll(replaying.clone()).await,
+        "the replacement replay must block durably"
+    );
+    assert_eq!(
+        poll_state.consecutive_failed_scans(&cp_key),
+        1,
+        "entering the blocked state starts the ladder"
+    );
+
+    assert!(!block_poll(replaying.clone()).await, "throttled");
+
+    poll_state.age_for_tests(&cp_key, std::time::Duration::from_secs(16));
+    assert!(block_poll(replaying.clone()).await);
+    assert_eq!(
+        poll_state.consecutive_failed_scans(&cp_key),
+        2,
+        "a repeat block must extend the streak, not restart it — a `clear()` \
+         before `record_blocked_replay` pins it at 1"
+    );
+
+    poll_state.age_for_tests(&cp_key, std::time::Duration::from_secs(16));
+    assert!(
+        !block_poll(replaying).await,
+        "the second window is 30 s; a blocked replay must not re-read the whole \
+         event history every 15 s forever"
+    );
+
+    cleanup(&path);
+}
+
+/// Issue #601 §2.5/§3.2. The OpenCode half of the same rule: its `Failed` arm
+/// must classify a mixed-snapshot rejection as contention (no fault streak, so
+/// no 15-minute suppression of an actively written store) while still moving
+/// the clock that throttles a contended replay's durable barrier.
+///
+/// Fails for: calling `record_failed_scan` directly from the `Failed` arm, or
+/// dropping the classification entirely.
+#[tokio::test]
+async fn a_contended_opencode_scan_moves_the_contention_clock_not_the_fault_ladder() {
+    let path = unique_opencode_db_path("contention-classification");
+    let _db = seed_opencode_db(&path);
+    let work = opencode_sqlite_work(&path);
+    let cp_key = checkpoint_key(&work.source_name, &work.path);
+    let config = moraine_config::AppConfig::default();
+    let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+    let poll_state = VolatilePollMap::new();
+    let metrics = Arc::new(Metrics::default());
+
+    crate::sqlite_poll::contention_injection::arm(&work.path, 1);
+    drive_opencode_poll_with_metrics(&config, &work, &checkpoints, &poll_state, &metrics).await;
+    assert_eq!(
+        metrics
+            .sqlite_scan_failures_total
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "the armed scan must actually reach the mixed-snapshot arm"
+    );
+    assert_eq!(
+        poll_state.consecutive_failed_scans(&cp_key),
+        0,
+        "contention must not climb OpenCode's fault ladder"
+    );
+    assert_eq!(
+        poll_state.consecutive_contended_scans(&cp_key),
+        1,
+        "…but it must leave the clock that throttles the replay barrier"
+    );
+
+    crate::sqlite_poll::contention_injection::disarm(&work.path);
+    cleanup(&path);
+}
+
+/// Issue #601 §3.2/§6 — OpenCode's half of the call-site guard. The classifier
+/// test above proves the contention clock *moves*; this proves the clock does
+/// not reach ordinary polls.
+///
+/// §2.5's `|| !failure_retry_due` disjunct on the cheap short-circuit was
+/// outcome-redundant with `should_skip_poll` until §3.2 put the contention
+/// clock inside `failure_retry_due` and deliberately left it out of
+/// `should_skip_poll`. Adding it now would stop scanning an actively written
+/// OpenCode store for up to 60 s — the prompt-visibility regression the
+/// exemption exists to prevent, on a store that is contended precisely because
+/// a session is streaming parts into it.
+///
+/// The end-to-end delivery half of this rule is
+/// `an_ordinary_poll_of_a_contended_database_is_not_throttled` on the Cursor
+/// adapter; this one pins the throttle at OpenCode's own call site.
+///
+/// Fails for: adding `|| !poll_state.failure_retry_due(..)` to the cheap
+/// short-circuit (the second scan never runs), or moving the contention clock
+/// into `should_skip_poll`.
+#[tokio::test]
+async fn an_ordinary_poll_of_a_contended_opencode_store_is_not_throttled() {
+    let path = unique_opencode_db_path("contended-ordinary-poll");
+    let db = seed_opencode_db(&path);
+    let work = opencode_sqlite_work(&path);
+    let cp_key = checkpoint_key(&work.source_name, &work.path);
+    let config = moraine_config::AppConfig::default();
+    let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+    let poll_state = VolatilePollMap::new();
+    let metrics = Arc::new(Metrics::default());
+
+    let cold =
+        drive_opencode_poll_with_metrics(&config, &work, &checkpoints, &poll_state, &metrics).await;
+    assert!(!cold.is_empty(), "the cold poll emits the fixture");
+
+    // The session is live, so the next two scans lose the bracket to the
+    // writer. Each poll is preceded by a real write, as a contended store's
+    // would be.
+    crate::sqlite_poll::contention_injection::arm(&work.path, 2);
+    touch_opencode_store(&db, "cred_contended_one");
+    drive_opencode_poll_with_metrics(&config, &work, &checkpoints, &poll_state, &metrics).await;
+    assert_eq!(poll_state.consecutive_contended_scans(&cp_key), 1);
+    assert_eq!(
+        poll_state.consecutive_failed_scans(&cp_key),
+        0,
+        "contention is not a fault (§3.2)"
+    );
+
+    // The very next tick, far inside the contention window the barrier is now
+    // serving, must still read the store.
+    touch_opencode_store(&db, "cred_contended_two");
+    drive_opencode_poll_with_metrics(&config, &work, &checkpoints, &poll_state, &metrics).await;
+    assert_eq!(
+        poll_state.consecutive_contended_scans(&cp_key),
+        2,
+        "an ordinary poll of a contended OpenCode store must not be throttled — \
+         the second scan has to run at the ordinary poll cadence"
+    );
+    assert_eq!(
+        metrics
+            .sqlite_scan_failures_total
+            .load(std::sync::atomic::Ordering::Relaxed),
+        2,
+        "…and must reach the scan, not return before it"
+    );
+
+    crate::sqlite_poll::contention_injection::disarm(&work.path);
+    cleanup(&path);
+}
+
+/// Writes a row no event cursor can advance on, so the stat fingerprint moves
+/// without changing what a scan would emit.
+fn touch_opencode_store(db: &Connection, credential_id: &str) {
+    db.execute(
+        "INSERT INTO credential (id, value, time_created, time_updated) \
+         VALUES (?1, 'rotated', 1780000004000, 1780000004000)",
+        rusqlite::params![credential_id],
+    )
+    .expect("write non-event row");
 }
 
 async fn capture_begin_replay_checkpoint(
@@ -624,91 +926,26 @@ fn cleanup(path: &Path) {
     let _ = std::fs::remove_file(format!("{}-shm", path.to_string_lossy()));
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn opencode_sqlite_real_db_smoke_from_env() {
-    let Some(path) = std::env::var_os("MORAINE_OPENCODE_REAL_DB") else {
-        return;
-    };
-    let path = PathBuf::from(path);
-    let work = opencode_sqlite_work(&path);
-    let checkpoints = Arc::new(RwLock::new(HashMap::new()));
-
-    let batches = run_opencode_poll(&work, &checkpoints).await;
-    let errors: Vec<Value> = batches
-        .iter()
-        .flat_map(|batch| batch.error_rows.iter().cloned())
-        .collect();
-    assert!(
-        errors.is_empty(),
-        "real OpenCode DB smoke errors: {errors:?}"
-    );
-
-    let raw_rows: Vec<Value> = batches
-        .iter()
-        .flat_map(|batch| batch.raw_rows.iter().cloned())
-        .collect();
-    assert!(
-        !raw_rows.is_empty(),
-        "real OpenCode DB smoke should emit synthetic raw rows"
-    );
-
-    let event_rows = all_event_rows(&batches);
-    assert!(
-        !event_rows.is_empty(),
-        "real OpenCode DB smoke should normalize at least one event row"
-    );
-    assert!(
-        event_rows
-            .iter()
-            .any(|row| row.get("harness").and_then(Value::as_str) == Some("opencode")),
-        "normalized rows should retain the opencode harness"
-    );
-
-    let checkpoint = batches
-        .last()
-        .and_then(|batch| batch.checkpoint.clone())
-        .expect("real OpenCode smoke checkpoint");
-    let cursor: Value = serde_json::from_str(&checkpoint.cursor_json).expect("cursor_json parses");
-    let expected_sequences = {
-        let connection = Connection::open(&path).expect("open real OpenCode smoke db");
-        let mut stmt = connection
-            .prepare("SELECT aggregate_id, seq FROM event_sequence ORDER BY aggregate_id")
-            .expect("prepare event_sequence query");
-        stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        })
-        .expect("query event_sequence")
-        .collect::<std::result::Result<BTreeMap<_, _>, _>>()
-        .expect("read event_sequence")
-    };
-    let cursor_sequences = cursor
-        .get("aggregate_sequences")
-        .and_then(Value::as_object)
-        .expect("cursor has aggregate sequences")
-        .iter()
-        .map(|(key, value)| {
-            (
-                key.clone(),
-                value.as_i64().expect("aggregate sequence is an integer"),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
-    assert_eq!(
-        cursor_sequences, expected_sequences,
-        "real OpenCode smoke should scan each aggregate through event_sequence"
-    );
-    assert!(
-        cursor
-            .get("aggregate_sequences")
-            .and_then(Value::as_object)
-            .is_some_and(|seqs| !seqs.is_empty()),
-        "real OpenCode smoke should persist aggregate sequence cursors"
-    );
-    assert!(
-        cursor.get("session_contexts").is_none() && cursor.get("message_contexts").is_none(),
-        "real OpenCode smoke cursor should stay bounded"
-    );
-}
+// `opencode_sqlite_real_db_smoke_from_env` lived here and is **deleted**
+// (issue #601 §3.1 Change 6, open question 6).
+//
+// It opened with `let Some(path) = std::env::var_os("MORAINE_OPENCODE_REAL_DB")
+// else { return; };` and that variable appeared exactly once in the entire
+// repository — that read. Every one of its 83 lines was dead and the test had
+// always been green: the eighth instance of this epic's signature bug, a guard
+// that cannot fail. The plan is explicit that it must be resolved rather than
+// left, and gives two options: wire the variable into a live gate that fails
+// when unset, or delete it.
+//
+// Deleted, because the fixture-based gates cover the same ground more
+// precisely and without needing a real OpenCode database on the host:
+//
+// - per-aggregate watermark persistence → `opencode_sqlite_second_poll_is_a_noop`
+//   and `opencode_incremental_scan_currently_re_reads_the_whole_aggregate`;
+// - normalization and harness attribution → the first-poll row assertions below;
+// - the "cursor stays bounded" assertion it ended on → restated by §3.1 Change 4
+//   as a size budget, because WI-06 *requires* persisting reconstruction
+//   context and an absence check would directly contradict it.
 
 #[tokio::test(flavor = "multi_thread")]
 async fn opencode_sqlite_first_poll_emits_allowlisted_conversation_rows() {
@@ -1075,8 +1312,11 @@ fn opencode_sqlite_scan_paginates_past_single_event_page() {
         .expect("insert many-event sequence");
     drop(connection);
 
-    let outcome =
-        scan_opencode_database(path.to_str().expect("utf-8 path"), &OpenCodeState::fresh());
+    let outcome = scan_opencode_database(
+        path.to_str().expect("utf-8 path"),
+        &OpenCodeState::fresh(),
+        &mut ScanLedger::default(),
+    );
     let (records, new_state, relevant_rows) = match outcome {
         OpenCodeScanOutcome::Scanned {
             records,
@@ -1142,8 +1382,11 @@ fn opencode_sqlite_project_dir_stays_on_first_absolute_session_directory() {
         .expect("advance event sequence");
     drop(connection);
 
-    let outcome =
-        scan_opencode_database(path.to_str().expect("utf-8 path"), &OpenCodeState::fresh());
+    let outcome = scan_opencode_database(
+        path.to_str().expect("utf-8 path"),
+        &OpenCodeState::fresh(),
+        &mut ScanLedger::default(),
+    );
     let records = match outcome {
         OpenCodeScanOutcome::Scanned { records, .. } => records,
         OpenCodeScanOutcome::Failed {
@@ -1525,4 +1768,956 @@ fn opencode_long_string_sanitizer_preserves_text_and_elides_binary_like_payloads
         "binary-like payload should be elided, got {} bytes",
         sanitized.len()
     );
+}
+
+/// Issue #601 §1.2 / WI-01. The live `opencode.db` carries
+/// `event_aggregate_seq_idx` and `event_aggregate_type_seq_idx`; the fixture
+/// carried neither, so every scan these unit tests measured was a full table
+/// scan and any cost budget calibrated here would have been miscalibrated in
+/// both directions.
+///
+/// Asserting on the query plan rather than on `sqlite_master` alone is what
+/// makes this a guard: dropping either index from the fixture flips `SEARCH …
+/// USING INDEX` to `SCAN event` and fails here — the calibration mutation the
+/// plan's checklist names for G3. **Both** indexes are plan-asserted; asserting
+/// one by `EXPLAIN` and the other only by its presence in `sqlite_master` would
+/// leave the type-scoped read (§3.1 Change 3's bounded context rebuild)
+/// uncalibrated, which is what shipped first.
+///
+/// The paged statement comes from `OPENCODE_EVENT_PAGE_SQL`, the constant the
+/// adapter itself pages with — a copy here could drift from the query that
+/// actually runs and certify a plan nothing uses.
+///
+/// Note what §1 corrects about the second index: on the live database SQLite
+/// picks `event_aggregate_seq_idx` even for the type-scoped form, because the
+/// `IN` list is not a leading-column equality. So the type-scoped assertion
+/// below requires *an* index, not specifically the type-scoped one; what it
+/// rules out is the full table scan the fixture used to force. The second index
+/// is present because production has it, not because it is load-bearing here.
+/// Issue #601 §3.2/§6. `build_event_row` reads four columns OpenCode declares
+/// NOT NULL. The `ScanLedger` refactor routed all four through a helper that
+/// absorbed NULL into `""`, which for `id`/`aggregate_id` is not a lossy field
+/// but a **broken identity**: they are the material behind
+/// `source_line_no`/`source_offset` and therefore behind `event_uid` (§6), so
+/// two drifted rows would synthesize records that collide. `data` going empty
+/// additionally reports `data_bytes = 0`, under-charging the ledger every
+/// budget in §2.1 is denominated on.
+///
+/// Fails for: reading any of the four through a NULL-absorbing helper.
+#[test]
+fn a_null_in_a_required_event_column_fails_the_scan() {
+    // Positional, matching the `event` projection: id, aggregate_id, seq,
+    // type, data.
+    let baseline = ["'evt_1'", "'ses_demo'", "1", "'session.created.1'", "'{}'"];
+    let connection = Connection::open_in_memory().expect("in-memory probe database");
+    let read = |values: &[&str]| {
+        let sql = format!("SELECT {}", values.join(", "));
+        connection.query_row(&sql, [], |row| {
+            let mut ledger = ScanLedger::default();
+            Ok(build_event_row(row, &mut ledger).map(|_| ()))
+        })
+    };
+
+    read(&baseline)
+        .expect("probe query")
+        .expect("the baseline row must read cleanly");
+
+    for (index, name) in [(0, "id"), (1, "aggregate_id"), (3, "type"), (4, "data")] {
+        let mut values = baseline;
+        values[index] = "NULL";
+        let error = read(&values)
+            .expect("probe query")
+            .err()
+            .unwrap_or_else(|| panic!("a NULL {name} must fail the scan, not become \"\""));
+        assert!(
+            format!("{error:#}").contains("Invalid column type"),
+            "a NULL {name} must surface as a column-type error; got {error:#}"
+        );
+    }
+}
+
+#[test]
+fn opencode_fixture_uses_the_production_event_index() {
+    let path = unique_opencode_db_path("fixture-index");
+    let connection = create_opencode_db(&path);
+
+    let mut indexes: Vec<String> = {
+        let mut stmt = connection
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'event'")
+            .expect("prepare index query");
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query indexes");
+        rows.map(|row| row.expect("index name")).collect()
+    };
+    indexes.sort();
+    assert!(
+        indexes.iter().any(|name| name == "event_aggregate_seq_idx"),
+        "fixture must carry the production event index; found {indexes:?}"
+    );
+    assert!(
+        indexes
+            .iter()
+            .any(|name| name == "event_aggregate_type_seq_idx"),
+        "fixture must carry the production type-scoped index; found {indexes:?}"
+    );
+
+    // The exact statement `scan_opencode_rows` pages with, taken from the
+    // adapter's own constant.
+    let plan: Vec<String> = {
+        let mut stmt = connection
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {}",
+                super::OPENCODE_EVENT_PAGE_SQL
+            ))
+            .expect("prepare explain");
+        let rows = stmt
+            .query_map(rusqlite::params!["ses_demo", -1_i64, 1_i64, 8_i64], |row| {
+                row.get::<_, String>(3)
+            })
+            .expect("query plan");
+        rows.map(|row| row.expect("plan detail")).collect()
+    };
+    let detail = plan.join("; ");
+    assert!(
+        detail.contains("USING INDEX event_aggregate_seq_idx"),
+        "the paged event scan must use the production index, not a table scan; \
+         plan was: {detail}"
+    );
+    assert!(
+        !detail.contains("SCAN event"),
+        "the paged event scan must not degrade to a full table scan; plan was: {detail}"
+    );
+
+    // The type-scoped read §3.1 Change 3 introduces for the bounded context
+    // rebuild. Presence in `sqlite_master` says nothing about the plan, so this
+    // is exercised rather than assumed: the measurement that justifies the
+    // rebuild (95 rows / 47 KB / 0.51 ms versus 639 / 6.9 MB / 32.8 ms) is only
+    // meaningful against an index-driven plan.
+    let type_scoped_plan: Vec<String> = {
+        let mut stmt = connection
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT id, aggregate_id, seq, type, data FROM event \
+                 WHERE aggregate_id = ?1 \
+                 AND type IN ('session.created.1','session.updated.1','message.updated.1') \
+                 ORDER BY seq",
+            )
+            .expect("prepare type-scoped explain");
+        let rows = stmt
+            .query_map(rusqlite::params!["ses_demo"], |row| row.get::<_, String>(3))
+            .expect("type-scoped plan");
+        rows.map(|row| row.expect("plan detail")).collect()
+    };
+    let type_scoped = type_scoped_plan.join("; ");
+    assert!(
+        type_scoped.contains("USING INDEX event_aggregate_seq_idx")
+            || type_scoped.contains("USING INDEX event_aggregate_type_seq_idx"),
+        "the type-scoped context rebuild must be index-driven; plan was: {type_scoped}"
+    );
+    assert!(
+        !type_scoped.contains("SCAN event"),
+        "the type-scoped context rebuild must not degrade to a full table scan; \
+         plan was: {type_scoped}"
+    );
+
+    drop(connection);
+    cleanup(&path);
+}
+
+/// Issue #601 §2.0 / WI-01, OpenCode arm. Payload bytes are the exact lengths
+/// of what SQLite materialized *plus* what its aggregate preflight forced it to
+/// decode; the census axis carries schema validation and the narrow
+/// `event_sequence` read.
+///
+/// Both totals record duplication the ledger exists to expose, so neither is an
+/// arbitrary constant:
+///
+/// - `opencode_aggregate_sequences` runs **twice** per scan (preflight + page
+///   loop), so the census is `2 ×` the `event_sequence` read;
+/// - `opencode_relevant_stats`'s `sum(length(data))` decodes every `data` byte
+///   in the range before the page loop reads the same rows again, so a cold
+///   scan's payload bytes are the row bytes **plus a second full pass over
+///   `data`** — the ~2× §1.1 finding 2 predicts, made visible instead of
+///   "real and invisible".
+///
+/// Issue #601 §3.1 Change 5 removes both duplications; these assertions are
+/// what force that to be restated rather than silently drifting.
+#[test]
+fn opencode_ledger_charges_payload_bytes_at_the_read_site() {
+    let path = unique_opencode_db_path("ledger-read-site");
+    let connection = seed_opencode_db(&path);
+    let expected_bytes: i64 = connection
+        .query_row(
+            "SELECT coalesce(sum(length(CAST(e.id AS BLOB)) \
+             + length(CAST(e.aggregate_id AS BLOB)) \
+             + length(CAST(e.type AS BLOB)) \
+             + length(CAST(e.data AS BLOB))), 0) \
+             FROM event e JOIN event_sequence s ON s.aggregate_id = e.aggregate_id \
+             WHERE e.seq <= s.seq",
+            [],
+            |row| row.get(0),
+        )
+        .expect("sum event payload bytes");
+    let expected_rows: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM event e JOIN event_sequence s \
+             ON s.aggregate_id = e.aggregate_id WHERE e.seq <= s.seq",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count read events");
+    let aggregate_id_bytes: i64 = connection
+        .query_row(
+            "SELECT coalesce(sum(length(CAST(aggregate_id AS BLOB))), 0) FROM event_sequence",
+            [],
+            |row| row.get(0),
+        )
+        .expect("sum aggregate id bytes");
+    let aggregates: i64 = connection
+        .query_row("SELECT count(*) FROM event_sequence", [], |row| row.get(0))
+        .expect("count aggregates");
+    // What the preflight aggregate decodes: `data` only, over the same range.
+    let preflight_data_bytes: i64 = connection
+        .query_row(
+            "SELECT coalesce(sum(length(CAST(coalesce(e.data, '') AS BLOB))), 0) \
+             FROM event e JOIN event_sequence s ON s.aggregate_id = e.aggregate_id \
+             WHERE e.seq <= s.seq",
+            [],
+            |row| row.get(0),
+        )
+        .expect("sum preflight decoded bytes");
+    drop(connection);
+
+    let mut ledger = ScanLedger::default();
+    let outcome = scan_opencode_database(
+        path.to_str().expect("utf-8 path"),
+        &OpenCodeState::fresh(),
+        &mut ledger,
+    );
+    let records = match outcome {
+        OpenCodeScanOutcome::Scanned { records, .. } => records,
+        OpenCodeScanOutcome::Failed {
+            error_kind,
+            error_text,
+        } => panic!("ledger scan failed: {error_kind}: {error_text}"),
+    };
+
+    assert!(
+        expected_rows > 0 && expected_bytes > 0,
+        "fixture must have events"
+    );
+    assert!(preflight_data_bytes > 0);
+    assert_eq!(
+        ledger.payload_bytes,
+        (expected_bytes + preflight_data_bytes) as u64,
+        "payload bytes are the materialized column lengths plus the bytes the \
+         aggregate preflight forced SQLite to decode; charging only the former \
+         under-reports a cold scan by ~2×"
+    );
+    assert_eq!(ledger.payload_rows, expected_rows as u64);
+    assert_eq!(ledger.rows_emitted, records.len() as u64);
+    assert_ne!(
+        ledger.rows_emitted, ledger.payload_rows,
+        "[DIVERGENT FIXTURE] events read and records emitted must differ, or the \
+         two axes are interchangeable and neither is tested"
+    );
+    // Census = schema validation + the `event_sequence` read, and the latter
+    // runs **twice** per scan today (preflight + page loop). Issue #601 §3.1
+    // Change 5 folds it to one; this assertion is what forces that number to
+    // be restated rather than silently drifting.
+    let schema_census = {
+        let connection = crate::sqlite_poll::open_read_only(path.to_str().expect("utf-8 path"))
+            .expect("reopen for schema census");
+        crate::sqlite_poll::expected_schema_census(&connection, &["event", "event_sequence"])
+    };
+    assert!(schema_census.census_rows > 0);
+    assert_eq!(
+        ledger.census_rows,
+        schema_census.census_rows + 2 * aggregates as u64,
+    );
+    assert_eq!(
+        ledger.census_bytes,
+        schema_census.census_bytes + 2 * aggregate_id_bytes as u64
+    );
+
+    cleanup(&path);
+}
+
+/// Calibration baseline for gates G1b/G3 (issue #601 §3.1). Today
+/// `scan_opencode_rows` starts its page loop at `last_seq = -1`, so appending
+/// one event re-reads the aggregate's entire history — 639 events / 6.9 MB on
+/// the reference host to normalize one new event.
+///
+/// This test *records* that, so that WI-06's fix has a measured "before" and
+/// so nobody can claim the fix without this assertion changing. When the
+/// watermark start lands, the incremental scan's payload bytes must collapse
+/// to the appended event and this assertion must be inverted.
+#[test]
+fn opencode_incremental_scan_currently_re_reads_the_whole_aggregate() {
+    let path = unique_opencode_db_path("incremental-baseline");
+    let connection = seed_opencode_db(&path);
+
+    // The cold scan pays for `data` twice: once in the aggregate preflight and
+    // once in the page loop. Measure the preflight's share so the warm
+    // comparison below is denominated on the page loop alone.
+    let cold_preflight_data_bytes: i64 = connection
+        .query_row(
+            "SELECT coalesce(sum(length(CAST(coalesce(e.data, '') AS BLOB))), 0) \
+             FROM event e JOIN event_sequence s ON s.aggregate_id = e.aggregate_id \
+             WHERE e.seq <= s.seq",
+            [],
+            |row| row.get(0),
+        )
+        .expect("measure cold preflight bytes");
+
+    let mut ledger = ScanLedger::default();
+    let cold = scan_opencode_database(
+        path.to_str().expect("utf-8 path"),
+        &OpenCodeState::fresh(),
+        &mut ledger,
+    );
+    let OpenCodeScanOutcome::Scanned { new_state, .. } = cold else {
+        panic!("cold scan should succeed");
+    };
+
+    let next_seq: i64 = connection
+        .query_row(
+            "SELECT seq + 1 FROM event_sequence WHERE aggregate_id = 'ses_demo'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read next sequence");
+    connection
+        .execute(
+            "INSERT INTO event (id, aggregate_id, seq, type, data) \
+             VALUES ('evt_baseline_append', 'ses_demo', ?1, 'session.updated.1', ?2)",
+            rusqlite::params![
+                next_seq,
+                serde_json::to_string(&json!({
+                    "info": {
+                        "id": "ses_demo",
+                        "directory": "/work/opencode-demo",
+                        "title": "OpenCode DB fixture",
+                        "time": {"created": 1780000000000_i64, "updated": 1780000009000_i64}
+                    }
+                }))
+                .unwrap()
+            ],
+        )
+        .expect("append one event");
+    connection
+        .execute(
+            "UPDATE event_sequence SET seq = ?1 WHERE aggregate_id = 'ses_demo'",
+            rusqlite::params![next_seq],
+        )
+        .expect("advance sequence");
+    let appended_bytes: i64 = connection
+        .query_row(
+            "SELECT length(CAST(id AS BLOB)) + length(CAST(aggregate_id AS BLOB)) \
+             + length(CAST(type AS BLOB)) + length(CAST(data AS BLOB)) \
+             FROM event WHERE id = 'evt_baseline_append'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("measure appended event");
+    // The preflight aggregate is denominated on `seq > prior_seq`, so on the
+    // warm scan it decodes only the appended event's `data` — while the page
+    // loop below still replays the whole aggregate. That asymmetry is §3.1
+    // Change 5's "the two axes must converge"; until they do, the warm total is
+    // the sum of both.
+    let appended_data_bytes: i64 = connection
+        .query_row(
+            "SELECT length(CAST(data AS BLOB)) FROM event WHERE id = 'evt_baseline_append'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("measure appended data");
+    drop(connection);
+
+    let mut incremental = ScanLedger::default();
+    let warm = scan_opencode_database(
+        path.to_str().expect("utf-8 path"),
+        &new_state,
+        &mut incremental,
+    );
+    assert!(matches!(warm, OpenCodeScanOutcome::Scanned { .. }));
+
+    // Cold = preflight(all data) + page loop(all rows). Warm = preflight(the
+    // appended event's data only) + page loop(all rows + the appended row).
+    let cold_page_loop_bytes = ledger.payload_bytes - cold_preflight_data_bytes as u64;
+    assert_eq!(
+        incremental.payload_bytes,
+        appended_data_bytes as u64 + cold_page_loop_bytes + appended_bytes as u64,
+        "BASELINE, NOT A TARGET: one appended event currently costs the whole \
+         aggregate's history because the page loop starts at seq = -1. Issue \
+         #601 WI-06 must make this collapse to the appended event alone (G1b/G3); \
+         when it does, invert this assertion rather than deleting it."
+    );
+    assert!(
+        incremental.payload_bytes > 4 * appended_bytes as u64,
+        "the fixture must make the replay cost visibly dominate the append"
+    );
+
+    cleanup(&path);
+}
+
+fn census_rows(metrics: &Arc<Metrics>) -> u64 {
+    metrics
+        .sqlite_poll_census_rows_total
+        .load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn poll_payload_rows(metrics: &Arc<Metrics>) -> u64 {
+    metrics
+        .sqlite_poll_payload_rows_total
+        .load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Issue #601 §2.0. The ledger is caller-owned so that a scan which reads and
+/// then fails is still charged. Every OpenCode ledger test destructured
+/// `Scanned` and panicked otherwise, so the guarantee was unverified on every
+/// failure arm.
+///
+/// The ceiling arm is reached through `opencode_relevant_stats`, whose
+/// `sum(length(data))` has already made SQLite decode the whole range — so
+/// "the bytes this scan had already paid for" is a real, non-zero number even
+/// though the page loop never ran.
+///
+/// Fails for: resetting or rebuilding the ledger on a `scan_opencode_database`
+/// failure arm, or dropping the aggregate byte charge from the preflight.
+#[test]
+fn a_failed_opencode_scan_still_reports_the_bytes_it_had_already_read() {
+    let path = unique_opencode_db_path("failure-arm-ledger");
+    let connection = seed_opencode_db(&path);
+    let base_seq: i64 = connection
+        .query_row(
+            "SELECT seq FROM event_sequence WHERE aggregate_id = 'ses_demo'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read base sequence");
+
+    // One event past `MAX_OPENCODE_RELEVANT_ROWS`, so the preflight ceiling
+    // fires before the page loop reads anything.
+    let overflow = 10_001i64;
+    connection
+        .execute_batch("BEGIN")
+        .expect("begin bulk insert");
+    {
+        let mut stmt = connection
+            .prepare(
+                "INSERT INTO event (id, aggregate_id, seq, type, data) VALUES (?1, ?2, ?3, ?4, ?5)",
+            )
+            .expect("prepare bulk insert");
+        for idx in 0..overflow {
+            stmt.execute(rusqlite::params![
+                format!("evt_ceiling_{idx:06}"),
+                "ses_demo",
+                base_seq + 1 + idx,
+                "message.part.updated.1",
+                r#"{"id":"prt_ceiling","messageID":"msg_demo","sessionID":"ses_demo"}"#,
+            ])
+            .expect("insert ceiling event");
+        }
+    }
+    connection
+        .execute(
+            "UPDATE event_sequence SET seq = ?1 WHERE aggregate_id = 'ses_demo'",
+            rusqlite::params![base_seq + overflow],
+        )
+        .expect("advance sequence");
+    connection.execute_batch("COMMIT").expect("commit");
+    drop(connection);
+
+    let mut ledger = ScanLedger::default();
+    let outcome = scan_opencode_database(
+        path.to_str().expect("utf-8 path"),
+        &OpenCodeState::fresh(),
+        &mut ledger,
+    );
+    let OpenCodeScanOutcome::Failed { error_kind, .. } = outcome else {
+        panic!("crossing the relevant-row ceiling must fail the scan");
+    };
+    assert_eq!(error_kind, crate::sqlite_poll::ERROR_KIND_TOO_LARGE);
+    assert!(
+        ledger.payload_bytes > 0,
+        "the preflight had already decoded the whole range; a failure arm that \
+         reports zero bytes contradicts the ledger's headline guarantee"
+    );
+    assert!(
+        ledger.census_rows > 0,
+        "and schema validation plus the event_sequence census are charged too"
+    );
+
+    cleanup(&path);
+}
+
+/// Issue #601 §2.0. `record_scan_ledger` folds every poll's ledger into the
+/// host-global counters, and until now nothing read those counters — no-opping
+/// all four call sites left the suite green, which is the exact
+/// unfailable-counter pattern this issue exists to remove.
+///
+/// **[DIVERGENT FIXTURE]** the third poll is arranged so the *rewind preflight*
+/// runs and the scan does not: the durable cursor's stat is stale (so the
+/// preflight is due) while the volatile entry covers the current stat (so
+/// `should_skip_poll` returns before the scan). That isolates
+/// `process_opencode_sqlite_db`'s preflight `record_scan_ledger` — the one call
+/// site a payload-only counter could never observe.
+///
+/// Fails for: no-opping either `record_scan_ledger` call site in the OpenCode
+/// adapter, or folding only the payload axis into `Metrics`.
+#[tokio::test(flavor = "multi_thread")]
+async fn opencode_poll_charges_its_ledger_to_the_shared_metrics() {
+    let path = unique_opencode_db_path("metrics-wiring");
+    let connection = seed_opencode_db(&path);
+    let work = opencode_sqlite_work(&path);
+    let cp_key = checkpoint_key(&work.source_name, &work.path);
+    let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+    let poll_state = VolatilePollMap::new();
+    let metrics = Arc::new(Metrics::default());
+    let config = moraine_config::AppConfig::default();
+
+    let first =
+        drive_opencode_poll_with_metrics(&config, &work, &checkpoints, &poll_state, &metrics).await;
+    assert!(!first.is_empty(), "the cold poll must emit");
+    assert!(
+        poll_payload_rows(&metrics) > 0,
+        "the scan's ledger must reach the shared counters"
+    );
+    assert!(census_rows(&metrics) > 0);
+
+    // Move the stat without changing any event, so the durable cursor is stale
+    // and the rewind preflight becomes due on the next poll.
+    connection
+        .execute(
+            "INSERT INTO credential (id, value, time_created, time_updated) \
+             VALUES ('cred_churn', 'x', 1, 1)",
+            [],
+        )
+        .expect("irrelevant write");
+    drop(connection);
+
+    let generation = checkpoints
+        .read()
+        .await
+        .get(&cp_key)
+        .map(|cp| cp.source_generation)
+        .expect("committed checkpoint");
+    let current_stat =
+        crate::sqlite_poll::stat_fingerprint(&work.path).expect("fixture stat fingerprint");
+    poll_state.record_noop_scan(&cp_key, generation, current_stat);
+
+    let payload_before = poll_payload_rows(&metrics);
+    let census_before = census_rows(&metrics);
+    let third =
+        drive_opencode_poll_with_metrics(&config, &work, &checkpoints, &poll_state, &metrics).await;
+    assert!(third.is_empty(), "the volatile entry must skip the scan");
+    assert_eq!(
+        poll_payload_rows(&metrics),
+        payload_before,
+        "the scan really was skipped, so nothing charged the payload axis"
+    );
+    assert!(
+        census_rows(&metrics) > census_before,
+        "but the rewind preflight still ran and still owes its census; a poll \
+         that reads must never be invisible to the counters"
+    );
+
+    cleanup(&path);
+}
+
+/// Issue #601 §2.1(2) / §2.5. The failure backoff has to gate the **whole
+/// poll**, not just the barrier and the scan behind it.
+///
+/// The rewind preflight opens the database and walks `event_sequence`, and it
+/// used to run *ahead* of the blocked-replay throttle — so a durably blocked
+/// OpenCode database still paid for a read, and still charged metrics, on every
+/// tick while the barrier and the scan were correctly suppressed. Cheap today,
+/// but "gate the barrier, not just the scan" has to apply to the whole poll or
+/// the next read added ahead of the throttle inherits the same hole.
+///
+/// **[DIVERGENT FIXTURE]** the durable cursor's stat is stale, so the preflight
+/// is genuinely due; without that the preflight would not run either way and
+/// the two behaviours would coincide.
+///
+/// Fails for: moving the throttle back below the preflight.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_throttled_blocked_replay_does_not_run_the_rewind_preflight() {
+    let path = unique_opencode_db_path("throttled-preflight");
+    let connection = seed_opencode_db(&path);
+    let work = opencode_sqlite_work(&path);
+    let cp_key = checkpoint_key(&work.source_name, &work.path);
+    let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+    let poll_state = VolatilePollMap::new();
+    let metrics = Arc::new(Metrics::default());
+    let config = moraine_config::AppConfig::default();
+
+    drive_opencode_poll_with_metrics(&config, &work, &checkpoints, &poll_state, &metrics).await;
+
+    // Move the stat without touching any event, so the preflight is due.
+    connection
+        .execute(
+            "INSERT INTO credential (id, value, time_created, time_updated) \
+             VALUES ('cred_churn', 'x', 1, 1)",
+            [],
+        )
+        .expect("irrelevant write");
+    drop(connection);
+
+    // Durably block the source and start its failure backoff, exactly as a
+    // failed replacement replay would.
+    let generation = {
+        let mut map = checkpoints.write().await;
+        let checkpoint = map.get_mut(&cp_key).expect("committed checkpoint");
+        checkpoint.status = "error".to_string();
+        checkpoint.block_reason = "seeded blocked replay".to_string();
+        checkpoint.final_scan_complete = false;
+        checkpoint.source_generation
+    };
+    poll_state.record_failed_scan(&cp_key, generation);
+    assert!(
+        !poll_state.failure_retry_due(&cp_key, generation),
+        "the fixture must actually be inside the backoff window, or this guard \
+         cannot fail"
+    );
+
+    let census_before = census_rows(&metrics);
+    let payload_before = poll_payload_rows(&metrics);
+    let batches =
+        drive_opencode_poll_with_metrics(&config, &work, &checkpoints, &poll_state, &metrics).await;
+    assert!(batches.is_empty(), "a throttled poll sends nothing");
+    assert_eq!(
+        poll_payload_rows(&metrics),
+        payload_before,
+        "the scan is throttled"
+    );
+    assert_eq!(
+        census_rows(&metrics),
+        census_before,
+        "and so is the preflight — a throttled poll must not open the database \
+         at all"
+    );
+
+    cleanup(&path);
+}
+
+/// Drives one poll against a durably blocked OpenCode source that is inside its
+/// failure-backoff window, and returns the checkpoint afterwards.
+///
+/// `mutate` seeds the blocked state and may adjust the checkpoint further (a
+/// replaced inode, say). The volatile entry is put into the backoff window
+/// *after* it runs, and the fixture asserts the window is real, so a test built
+/// on this cannot pass by accident.
+async fn poll_a_throttled_blocked_replay(
+    config: &moraine_config::AppConfig,
+    work: &WorkItem,
+    checkpoints: &Arc<RwLock<HashMap<String, Checkpoint>>>,
+    mutate: impl FnOnce(&mut Checkpoint),
+) -> Checkpoint {
+    let cp_key = checkpoint_key(&work.source_name, &work.path);
+    let poll_state = VolatilePollMap::new();
+    let metrics = Arc::new(Metrics::default());
+    let cold_config = moraine_config::AppConfig::default();
+
+    drive_opencode_poll_with_metrics(&cold_config, work, checkpoints, &poll_state, &metrics).await;
+
+    let generation = {
+        let mut map = checkpoints.write().await;
+        let checkpoint = map
+            .get_mut(&cp_key)
+            .expect("the cold poll commits a checkpoint");
+        checkpoint.status = "error".to_string();
+        checkpoint.block_reason = "seeded blocked replay".to_string();
+        checkpoint.final_scan_complete = false;
+        mutate(checkpoint);
+        checkpoint.source_generation
+    };
+    poll_state.record_failed_scan(&cp_key, generation);
+    assert!(
+        !poll_state.failure_retry_due(&cp_key, generation),
+        "the fixture must actually be inside the backoff window, or these \
+         guards cannot fail"
+    );
+
+    drive_opencode_poll_with_metrics(config, work, checkpoints, &poll_state, &metrics).await;
+
+    checkpoints
+        .read()
+        .await
+        .get(&cp_key)
+        .cloned()
+        .expect("the checkpoint survives the retry")
+}
+
+/// Issue #601 §2.1(2)/§2.5 — the **width** of OpenCode's blocked-replay
+/// throttle gate, first conjunct.
+///
+/// This gate is not the redundant one it looks like. The Cursor and NAC gates
+/// carry `&& !starts_replacement` *below* the generation bump, so
+/// `failure_retry_due` is asked about a generation the volatile entry has never
+/// seen and returns `true` whatever the conjunct says — dropping it there is an
+/// equivalent mutant. OpenCode's gate has to sit **above** the bump, because
+/// the bump depends on `sequence_rewound` and that is what the rewind preflight
+/// this gate exists to suppress computes. So `checkpoint.source_generation` is
+/// still the old value here and `failure_retry_due` genuinely returns `false`.
+///
+/// Consequence of dropping `&& !generation_changed`: an OpenCode store that was
+/// durably blocked and is then **replaced** — a new inode, so every logical
+/// identity and every event UID starts over — is ignored for up to
+/// `FAILURE_BACKOFF_MAX` (15 minutes) instead of replaying on the next tick.
+///
+/// **[DIVERGENT FIXTURE]** the volatile entry is genuinely inside the backoff
+/// window (asserted), so the gate's last conjunct is true and the first is the
+/// only thing holding the poll open.
+///
+/// Fails for: dropping `&& !generation_changed` from the throttle gate.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replaced_opencode_database_bypasses_the_blocked_replay_throttle() {
+    let path = unique_opencode_db_path("replaced-under-throttle");
+    let _db = seed_opencode_db(&path);
+    let work = opencode_sqlite_work(&path);
+    let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+    let config = moraine_config::AppConfig::default();
+
+    let mut generation_before = 0;
+    let after = poll_a_throttled_blocked_replay(&config, &work, &checkpoints, |checkpoint| {
+        generation_before = checkpoint.source_generation;
+        // The database was replaced under the block. Recording a different
+        // inode is what a replacement looks like to the poll, and is
+        // deterministic where deleting and recreating the file is not.
+        checkpoint.source_inode = checkpoint.source_inode.wrapping_add(1);
+    })
+    .await;
+
+    assert_eq!(
+        after.source_generation,
+        generation_before + 1,
+        "a replaced database is a new logical identity and must start its \
+         generation at once, not after a 15-minute backoff"
+    );
+    assert_eq!(after.status, "active");
+    assert!(after.final_scan_complete);
+    assert!(after.block_reason.is_empty());
+
+    cleanup(&path);
+}
+
+/// Issue #601 §2.1(2)/§2.5 — the same gate's **second** conjunct.
+///
+/// Consequence of dropping `&& !exclusions_changed`: an operator who widens or
+/// narrows `exclude_project_dirs` to unblock a source waits out the failure
+/// backoff before the policy takes effect, up to 15 minutes after the config
+/// change. The width argument is the same as its sibling above — this gate runs
+/// above the generation bump, so the fall-through conjunct cannot cover it.
+///
+/// Fails for: dropping `&& !exclusions_changed` from the throttle gate.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_exclusion_change_bypasses_the_opencode_blocked_replay_throttle() {
+    let path = unique_opencode_db_path("exclusions-under-throttle");
+    let _db = seed_opencode_db(&path);
+    let work = opencode_sqlite_work(&path);
+    let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+
+    // The cold poll inside the helper runs under the default policy; the
+    // throttled retry runs under a changed one.
+    let mut changed = moraine_config::AppConfig::default();
+    changed.ingest.exclude_project_dirs = vec!["/no/such/dir/**".to_string()];
+
+    let mut generation_before = 0;
+    let after = poll_a_throttled_blocked_replay(&changed, &work, &checkpoints, |checkpoint| {
+        generation_before = checkpoint.source_generation;
+    })
+    .await;
+
+    assert_eq!(
+        after.source_generation,
+        generation_before + 1,
+        "a changed exclusion policy replays immediately; rows skipped under \
+         the prior policy must not wait out a failure backoff"
+    );
+    assert_eq!(after.status, "active");
+    assert!(after.final_scan_complete);
+    assert!(after.block_reason.is_empty());
+
+    cleanup(&path);
+}
+
+/// Issue #601 §2.1(2) — OpenCode's half of "a durable `BeginReplay` barrier is
+/// never sent with no scan behind it". The Cursor site is pinned by
+/// `blocked_replay_scans_behind_its_barrier`; the identical guard at OpenCode
+/// was not, and dropping `!replacement_replay` there was green.
+///
+/// `should_skip_poll` runs *after* the barrier, and a blocked-replay retry
+/// reuses its generation, so a volatile entry covering the current stat skips
+/// the scan while the barrier has already been persisted — the source stays in
+/// `replaying` forever, one barrier per tick.
+///
+/// **[DIVERGENT FIXTURE]** the volatile entry must genuinely cover the current
+/// stat; with an uncovered stat the skip never triggers and the two behaviours
+/// coincide.
+///
+/// Fails for: dropping the `!replacement_replay` guard on the
+/// `should_skip_poll` call.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_opencode_blocked_replay_scans_behind_its_barrier() {
+    let path = unique_opencode_db_path("blocked-replay-scan");
+    let _db = seed_opencode_db(&path);
+    let work = opencode_sqlite_work(&path);
+    let cp_key = checkpoint_key(&work.source_name, &work.path);
+    let config = moraine_config::AppConfig::default();
+    let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+    let poll_state = VolatilePollMap::new();
+    let metrics = Arc::new(Metrics::default());
+
+    drive_opencode_poll_with_metrics(&config, &work, &checkpoints, &poll_state, &metrics).await;
+
+    let generation = {
+        let mut map = checkpoints.write().await;
+        let checkpoint = map
+            .get_mut(&cp_key)
+            .expect("the cold poll commits a checkpoint");
+        checkpoint.status = "error".to_string();
+        checkpoint.block_reason = "seeded blocked replay".to_string();
+        checkpoint.final_scan_complete = false;
+        checkpoint.source_generation
+    };
+
+    // And make the volatile entry claim the current stat as covered, which is
+    // the only state in which the post-barrier skip can fire.
+    let current_stat = stat_fingerprint(&work.path).expect("fixture stat");
+    poll_state.record_noop_scan(&cp_key, generation, current_stat);
+    assert!(
+        poll_state.should_skip_poll(&cp_key, generation, &current_stat),
+        "the fixture must actually reach the skip condition, or this guard \
+         cannot fail"
+    );
+
+    drive_opencode_poll_with_metrics(&config, &work, &checkpoints, &poll_state, &metrics).await;
+
+    let after = checkpoints
+        .read()
+        .await
+        .get(&cp_key)
+        .cloned()
+        .expect("the checkpoint survives the retry");
+    assert_eq!(
+        after.status, "active",
+        "a blocked replay retry must run its scan and finalize, not send a \
+         barrier and skip"
+    );
+    assert!(after.final_scan_complete);
+    assert!(after.block_reason.is_empty());
+
+    cleanup(&path);
+}
+
+/// Issue #601 §2.5 — the other direction on the same call. Cursor's
+/// `failed_scan_backs_off_instead_of_rescanning_every_tick` fails when the
+/// `should_skip_poll` call is removed outright; OpenCode had no equivalent, so
+/// disabling its call was green and the §2.5 defect could come straight back
+/// on this adapter alone.
+///
+/// Denominated on an **observed scan count**, never on absence of
+/// `ingest_errors` rows: those are rate-limited by `state.last_error`, so
+/// `opencode_sqlite_schema_mismatch_emits_one_error_and_preserves_cursor` stays
+/// green no matter how many scans ran.
+///
+/// Fails for: removing the `should_skip_poll` call, or reverting
+/// `record_failed_scan` to its `get_mut`-only form (a first failing scan has no
+/// prior entry to modify).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_opencode_scan_backs_off_instead_of_rescanning_every_tick() {
+    let path = unique_opencode_db_path("failure-backoff-first-scan");
+    let db = Connection::open(&path).expect("create db");
+    db.execute_batch(
+        "CREATE TABLE session (id TEXT PRIMARY KEY);
+         CREATE TABLE message (id TEXT PRIMARY KEY);
+         CREATE TABLE part (id TEXT PRIMARY KEY);
+         CREATE TABLE session_message (id TEXT PRIMARY KEY);",
+    )
+    .expect("create incomplete opencode schema");
+    drop(db);
+
+    let work = opencode_sqlite_work(&path);
+    let config = moraine_config::AppConfig::default();
+    let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+    let poll_state = VolatilePollMap::new();
+    let metrics = Arc::new(Metrics::default());
+
+    for _ in 0..10 {
+        drive_opencode_poll_with_metrics(&config, &work, &checkpoints, &poll_state, &metrics).await;
+    }
+
+    let failures = metrics
+        .sqlite_scan_failures_total
+        .load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        failures >= 1,
+        "the first tick must actually attempt the scan"
+    );
+    assert!(
+        failures <= 2,
+        "10 ticks against an OpenCode database whose first scan fails must not \
+         run 10 scans; observed {failures}"
+    );
+
+    cleanup(&path);
+}
+
+/// Issue #601 §2.1(2) — OpenCode's half of the `retry_blocked_replay` narrowing
+/// width. See the Cursor twin
+/// `a_crash_interrupted_replay_resumes_from_its_replaying_status` for the
+/// argument; here the predicate additionally feeds the blocked-replay throttle
+/// gate, so its width is load-bearing for code this PR adds.
+///
+/// **[DIVERGENT FIXTURE]** the stat is unchanged since the cold poll, which is
+/// what a crashed replay looks like and what makes the two behaviours diverge:
+/// with the disjunct the cursor is reset and the scan runs, without it the
+/// unchanged stat and `event_scan_complete` return early.
+///
+/// Fails for: dropping the `checkpoint.status == "replaying"` disjunct.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_crash_interrupted_opencode_replay_resumes_from_its_replaying_status() {
+    let path = unique_opencode_db_path("replaying-status-resume");
+    let _db = seed_opencode_db(&path);
+    let work = opencode_sqlite_work(&path);
+    let cp_key = checkpoint_key(&work.source_name, &work.path);
+    let config = moraine_config::AppConfig::default();
+    let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+    let poll_state = VolatilePollMap::new();
+    let metrics = Arc::new(Metrics::default());
+
+    drive_opencode_poll_with_metrics(&config, &work, &checkpoints, &poll_state, &metrics).await;
+
+    // Exactly what a crash between `BeginReplay` and `FinalizeReplay` leaves:
+    // `replaying`, no error, no block reason.
+    {
+        let mut map = checkpoints.write().await;
+        let checkpoint = map
+            .get_mut(&cp_key)
+            .expect("the cold poll commits a checkpoint");
+        checkpoint.status = "replaying".to_string();
+        checkpoint.block_reason.clear();
+        checkpoint.final_scan_complete = false;
+    }
+
+    drive_opencode_poll_with_metrics(&config, &work, &checkpoints, &poll_state, &metrics).await;
+
+    let after = checkpoints
+        .read()
+        .await
+        .get(&cp_key)
+        .cloned()
+        .expect("the checkpoint survives the retry");
+    assert_eq!(
+        after.status, "active",
+        "an interrupted replay must resume and finish, not be relabelled"
+    );
+    assert!(
+        after.final_scan_complete,
+        "a resumed replay finalizes; without the `replaying` disjunct the poll \
+         returns on the unchanged stat and the source is stuck"
+    );
+
+    cleanup(&path);
 }
