@@ -14,11 +14,20 @@ use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, warn};
 
 use super::{
-    hash_str, open_read_only, sqlite_data_version, stat_fingerprint, truncate_chars_local,
+    hash_str, open_read_only, record_scan_failure, record_scan_ledger, sqlite_data_version,
+    stat_fingerprint, take_payload_required_string, truncate_chars_local, ScanLedger,
     StatFingerprint, SyntheticRecord, VolatilePollMap, CURSOR_STATE_VERSION,
     ERROR_KIND_MIXED_SNAPSHOT, ERROR_KIND_OPEN, ERROR_KIND_SCAN, ERROR_KIND_SCHEMA,
     ERROR_KIND_TOO_LARGE, SCAN_PAGE_MAX_BYTES, SCAN_PAGE_SIZE,
 };
+
+/// The paged event read, shared with the fixture-plan assertion in
+/// `opencode_fixture_uses_the_production_event_index` so the plan that test
+/// certifies is the plan this adapter actually runs. A copy in the test would
+/// let the two drift and the certification would become meaningless.
+const OPENCODE_EVENT_PAGE_SQL: &str = "SELECT id, aggregate_id, seq, type, data FROM event \
+     WHERE aggregate_id = ?1 AND seq > ?2 AND seq <= ?3 \
+     ORDER BY seq LIMIT ?4";
 
 const MAX_OPENCODE_RELEVANT_ROWS: u64 = 10_000;
 const MAX_OPENCODE_SCAN_BYTES: u64 = 128 * 1024 * 1024;
@@ -192,24 +201,67 @@ pub(crate) async fn process_opencode_sqlite_db(
     let policy_fingerprint =
         super::sqlite_policy_fingerprint(SOURCE_FORMAT_OPENCODE_SQLITE, current_exclusions_hash);
 
-    let sequence_rewound = if had_committed && current_stat != state.stat {
-        let scan_db_path = source_file.clone();
-        let prior = state.clone();
-        tokio::task::spawn_blocking(move || opencode_sequences_rewound(&scan_db_path, &prior))
-            .await
-            .context("opencode_sqlite sequence preflight panicked")?
-            .unwrap_or(false)
-    } else {
-        false
-    };
-
     // Replaced databases restart logical identities. Changed exclusions replay
     // the event history so rows skipped under the prior policy can return.
     let generation_changed = had_committed && checkpoint.source_inode != inode;
     let exclusions_changed =
         had_committed && state.project_exclusions_hash != current_exclusions_hash;
+    // The `replaying` disjunct resumes a replay a crash interrupted between
+    // `BeginReplay` and `FinalizeReplay`; the `error` disjunct cannot cover it,
+    // because a crash never wrote a block reason. Width note at the Cursor
+    // site; `a_crash_interrupted_opencode_replay_resumes_from_its_replaying_status`
+    // fails if it goes. It also feeds the throttle gate immediately below, so
+    // its width is load-bearing for that gate too.
     let retry_blocked_replay = checkpoint.status == "replaying"
         || (checkpoint.status == "error" && !checkpoint.block_reason.is_empty());
+
+    // The failure backoff gates the **whole poll**, not just the barrier and
+    // the scan behind it (issue #601 §2.1(2), §2.5). The rewind preflight below
+    // opens the database and walks `event_sequence`, and it used to run ahead
+    // of this return, so a durably blocked database still paid for a read — and
+    // still charged metrics — on every single tick while everything downstream
+    // was throttled. `starts_replacement` is not known yet, but its other two
+    // disjuncts are, and they are the only ones that may bypass the throttle: a
+    // rewind discovered by the preflight cannot be a reason to have run the
+    // preflight.
+    //
+    // **Both bypass conjuncts are genuinely load-bearing here, unlike the
+    // `!starts_replacement` conjunct on the Cursor and NAC gates.** There the
+    // gate sits *below* the generation bump, so `failure_retry_due` is asked
+    // about a generation the volatile entry has never seen and answers `true`
+    // whatever the conjunct says — an equivalent mutant. This gate has to sit
+    // *above* the bump (the bump depends on `sequence_rewound`, which is what
+    // the preflight computes), so `checkpoint.source_generation` is still the
+    // old value and `failure_retry_due` genuinely answers `false`. Drop either
+    // conjunct and an OpenCode store whose file was replaced, or whose
+    // exclusion set changed, is ignored for up to `FAILURE_BACKOFF_MAX`.
+    // `a_replaced_opencode_database_bypasses_the_blocked_replay_throttle` and
+    // `an_exclusion_change_bypasses_the_opencode_blocked_replay_throttle` fail,
+    // one per conjunct.
+    if retry_blocked_replay
+        && !generation_changed
+        && !exclusions_changed
+        && !poll_state.failure_retry_due(&cp_key, checkpoint.source_generation)
+    {
+        return Ok(());
+    }
+
+    let sequence_rewound = if had_committed && current_stat != state.stat {
+        let scan_db_path = source_file.clone();
+        let prior = state.clone();
+        let (rewound, preflight_ledger) = tokio::task::spawn_blocking(move || {
+            let mut ledger = ScanLedger::default();
+            let rewound = opencode_sequences_rewound(&scan_db_path, &prior, &mut ledger);
+            (rewound, ledger)
+        })
+        .await
+        .context("opencode_sqlite sequence preflight panicked")?;
+        record_scan_ledger(metrics, &preflight_ledger);
+        rewound.unwrap_or(false)
+    } else {
+        false
+    };
+
     let starts_replacement = generation_changed || exclusions_changed || sequence_rewound;
     if starts_replacement {
         checkpoint.source_inode = inode;
@@ -249,22 +301,49 @@ pub(crate) async fn process_opencode_sqlite_db(
     // Cheap no-change short-circuit: nothing touched the database or its WAL
     // sidecars since the last poll. `event_scan_complete` also forces one real
     // scan after upgrading from the earlier projection cursor state.
-    if state.stat == current_stat && state.last_error.is_empty() && state.event_scan_complete {
+    // §2.5's `|| !failure_retry_due` disjunct is absent and **must stay absent
+    // while the contention clock lives in `failure_retry_due`** — WI-04 must
+    // not add it. It is no longer outcome-redundant with `should_skip_poll`'s
+    // failure arm below: §3.2's contention exemption keeps that clock out of
+    // `should_skip_poll` on purpose, so after a mixed-snapshot rejection
+    // `failure_retry_due` is false for up to 60 s while `should_skip_poll`
+    // stays false. The disjunct would skip ordinary polls of an actively
+    // written OpenCode store for that whole window — the §6 prompt-visibility
+    // regression the exemption exists to prevent. A pre-`should_skip_poll`
+    // throttle for the sweep slice must read the fault ladder alone.
+    // `an_ordinary_poll_of_a_contended_opencode_store_is_not_throttled` fails
+    // if it is added. See `plans/601-delta-sqlite.md` §7 WI-10.
+    if state.stat == current_stat && state.event_scan_complete && state.last_error.is_empty() {
         return Ok(());
     }
 
     // Volatile short-circuit + rescan backoff (issue #443): no-op scans leave
     // the durable checkpoint untouched, so their coverage lives here instead.
-    if poll_state.should_skip_poll(&cp_key, checkpoint.source_generation, &current_stat) {
+    // Skipped during a replay so the barrier always has a scan behind it.
+    //
+    // Both halves are pinned, one test each, mirroring the Cursor site:
+    // `an_opencode_blocked_replay_scans_behind_its_barrier` fails if the
+    // `!replacement_replay` guard goes (the durable barrier is sent and the
+    // skip then fires behind it, one barrier per tick forever), and
+    // `a_failed_opencode_scan_backs_off_instead_of_rescanning_every_tick` fails
+    // if the call goes (a database whose scan fails re-runs the whole failed
+    // scan on every reconcile tick and every debounced watcher event).
+    if !replacement_replay
+        && poll_state.should_skip_poll(&cp_key, checkpoint.source_generation, &current_stat)
+    {
         return Ok(());
     }
 
     let scan_db_path = source_file.clone();
     let scan_state = state.clone();
-    let outcome =
-        tokio::task::spawn_blocking(move || scan_opencode_database(&scan_db_path, &scan_state))
-            .await
-            .context("opencode_sqlite scan task panicked")?;
+    let (outcome, ledger) = tokio::task::spawn_blocking(move || {
+        let mut ledger = ScanLedger::default();
+        let outcome = scan_opencode_database(&scan_db_path, &scan_state, &mut ledger);
+        (outcome, ledger)
+    })
+    .await
+    .context("opencode_sqlite scan task panicked")?;
+    record_scan_ledger(metrics, &ledger);
 
     match outcome {
         OpenCodeScanOutcome::Scanned {
@@ -412,7 +491,7 @@ pub(crate) async fn process_opencode_sqlite_db(
                         ..final_checkpoint
                     };
                     super::block_database_replay(&sink_tx, &blocked_checkpoint, reason).await?;
-                    poll_state.clear(&cp_key);
+                    poll_state.record_blocked_replay(&cp_key, checkpoint.source_generation);
                     return Ok(());
                 }
                 let active_checkpoint = Checkpoint {
@@ -434,18 +513,28 @@ pub(crate) async fn process_opencode_sqlite_db(
 
             if emitted > 0 {
                 debug!(
-                    "{}:{} opencode_sqlite emitted {} changed records ({} relevant rows)",
-                    work.source_name, source_file, emitted, relevant_rows
+                    "{}:{} opencode_sqlite emitted {} changed records ({} relevant rows, \
+                     {} payload rows, {} payload bytes)",
+                    work.source_name,
+                    source_file,
+                    emitted,
+                    relevant_rows,
+                    ledger.payload_rows,
+                    ledger.payload_bytes
                 );
             }
-            let _ = metrics;
             Ok(())
         }
         OpenCodeScanOutcome::Failed {
             error_kind,
             error_text,
         } => {
-            poll_state.record_failed_scan(&cp_key);
+            record_scan_failure(metrics);
+            poll_state.record_scan_failure_outcome(
+                &cp_key,
+                checkpoint.source_generation,
+                error_kind,
+            );
 
             // Emit each failure mode once per state change, not once per
             // reconcile tick: the marker is durable and reconcile re-polls every
@@ -515,7 +604,13 @@ pub(crate) async fn process_opencode_sqlite_db(
     }
 }
 
-fn scan_opencode_database(db_path: &str, prior: &OpenCodeState) -> OpenCodeScanOutcome {
+/// The caller owns `ledger` so that every early return — including each
+/// failure arm — still reports the bytes this scan had already paid for.
+fn scan_opencode_database(
+    db_path: &str,
+    prior: &OpenCodeState,
+    ledger: &mut ScanLedger,
+) -> OpenCodeScanOutcome {
     let connection = match open_read_only(db_path) {
         Ok(connection) => connection,
         Err(exc) => {
@@ -538,7 +633,7 @@ fn scan_opencode_database(db_path: &str, prior: &OpenCodeState) -> OpenCodeScanO
         }
     };
 
-    let schema_fingerprint = match validate_opencode_schema(&connection) {
+    let schema_fingerprint = match validate_opencode_schema(&connection, ledger) {
         Ok(fingerprint) => fingerprint,
         Err(text) => {
             return OpenCodeScanOutcome::Failed {
@@ -548,7 +643,7 @@ fn scan_opencode_database(db_path: &str, prior: &OpenCodeState) -> OpenCodeScanO
         }
     };
 
-    match opencode_relevant_stats(&connection, prior) {
+    match opencode_relevant_stats(&connection, prior, ledger) {
         Ok(stats) if stats.rows > MAX_OPENCODE_RELEVANT_ROWS => {
             return OpenCodeScanOutcome::Failed {
                 error_kind: ERROR_KIND_TOO_LARGE,
@@ -585,7 +680,7 @@ fn scan_opencode_database(db_path: &str, prior: &OpenCodeState) -> OpenCodeScanO
         }
     }
 
-    let result = scan_opencode_rows(&connection, prior);
+    let result = scan_opencode_rows(&connection, prior, ledger);
     let data_version_after = match sqlite_data_version(&connection) {
         Ok(value) => value,
         Err(exc) => {
@@ -595,7 +690,12 @@ fn scan_opencode_database(db_path: &str, prior: &OpenCodeState) -> OpenCodeScanO
             }
         }
     };
-    if data_version_before != data_version_after || stat_fingerprint(db_path) != Some(opened_stat) {
+    if super::snapshot_is_mixed(
+        db_path,
+        data_version_before,
+        data_version_after,
+        opened_stat,
+    ) {
         return OpenCodeScanOutcome::Failed {
             error_kind: ERROR_KIND_MIXED_SNAPSHOT,
             error_text:
@@ -622,19 +722,17 @@ fn scan_opencode_database(db_path: &str, prior: &OpenCodeState) -> OpenCodeScanO
     }
 }
 
-fn validate_opencode_schema(connection: &Connection) -> std::result::Result<u64, String> {
+fn validate_opencode_schema(
+    connection: &Connection,
+    ledger: &mut ScanLedger,
+) -> std::result::Result<u64, String> {
     let mut schema_material = String::new();
     for (table, required_columns) in [
         ("event", EVENT_COLUMNS),
         ("event_sequence", EVENT_SEQUENCE_COLUMNS),
     ] {
-        let schema_sql: Option<String> = connection
-            .query_row(
-                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
-                rusqlite::params![table],
-                |row| row.get(0),
-            )
-            .map_err(|exc| match exc {
+        let schema_sql =
+            super::schema_sql_for_table(connection, table, ledger).map_err(|exc| match exc {
                 rusqlite::Error::QueryReturnedNoRows => {
                     format!("required table {table} is missing")
                 }
@@ -643,7 +741,8 @@ fn validate_opencode_schema(connection: &Connection) -> std::result::Result<u64,
         schema_material.push_str(&schema_sql.unwrap_or_default());
         schema_material.push('\n');
 
-        let names = table_columns(connection, table).map_err(|exc| exc.to_string())?;
+        let names = super::table_column_names(connection, table, ledger)
+            .map_err(|exc| format!("{exc:#}"))?;
         for column in required_columns {
             if !names.iter().any(|name| name == column) {
                 return Err(format!("table {table} is missing required column {column}"));
@@ -653,16 +752,6 @@ fn validate_opencode_schema(connection: &Connection) -> std::result::Result<u64,
     Ok(hash_str(&schema_material))
 }
 
-fn table_columns(connection: &Connection, table: &str) -> Result<Vec<String>> {
-    let mut stmt = connection
-        .prepare(&format!("PRAGMA table_info({table})"))
-        .with_context(|| format!("failed to inspect {table} columns"))?;
-    let names = stmt
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    Ok(names)
-}
-
 #[derive(Default)]
 struct OpenCodeRelevantStats {
     rows: u64,
@@ -670,17 +759,38 @@ struct OpenCodeRelevantStats {
     max_row_bytes: u64,
 }
 
+/// Preflight sizing, and an honest account of what it costs.
+///
+/// The per-aggregate statement below is a scalar aggregate, so it materializes
+/// no row — but `sum(length(coalesce(data, '')))` makes SQLite decode every
+/// byte of `data` in the range (§1.1 finding 2). Those bytes are charged on the
+/// payload axis, which is why a cold OpenCode scan's `payload_bytes` is roughly
+/// **twice** its `data` size: once here and once in the page loop. That is the
+/// truth, and it is what makes the duplication visible to a byte budget instead
+/// of leaving it "real and invisible".
+///
+/// Issue #601 §3.1 Change 5 folds this O(#aggregates) preflight into the single
+/// `event_sequence` read, at which point the doubling disappears;
+/// `opencode_ledger_charges_payload_bytes_at_the_read_site` pins the current
+/// number so that change cannot land silently.
 fn opencode_relevant_stats(
     connection: &Connection,
     prior: &OpenCodeState,
+    ledger: &mut ScanLedger,
 ) -> Result<OpenCodeRelevantStats> {
     let mut stats = OpenCodeRelevantStats::default();
-    for aggregate in opencode_aggregate_sequences(connection)? {
+    for aggregate in opencode_aggregate_sequences(connection, ledger)? {
         let prior_seq = opencode_scan_from_seq(prior, &aggregate);
         let (rows, total_bytes, max_row_bytes): (i64, i64, i64) = connection
             .query_row(
-                "SELECT count(*), coalesce(sum(length(coalesce(data, ''))), 0), \
-                 coalesce(max(length(coalesce(data, ''))), 0) \
+                // `CAST(… AS BLOB)` on purpose: bare `length()` over a TEXT
+                // value counts *characters*, and both results are compared
+                // against byte ceilings and charged to a byte axis. The
+                // in-scan check (`build_event_row`) measures real bytes, so
+                // the character form also made the preflight and the loop
+                // disagree on any non-ASCII payload.
+                "SELECT count(*), coalesce(sum(length(CAST(coalesce(data, '') AS BLOB))), 0), \
+                 coalesce(max(length(CAST(coalesce(data, '') AS BLOB))), 0) \
                  FROM event WHERE aggregate_id = ?1 AND seq > ?2 AND seq <= ?3",
                 rusqlite::params![&aggregate.aggregate_id, prior_seq, aggregate.seq],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
@@ -694,6 +804,10 @@ fn opencode_relevant_stats(
         stats.rows = stats.rows.saturating_add(rows.max(0) as u64);
         stats.total_bytes = stats.total_bytes.saturating_add(total_bytes.max(0) as u64);
         stats.max_row_bytes = stats.max_row_bytes.max(max_row_bytes.max(0) as u64);
+        // `sum(length(data))` is exactly the count of bytes SQLite decoded to
+        // answer this statement, so it is also exactly what the payload axis
+        // owes for it.
+        ledger.charge_aggregate_payload_bytes(total_bytes.max(0) as u64);
     }
     Ok(stats)
 }
@@ -701,6 +815,7 @@ fn opencode_relevant_stats(
 fn scan_opencode_rows(
     connection: &Connection,
     prior: &OpenCodeState,
+    ledger: &mut ScanLedger,
 ) -> std::result::Result<(Vec<SyntheticRecord>, OpenCodeState, u64), OpenCodeScanError> {
     let mut records = Vec::new();
     let mut accumulated = OpenCodeAccumulated::default();
@@ -711,7 +826,7 @@ fn scan_opencode_rows(
     let mut context_events = 0u64;
     let mut context_bytes = 0u64;
 
-    for aggregate in opencode_aggregate_sequences(connection)? {
+    for aggregate in opencode_aggregate_sequences(connection, ledger)? {
         let scan_from_seq = opencode_scan_from_seq(prior, &aggregate);
         if aggregate.seq <= scan_from_seq {
             aggregate_sequences.insert(aggregate.aggregate_id.clone(), scan_from_seq);
@@ -725,11 +840,7 @@ fn scan_opencode_rows(
             let mut page_bytes = 0usize;
             let mut page_capped = false;
             {
-                let mut stmt = connection.prepare_cached(
-                    "SELECT id, aggregate_id, seq, type, data FROM event \
-                     WHERE aggregate_id = ?1 AND seq > ?2 AND seq <= ?3 \
-                     ORDER BY seq LIMIT ?4",
-                )?;
+                let mut stmt = connection.prepare_cached(OPENCODE_EVENT_PAGE_SQL)?;
                 let mut rows = stmt.query(rusqlite::params![
                     &aggregate.aggregate_id,
                     last_seq,
@@ -737,7 +848,7 @@ fn scan_opencode_rows(
                     SCAN_PAGE_SIZE as i64
                 ])?;
                 while let Some(row) = rows.next()? {
-                    let event = build_event_row(row)?;
+                    let event = build_event_row(row, ledger)?;
                     if event.data_bytes > SCAN_PAGE_MAX_BYTES {
                         return Err(OpenCodeScanError::TooLarge(format!(
                             "largest OpenCode event is {} bytes, exceeding the {} byte row ceiling",
@@ -811,15 +922,22 @@ fn scan_opencode_rows(
     new_state.project_exclusions_hash = prior.project_exclusions_hash;
     new_state.event_scan_complete = true;
     new_state.aggregate_sequences = aggregate_sequences;
+    ledger.rows_emitted = records.len() as u64;
     Ok((records, new_state, relevant_events))
 }
 
-fn opencode_sequences_rewound(db_path: &str, prior: &OpenCodeState) -> Result<bool> {
+fn opencode_sequences_rewound(
+    db_path: &str,
+    prior: &OpenCodeState,
+    ledger: &mut ScanLedger,
+) -> Result<bool> {
     if prior.aggregate_sequences.is_empty() {
         return Ok(false);
     }
     let connection = open_read_only(db_path)?;
-    let current = opencode_aggregate_sequences(&connection)?
+    // A preflight on its own connection, before the scan's ledger exists; its
+    // census is charged into a scratch ledger that is folded in by the caller.
+    let current = opencode_aggregate_sequences(&connection, ledger)?
         .into_iter()
         .map(|aggregate| (aggregate.aggregate_id, aggregate.seq))
         .collect::<BTreeMap<_, _>>();
@@ -846,28 +964,47 @@ fn opencode_scan_from_seq(prior: &OpenCodeState, aggregate: &OpenCodeAggregateSe
     }
 }
 
-fn opencode_aggregate_sequences(connection: &Connection) -> Result<Vec<OpenCodeAggregateSequence>> {
+/// The one narrow read in this adapter: `event_sequence` carries no payload
+/// column, so it is charged on the census axis. It runs more than once per
+/// poll today (issue #601 §3.1 Change 5) and the ledger now shows that.
+fn opencode_aggregate_sequences(
+    connection: &Connection,
+    ledger: &mut ScanLedger,
+) -> Result<Vec<OpenCodeAggregateSequence>> {
     let mut stmt = connection
         .prepare_cached("SELECT aggregate_id, seq FROM event_sequence ORDER BY aggregate_id")?;
-    let aggregates = stmt
-        .query_map([], |row| {
-            Ok(OpenCodeAggregateSequence {
-                aggregate_id: row.get(0)?,
-                seq: row.get(1)?,
-            })
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut rows = stmt.query([])?;
+    let mut aggregates = Vec::new();
+    while let Some(row) = rows.next()? {
+        let aggregate_id: String = row.get(0)?;
+        ledger.charge_census_row(aggregate_id.len());
+        aggregates.push(OpenCodeAggregateSequence {
+            aggregate_id,
+            seq: row.get(1)?,
+        });
+    }
     Ok(aggregates)
 }
 
-fn build_event_row(row: &rusqlite::Row<'_>) -> Result<OpenCodeEventRow> {
-    let data_text = row.get::<_, String>(4)?;
+fn build_event_row(row: &rusqlite::Row<'_>, ledger: &mut ScanLedger) -> Result<OpenCodeEventRow> {
+    // This projection includes `data`, so the whole row is charged on the
+    // payload axis at the point SQLite hands it over.
+    ledger.charge_payload_row();
+    // All four are NOT NULL in OpenCode's `event` table, and `id` /
+    // `aggregate_id` are the material behind `source_line_no`/`source_offset`
+    // and therefore behind `event_uid` (§6). A NULL is schema drift: fail the
+    // scan instead of minting a record keyed on the empty string with
+    // `data_bytes = 0`.
+    let id = take_payload_required_string(ledger, row, 0)?;
+    let aggregate_id = take_payload_required_string(ledger, row, 1)?;
+    let event_type = take_payload_required_string(ledger, row, 3)?;
+    let data_text = take_payload_required_string(ledger, row, 4)?;
     let data = serde_json::from_str::<Value>(&data_text).unwrap_or_else(|_| json!(data_text));
     Ok(OpenCodeEventRow {
-        id: row.get(0)?,
-        aggregate_id: row.get(1)?,
+        id,
+        aggregate_id,
         seq: row.get(2)?,
-        event_type: row.get(3)?,
+        event_type,
         data,
         data_bytes: data_text.len(),
     })

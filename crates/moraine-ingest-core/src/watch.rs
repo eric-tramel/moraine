@@ -177,6 +177,34 @@ fn tracked_path_identity(format: SourceFormat, path: &str) -> String {
         .unwrap_or_else(|_| path.to_string())
 }
 
+/// Queues one poll per tracked path a watcher event touched.
+///
+/// This is the path **100 % of real filesystem events take**; `queue_rescan`
+/// only covers watcher *recovery*. Both funnel through `WorkItem::watcher`, so
+/// the crate holds exactly one `WorkTrigger::Watcher` literal and
+/// `watcher_work_items_are_stamped_as_watcher_triggered` guards both paths.
+/// Extracting this out of the receive loop is what makes the primary path
+/// reachable from a test at all — inline in the loop it could only be exercised
+/// through a live `notify` backend.
+fn queue_watcher_event(
+    event: &Event,
+    glob_pattern: &str,
+    source_name: &str,
+    harness: &str,
+    format: SourceFormat,
+    tx: &mpsc::UnboundedSender<WorkItem>,
+) {
+    for path in event_tracked_paths(event, format, glob_pattern) {
+        let _ = tx.send(WorkItem::watcher(
+            source_name,
+            harness,
+            format,
+            glob_pattern,
+            path,
+        ));
+    }
+}
+
 fn queue_rescan(
     glob_pattern: &str,
     source_name: &str,
@@ -189,13 +217,14 @@ fn queue_rescan(
     match enumerate_tracked_files(glob_pattern, format) {
         Ok(paths) => {
             for path in paths {
-                let _ = tx.send(WorkItem {
-                    source_name: source_name.to_string(),
-                    harness: harness.to_string(),
+                // A rescan is watcher-driven recovery, not reconciliation.
+                let _ = tx.send(WorkItem::watcher(
+                    source_name,
+                    harness,
                     format,
-                    source_glob: glob_pattern.to_string(),
+                    glob_pattern,
                     path,
-                });
+                ));
             }
         }
         Err(exc) => {
@@ -352,15 +381,14 @@ pub(crate) fn spawn_watcher_threads(
                             continue;
                         }
 
-                        for path in event_tracked_paths(&event, format, &glob_pattern) {
-                            let _ = tx_clone.send(WorkItem {
-                                source_name: source_name.clone(),
-                                harness: harness.clone(),
-                                format,
-                                source_glob: glob_pattern.clone(),
-                                path,
-                            });
-                        }
+                        queue_watcher_event(
+                            &event,
+                            &glob_pattern,
+                            &source_name,
+                            &harness,
+                            format,
+                            &tx_clone,
+                        );
                     }
                     Ok(Err(exc)) => {
                         eprintln!("[moraine-rust] watcher event error ({source_name}): {exc}");
@@ -413,10 +441,43 @@ pub(crate) fn enumerate_tracked_files(
     Ok(files)
 }
 
+/// Enumerate a source's tracked files as one-shot **startup** polls.
+///
+/// This is the crate's only path from an `IngestSource` to a
+/// `WorkTrigger::Startup` item, and all three producers go through it: the
+/// startup backfill in `run_ingestor`, the tee router's backend-discovery
+/// probe, and the tee router's targeted replay pass. Each of those used to
+/// enumerate and then stamp inline, which left the *stamp* guarded and the
+/// *choice of stamp* unguarded: `startup_work_items_are_stamped_as_startup_triggered`
+/// pinned `WorkItem::startup` itself, so all three call sites could be
+/// repointed at `WorkItem::watcher` with the whole suite green. That matters
+/// most at the backfill site, where the item reaches `enqueue_work` and a
+/// `Watcher` stamp is exactly what `arm_owed_reconcile`'s `Startup` refusal
+/// (plan §7.1 D1c) exists to prevent — a startup poll made sweep-eligible by an
+/// owed reconcile tick.
+///
+/// Same rule, and the same reason, as `queue_watcher_event`: fold the
+/// enumeration and the stamp into one function so the crate holds one literal
+/// per trigger and one test can hold it.
+pub(crate) fn enumerate_startup_work_items(source: &IngestSource) -> Result<Vec<WorkItem>> {
+    Ok(enumerate_tracked_files(&source.glob, source.format)?
+        .into_iter()
+        .map(|path| {
+            WorkItem::startup(
+                &source.name,
+                &source.harness,
+                source.format,
+                &source.glob,
+                path,
+            )
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Metrics;
+    use crate::{Metrics, WorkTrigger};
     use notify::{
         event::{CreateKind, DataChange, Flag, ModifyKind, RenameMode},
         EventKind,
@@ -424,6 +485,129 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::Ordering;
     use tokio::sync::mpsc;
+
+    /// Issue #601 §2.4 / WI-03. A reconciliation sweep must never attach to a
+    /// watcher-driven poll, so **both** watcher entry points have to stamp
+    /// `Watcher`:
+    ///
+    /// - `queue_watcher_event` — the per-event fan-out that 100 % of real
+    ///   filesystem events take;
+    /// - `queue_rescan` — watcher *recovery* only (registration failure, event
+    ///   error, or a backend rescan flag).
+    ///
+    /// The earlier version of this test covered the recovery path alone, so
+    /// the stamp on the primary path was unguarded and could be flipped to
+    /// `Reconcile` with the whole suite still green. Both now funnel through
+    /// `WorkItem::watcher`.
+    ///
+    /// Fails for: stamping either path with anything but `Watcher`.
+    #[test]
+    fn watcher_work_items_are_stamped_as_watcher_triggered() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock before unix epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("moraine-watch-trigger-{nonce}"));
+        std::fs::create_dir_all(&dir).expect("create watcher fixture dir");
+        let file = dir.join("session.jsonl");
+        std::fs::write(&file, b"{}\n").expect("write watcher fixture file");
+        let glob_pattern = dir.join("*.jsonl").to_string_lossy().to_string();
+
+        // The primary path: a data-change event naming the tracked file, the
+        // exact shape `spawn_watcher_threads` forwards on every write.
+        let (tx, mut rx) = mpsc::unbounded_channel::<WorkItem>();
+        let event =
+            Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Any))).add_path(file.clone());
+        assert!(
+            event_is_relevant(&event.kind) && !event_requires_rescan(&event),
+            "the fixture event must reach the per-event fan-out, or this guard \
+             cannot fail"
+        );
+        queue_watcher_event(
+            &event,
+            &glob_pattern,
+            "watch-trigger-test",
+            "codex",
+            SourceFormat::Jsonl,
+            &tx,
+        );
+        let queued = rx
+            .try_recv()
+            .expect("a watcher event must enqueue the tracked file");
+        assert_eq!(queued.trigger, WorkTrigger::Watcher);
+        assert_eq!(queued.path, file.to_string_lossy());
+        assert!(rx.try_recv().is_err(), "one event, one queued poll");
+
+        // The recovery path.
+        let (tx, mut rx) = mpsc::unbounded_channel::<WorkItem>();
+        queue_rescan(
+            &glob_pattern,
+            "watch-trigger-test",
+            "codex",
+            SourceFormat::Jsonl,
+            &tx,
+            &Arc::new(Metrics::default()),
+        );
+
+        let queued = rx.try_recv().expect("rescan must enqueue the tracked file");
+        assert_eq!(queued.trigger, WorkTrigger::Watcher);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Issue #601 §2.4 / WI-03. The startup backfill, the tee router's
+    /// backend-discovery probe and its replay pass all queue one-shot polls
+    /// that must not pay sweep cost — `Startup` is documented as never
+    /// sweep-eligible and nothing enforced that.
+    ///
+    /// An earlier revision of this test asserted on `WorkItem::startup`
+    /// directly, which pins the **constructor** and not which constructor each
+    /// site calls: all three sites were swappable to `WorkItem::watcher` with
+    /// the whole suite green. It now drives `enumerate_startup_work_items`,
+    /// which is the single path from a source to a startup item and the only
+    /// thing those three sites call.
+    ///
+    /// Fails for: stamping anything but `Startup` in
+    /// `enumerate_startup_work_items` — and therefore at every site that
+    /// enumerates through it.
+    #[test]
+    fn startup_work_items_are_stamped_as_startup_triggered() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock before unix epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("moraine-startup-trigger-{nonce}"));
+        std::fs::create_dir_all(&dir).expect("create startup fixture dir");
+        std::fs::write(dir.join("first.jsonl"), b"{}\n").expect("write first fixture file");
+        std::fs::write(dir.join("second.jsonl"), b"{}\n").expect("write second fixture file");
+        let glob_pattern = dir.join("*.jsonl").to_string_lossy().to_string();
+
+        let source = IngestSource {
+            name: "startup-trigger-test".to_string(),
+            harness: "codex".to_string(),
+            enabled: true,
+            glob: glob_pattern.clone(),
+            watch_root: dir.to_string_lossy().to_string(),
+            format: SourceFormat::Jsonl,
+        };
+        let items = enumerate_startup_work_items(&source).expect("enumerate startup work items");
+
+        assert_eq!(items.len(), 2, "both fixture files must be enumerated");
+        for work in &items {
+            assert_eq!(work.trigger, WorkTrigger::Startup);
+            assert_eq!(work.source_name, "startup-trigger-test");
+            assert_eq!(work.source_glob, glob_pattern);
+            // And it is still not sweep-eligible after coalescing with a
+            // reconcile tick, which is the property the trigger exists to
+            // carry.
+            assert_eq!(
+                work.trigger.merge(WorkTrigger::Reconcile),
+                WorkTrigger::Startup
+            );
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn rescan_events_require_reconcile() {

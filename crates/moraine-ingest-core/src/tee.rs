@@ -17,7 +17,7 @@ use crate::model::{Checkpoint, RowBatch};
 use crate::publication_identity::PublicationIdentity;
 use crate::redaction::{RedactionAudit, SecretRedactor};
 use crate::sink::{spawn_sink_task, SinkAuthorConfig, SinkRole};
-use crate::watch::enumerate_tracked_files;
+use crate::watch::enumerate_startup_work_items;
 use crate::{Metrics, SinkMessage, WorkItem};
 use moraine_clickhouse::{enforce_remote_schema_policy, ClickHouseClient};
 use moraine_config::{AppConfig, ClickHouseConfig, IngestSource, DEFAULT_BACKEND_NAME};
@@ -611,7 +611,10 @@ async fn discover_startup_backend_targets(context: &TeeRouterContext) -> BTreeSe
 
     let metrics = Arc::new(Metrics::default());
     for source in context.sources.iter() {
-        let files = match enumerate_tracked_files(&source.glob, source.format) {
+        // A one-shot backend-discovery probe. Never reconciliation: it must
+        // not pay sweep cost, which is why the stamp comes from
+        // `enumerate_startup_work_items` rather than a local literal.
+        let files = match enumerate_startup_work_items(source) {
             Ok(files) => files,
             Err(exc) => {
                 warn!(
@@ -622,8 +625,8 @@ async fn discover_startup_backend_targets(context: &TeeRouterContext) -> BTreeSe
             }
         };
 
-        for path in files {
-            match discover_file_backend_targets(context, source, path, metrics.clone()).await {
+        for work in files {
+            match discover_file_backend_targets(context, &work, metrics.clone()).await {
                 Ok(file_targets) => targets.extend(file_targets),
                 Err(exc) => warn!(
                     source = %source.name,
@@ -637,23 +640,15 @@ async fn discover_startup_backend_targets(context: &TeeRouterContext) -> BTreeSe
 
 async fn discover_file_backend_targets(
     context: &TeeRouterContext,
-    source: &IngestSource,
-    path: String,
+    work: &WorkItem,
     metrics: Arc<Metrics>,
 ) -> Result<BTreeSet<String>, anyhow::Error> {
     let checkpoints = Arc::new(RwLock::new(HashMap::<String, Checkpoint>::new()));
     let poll_state = crate::sqlite_poll::VolatilePollMap::new();
     let (tx, mut rx) = mpsc::channel::<SinkMessage>(16);
-    let work = WorkItem {
-        source_name: source.name.clone(),
-        harness: source.harness.clone(),
-        format: source.format,
-        source_glob: source.glob.clone(),
-        path,
-    };
     let process = process_file(
         &context.config,
-        &work,
+        work,
         checkpoints,
         &poll_state,
         tx,
@@ -1007,7 +1002,9 @@ async fn run_replay_pass(
         }
     }
     for source in sources {
-        let files = match enumerate_tracked_files(&source.glob, source.format) {
+        // One-shot catch-up polls, so `Startup` — same single-literal rule as
+        // the discovery probe above.
+        let files = match enumerate_startup_work_items(source) {
             Ok(files) => files,
             Err(exc) => {
                 pass_complete = false;
@@ -1026,7 +1023,7 @@ async fn run_replay_pass(
         // host-filtered), so teammates' files on a shared backend never
         // trip this warning.
         {
-            let enumerated: HashSet<&str> = files.iter().map(String::as_str).collect();
+            let enumerated: HashSet<&str> = files.iter().map(|work| work.path.as_str()).collect();
             let map = floor.read().await;
             for cp in map.values() {
                 if cp.source_name == source.name && !enumerated.contains(cp.source_file.as_str()) {
@@ -1047,14 +1044,7 @@ async fn run_replay_pass(
         // Replay reads against this backend's own floor, not the live
         // pipeline's, so it gets a fresh volatile map: every file scans.
         let poll_state = crate::sqlite_poll::VolatilePollMap::new();
-        for path in files {
-            let work = WorkItem {
-                source_name: source.name.clone(),
-                harness: source.harness.clone(),
-                format: source.format,
-                source_glob: source.glob.clone(),
-                path,
-            };
+        for work in files {
             let key = crate::checkpoint::checkpoint_key(&work.source_name, &work.path);
             let placeholder = floor.read().await.get(&key).cloned().unwrap_or_else(|| {
                 let source_inode = std::fs::metadata(&work.path)

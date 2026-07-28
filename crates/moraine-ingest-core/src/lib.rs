@@ -27,7 +27,7 @@ use crate::sink::{spawn_sink_task, SinkAuthorConfig, SinkRole};
 use crate::tee::{
     spawn_tee_router, RedactionContext, RouteResolver, SharedRouteResolver, StatusRegistry,
 };
-use crate::watch::{enumerate_tracked_files, spawn_watcher_threads};
+use crate::watch::{enumerate_startup_work_items, spawn_watcher_threads};
 use anyhow::{bail, Context, Result};
 use moraine_clickhouse::{ClickHouseClient, QueryClass, QueryEnvelope};
 use moraine_config::{
@@ -46,6 +46,40 @@ pub(crate) const WATCHER_BACKEND_NATIVE: u64 = 1;
 pub(crate) const WATCHER_BACKEND_POLL: u64 = 2;
 pub(crate) const WATCHER_BACKEND_MIXED: u64 = 3;
 
+/// Why a `WorkItem` was queued (issue #601 §2.4). Nothing downstream of
+/// `process_file` could previously tell a watcher tick from a reconcile tick,
+/// which is what makes "reconciliation must not run on every watcher event"
+/// unimplementable and untestable.
+///
+/// The variants are ordered by how much expensive reconciliation work a poll
+/// under that trigger may do — least first — and `merge` relies on that
+/// ordering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub(crate) enum WorkTrigger {
+    /// A filesystem watcher event, or a watcher-driven rescan. Latency-
+    /// sensitive and arbitrarily bursty, so never sweep-eligible.
+    #[default]
+    Watcher,
+    /// A one-shot poll outside the steady-state loops: startup backfill and
+    /// the tee router's backend-discovery probe. Not sweep-eligible either —
+    /// startup is the worst moment to add a broad scan.
+    Startup,
+    /// A `reconcile_interval_seconds` tick. The only trigger a reconciliation
+    /// sweep slice may attach to.
+    Reconcile,
+}
+
+impl WorkTrigger {
+    /// Coalescing two queued items keeps the *least* reconciliation-eligible
+    /// trigger, so a watcher burst that swallows a reconcile tick does not
+    /// become sweep-eligible (latency wins). The next reconcile tick is.
+    /// This is also what stops `complete_work`'s dirty re-enqueue from
+    /// upgrading a watcher item to `Reconcile`.
+    pub(crate) fn merge(self, other: Self) -> Self {
+        self.min(other)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct WorkItem {
     pub(crate) source_name: String,
@@ -53,9 +87,56 @@ pub(crate) struct WorkItem {
     pub(crate) format: SourceFormat,
     pub(crate) source_glob: String,
     pub(crate) path: String,
+    pub(crate) trigger: WorkTrigger,
 }
 
 impl WorkItem {
+    /// The **only** place non-test code stamps `WorkTrigger::Watcher`. Both
+    /// watcher paths — the per-event fan-out that every real filesystem event
+    /// takes, and `queue_rescan`'s recovery enumeration — go through here, so
+    /// there is a single literal for `watcher_work_items_are_stamped_as_watcher_triggered`
+    /// to guard. A second literal would be a stamp no test covers, which is
+    /// exactly how the per-event path went unguarded.
+    pub(crate) fn watcher(
+        source_name: &str,
+        harness: &str,
+        format: SourceFormat,
+        source_glob: &str,
+        path: String,
+    ) -> Self {
+        Self {
+            source_name: source_name.to_string(),
+            harness: harness.to_string(),
+            format,
+            source_glob: source_glob.to_string(),
+            path,
+            trigger: WorkTrigger::Watcher,
+        }
+    }
+
+    /// The **only** place non-test code stamps `WorkTrigger::Startup`: the
+    /// startup backfill in `run_ingestor`, the tee router's backend-discovery
+    /// probe, and its replay pass. Same single-literal rule as `watcher`.
+    pub(crate) fn startup(
+        source_name: &str,
+        harness: &str,
+        format: SourceFormat,
+        source_glob: &str,
+        path: String,
+    ) -> Self {
+        Self {
+            source_name: source_name.to_string(),
+            harness: harness.to_string(),
+            format,
+            source_glob: source_glob.to_string(),
+            path,
+            trigger: WorkTrigger::Startup,
+        }
+    }
+
+    /// Deliberately excludes `trigger`: it is the coalescing key, and a
+    /// trigger-bearing key would give every watcher event its own queue entry
+    /// and defeat the debounce entirely.
     pub(crate) fn key(&self) -> String {
         format!("{}\n{}", self.source_name, self.path)
     }
@@ -67,6 +148,73 @@ pub(crate) struct DispatchState {
     pub(crate) inflight: HashSet<String>,
     pub(crate) dirty: HashSet<String>,
     pub(crate) item_by_key: HashMap<String, WorkItem>,
+    /// Keys owed a reconcile tick that arrived while the key was already
+    /// pending, inflight or dirty (issue #601 §2.4, and the starvation defect
+    /// that merge alone creates).
+    ///
+    /// The merge rule is right — an *inflight* poll must never be upgraded to
+    /// `Reconcile` mid-flight — but dropping the tick outright is not: on a
+    /// continuously written database the key is pending or inflight most of
+    /// the time, so every reconcile tick would be downgraded and discarded and
+    /// the sweep would never run on the one source with the most history to
+    /// sweep. That is the coverage hazard §0 exists to prevent, and it would
+    /// make §4's "measured maximum complete-sweep interval" unbounded.
+    ///
+    /// So the tick is remembered here and re-armed onto the *next* poll of that
+    /// key that starts fresh.
+    ///
+    /// **This is a debt ledger with exactly one creator and exactly one
+    /// reaper.** An entry is created only by an incoming `Reconcile` that no
+    /// dispatch carried — `enqueue_work`'s settle/owe condition — and removed
+    /// only by the dispatch that carries one (`arm_owed_reconcile`).
+    ///
+    /// It is specifically **not** removed by the key leaving the dispatcher.
+    /// `complete_work`'s prune used to do that and was deleted, because every
+    /// reachable firing of it destroyed a live tick: a debt can only exist on a
+    /// key that was pending when the tick landed, and such a key reaches the
+    /// prune with the tick still unpaid (`complete_work`'s comment carries the
+    /// case analysis; plan §7.1 D1a records the deviation).
+    ///
+    /// So the creating condition is the *whole* bound on this map, in both
+    /// directions, and neither direction may be weakened without the other
+    /// noticing. Over-owing it — recording a tick that a dispatch did in fact
+    /// carry — is now permanent rather than self-correcting, and grows the map
+    /// to the full tracked-path set while making every later watcher poll of
+    /// every path sweep-eligible. Under-owing it drops ticks outright and
+    /// unbounds §4's complete-sweep interval. The pair
+    /// `a_reconcile_sweep_over_idle_paths_leaves_no_standing_debt` (upper) and
+    /// `two_reconcile_ticks_straddling_one_queued_poll_buy_two_polls` (lower)
+    /// bound that one condition from both sides.
+    ///
+    /// An entry is never created by noticing that a *stored* item's trigger was
+    /// downgraded: that item describes a poll which already exists, so re-owing
+    /// on its downgrade re-owes a paid tick and latches the key permanently
+    /// sweep-eligible under pure watcher churn. Creation is therefore bounded
+    /// by the reconcile cadence, which is what makes "one tick buys **at most**
+    /// one reconcile-eligible poll" true.
+    ///
+    /// The converse — one tick buys *at least* one — deliberately does **not**
+    /// hold, and the type is where that is decided. This is a `HashSet`, so
+    /// several ticks landing on a key that never leaves the
+    /// pending/inflight/dirty window between them collapse into a single debt:
+    /// the second `insert` is a no-op and one sweep slice settles all of them.
+    /// That is the right trade, not an oversight. A sweep slice covers
+    /// everything that has accumulated since the previous one, so the debt is a
+    /// *flag* — "this key owes a sweep" — and not an amount of work; N flags
+    /// would buy N identical sweeps of a key that only ever needed one. §4's
+    /// complete-sweep interval is bounded by the rate at which the key polls at
+    /// all, which coalescing does not change. `two_reconcile_ticks_straddling_
+    /// one_queued_poll_buy_two_polls` shows the other case and does not
+    /// contradict this one: its first tick is *dispatched*, so only one tick is
+    /// ever owed. `reconcile_ticks_landing_on_one_queued_poll_coalesce` pins
+    /// the coalescing itself, which is what a `HashMap<String, u32>` here would
+    /// break.
+    ///
+    /// Retention cost: one `String` per indebted path. A path that stays
+    /// tracked settles on its next poll; a path that leaves tracking while
+    /// still indebted is never enumerated again, so its entry lives until the
+    /// process restarts.
+    pub(crate) reconcile_owed: HashSet<String>,
 }
 
 #[derive(Default)]
@@ -84,6 +232,23 @@ pub(crate) struct Metrics {
     pub(crate) watcher_reset_count: AtomicU64,
     pub(crate) watcher_last_reset_unix_ms: AtomicU64,
     pub(crate) watcher_backend_state: AtomicU64,
+    /// Payload bytes materialized by SQLite polls (issue #601 §2.0). Charged
+    /// from `ScanLedger` at the read site on both the success and the failure
+    /// path, never derived from emitted-record counts.
+    pub(crate) sqlite_poll_payload_bytes_total: AtomicU64,
+    /// Rows whose payload column a SQLite poll materialized.
+    pub(crate) sqlite_poll_payload_rows_total: AtomicU64,
+    /// Census rows walked by SQLite polls. Both ledger axes are folded here,
+    /// not just the payload one: a counter no test can read is an unfailable
+    /// guard, and the OpenCode rewind preflight charges *only* the census
+    /// axis, so a payload-only fold would leave that call site uncoverable.
+    pub(crate) sqlite_poll_census_rows_total: AtomicU64,
+    /// Census bytes materialized by SQLite polls.
+    pub(crate) sqlite_poll_census_bytes_total: AtomicU64,
+    /// Completed SQLite scans that ended in a failure outcome. This is the
+    /// observed-scan denominator the failure-backoff gate asserts on;
+    /// `ingest_errors` rows are rate-limited and cannot count scans.
+    pub(crate) sqlite_scan_failures_total: AtomicU64,
     pub(crate) last_error: Mutex<String>,
 }
 
@@ -533,34 +698,26 @@ pub async fn run_ingestor(config: AppConfig) -> Result<()> {
     if config.ingest.backfill_on_start {
         let mut backfill_sources = Vec::new();
         for source in &enabled_sources {
-            let files = enumerate_tracked_files(&source.glob, source.format)?;
+            // `enumerate_startup_work_items` is the single literal that stamps
+            // `Startup` (see its doc): a `Watcher` stamp here would let
+            // `arm_owed_reconcile` upgrade a backfill poll to `Reconcile`,
+            // which is the one inversion plan §7.1 D1c exists to refuse.
+            let files = enumerate_startup_work_items(source)?;
             info!(
                 "startup backfill queueing {} files for source={} (format={})",
                 files.len(),
                 source.name,
                 source.format
             );
-            backfill_sources.push((source.clone(), files.into_iter()));
+            backfill_sources.push(files.into_iter());
         }
 
         loop {
             let mut queued_any = false;
-            for (source, files) in &mut backfill_sources {
-                if let Some(path) = files.next() {
+            for files in &mut backfill_sources {
+                if let Some(work) = files.next() {
                     queued_any = true;
-                    enqueue_work(
-                        WorkItem {
-                            source_name: source.name.clone(),
-                            harness: source.harness.clone(),
-                            format: source.format,
-                            source_glob: source.glob.clone(),
-                            path,
-                        },
-                        &process_tx,
-                        &dispatch,
-                        &metrics,
-                    )
-                    .await;
+                    enqueue_work(work, &process_tx, &dispatch, &metrics).await;
                 }
             }
 

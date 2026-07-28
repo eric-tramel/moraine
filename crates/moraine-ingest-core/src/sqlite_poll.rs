@@ -140,6 +140,119 @@ impl CursorState {
     }
 }
 
+/// Test-only injection point for the mixed-snapshot bracket.
+///
+/// The bracket only trips when something commits inside the scan's read
+/// window, so the only way to observe that arm without an injection point is
+/// to race a concurrent writer and hope — which made the single guard over
+/// Cursor's one post-read failure arm nondeterministic, and made the *replay*
+/// consequences of a contended scan untestable altogether.
+///
+/// Armings are keyed by database path and each `take` consumes one, so tests
+/// running in parallel threads of the same binary (every path comes from
+/// `unique_db_path`/`fixture_db`) cannot contaminate one another, and an
+/// arming that is never consumed cannot leak into a later test on a different
+/// database.
+#[cfg(test)]
+pub(crate) mod contention_injection {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    fn armed() -> &'static Mutex<HashMap<String, u32>> {
+        static ARMED: OnceLock<Mutex<HashMap<String, u32>>> = OnceLock::new();
+        ARMED.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    /// Force the next `times` scans of `db_path` to fail the mixed-snapshot
+    /// bracket, exactly as a writer committing mid-scan would.
+    pub(crate) fn arm(db_path: &str, times: u32) {
+        armed()
+            .lock()
+            .expect("contention injection mutex poisoned")
+            .insert(db_path.to_string(), times);
+    }
+
+    /// Cancel any remaining armings for `db_path`.
+    pub(crate) fn disarm(db_path: &str) {
+        armed()
+            .lock()
+            .expect("contention injection mutex poisoned")
+            .remove(db_path);
+    }
+
+    /// Consume one arming for `db_path`, if any.
+    pub(crate) fn take(db_path: &str) -> bool {
+        let mut map = armed().lock().expect("contention injection mutex poisoned");
+        let Some(remaining) = map.get_mut(db_path) else {
+            return false;
+        };
+        *remaining -= 1;
+        if *remaining == 0 {
+            map.remove(db_path);
+        }
+        true
+    }
+}
+
+/// True when a test has armed `db_path` for a forced mixed-snapshot rejection.
+/// Compiles to a constant `false` outside the test build.
+#[cfg(test)]
+fn forced_mixed_snapshot(db_path: &str) -> bool {
+    contention_injection::take(db_path)
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn forced_mixed_snapshot(_db_path: &str) -> bool {
+    false
+}
+
+/// True when the scan that just finished cannot be trusted to have read one
+/// point-in-time view of the database, so its results are discarded and the
+/// cursor stays where it was.
+///
+/// All three adapters bracket their row scan with this, which is why it is a
+/// function and not three copies of the same expression: the sites are
+/// load-bearing for §3.2 and silent drift between them has no natural guard.
+///
+/// **Known hazard (gate G1d, §3.2).** The stat disjunct compares full
+/// `StatFingerprint`s, `shm_len`/`shm_mtime_ns` included, so it can reject a
+/// scan when `data_version` is unchanged — i.e. when nothing committed at all
+/// and only a concurrent *reader* churned the `-shm` sidecar. That is
+/// load-sensitive rather than theoretical: under a loaded host
+/// `nac::tests::oversized_normalized_rows_fail_before_any_payload_is_sent` has
+/// been observed failing with `sqlite_mixed_snapshot` in place of the error
+/// kind it asserts. §3.2 requires the guard be preserved exactly, so it is;
+/// narrowing it to the sidecars that imply a commit is G1d's job and needs the
+/// sandbox (`/proc/self/io`) to be measured honestly.
+///
+/// **What holds this width, and what does not.** Every *production* rejection
+/// arrives through one of the two real disjuncts and none through the hook —
+/// but until this predicate had its own test, that was true of no test either.
+/// A commit landing between a scan's two `data_version` reads is not
+/// deterministically reachable: the scan runs inside a single function call,
+/// and `forced_mixed_snapshot` is its only seam — a seam that short-circuits
+/// both real disjuncts, so every adapter contention test reached the arm
+/// without ever evaluating them. Racing a concurrent writer would reach them
+/// but only probabilistically, and a second injection hook that performed a
+/// real mid-scan commit would be more production surface than the guard it
+/// checks. So the disjuncts are bounded here instead, separately and
+/// deterministically, by
+/// `the_mixed_snapshot_bracket_fires_on_a_moved_data_version_and_on_a_moved_stat`:
+/// dropping either one, or widening the predicate to fire unconditionally,
+/// fails it. The three *call sites* stay bounded by the adapters' contention
+/// tests, which reach this through the hook.
+fn snapshot_is_mixed(
+    db_path: &str,
+    data_version_before: i64,
+    data_version_after: i64,
+    opened_stat: StatFingerprint,
+) -> bool {
+    forced_mixed_snapshot(db_path)
+        || data_version_before != data_version_after
+        || stat_fingerprint(db_path) != Some(opened_stat)
+}
+
 /// After this many consecutive no-op scans, a database is considered
 /// stat-noisy and rescans are throttled to `NOOP_RESCAN_MIN_INTERVAL`.
 /// Below the threshold every stat change scans immediately, so ordinary
@@ -163,9 +276,62 @@ const NOOP_RESCAN_MIN_INTERVAL: Duration = Duration::from_secs(15);
 /// bounded by the number of distinct watched database paths.
 struct VolatilePollEntry {
     source_generation: u32,
-    stat: StatFingerprint,
+    /// The stat fingerprint a completed no-op scan covered. `None` means no
+    /// scan has covered a fingerprint yet — the state a failed scan leaves
+    /// behind, and deliberately not a sentinel value that a real fingerprint
+    /// could collide with.
+    stat: Option<StatFingerprint>,
     consecutive_noop_scans: u32,
+    consecutive_failed_scans: u32,
     last_scan_at: Instant,
+    /// When the last mixed-snapshot rejection happened, and how many have run
+    /// back to back. Kept **separate from `consecutive_failed_scans`** on
+    /// purpose: contention is not a fault, so it must not climb the 15 s → 15
+    /// min ladder or suppress ordinary scans of an active database. What it
+    /// does have to do is throttle the *durable replay barrier*, which is why
+    /// it exists at all — see `failure_retry_due`.
+    last_contended_at: Option<Instant>,
+    consecutive_contended_scans: u32,
+}
+
+/// Base delay after one failed scan, doubling per consecutive failure.
+const FAILURE_BACKOFF_BASE: Duration = Duration::from_secs(15);
+
+/// Ceiling on the failure backoff: a permanently broken database still retries
+/// every 15 minutes, so recovery from an environmental fault (a lock, a
+/// permission) never needs a restart.
+const FAILURE_BACKOFF_MAX: Duration = Duration::from_secs(15 * 60);
+
+/// `min(15 s * 2^(n-1), 15 min)` for `n` consecutive failures; zero failures
+/// means retry immediately.
+fn failure_backoff(consecutive_failed_scans: u32) -> Duration {
+    if consecutive_failed_scans == 0 {
+        return Duration::ZERO;
+    }
+    let shift = consecutive_failed_scans.saturating_sub(1).min(31);
+    FAILURE_BACKOFF_BASE
+        .saturating_mul(1u32 << shift)
+        .min(FAILURE_BACKOFF_MAX)
+}
+
+/// Base delay before a *contended* replay barrier is re-sent.
+const CONTENTION_BACKOFF_BASE: Duration = Duration::from_secs(15);
+
+/// Ceiling on the contention backoff. Far below `FAILURE_BACKOFF_MAX` on
+/// purpose: contention is transient and self-clearing, and a replacement
+/// database that is merely busy must become visible within a minute of the
+/// writer pausing, not within fifteen.
+const CONTENTION_BACKOFF_MAX: Duration = Duration::from_secs(60);
+
+/// `min(15 s * 2^(n-1), 60 s)` for `n` consecutive mixed-snapshot rejections.
+fn contention_backoff(consecutive_contended_scans: u32) -> Duration {
+    if consecutive_contended_scans == 0 {
+        return Duration::ZERO;
+    }
+    let shift = consecutive_contended_scans.saturating_sub(1).min(31);
+    CONTENTION_BACKOFF_BASE
+        .saturating_mul(1u32 << shift)
+        .min(CONTENTION_BACKOFF_MAX)
 }
 
 /// One map per ingest pipeline, created in `run_ingestor` and threaded
@@ -187,10 +353,11 @@ impl VolatilePollMap {
             .expect("volatile poll state mutex poisoned")
     }
 
-    /// True when a poll should be skipped without scanning: either the last
-    /// no-op scan already covered the current stat fingerprint (the durable
-    /// checkpoint is intentionally stale after a no-op scan), or the database
-    /// is stat-noisy and still inside its rescan backoff window.
+    /// True when a poll should be skipped without scanning: the last no-op
+    /// scan already covered the current stat fingerprint (the durable
+    /// checkpoint is intentionally stale after a no-op scan), the database is
+    /// stat-noisy and still inside its rescan backoff window, or its last scan
+    /// failed and the failure backoff has not expired.
     fn should_skip_poll(
         &self,
         cp_key: &str,
@@ -204,15 +371,60 @@ impl VolatilePollMap {
         if entry.source_generation != source_generation {
             return false;
         }
-        if entry.stat == *current_stat {
+        if entry.stat == Some(*current_stat) {
+            return true;
+        }
+        // The failure arm is independent of the no-op streak: a database whose
+        // first scan fails has no streak to throttle on, which is exactly the
+        // case that re-ran a full failed scan on every tick (issue #601 §2.5).
+        if entry.last_scan_at.elapsed() < failure_backoff(entry.consecutive_failed_scans) {
             return true;
         }
         entry.consecutive_noop_scans >= NOOP_SCAN_BACKOFF_THRESHOLD
             && entry.last_scan_at.elapsed() < NOOP_RESCAN_MIN_INTERVAL
     }
 
+    /// True when a database whose last scan did not succeed is due for another
+    /// attempt. An absent entry (fresh process, or a scan that last succeeded)
+    /// is always due, so a restart never inherits a suppression.
+    ///
+    /// This gates the **durable replay barrier**, which is why it consults the
+    /// contention clock as well as the fault ladder. A mixed-snapshot rejection
+    /// is exempt from the fault ladder (§3.2: contention is not a fault) but it
+    /// must never be exempt from *this*: the `Failed` arm of a replacement
+    /// replay emits `BlockReplay` plus an append-only `ingest_errors` row, and
+    /// the next tick sees `retry_blocked_replay` with `starts_replacement`
+    /// false. With no clock at all that is `BeginReplay` + a full cold scan +
+    /// `BlockReplay` + one error row **per poll, forever** while contention
+    /// persists — at the 30 s reconcile cadence *and* on every 50 ms-debounced
+    /// watcher event. A replacement replay is the longest scan an adapter runs,
+    /// so it is the scan most likely to lose the bracket in the first place.
+    ///
+    /// The contention clock deliberately does *not* appear in
+    /// `should_skip_poll`: throttling ordinary scans of a contended database is
+    /// exactly the active-session freshness regression the exemption exists to
+    /// prevent.
+    fn failure_retry_due(&self, cp_key: &str, source_generation: u32) -> bool {
+        let map = self.lock();
+        let Some(entry) = map.get(cp_key) else {
+            return true;
+        };
+        if entry.source_generation != source_generation {
+            return true;
+        }
+        if entry.last_scan_at.elapsed() < failure_backoff(entry.consecutive_failed_scans) {
+            return false;
+        }
+        match entry.last_contended_at {
+            Some(at) => at.elapsed() >= contention_backoff(entry.consecutive_contended_scans),
+            None => true,
+        }
+    }
+
     /// Record a scan that changed nothing durable: remember the stat
-    /// fingerprint it covered and extend the no-op streak.
+    /// fingerprint it covered and extend the no-op streak. A no-op scan is a
+    /// *successful* scan, so it also clears the failure streak while keeping
+    /// the no-op streak.
     fn record_noop_scan(&self, cp_key: &str, source_generation: u32, stat: StatFingerprint) {
         let mut map = self.lock();
         let entry = map
@@ -224,13 +436,33 @@ impl VolatilePollMap {
             })
             .or_insert(VolatilePollEntry {
                 source_generation,
-                stat,
+                stat: Some(stat),
                 consecutive_noop_scans: 0,
+                consecutive_failed_scans: 0,
                 last_scan_at: Instant::now(),
+                last_contended_at: None,
+                consecutive_contended_scans: 0,
             });
         entry.source_generation = source_generation;
-        entry.stat = stat;
+        entry.stat = Some(stat);
         entry.consecutive_noop_scans = entry.consecutive_noop_scans.saturating_add(1);
+        entry.consecutive_failed_scans = 0;
+        // A scan that completed cleanly is proof the contention has passed, so
+        // the **ladder** resets and not just its clock. Nothing observes the
+        // reset until the next rejection — `consecutive_contended_scans` is
+        // read only inside `failure_retry_due`'s `Some(last_contended_at)` arm
+        // — so a stale streak left here is silent right up to the moment
+        // `record_contended_scan` increments from it, and the barrier throttle
+        // then resumes near the 60 s ceiling instead of at the 15 s base.
+        // `a_clean_scan_resets_the_contention_ladder_not_only_its_clock` fails
+        // if this line goes.
+        //
+        // The `last_contended_at` reset below is, *given* this one, an
+        // equivalent mutant and is deliberately not claimed as pinned:
+        // `contention_backoff(0)` is `Duration::ZERO`, so a zeroed streak
+        // answers `true` through the `Some` arm exactly as `None` does.
+        entry.consecutive_contended_scans = 0;
+        entry.last_contended_at = None;
         entry.last_scan_at = Instant::now();
     }
 
@@ -243,15 +475,451 @@ impl VolatilePollMap {
         self.lock().remove(cp_key);
     }
 
-    /// A failed scan refreshes the backoff clock of an existing no-op streak
-    /// so a persistently failing stat-noisy database retries on the throttled
-    /// cadence instead of every reconcile tick. Without a streak this is a
-    /// no-op and the failure retries exactly as before.
-    fn record_failed_scan(&self, cp_key: &str) {
+    /// Entering a durably blocked replay is a scan failure for backoff
+    /// purposes, and the **only** sanctioned way to record it.
+    ///
+    /// It exists as its own entry point because the obvious-looking
+    /// `clear(); record_failed_scan();` pair is a live defect: `clear` deletes
+    /// the entry, so `record_failed_scan`'s `or_insert` restarts the streak at
+    /// 1 on every retry and pins the path at the 15 s floor forever. The
+    /// trigger is a record failing `normalize_record` during a replacement
+    /// replay — deterministic and content-driven, so it recurs on every retry —
+    /// which means a flat floor re-sends a durable `BeginReplay` barrier and
+    /// re-reads the entire database every 15 s indefinitely.
+    /// `record_failed_scan` already sets `stat` to `None`, which is the only
+    /// suppression the `clear` was there to avoid.
+    fn record_blocked_replay(&self, cp_key: &str, source_generation: u32) {
+        self.record_failed_scan(cp_key, source_generation);
+    }
+
+    /// Record a completed scan that ended in a failure outcome, routing it to
+    /// the fault ladder or the contention exemption by `error_kind`.
+    ///
+    /// **Mixed-snapshot rejections do not escalate.** `ERROR_KIND_MIXED_SNAPSHOT`
+    /// means the database was being written while the scan read it; that is a
+    /// *contention* signal, not a fault, and it happens precisely when the
+    /// source is active — which is when prompt visibility matters most (§6).
+    /// Routing it into the 15 s → 15 min ladder would regress active-session
+    /// freshness by up to 15 minutes, and the mitigation the spec pairs with
+    /// that ("smaller scans make retries rare") is WI-07/WI-08 and does not
+    /// exist yet. So a contended scan retries at the ordinary poll cadence and
+    /// leaves the fault streak untouched — neither extending it nor clearing a
+    /// genuine one underneath it.
+    ///
+    /// **Exempt from the fault ladder is not exempt from the replay throttle.**
+    /// The rejection still routes to `record_contended_scan`, whose clock
+    /// `failure_retry_due` reads, because a replacement replay's `Failed` arm
+    /// emits a durable `BlockReplay` and an append-only `ingest_errors` row —
+    /// recording nothing at all would re-run that on every tick forever. The
+    /// two clocks are read in different places on purpose: `should_skip_poll`
+    /// (ordinary scans) sees only the fault ladder, `failure_retry_due` (the
+    /// replay barrier) sees both.
+    ///
+    /// Every adapter's `Failed` arm goes through this one entry point, so the
+    /// classification cannot drift between them.
+    ///
+    /// **The exemption's width is the whole guard.** One kind is named out of
+    /// five, and naming one more is a one-token edit that no outcome assertion
+    /// can see — `sqlite_scan_error` and `sqlite_cursor_too_large` were both
+    /// admissible with the suite green. `sqlite_scan_error` is the expensive
+    /// one: eleven of the seventeen production failure sites emit it, covering
+    /// the paged read, both `data_version` reads and every adapter's row loop.
+    /// Route it here and no scan failure ever reaches `record_failed_scan`,
+    /// `consecutive_failed_scans` stays 0, `should_skip_poll`'s failure arm
+    /// never fires, and the §2.5 defect this work item exists to remove comes
+    /// straight back — a full failed scan on every reconcile tick and every
+    /// debounced watcher event, forever — while the barrier throttle silently
+    /// drops from `FAILURE_BACKOFF_MAX` to `CONTENTION_BACKOFF_MAX`.
+    /// `each_error_kind_routes_to_exactly_one_backoff_clock` pins the routing
+    /// per kind rather than the outcome, so widening at *any* neighbour fails.
+    fn record_scan_failure_outcome(&self, cp_key: &str, source_generation: u32, error_kind: &str) {
+        if error_kind == ERROR_KIND_MIXED_SNAPSHOT {
+            self.record_contended_scan(cp_key, source_generation);
+            return;
+        }
+        self.record_failed_scan(cp_key, source_generation);
+    }
+
+    /// A failed scan starts (or extends) the failure backoff. It **creates**
+    /// the entry when absent: the previous `get_mut`-only version did nothing
+    /// for a database whose first scan failed, or whose failure followed any
+    /// emitting scan (which clears the entry), so the most common failure
+    /// shapes had no backoff at all and re-ran a full failed scan on every
+    /// reconcile tick and every debounced watcher event, forever.
+    ///
+    /// The entry records **no covered stat**: a failure covered nothing, and
+    /// claiming otherwise would suppress rescans of an unchanged file
+    /// permanently rather than for the backoff window. That is also why the
+    /// blocked-replay path must **not** `clear` before calling this: `clear`
+    /// deletes the entry, so the very next `or_insert` restarts the streak at
+    /// 1 and pins the retry at the 15 s floor forever. Setting `stat` to `None`
+    /// here already removes the only suppression `clear` was there to avoid.
+    fn record_failed_scan(&self, cp_key: &str, source_generation: u32) {
+        let mut map = self.lock();
+        let entry = map
+            .entry(cp_key.to_string())
+            .and_modify(|entry| {
+                if entry.source_generation != source_generation {
+                    entry.consecutive_noop_scans = 0;
+                    entry.consecutive_failed_scans = 0;
+                    entry.consecutive_contended_scans = 0;
+                    entry.last_contended_at = None;
+                }
+            })
+            .or_insert(VolatilePollEntry {
+                source_generation,
+                stat: None,
+                consecutive_noop_scans: 0,
+                consecutive_failed_scans: 0,
+                last_scan_at: Instant::now(),
+                last_contended_at: None,
+                consecutive_contended_scans: 0,
+            });
+        entry.source_generation = source_generation;
+        entry.stat = None;
+        entry.consecutive_failed_scans = entry.consecutive_failed_scans.saturating_add(1);
+        entry.last_scan_at = Instant::now();
+    }
+
+    /// Record a scan the mixed-snapshot bracket rejected.
+    ///
+    /// Contention is **not** a fault (§3.2), so `consecutive_failed_scans` is
+    /// untouched and `should_skip_poll` keeps letting ordinary scans through at
+    /// the full poll cadence — that exemption is what protects active-session
+    /// freshness. What this *does* record is a clock `failure_retry_due` reads,
+    /// so a replacement replay that keeps losing the bracket stops re-sending
+    /// its durable barrier (and appending an `ingest_errors` row) on every tick.
+    ///
+    /// Like `record_failed_scan` it clears the covered stat: a rejected scan
+    /// covered nothing, and a mixed-snapshot rejection means the database moved
+    /// under it, so any fingerprint a previous no-op scan recorded is stale.
+    fn record_contended_scan(&self, cp_key: &str, source_generation: u32) {
+        let mut map = self.lock();
+        let entry = map
+            .entry(cp_key.to_string())
+            .and_modify(|entry| {
+                if entry.source_generation != source_generation {
+                    entry.consecutive_noop_scans = 0;
+                    entry.consecutive_failed_scans = 0;
+                    entry.consecutive_contended_scans = 0;
+                }
+            })
+            .or_insert(VolatilePollEntry {
+                source_generation,
+                stat: None,
+                consecutive_noop_scans: 0,
+                consecutive_failed_scans: 0,
+                last_scan_at: Instant::now(),
+                last_contended_at: None,
+                consecutive_contended_scans: 0,
+            });
+        entry.source_generation = source_generation;
+        entry.stat = None;
+        entry.consecutive_contended_scans = entry.consecutive_contended_scans.saturating_add(1);
+        entry.last_contended_at = Some(Instant::now());
+    }
+
+    /// Consecutive failed scans recorded for `cp_key`; zero when no entry
+    /// exists. Test-only: it is how a backoff test observes escalation without
+    /// sleeping through a 15 s → 30 s → 60 s ladder in real time.
+    #[cfg(test)]
+    fn consecutive_failed_scans(&self, cp_key: &str) -> u32 {
+        self.lock()
+            .get(cp_key)
+            .map_or(0, |entry| entry.consecutive_failed_scans)
+    }
+
+    /// Consecutive mixed-snapshot rejections recorded for `cp_key`. Test-only:
+    /// it is how the contention tests assert that the contention clock moved
+    /// while the fault ladder did not.
+    #[cfg(test)]
+    fn consecutive_contended_scans(&self, cp_key: &str) -> u32 {
+        self.lock()
+            .get(cp_key)
+            .map_or(0, |entry| entry.consecutive_contended_scans)
+    }
+
+    /// Backdate `cp_key`'s last-scan clock so the next poll sees `by` of
+    /// elapsed time. Test-only: without it a backoff test can only drive ticks
+    /// inside the first 15 s window, where a flat floor and an exponential
+    /// ladder are indistinguishable — which is exactly how the blocked-replay
+    /// reset went unnoticed.
+    #[cfg(test)]
+    fn age_for_tests(&self, cp_key: &str, by: Duration) {
         if let Some(entry) = self.lock().get_mut(cp_key) {
-            entry.last_scan_at = Instant::now();
+            entry.last_scan_at = entry
+                .last_scan_at
+                .checked_sub(by)
+                .unwrap_or(entry.last_scan_at);
+            // Both clocks age together, so a test that walks the fault ladder
+            // is never silently held back by a stale contention clock (and
+            // vice versa).
+            entry.last_contended_at = entry
+                .last_contended_at
+                .map(|at| at.checked_sub(by).unwrap_or(at));
         }
     }
+}
+
+/// Per-poll work accounting (issue #601 §2.0). Charged at the exact point
+/// bytes leave SQLite, never derived from emitted-record counts.
+///
+/// **Charging rules.** Every cost gate in this issue is denominated on one of
+/// these axes, so what each one means has to be pinned down here rather than
+/// argued about per call site:
+///
+/// - `census_*` is charged by a row-materializing read whose projection
+///   **excludes** the adapter's payload column(s) — the cheap change-detection
+///   read. An adapter with no such read reports zero, which is the honest
+///   answer, not a rounding of the payload read down.
+/// - `payload_*` is charged by a row-materializing read whose projection
+///   **includes** a payload column. Bytes are every variable-length byte that
+///   read handed to Rust, identity columns included.
+/// - Bytes charged per row are the length of what SQLite actually handed to
+///   Rust, never a SQL-side `length()` expression and never the size of what
+///   was emitted: a row that is read and discarded still costs its bytes.
+/// - Fixed-width scalars (INTEGER/REAL) are 8 bytes and are charged on neither
+///   axis; they cannot move a byte budget.
+/// - **Scalar-aggregate statements materialize no row, so they charge no rows
+///   on either axis.** Their *bytes* follow what SQLite had to decode: an
+///   aggregate over identity or fixed-width columns (`count(*)`, `max(id)`) is
+///   charged nothing, but an aggregate over a payload column
+///   (`sum(length(data))`) forces SQLite to decode every byte of that column —
+///   §1.1 finding 2 measured `length()` on a TEXT-affine column at 48.5 ms /
+///   48 MB, so it is emphatically not a cheap probe — and those bytes are
+///   charged on the payload axis through `charge_aggregate_payload_bytes`.
+///   Without that rule a cold OpenCode scan under-reports its true byte cost by
+///   roughly 2×, and the ledger could be used to argue an aggregate preflight
+///   is free. It is not.
+///
+/// Both axes are always recorded: rows cannot catch content growth, bytes
+/// cannot catch a full scan of narrow rows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ScanLedger {
+    /// Rows touched by a covering/narrow census.
+    pub(crate) census_rows: u64,
+    /// Key/metadata bytes materialized by the census.
+    pub(crate) census_bytes: u64,
+    /// Rows whose payload column was materialized.
+    pub(crate) payload_rows: u64,
+    /// Payload bytes materialized (the expensive axis).
+    pub(crate) payload_bytes: u64,
+    /// Synthetic records produced by the scan.
+    pub(crate) rows_emitted: u64,
+    // `sweep_rows` / `sweep_bytes` deliberately do **not** exist yet. Nothing
+    // charges a sweep until WI-04 introduces one, so a field carrying a
+    // permanent zero would be a field G6a could assert on and never fail —
+    // the exact unfailable-guard shape this issue is removing. WI-04 adds them
+    // together with the code that charges them.
+}
+
+impl ScanLedger {
+    /// One row materialized by a payload-bearing read. Call once per row,
+    /// before its columns are taken, regardless of how many payload columns
+    /// that row has.
+    pub(crate) fn charge_payload_row(&mut self) {
+        self.payload_rows = self.payload_rows.saturating_add(1);
+    }
+
+    /// One row materialized by a census read that excluded the payload column.
+    pub(crate) fn charge_census_row(&mut self, bytes: usize) {
+        self.census_rows = self.census_rows.saturating_add(1);
+        self.census_bytes = self.census_bytes.saturating_add(bytes as u64);
+    }
+
+    fn charge_payload_bytes(&mut self, bytes: usize) {
+        self.payload_bytes = self.payload_bytes.saturating_add(bytes as u64);
+    }
+
+    /// Bytes a scalar aggregate over a payload column forced SQLite to decode.
+    /// No row is charged — none was materialized — but the bytes were really
+    /// paid, so a byte budget must see them. See the aggregate rule on
+    /// `ScanLedger`.
+    pub(crate) fn charge_aggregate_payload_bytes(&mut self, bytes: u64) {
+        self.payload_bytes = self.payload_bytes.saturating_add(bytes);
+    }
+}
+
+/// The only sanctioned way to materialize a variable-length payload column:
+/// it charges the ledger at the read site, before the value is visible to the
+/// caller. A new `row.get(payload_col)` that bypasses this is a ledger
+/// under-report, and every budget denominated on `payload_bytes` becomes a lie
+/// — reviewers reject it.
+pub(crate) fn take_payload_text(
+    ledger: &mut ScanLedger,
+    row: &rusqlite::Row<'_>,
+    index: usize,
+) -> rusqlite::Result<Option<String>> {
+    let value: Option<String> = row.get(index)?;
+    ledger.charge_payload_bytes(value.as_ref().map_or(0, String::len));
+    Ok(value)
+}
+
+/// `take_payload_text` for a column the schema declares NOT NULL.
+///
+/// A NULL here is **schema drift, and §3.2 wants it surfaced rather than
+/// absorbed**: `row.get::<_, String>` raises `InvalidColumnType`, which fails
+/// the scan and leaves the checkpoint where it was. That is deliberately the
+/// same behaviour these columns had before the ledger existed; the ledger
+/// charge is the only thing this wrapper adds.
+///
+/// Absorbing the NULL instead is not a smaller version of the same thing. An
+/// empty id column manufactures a record whose `source_line_no`/`source_offset`
+/// — and therefore whose `event_uid` — are hashed from nothing (§6 "stable
+/// logical IDs"); an empty timestamp column manufactures an epoch.
+///
+/// This is the default for a text column. `take_payload_nullable_string` is
+/// the per-column exception, and each of its call sites has to name the column
+/// it applies to and why that column tolerates NULL.
+pub(crate) fn take_payload_required_string(
+    ledger: &mut ScanLedger,
+    row: &rusqlite::Row<'_>,
+    index: usize,
+) -> rusqlite::Result<String> {
+    let value: String = row.get(index)?;
+    ledger.charge_payload_bytes(value.len());
+    Ok(value)
+}
+
+/// `take_payload_text` for a column that genuinely tolerates NULL, where the
+/// empty string is the documented default rather than a swallowed defect.
+/// See `take_payload_required_string` for the rule this is the exception to.
+pub(crate) fn take_payload_nullable_string(
+    ledger: &mut ScanLedger,
+    row: &rusqlite::Row<'_>,
+    index: usize,
+) -> rusqlite::Result<String> {
+    Ok(take_payload_text(ledger, row, index)?.unwrap_or_default())
+}
+
+/// `take_payload_text` for a column whose storage class is not trusted:
+/// Cursor writes JSON documents as TEXT into a column declared BLOB, so the
+/// value is taken by reference and charged by its materialized byte length.
+pub(crate) fn take_payload_blob(
+    ledger: &mut ScanLedger,
+    row: &rusqlite::Row<'_>,
+    index: usize,
+) -> rusqlite::Result<Option<Vec<u8>>> {
+    let value = match row.get_ref(index)? {
+        ValueRef::Null => None,
+        ValueRef::Text(text) => Some(text.to_vec()),
+        ValueRef::Blob(blob) => Some(blob.to_vec()),
+        ValueRef::Integer(int) => Some(int.to_string().into_bytes()),
+        ValueRef::Real(real) => Some(real.to_string().into_bytes()),
+    };
+    ledger.charge_payload_bytes(value.as_ref().map_or(0, Vec::len));
+    Ok(value)
+}
+
+/// Fold one poll's ledger into the host-global counters. Called once per poll
+/// that actually scanned, on both the success and the failure path, so a scan
+/// that read 48 MB and then lost the mixed-snapshot race is still charged.
+///
+/// **Both axes are folded, not just the payload one.** A counter nothing can
+/// read is the unfailable-guard pattern this issue exists to remove, and the
+/// OpenCode rewind preflight charges the census axis *only* — folding payload
+/// alone would leave that call site unable to move any observable at all.
+pub(crate) fn record_scan_ledger(metrics: &Arc<Metrics>, ledger: &ScanLedger) {
+    metrics
+        .sqlite_poll_payload_bytes_total
+        .fetch_add(ledger.payload_bytes, std::sync::atomic::Ordering::Relaxed);
+    metrics
+        .sqlite_poll_payload_rows_total
+        .fetch_add(ledger.payload_rows, std::sync::atomic::Ordering::Relaxed);
+    metrics
+        .sqlite_poll_census_rows_total
+        .fetch_add(ledger.census_rows, std::sync::atomic::Ordering::Relaxed);
+    metrics
+        .sqlite_poll_census_bytes_total
+        .fetch_add(ledger.census_bytes, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Reads one table's `CREATE TABLE` text out of `sqlite_master`, charging it
+/// on the census axis.
+///
+/// Schema validation is a row-materializing read whose projection excludes
+/// every payload column, so the ledger's census rule covers it exactly. It ran
+/// uncharged on every poll of all three adapters — a TEXT column pulled into
+/// Rust that neither axis knew about, which is the kind of invisible cost the
+/// ledger exists to expose.
+pub(crate) fn schema_sql_for_table(
+    connection: &Connection,
+    table: &str,
+    ledger: &mut ScanLedger,
+) -> rusqlite::Result<Option<String>> {
+    let sql: Option<String> = connection.query_row(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        rusqlite::params![table],
+        |row| row.get(0),
+    )?;
+    ledger.charge_census_row(sql.as_ref().map_or(0, String::len));
+    Ok(sql)
+}
+
+/// `PRAGMA table_info` column names, charged on the census axis for the same
+/// reason as `schema_sql_for_table`: one materialized row per column.
+pub(crate) fn table_column_names(
+    connection: &Connection,
+    table: &str,
+    ledger: &mut ScanLedger,
+) -> Result<Vec<String>> {
+    let mut stmt = connection
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .with_context(|| format!("failed to inspect {table} columns"))?;
+    let names = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<std::result::Result<Vec<String>, _>>()?;
+    for name in &names {
+        ledger.charge_census_row(name.len());
+    }
+    Ok(names)
+}
+
+/// The census a scan owes for validating `tables`, so every adapter's ledger
+/// test can state its census total as "schema validation **plus** this
+/// adapter's own census read" rather than as an unexplained constant.
+///
+/// Deliberately **does not** call `schema_sql_for_table` /
+/// `table_column_names`: an expectation computed by the very functions under
+/// test moves with them, so dropping a charge would lower both sides equally
+/// and every assertion would stay green. This is an independent oracle — one
+/// `sqlite_master.sql` row per table, one `PRAGMA table_info` row per column,
+/// each charged its own materialized length.
+#[cfg(test)]
+pub(crate) fn expected_schema_census(connection: &Connection, tables: &[&str]) -> ScanLedger {
+    let mut ledger = ScanLedger::default();
+    for table in tables {
+        let sql: Option<String> = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                rusqlite::params![table],
+                |row| row.get(0),
+            )
+            .expect("fixture schema row");
+        ledger.census_rows += 1;
+        ledger.census_bytes += sql.as_ref().map_or(0, String::len) as u64;
+
+        let mut stmt = connection
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .expect("fixture column names");
+        let names: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("fixture column names")
+            .map(|row| row.expect("fixture column name"))
+            .collect();
+        ledger.census_rows += names.len() as u64;
+        ledger.census_bytes += names.iter().map(|name| name.len() as u64).sum::<u64>();
+    }
+    ledger
+}
+
+/// One completed scan that ended in `Failed`. Denominated on observed scans,
+/// which is what the failure-backoff gate asserts on — not on `ingest_errors`
+/// rows, which are rate-limited and therefore cannot count scans.
+pub(crate) fn record_scan_failure(metrics: &Arc<Metrics>) {
+    metrics
+        .sqlite_scan_failures_total
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// One synthetic record ready for `normalize_record`, with the stable
@@ -473,6 +1141,15 @@ pub(crate) async fn process_cursor_sqlite_db(
     let generation_changed = had_committed && checkpoint.source_inode != inode;
     let exclusions_changed =
         had_committed && state.project_exclusions_hash != current_exclusions_hash;
+    // Both disjuncts are load-bearing and they do not cover each other. A
+    // process that dies between `BeginReplay` and `FinalizeReplay` leaves
+    // `replaying` with no error status and no block reason, so dropping the
+    // first disjunct strands that source: the poll becomes ordinary, the
+    // cursor is not reset, the barrier is never re-sent, and the status is
+    // quietly rewritten to `active`.
+    // `a_crash_interrupted_replay_resumes_from_its_replaying_status` fails if
+    // it goes. Widening the *second* disjunct to a bare `status == "error"` is
+    // green at all three adapters and is recorded, unfixed, as plan §7.2 F2.
     let retry_blocked_replay = checkpoint.status == "replaying"
         || (checkpoint.status == "error" && !checkpoint.block_reason.is_empty());
     let starts_replacement = generation_changed || exclusions_changed;
@@ -500,27 +1177,71 @@ pub(crate) async fn process_cursor_sqlite_db(
         .last_offset
         .checked_add(1)
         .context("cursor_sqlite poll sequence exhausted")?;
+    // The failure backoff has to gate the *barrier*, not just the scan:
+    // `begin_database_replay` is durable, so throttling only the scan behind
+    // it would re-send a barrier with nothing behind it on every tick — the
+    // failure mode §2.1(2) warns about. A genuine replacement (new inode,
+    // changed exclusions) bumped the generation above and is never throttled.
+    if retry_blocked_replay
+        && !starts_replacement
+        && !poll_state.failure_retry_due(&cp_key, checkpoint.source_generation)
+    {
+        return Ok(());
+    }
     if replacement_replay {
         begin_database_replay(&sink_tx, &checkpoint, scan_boundary, &policy_fingerprint).await?;
     }
 
     // Cheap no-change short-circuit: nothing touched the database or its WAL
     // sidecars since the last successful poll.
+    //
+    // §2.5 also specifies a `|| !failure_retry_due` disjunct here. **It must
+    // not be added while the contention clock lives in `failure_retry_due`** —
+    // not by WI-04, not as a tidy-up.
+    //
+    // It was once outcome-redundant with `should_skip_poll`'s failure arm
+    // below. §3.2's contention exemption broke that equivalence on purpose:
+    // `failure_retry_due` reads `last_contended_at` as well as the fault
+    // ladder, `should_skip_poll` deliberately does not. After a mixed-snapshot
+    // rejection the two disagree by design — `failure_retry_due` is false for
+    // up to `CONTENTION_BACKOFF_MAX` (60 s) while `should_skip_poll` stays
+    // false, so ordinary scans keep running at the full poll cadence.
+    //
+    // So the disjunct is now outcome-**changing**: it would return early on an
+    // ordinary poll of a contended — i.e. actively written — database for up to
+    // a minute. That is exactly the active-session freshness regression the
+    // exemption exists to prevent, and exactly what `record_contended_scan`'s
+    // doc comment promises does not happen. A pre-`should_skip_poll` throttle
+    // for WI-04's sweep slice must therefore read the fault ladder alone.
+    //
+    // `an_ordinary_poll_of_a_contended_database_is_not_throttled` fails if the
+    // disjunct is added; `a_contended_replacement_replay_throttles_its_barrier`
+    // bounds the other direction (the durable barrier *is* throttled). See the
+    // deviation record in `plans/601-delta-sqlite.md` §7 WI-10.
     if state.stat == current_stat && state.last_error.is_empty() {
         return Ok(());
     }
 
     // Volatile short-circuit + rescan backoff (issue #443): no-op scans leave
     // the durable checkpoint untouched, so their coverage lives here instead.
-    if poll_state.should_skip_poll(&cp_key, checkpoint.source_generation, &current_stat) {
+    // Skipped during a replay: the barrier has already been sent, and a skip
+    // here would leave it with no scan behind it.
+    if !replacement_replay
+        && poll_state.should_skip_poll(&cp_key, checkpoint.source_generation, &current_stat)
+    {
         return Ok(());
     }
 
     let scan_db_path = source_file.clone();
     let scan_state = state.clone();
-    let outcome = tokio::task::spawn_blocking(move || scan_database(&scan_db_path, &scan_state))
-        .await
-        .context("cursor_sqlite scan task panicked")?;
+    let (outcome, ledger) = tokio::task::spawn_blocking(move || {
+        let mut ledger = ScanLedger::default();
+        let outcome = scan_database(&scan_db_path, &scan_state, &mut ledger);
+        (outcome, ledger)
+    })
+    .await
+    .context("cursor_sqlite scan task panicked")?;
+    record_scan_ledger(metrics, &ledger);
 
     match outcome {
         ScanOutcome::Scanned {
@@ -677,7 +1398,7 @@ pub(crate) async fn process_cursor_sqlite_db(
                         ..final_checkpoint
                     };
                     block_database_replay(&sink_tx, &blocked_checkpoint, reason).await?;
-                    poll_state.clear(&cp_key);
+                    poll_state.record_blocked_replay(&cp_key, checkpoint.source_generation);
                     return Ok(());
                 }
                 let active_checkpoint = Checkpoint {
@@ -699,18 +1420,28 @@ pub(crate) async fn process_cursor_sqlite_db(
 
             if emitted > 0 {
                 debug!(
-                    "{}:{} cursor_sqlite emitted {} changed records ({} relevant keys)",
-                    work.source_name, source_file, emitted, relevant_keys
+                    "{}:{} cursor_sqlite emitted {} changed records ({} relevant keys, \
+                     {} payload rows, {} payload bytes)",
+                    work.source_name,
+                    source_file,
+                    emitted,
+                    relevant_keys,
+                    ledger.payload_rows,
+                    ledger.payload_bytes
                 );
             }
-            let _ = metrics;
             Ok(())
         }
         ScanOutcome::Failed {
             error_kind,
             error_text,
         } => {
-            poll_state.record_failed_scan(&cp_key);
+            record_scan_failure(metrics);
+            poll_state.record_scan_failure_outcome(
+                &cp_key,
+                checkpoint.source_generation,
+                error_kind,
+            );
 
             // A repeat of the failure already marked in the committed
             // checkpoint sends nothing: the marker is durable, and reconcile
@@ -793,7 +1524,10 @@ pub(crate) async fn process_cursor_sqlite_db(
 
 /// Blocking phase: open the database read-only, validate schema, scan the
 /// relevant key ranges, and synthesize records for new/changed keys.
-fn scan_database(db_path: &str, prior: &CursorState) -> ScanOutcome {
+///
+/// The caller owns `ledger` so that every early return — including each
+/// failure arm — still reports the bytes this scan had already paid for.
+fn scan_database(db_path: &str, prior: &CursorState, ledger: &mut ScanLedger) -> ScanOutcome {
     let connection = match open_read_only(db_path) {
         Ok(connection) => connection,
         Err(exc) => {
@@ -816,7 +1550,7 @@ fn scan_database(db_path: &str, prior: &CursorState) -> ScanOutcome {
         }
     };
 
-    let schema_fingerprint = match validate_schema(&connection) {
+    let schema_fingerprint = match validate_schema(&connection, ledger) {
         Ok(fingerprint) => fingerprint,
         Err(text) => {
             return ScanOutcome::Failed {
@@ -865,6 +1599,7 @@ fn scan_database(db_path: &str, prior: &CursorState) -> ScanOutcome {
             &mut new_state.kv_hashes,
             &mut records,
             &mut workspace_cache,
+            ledger,
         );
         match scan {
             Ok(seen) => relevant_keys += seen,
@@ -899,7 +1634,12 @@ fn scan_database(db_path: &str, prior: &CursorState) -> ScanOutcome {
             }
         }
     };
-    if data_version_before != data_version_after || stat_fingerprint(db_path) != Some(opened_stat) {
+    if snapshot_is_mixed(
+        db_path,
+        data_version_before,
+        data_version_after,
+        opened_stat,
+    ) {
         return ScanOutcome::Failed {
             error_kind: ERROR_KIND_MIXED_SNAPSHOT,
             error_text:
@@ -941,6 +1681,7 @@ fn scan_database(db_path: &str, prior: &CursorState) -> ScanOutcome {
         rank(a).cmp(&rank(b))
     });
 
+    ledger.rows_emitted = records.len() as u64;
     ScanOutcome::Scanned {
         records,
         new_state,
@@ -1032,14 +1773,12 @@ fn sqlite_immutable_uri(db_path: &str) -> String {
     format!("file:{encoded}?immutable=1")
 }
 
-fn validate_schema(connection: &Connection) -> std::result::Result<u64, String> {
-    let schema_sql: Option<String> = connection
-        .query_row(
-            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'cursorDiskKV'",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|exc| match exc {
+fn validate_schema(
+    connection: &Connection,
+    ledger: &mut ScanLedger,
+) -> std::result::Result<u64, String> {
+    let schema_sql =
+        schema_sql_for_table(connection, "cursorDiskKV", ledger).map_err(|exc| match exc {
             rusqlite::Error::QueryReturnedNoRows => {
                 "required table cursorDiskKV is missing".to_string()
             }
@@ -1049,22 +1788,15 @@ fn validate_schema(connection: &Connection) -> std::result::Result<u64, String> 
     let schema_sql = schema_sql.unwrap_or_default();
     let mut has_key = false;
     let mut has_value = false;
-    connection
-        .prepare("PRAGMA table_info(cursorDiskKV)")
-        .and_then(|mut stmt| {
-            let names = stmt
-                .query_map([], |row| row.get::<_, String>(1))?
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            for name in names {
-                match name.as_str() {
-                    "key" => has_key = true,
-                    "value" => has_value = true,
-                    _ => {}
-                }
-            }
-            Ok(())
-        })
-        .map_err(|exc| exc.to_string())?;
+    for name in
+        table_column_names(connection, "cursorDiskKV", ledger).map_err(|exc| format!("{exc:#}"))?
+    {
+        match name.as_str() {
+            "key" => has_key = true,
+            "value" => has_value = true,
+            _ => {}
+        }
+    }
 
     if !has_key || !has_value {
         return Err(format!(
@@ -1074,15 +1806,25 @@ fn validate_schema(connection: &Connection) -> std::result::Result<u64, String> 
     Ok(hash_str(&schema_sql))
 }
 
+/// The relevant-key census, shared with the plan assertion in
+/// `cursor_relevant_key_count_is_a_covering_index_scan` so the statement that
+/// test certifies is the statement this adapter actually runs. A copy in the
+/// test would let the two drift and the certification would mean nothing.
+///
+/// Strictly greater, matching `scan_prefix`'s seed of the bare prefix — a key
+/// exactly equal to the prefix is never scanned and must not count toward the
+/// ceiling. The projection stays `count(*)` over indexed columns only: adding
+/// any reference to `value` costs the covering index and turns a 0.056 ms /
+/// 19 KB read into a 55 ms / 48 MB one (§1.1).
+const CURSOR_RELEVANT_KEY_COUNT_SQL: &str =
+    "SELECT count(*) FROM cursorDiskKV WHERE key > ?1 AND key < ?2";
+
 fn count_relevant_keys(connection: &Connection) -> Result<usize> {
     let mut total = 0usize;
     for prefix in RELEVANT_PREFIXES {
         let count: i64 = connection
             .query_row(
-                // Strictly greater, matching scan_prefix's seed of the bare
-                // prefix — a key exactly equal to the prefix is never scanned
-                // and must not count toward the ceiling.
-                "SELECT count(*) FROM cursorDiskKV WHERE key > ?1 AND key < ?2",
+                CURSOR_RELEVANT_KEY_COUNT_SQL,
                 rusqlite::params![prefix, prefix_range_end(prefix)],
                 |row| row.get(0),
             )
@@ -1106,6 +1848,7 @@ fn scan_prefix(
     new_hashes: &mut BTreeMap<String, String>,
     records: &mut Vec<SyntheticRecord>,
     workspace_cache: &mut HashMap<String, Option<String>>,
+    ledger: &mut ScanLedger,
 ) -> Result<u64> {
     let range_end = prefix_range_end(prefix);
     let mut last_key = prefix.to_string();
@@ -1129,17 +1872,19 @@ fn scan_prefix(
                 ])
                 .context("prefix scan query failed")?;
             while let Some(row) = rows.next().context("prefix scan row failed")? {
-                let key = row.get::<_, String>(0).context("prefix scan key failed")?;
+                // This projection includes `value`, so the whole row is a
+                // payload read: the key bytes are materialized alongside it
+                // and are charged on the same axis. Cursor has no census read
+                // today (issue #601 §3.3 Change 1 adds one), so `census_rows`
+                // stays zero here rather than borrowing this read's rows.
+                ledger.charge_payload_row();
+                let key = take_payload_required_string(ledger, row, 0)
+                    .context("prefix scan key failed")?;
                 // Cursor writes JSON documents as TEXT even though the
                 // column is declared BLOB; accept any storage class instead
                 // of trusting the declared affinity.
-                let value = match row.get_ref(1).context("prefix scan value failed")? {
-                    ValueRef::Null => None,
-                    ValueRef::Text(text) => Some(text.to_vec()),
-                    ValueRef::Blob(blob) => Some(blob.to_vec()),
-                    ValueRef::Integer(int) => Some(int.to_string().into_bytes()),
-                    ValueRef::Real(real) => Some(real.to_string().into_bytes()),
-                };
+                let value =
+                    take_payload_blob(ledger, row, 1).context("prefix scan value failed")?;
                 page_bytes += value.as_ref().map_or(0, Vec::len);
                 page.push((key, value));
                 if page_bytes >= SCAN_PAGE_MAX_BYTES {
@@ -1159,7 +1904,7 @@ fn scan_prefix(
             let unchanged = prior_hashes.get(&key) == Some(&hash);
             if !unchanged && !bytes.is_empty() {
                 if let Some(mut record) = synthesize_cursor_sqlite_record(&key, &bytes) {
-                    stamp_bubble_workspace(connection, workspace_cache, &mut record);
+                    stamp_bubble_workspace(connection, workspace_cache, &mut record, ledger);
                     records.push(record);
                 }
             }
@@ -1388,6 +2133,7 @@ fn stamp_bubble_workspace(
     connection: &Connection,
     cache: &mut HashMap<String, Option<String>>,
     synthetic: &mut SyntheticRecord,
+    ledger: &mut ScanLedger,
 ) {
     let Some(record) = synthetic.record.as_object_mut() else {
         return;
@@ -1399,10 +2145,16 @@ fn stamp_bubble_workspace(
         return;
     };
     let composer_id = composer_id.to_string();
-    let workspace = cache
-        .entry(composer_id.clone())
-        .or_insert_with(|| lookup_composer_workspace(connection, &composer_id))
-        .clone();
+    let workspace = match cache.get(&composer_id) {
+        Some(cached) => cached.clone(),
+        None => {
+            // A cache miss is a real second payload read of the composer blob
+            // (up to 2.4 MB on the reference host) and is charged as one.
+            let resolved = lookup_composer_workspace(connection, &composer_id, ledger);
+            cache.insert(composer_id.clone(), resolved.clone());
+            resolved
+        }
+    };
     if let Some(path) = workspace {
         record.insert("workspacePath".to_string(), json!(path));
     }
@@ -1412,18 +2164,28 @@ fn stamp_bubble_workspace(
 /// parent `composerData:` blob. Works even for composers the synthesizer
 /// defers (no positive `createdAt` yet): Cursor writes the workspace
 /// identifier at creation. Any failure resolves to `None`.
-fn lookup_composer_workspace(connection: &Connection, composer_id: &str) -> Option<String> {
-    let bytes: Vec<u8> = connection
-        .query_row(
-            "SELECT value FROM cursorDiskKV WHERE key = ?1",
-            rusqlite::params![format!("composerData:{composer_id}")],
-            |row| match row.get_ref(0)? {
-                ValueRef::Text(text) => Ok(text.to_vec()),
-                ValueRef::Blob(blob) => Ok(blob.to_vec()),
-                _ => Ok(Vec::new()),
-            },
-        )
-        .ok()?;
+fn lookup_composer_workspace(
+    connection: &Connection,
+    composer_id: &str,
+    ledger: &mut ScanLedger,
+) -> Option<String> {
+    // `query_row` holds the closure's borrow for its whole call, so the read
+    // is charged into a scratch ledger and folded in unconditionally — a row
+    // that materialized bytes and then failed to parse still cost them.
+    let mut row_ledger = ScanLedger::default();
+    let read = connection.query_row(
+        "SELECT value FROM cursorDiskKV WHERE key = ?1",
+        rusqlite::params![format!("composerData:{composer_id}")],
+        |row| {
+            row_ledger.charge_payload_row();
+            Ok(take_payload_blob(&mut row_ledger, row, 0)?.unwrap_or_default())
+        },
+    );
+    ledger.payload_rows = ledger.payload_rows.saturating_add(row_ledger.payload_rows);
+    ledger.payload_bytes = ledger
+        .payload_bytes
+        .saturating_add(row_ledger.payload_bytes);
+    let bytes: Vec<u8> = read.ok()?;
     let parsed: Value = serde_json::from_slice(&bytes).ok()?;
     parsed
         .pointer("/workspaceIdentifier/uri/fsPath")
@@ -1543,6 +2305,7 @@ fn truncate_chars_local(input: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
     use crate::model::RowBatch;
+    use crate::WorkTrigger;
     use moraine_config::SourceFormat;
     use serde_json::json;
     use std::path::{Path, PathBuf};
@@ -1690,6 +2453,7 @@ mod tests {
             format: SourceFormat::CursorSqlite,
             source_glob: String::new(),
             path: path.to_string_lossy().to_string(),
+            trigger: WorkTrigger::Watcher,
         }
     }
 
@@ -1715,8 +2479,25 @@ mod tests {
         checkpoints: &Arc<RwLock<HashMap<String, Checkpoint>>>,
         poll_state: &VolatilePollMap,
     ) -> Vec<RowBatch> {
+        run_poll_with_state_and_metrics(
+            work,
+            checkpoints,
+            poll_state,
+            &Arc::new(Metrics::default()),
+        )
+        .await
+    }
+
+    /// Shares one `Metrics` across several polls so a test can count the scans
+    /// that actually ran (`sqlite_scan_failures_total`) rather than the errors
+    /// that were reported, which are deliberately rate-limited.
+    async fn run_poll_with_state_and_metrics(
+        work: &WorkItem,
+        checkpoints: &Arc<RwLock<HashMap<String, Checkpoint>>>,
+        poll_state: &VolatilePollMap,
+        metrics: &Arc<Metrics>,
+    ) -> Vec<RowBatch> {
         let config = moraine_config::AppConfig::default();
-        let metrics = Arc::new(Metrics::default());
         let (sink_tx, mut sink_rx) = mpsc::channel::<SinkMessage>(64);
         let process = process_cursor_sqlite_db(
             &config,
@@ -1724,7 +2505,7 @@ mod tests {
             checkpoints.clone(),
             poll_state,
             sink_tx,
-            &metrics,
+            metrics,
         );
         tokio::pin!(process);
         let mut batches = Vec::new();
@@ -1800,6 +2581,648 @@ mod tests {
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{}", path.to_string_lossy(), suffix));
         }
+    }
+
+    fn payload_rows(metrics: &Arc<Metrics>) -> u64 {
+        metrics
+            .sqlite_poll_payload_rows_total
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn payload_bytes(metrics: &Arc<Metrics>) -> u64 {
+        metrics
+            .sqlite_poll_payload_bytes_total
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Issue #601 §2.5. The ladder itself — nothing asserted its shape, so
+    /// `failure_backoff` could return `Duration::MAX` for every non-zero `n`
+    /// with the whole suite still green. That is the latch class inverted: a
+    /// permanently broken database would never retry, and §2.5's stated
+    /// purpose for the cap ("recovery from an environmental fault never needs
+    /// a restart") could not fail.
+    ///
+    /// Fails for: replacing the body with a constant, dropping the doubling,
+    /// dropping `.min(31)` (`1u32 << 32` overflows in debug), or removing the
+    /// `FAILURE_BACKOFF_MAX` clamp.
+    #[test]
+    fn failure_backoff_doubles_from_the_base_and_saturates_at_the_cap() {
+        assert_eq!(
+            failure_backoff(0),
+            Duration::ZERO,
+            "no failures means retry immediately"
+        );
+        assert_eq!(failure_backoff(1), Duration::from_secs(15));
+        assert_eq!(failure_backoff(2), Duration::from_secs(30));
+        assert_eq!(failure_backoff(3), Duration::from_secs(60));
+        assert_eq!(failure_backoff(6), Duration::from_secs(15 * 32));
+        // 15 s * 2^6 = 960 s overshoots the 900 s ceiling, so n = 7 is the
+        // first genuinely clamped step rather than a coincidence.
+        assert!(Duration::from_secs(15 * 64) > FAILURE_BACKOFF_MAX);
+        assert_eq!(failure_backoff(7), FAILURE_BACKOFF_MAX);
+        assert_eq!(failure_backoff(60), FAILURE_BACKOFF_MAX);
+        // The shift clamp: without `.min(31)` this panics on overflow.
+        assert_eq!(failure_backoff(u32::MAX), FAILURE_BACKOFF_MAX);
+        assert_eq!(
+            FAILURE_BACKOFF_MAX,
+            Duration::from_secs(15 * 60),
+            "a permanently broken database still retries every 15 minutes"
+        );
+    }
+
+    /// Issue #601 §3.2 — the *contention* ladder's shape. It was mirrored from
+    /// the fault ladder above for its lower bound (it throttles) and its upper
+    /// bound (it does not latch), but not for its **width**, and only the base
+    /// was pinned — incidentally, through
+    /// `a_contended_replacement_replay_throttles_its_barrier`'s single
+    /// `age_for_tests(.., 16 s)` step. That test never reaches
+    /// `consecutive_contended_scans >= 3`, so everything above the first step
+    /// was free: `CONTENTION_BACKOFF_MAX` could be set to `FAILURE_BACKOFF_MAX`
+    /// — literally the fifteen minutes the constant's own doc says must not
+    /// happen — or collapsed onto the base so the ladder cannot grow at all, or
+    /// the doubling removed outright, with the whole suite green.
+    ///
+    /// Fails for: any of those three, moving the base, or dropping `.min(31)`
+    /// (`1u32 << 32` overflows in debug).
+    #[test]
+    fn contention_backoff_doubles_from_the_base_and_saturates_at_a_minute() {
+        assert_eq!(
+            contention_backoff(0),
+            Duration::ZERO,
+            "no contention means retry immediately"
+        );
+        assert_eq!(contention_backoff(1), Duration::from_secs(15));
+        assert_eq!(contention_backoff(2), Duration::from_secs(30));
+        // 15 s * 2^2 = 60 s meets the ceiling exactly, so n = 4 is the first
+        // genuinely clamped step rather than a coincidence.
+        assert_eq!(contention_backoff(3), Duration::from_secs(60));
+        assert!(Duration::from_secs(15 * 8) > CONTENTION_BACKOFF_MAX);
+        assert_eq!(contention_backoff(4), CONTENTION_BACKOFF_MAX);
+        assert_eq!(contention_backoff(60), CONTENTION_BACKOFF_MAX);
+        // The shift clamp: without `.min(31)` this panics on overflow.
+        assert_eq!(contention_backoff(u32::MAX), CONTENTION_BACKOFF_MAX);
+        assert_eq!(
+            CONTENTION_BACKOFF_MAX,
+            Duration::from_secs(60),
+            "a replacement database that is merely busy must become visible \
+             within a minute of the writer pausing"
+        );
+        assert!(
+            CONTENTION_BACKOFF_MAX < FAILURE_BACKOFF_MAX,
+            "…not within fifteen — the two ladders are separate precisely \
+             because contention is transient and self-clearing and a fault is \
+             not, so collapsing the ceilings together erases the distinction"
+        );
+    }
+
+    /// Issue #601 §2.5, the escalation the ladder exists for.
+    ///
+    /// The `clear(); record_failed_scan();` pair the blocked-replay path used
+    /// to run is indistinguishable from a single `record_failed_scan` *inside
+    /// one backoff window*, which is why a test driving ten retries in fifteen
+    /// seconds proved nothing. Backdating the entry's clock makes the
+    /// difference observable: after two failures the window is 30 s, so
+    /// sixteen seconds of elapsed time must **not** be enough.
+    ///
+    /// Fails for: resetting the streak on each failure (every window stays
+    /// 15 s, so the 16 s probe is due), or dropping the escalation entirely.
+    #[test]
+    fn repeated_failures_escalate_the_retry_window() {
+        let map = VolatilePollMap::new();
+        let key = "escalation-key";
+
+        map.record_failed_scan(key, 1);
+        assert_eq!(map.consecutive_failed_scans(key), 1);
+        assert!(
+            !map.failure_retry_due(key, 1),
+            "inside the first 15 s window"
+        );
+        map.age_for_tests(key, Duration::from_secs(16));
+        assert!(map.failure_retry_due(key, 1), "15 s window has expired");
+
+        map.record_failed_scan(key, 1);
+        assert_eq!(map.consecutive_failed_scans(key), 2);
+        map.age_for_tests(key, Duration::from_secs(16));
+        assert!(
+            !map.failure_retry_due(key, 1),
+            "the second window is 30 s, so 16 s is not yet due — this is the \
+             assertion a reset-to-1 bug fails"
+        );
+        map.age_for_tests(key, Duration::from_secs(16));
+        assert!(map.failure_retry_due(key, 1), "32 s > 30 s");
+
+        // And `clear` genuinely does restart the ladder: the defect the
+        // blocked-replay path shipped, pinned here so a reintroduction is a
+        // visible behavioral claim rather than an invisible one.
+        map.record_failed_scan(key, 1);
+        assert_eq!(map.consecutive_failed_scans(key), 3);
+        map.clear(key);
+        map.record_failed_scan(key, 1);
+        assert_eq!(
+            map.consecutive_failed_scans(key),
+            1,
+            "clear() before record_failed_scan() resets the ladder — which is \
+             why `record_blocked_replay` must never do it"
+        );
+    }
+
+    /// Issue #601 §6 / §3.2. A mixed-snapshot rejection means the database was
+    /// being written while the scan read it. That is **contention**, not a
+    /// fault: it happens precisely when the source is active, which is when
+    /// prompt visibility matters most. Routing it into the 15 s → 15 min fault
+    /// ladder would regress active-session freshness by up to fifteen minutes,
+    /// and the mitigation the spec pairs with that ("smaller scans make retries
+    /// rare") is WI-07/WI-08 and does not exist yet.
+    ///
+    /// Fails for: routing `sqlite_mixed_snapshot` through the fault ladder, or
+    /// making the exemption swallow a genuine fault's streak.
+    #[test]
+    fn mixed_snapshot_rejection_does_not_escalate_the_failure_backoff() {
+        let stat = StatFingerprint::default();
+        let map = VolatilePollMap::new();
+        let key = "contended-key";
+
+        for _ in 0..5 {
+            map.record_scan_failure_outcome(key, 1, ERROR_KIND_MIXED_SNAPSHOT);
+        }
+        assert_eq!(
+            map.consecutive_failed_scans(key),
+            0,
+            "contention must not build a fault streak"
+        );
+        assert!(
+            !map.should_skip_poll(key, 1, &stat),
+            "a contended database retries at the ordinary poll cadence"
+        );
+
+        // A genuine fault still escalates, and a contended retry underneath it
+        // neither extends nor clears it.
+        map.record_scan_failure_outcome(key, 1, ERROR_KIND_SCHEMA);
+        map.record_scan_failure_outcome(key, 1, ERROR_KIND_SCHEMA);
+        assert_eq!(map.consecutive_failed_scans(key), 2);
+        map.record_scan_failure_outcome(key, 1, ERROR_KIND_MIXED_SNAPSHOT);
+        assert_eq!(
+            map.consecutive_failed_scans(key),
+            2,
+            "contention leaves a genuine fault ladder exactly where it was"
+        );
+        assert!(
+            map.should_skip_poll(key, 1, &stat),
+            "the fault ladder holds"
+        );
+    }
+
+    /// Issue #601 §3.2 / §2.5 — the classifier's **extent**, per error kind
+    /// rather than per outcome.
+    ///
+    /// `mixed_snapshot_rejection_does_not_escalate_the_failure_backoff` bounds
+    /// the predicate from beneath (the named kind is exempt) and at one
+    /// neighbour (`sqlite_schema_mismatch` is not). It does not bound the
+    /// width, and two of the four neighbours were open: widening to
+    /// `|| error_kind == ERROR_KIND_SCAN` and to
+    /// `|| error_kind == ERROR_KIND_TOO_LARGE` were both green. The first is
+    /// the expensive one — `sqlite_scan_error` is emitted at eleven of the
+    /// seventeen production failure sites — and it silently restores the exact
+    /// §2.5 defect: no fault streak, so `should_skip_poll` never backs off and
+    /// a full failed scan re-runs on every reconcile tick and every debounced
+    /// watcher event, while the durable barrier's throttle collapses from
+    /// fifteen minutes to sixty seconds.
+    ///
+    /// Every kind is asserted on both clocks *and* on the gate the clock
+    /// serves, so there is no neighbour left to widen into and no direction to
+    /// narrow in.
+    ///
+    /// Fails for: routing any fault kind to the contention clock, routing
+    /// `sqlite_mixed_snapshot` to the fault ladder, or collapsing the split.
+    #[test]
+    fn each_error_kind_routes_to_exactly_one_backoff_clock() {
+        let stat = StatFingerprint::default();
+
+        for kind in [
+            ERROR_KIND_OPEN,
+            ERROR_KIND_SCHEMA,
+            ERROR_KIND_TOO_LARGE,
+            ERROR_KIND_SCAN,
+        ] {
+            let map = VolatilePollMap::new();
+            let key = "fault-routing";
+            map.record_scan_failure_outcome(key, 1, kind);
+            assert_eq!(
+                map.consecutive_failed_scans(key),
+                1,
+                "{kind} is a fault and must climb the fault ladder"
+            );
+            assert_eq!(
+                map.consecutive_contended_scans(key),
+                0,
+                "{kind} is not contention and must not move the contention clock"
+            );
+            // The consequence, at the gate §2.5 exists to serve: with no fault
+            // streak the very next tick re-runs the whole failed scan.
+            assert!(
+                map.should_skip_poll(key, 1, &stat),
+                "{kind} must make the next ordinary poll back off"
+            );
+        }
+
+        let map = VolatilePollMap::new();
+        let key = "contention-routing";
+        map.record_scan_failure_outcome(key, 1, ERROR_KIND_MIXED_SNAPSHOT);
+        assert_eq!(
+            map.consecutive_failed_scans(key),
+            0,
+            "contention is the one kind exempt from the fault ladder (§3.2)"
+        );
+        assert_eq!(
+            map.consecutive_contended_scans(key),
+            1,
+            "…and the one kind that moves the contention clock"
+        );
+        assert!(
+            !map.should_skip_poll(key, 1, &stat),
+            "a contended database keeps scanning at the ordinary poll cadence"
+        );
+    }
+
+    /// Issue #601 §3.2 — the mixed-snapshot bracket's **extent**, one disjunct
+    /// at a time.
+    ///
+    /// The bracket is the production trigger for the entire contention
+    /// feature, and no test in any of the three adapters reached it through a
+    /// real disjunct: every one arms `contention_injection`, and
+    /// `forced_mixed_snapshot` short-circuits the rest of the expression. So
+    /// all three brackets could be reduced to the bare `#[cfg(test)]` hook —
+    /// deleting *both* real disjuncts — with the suite green in each adapter,
+    /// and dropping either one alone was green too.
+    ///
+    /// Why the guard is bounded here rather than through a live scan is
+    /// recorded on `snapshot_is_mixed` itself: a commit landing between a
+    /// scan's two `data_version` reads is not deterministically reachable, and
+    /// racing for it would give a probabilistic test that also cannot say which
+    /// disjunct fired.
+    ///
+    /// Fails for: dropping the `data_version` disjunct, dropping the stat
+    /// disjunct, or widening the predicate to fire unconditionally.
+    #[test]
+    fn the_mixed_snapshot_bracket_fires_on_a_moved_data_version_and_on_a_moved_stat() {
+        let path = unique_db_path("mixed-snapshot-extent");
+        std::fs::write(&path, b"a file standing in for a database").expect("seed probe file");
+        let db_path = path.to_string_lossy().to_string();
+        let opened = stat_fingerprint(&db_path).expect("the probe file exists");
+
+        // Upper bound: a quiet database is a clean scan. Widening the predicate
+        // to fire unconditionally dies here, and so does any rewrite that
+        // rejects a scan nothing touched.
+        assert!(
+            !snapshot_is_mixed(&db_path, 7, 7, opened),
+            "an unchanged data_version over an unchanged file is a clean scan"
+        );
+
+        // Lower bound A — a writer committed during the scan. `data_version`
+        // moved while the file did not: the WAL case, where the commit lands in
+        // the `-wal` and a coarse-resolution stat can still compare equal.
+        assert!(
+            snapshot_is_mixed(&db_path, 7, 8, opened),
+            "a data_version that moved during the scan is a torn read"
+        );
+
+        // Lower bound B — the file moved under the scan while `data_version`
+        // did not: a checkpoint, a rotation, or a wholesale replacement.
+        std::fs::write(&path, b"a file standing in for a database, now longer")
+            .expect("grow the probe file");
+        let grown = stat_fingerprint(&db_path).expect("the probe file still exists");
+        assert_ne!(
+            grown, opened,
+            "the probe must actually move the fingerprint, or bound B proves nothing"
+        );
+        assert!(
+            snapshot_is_mixed(&db_path, 7, 7, opened),
+            "a file that changed under the scan is a torn read even when \
+             data_version did not move"
+        );
+
+        cleanup(&path);
+    }
+
+    /// Issue #601 §2.0. The ledger is **caller-owned** precisely so that a scan
+    /// which reads 48 MB and then loses the mixed-snapshot race is still
+    /// charged for what it read. Nothing asserted that: every ledger test
+    /// destructured `Scanned` and panicked otherwise, so resetting the ledger
+    /// on any failure arm left the suite green and the guarantee unverified.
+    ///
+    /// This drives the one post-read failure arm Cursor has. The contention is
+    /// **injected**, not raced for: the bracket sits after the paged read, so
+    /// arming it reproduces exactly the state a writer committing mid-scan
+    /// produces — a full ledger and a rejected outcome — without the retry loop
+    /// the earlier version needed, which could fail for reasons unrelated to
+    /// the code it guards.
+    ///
+    /// Fails for: resetting or rebuilding the ledger on the mixed-snapshot
+    /// return.
+    #[test]
+    fn a_failed_scan_still_reports_the_bytes_it_had_already_read() {
+        let path = unique_db_path("failure-arm-ledger");
+        let db = create_kv_db(&path);
+        db.execute_batch("BEGIN").expect("begin seed");
+        for idx in 0..8 {
+            put(
+                &db,
+                &format!("bubbleId:{COMPOSER_ID}:seed{idx:04}"),
+                &json!({"_v": 3, "type": 1, "bubbleId": USER_BUBBLE_ID,
+                        "createdAt": "2026-05-08T02:04:37.835Z",
+                        "text": "y".repeat(96 * 1024)}),
+            );
+        }
+        db.execute_batch("COMMIT").expect("commit seed");
+        drop(db);
+
+        let db_path = path.to_string_lossy().to_string();
+        contention_injection::arm(&db_path, 1);
+        let mut ledger = ScanLedger::default();
+        let outcome = scan_database(&db_path, &CursorState::fresh(), &mut ledger);
+        assert!(
+            matches!(
+                outcome,
+                ScanOutcome::Failed {
+                    error_kind: ERROR_KIND_MIXED_SNAPSHOT,
+                    ..
+                }
+            ),
+            "the armed scan must reach the mixed-snapshot arm; without observing \
+             the arm this test proves nothing"
+        );
+        assert!(
+            ledger.payload_rows > 0,
+            "the rejected scan had already read rows"
+        );
+        assert!(
+            ledger.payload_bytes > 64 * 1024,
+            "and it must still be charged for the bytes it read; got {}",
+            ledger.payload_bytes
+        );
+
+        // Armings are one-shot and path-keyed: the very next scan of the same
+        // database succeeds, so nothing leaks into another test.
+        let mut clean = ScanLedger::default();
+        assert!(matches!(
+            scan_database(&db_path, &CursorState::fresh(), &mut clean),
+            ScanOutcome::Scanned { .. }
+        ));
+
+        cleanup(&path);
+    }
+
+    /// Issue #601 §2.5 / §3.2. Mixed-snapshot rejections are exempt from the
+    /// **fault ladder**; they must never be exempt from the **replay throttle**.
+    ///
+    /// A replacement replay is the longest scan an adapter runs — cold, whole
+    /// database — so it is the scan most likely to lose the `data_version`/stat
+    /// bracket in the first place. Its `Failed` arm emits a durable
+    /// `BlockReplay` plus an append-only `ingest_errors` row, and the next tick
+    /// sees `retry_blocked_replay` true with `starts_replacement` false (the
+    /// blocked checkpoint carries the current inode and exclusions hash). If
+    /// the exemption leaves no clock behind, `failure_retry_due` says "due" and
+    /// the pre-barrier throttle never fires: `BeginReplay` + full cold scan +
+    /// `BlockReplay` + one error row **per poll, forever**, at the reconcile
+    /// cadence and on every 50 ms-debounced watcher event.
+    ///
+    /// Driven through an actual replay rather than `VolatilePollMap` directly,
+    /// because the barrier — not the map — is what was unguarded.
+    ///
+    /// Fails for: `record_scan_failure_outcome` returning without recording
+    /// anything for `ERROR_KIND_MIXED_SNAPSHOT`, or `failure_retry_due`
+    /// ignoring the contention clock.
+    #[tokio::test]
+    async fn a_contended_replacement_replay_throttles_its_barrier() {
+        let path = unique_db_path("contended-replay-barrier");
+        let _db = seed_fixture_db(&path);
+        let work = sqlite_work(&path);
+        let db_path = work.path.clone();
+        let cp_key = checkpoint_key(&work.source_name, &work.path);
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let poll_state = VolatilePollMap::new();
+        let metrics = Arc::new(Metrics::default());
+
+        // Cold poll commits a checkpoint under the default exclusion policy.
+        run_poll_with_state_and_metrics(&work, &checkpoints, &poll_state, &metrics).await;
+        assert!(checkpoints.read().await.contains_key(&cp_key));
+
+        // Changing the exclusion set starts a replacement replay. Every scan
+        // from here loses the mixed-snapshot bracket, as a busy database's
+        // cold re-read would.
+        let mut replaying = moraine_config::AppConfig::default();
+        replaying.ingest.exclude_project_dirs = vec!["/no/such/dir/**".to_string()];
+        contention_injection::arm(&db_path, 64);
+        let block_poll = |config: moraine_config::AppConfig| {
+            let work = work.clone();
+            let checkpoints = checkpoints.clone();
+            let poll_state = poll_state.clone();
+            let metrics = metrics.clone();
+            async move { run_replay_poll(&config, &work, &checkpoints, &poll_state, &metrics).await }
+        };
+
+        assert!(
+            block_poll(replaying.clone()).await,
+            "the contended replay blocks durably"
+        );
+        assert_eq!(
+            poll_state.consecutive_failed_scans(&cp_key),
+            0,
+            "contention must not climb the fault ladder (§3.2)"
+        );
+        assert_eq!(
+            poll_state.consecutive_contended_scans(&cp_key),
+            1,
+            "…but it must leave a clock behind"
+        );
+
+        // The retry is throttled: no barrier, no scan, no second error row.
+        let scans_before = payload_rows(&metrics);
+        assert!(
+            !block_poll(replaying.clone()).await,
+            "a contended blocked replay must not re-send BeginReplay/BlockReplay \
+             on the very next tick"
+        );
+        assert_eq!(
+            payload_rows(&metrics),
+            scans_before,
+            "and must not re-read the whole database either"
+        );
+
+        // Ten more ticks change nothing — this is the "per poll, forever" shape.
+        for _ in 0..10 {
+            assert!(!block_poll(replaying.clone()).await);
+        }
+        assert_eq!(payload_rows(&metrics), scans_before);
+
+        // Once the contention window expires the retry runs again, so recovery
+        // is not sacrificed: the clock throttles, it does not latch.
+        poll_state.age_for_tests(&cp_key, Duration::from_secs(16));
+        assert!(
+            block_poll(replaying).await,
+            "an expired contention window must let the replay retry"
+        );
+        assert_eq!(
+            poll_state.consecutive_failed_scans(&cp_key),
+            0,
+            "still not a fault"
+        );
+        assert_eq!(poll_state.consecutive_contended_scans(&cp_key), 2);
+
+        contention_injection::disarm(&db_path);
+        cleanup(&path);
+    }
+
+    /// Issue #601 §3.2/§6 — the direction
+    /// `a_contended_replacement_replay_throttles_its_barrier` does **not**
+    /// bound. That test proves a contended *replay barrier* is throttled; this
+    /// one proves an ordinary poll of the same database is not, which is the
+    /// half the exemption exists for.
+    ///
+    /// The two clocks are read in different places on purpose:
+    /// `failure_retry_due` (the barrier) consults `last_contended_at`,
+    /// `should_skip_poll` (ordinary scans) deliberately does not. A database is
+    /// contended precisely because someone is writing to it, so throttling its
+    /// ordinary polls regresses freshness on the only sessions anyone is
+    /// watching. Nothing pinned that asymmetry at a **call site** — the
+    /// predicates could be asserted directly, but the short-circuits could not
+    /// — which is how the short-circuit comments were able to keep instructing
+    /// WI-04 to add §2.5's `|| !failure_retry_due` disjunct after §3.2 made it
+    /// outcome-changing. That disjunct puts the barrier's clock in front of
+    /// every ordinary poll.
+    ///
+    /// Fails for: adding `|| !poll_state.failure_retry_due(..)` to the cheap
+    /// no-change short-circuit (the second contended scan never runs, and the
+    /// writer's next edit stays invisible for up to 60 s), or moving the
+    /// contention clock into `should_skip_poll`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_ordinary_poll_of_a_contended_database_is_not_throttled() {
+        let path = unique_db_path("contended-ordinary-poll");
+        let db = seed_fixture_db(&path);
+        let work = sqlite_work(&path);
+        let db_path = work.path.clone();
+        let cp_key = checkpoint_key(&work.source_name, &work.path);
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let poll_state = VolatilePollMap::new();
+        let metrics = Arc::new(Metrics::default());
+
+        let cold =
+            run_poll_with_state_and_metrics(&work, &checkpoints, &poll_state, &metrics).await;
+        assert!(
+            !all_event_rows(&cold).is_empty(),
+            "the cold poll emits the fixture"
+        );
+
+        // The session is live. The writer commits, and the next two scans lose
+        // the mixed-snapshot bracket to it.
+        contention_injection::arm(&db_path, 2);
+        put(
+            &db,
+            &format!("bubbleId:{COMPOSER_ID}:{TOOL_BUBBLE_ID}"),
+            &tool_bubble_value("running", false),
+        );
+        run_poll_with_state_and_metrics(&work, &checkpoints, &poll_state, &metrics).await;
+        assert_eq!(
+            poll_state.consecutive_contended_scans(&cp_key),
+            1,
+            "the first scan is rejected by the bracket"
+        );
+        assert_eq!(
+            poll_state.consecutive_failed_scans(&cp_key),
+            0,
+            "contention is not a fault (§3.2)"
+        );
+
+        // Immediately — far inside the 15 s contention window the barrier is
+        // now serving — the next ordinary poll must still read the database.
+        put(
+            &db,
+            &format!("bubbleId:{COMPOSER_ID}:{THINKING_BUBBLE_ID}"),
+            &thinking_bubble_value(),
+        );
+        run_poll_with_state_and_metrics(&work, &checkpoints, &poll_state, &metrics).await;
+        assert_eq!(
+            poll_state.consecutive_contended_scans(&cp_key),
+            2,
+            "an ordinary poll of a contended database must not be throttled — \
+             the second scan has to run at the ordinary poll cadence"
+        );
+        assert_eq!(
+            metrics
+                .sqlite_scan_failures_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "…and must reach the scan, not return before it"
+        );
+
+        // The writer's edit lands and the contention clears. This poll is still
+        // well inside the contention window, and it is the poll that makes an
+        // active session visible.
+        contention_injection::disarm(&db_path);
+        put(
+            &db,
+            &format!("bubbleId:{COMPOSER_ID}:{TOOL_BUBBLE_ID}"),
+            &tool_bubble_value("completed", true),
+        );
+        let fresh =
+            run_poll_with_state_and_metrics(&work, &checkpoints, &poll_state, &metrics).await;
+        assert_eq!(
+            event_uid_by_kind(&all_event_rows(&fresh), "tool_result").len(),
+            1,
+            "a contended database's next write must be visible at the ordinary \
+             poll cadence, not after a 60 s barrier backoff"
+        );
+
+        cleanup(&path);
+    }
+
+    /// Issue #601 §1.1. `count_relevant_keys` is Cursor's only census-shaped
+    /// read today: two range scans over the unique `key` index, measured at
+    /// 0.056 ms / 19 KB for 247 keys on the reference host **because the index
+    /// covers them**. Nothing pinned that, so the same statement degrading to
+    /// a table scan — 48 MB and 55 ms on that host — would be invisible.
+    ///
+    /// It stays a scalar aggregate, so by the `ScanLedger` charging rules it
+    /// materializes no row and is charged on neither axis. This plan assertion
+    /// is what keeps that silence honest rather than an unstated cost; see the
+    /// matching note on `ledger_charges_payload_bytes_at_the_read_site`.
+    ///
+    /// Fails for: widening the count's projection or predicate such that
+    /// SQLite stops using the covering index.
+    #[test]
+    fn cursor_relevant_key_count_is_a_covering_index_scan() {
+        let path = unique_db_path("census-plan");
+        let db = seed_fixture_db(&path);
+
+        for prefix in RELEVANT_PREFIXES {
+            let plan: Vec<String> = {
+                let mut stmt = db
+                    .prepare(&format!(
+                        "EXPLAIN QUERY PLAN {CURSOR_RELEVANT_KEY_COUNT_SQL}"
+                    ))
+                    .expect("prepare explain");
+                let rows = stmt
+                    .query_map(rusqlite::params![prefix, prefix_range_end(prefix)], |row| {
+                        row.get::<_, String>(3)
+                    })
+                    .expect("query plan");
+                rows.map(|row| row.expect("plan detail")).collect()
+            };
+            let detail = plan.join("; ");
+            assert!(
+                detail.contains("COVERING INDEX"),
+                "the relevant-key census must stay index-covered for {prefix}; \
+                 plan was: {detail}"
+            );
+            assert!(
+                !detail.contains("SCAN cursorDiskKV"),
+                "the census must never degrade to a table scan for {prefix}; \
+                 plan was: {detail}"
+            );
+        }
+
+        drop(db);
+        cleanup(&path);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2235,26 +3658,71 @@ mod tests {
         cleanup(&path);
     }
 
+    /// Issue #601 §8. `second.is_empty()` alone is satisfied *equally* by the
+    /// cheap stat short-circuit and by a complete re-scan that finds nothing —
+    /// deleting the `state.stat == current_stat` short-circuit left this test
+    /// green, which made it a guard that could not fail for the property it is
+    /// named after. `sqlite_poll_payload_rows_total` is the instrument that
+    /// distinguishes them: a poll that short-circuited read no rows.
+    ///
+    /// **[DIVERGENT FIXTURE]** each poll gets a *fresh* `VolatilePollMap`, so
+    /// the issue-#443 volatile short-circuit cannot stand in for the durable
+    /// one and mask the mutation.
+    ///
+    /// Fails for: deleting the `state.stat == current_stat` short-circuit.
     #[tokio::test(flavor = "multi_thread")]
     async fn unchanged_db_is_a_noop_on_the_next_poll() {
         let path = unique_db_path("noop");
         let _db = seed_fixture_db(&path);
         let work = sqlite_work(&path);
         let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let metrics = Arc::new(Metrics::default());
 
-        let first = run_poll(&work, &checkpoints).await;
+        let first =
+            run_poll_with_state_and_metrics(&work, &checkpoints, &VolatilePollMap::new(), &metrics)
+                .await;
         assert!(!first.is_empty());
+        let read_after_first = payload_rows(&metrics);
+        let bytes_after_first = payload_bytes(&metrics);
+        assert!(
+            read_after_first > 0 && bytes_after_first > 0,
+            "the cold poll must actually read rows and bytes, or the comparison \
+             below is vacuous"
+        );
 
-        let second = run_poll(&work, &checkpoints).await;
+        let second =
+            run_poll_with_state_and_metrics(&work, &checkpoints, &VolatilePollMap::new(), &metrics)
+                .await;
         assert!(
             second.is_empty(),
             "unchanged database must produce zero batches; got {}",
             second.len()
         );
+        assert_eq!(
+            payload_rows(&metrics),
+            read_after_first,
+            "an unchanged database must not be re-read at all — zero batches is \
+             also what a full re-scan finding nothing produces"
+        );
+        assert_eq!(
+            payload_bytes(&metrics),
+            bytes_after_first,
+            "both axes: rows cannot catch content growth, bytes cannot catch a \
+             scan of narrow rows"
+        );
 
         cleanup(&path);
     }
 
+    /// Issue #601 §8 and issue #443. Every "sends nothing" assertion here is
+    /// also satisfied by a full re-scan that finds nothing, so each step now
+    /// states what it read as well as what it sent — that is the only way the
+    /// two short-circuits (durable stat, volatile stat coverage) become
+    /// mutation-provable at all.
+    ///
+    /// Fails for: deleting the `state.stat == current_stat` short-circuit
+    /// (the fifth poll re-reads), or deleting the `should_skip_poll` call (the
+    /// third poll re-reads).
     #[tokio::test(flavor = "multi_thread")]
     async fn irrelevant_write_scans_but_persists_no_checkpoint() {
         let path = unique_db_path("noop-checkpoint");
@@ -2262,8 +3730,10 @@ mod tests {
         let work = sqlite_work(&path);
         let checkpoints = Arc::new(RwLock::new(HashMap::new()));
         let poll_state = VolatilePollMap::new();
+        let metrics = Arc::new(Metrics::default());
 
-        let first = run_poll_with_state(&work, &checkpoints, &poll_state).await;
+        let first =
+            run_poll_with_state_and_metrics(&work, &checkpoints, &poll_state, &metrics).await;
         assert!(!first.is_empty());
         let cp_key = checkpoint_key(&work.source_name, &work.path);
         let baseline = checkpoints
@@ -2272,24 +3742,40 @@ mod tests {
             .get(&cp_key)
             .cloned()
             .expect("committed checkpoint after first poll");
+        let read_after_first = payload_rows(&metrics);
+        assert!(read_after_first > 0);
 
         // Cursor constantly rewrites non-transcript keys (issue #443): the
         // stat fingerprint moves but no relevant key changes.
         put(&db, "agentKv:blob:0000", &json!({"opaque": "blob"}));
 
-        let second = run_poll_with_state(&work, &checkpoints, &poll_state).await;
+        let second =
+            run_poll_with_state_and_metrics(&work, &checkpoints, &poll_state, &metrics).await;
         assert!(
             second.is_empty(),
             "a no-op scan must send nothing durable; got {} batches",
             second.len()
         );
+        let read_after_second = payload_rows(&metrics);
+        assert!(
+            read_after_second > read_after_first,
+            "the stat moved, so this poll genuinely re-scanned — the test name's \
+             'scans but persists no checkpoint' has to be observable"
+        );
 
         // The same stat fingerprint is now covered by volatile state, so a
-        // re-poll without further writes also sends nothing.
-        let third = run_poll_with_state(&work, &checkpoints, &poll_state).await;
+        // re-poll without further writes also sends nothing *and reads
+        // nothing*.
+        let third =
+            run_poll_with_state_and_metrics(&work, &checkpoints, &poll_state, &metrics).await;
         assert!(
             third.is_empty(),
             "volatile stat coverage must short-circuit"
+        );
+        assert_eq!(
+            payload_rows(&metrics),
+            read_after_second,
+            "volatile coverage must skip the scan, not just its output"
         );
 
         // A relevant write below the backoff threshold is picked up
@@ -2299,7 +3785,8 @@ mod tests {
             &format!("bubbleId:{COMPOSER_ID}:{TOOL_BUBBLE_ID}"),
             &tool_bubble_value("completed", true),
         );
-        let fourth = run_poll_with_state(&work, &checkpoints, &poll_state).await;
+        let fourth =
+            run_poll_with_state_and_metrics(&work, &checkpoints, &poll_state, &metrics).await;
         let rows = all_event_rows(&fourth);
         assert_eq!(event_uid_by_kind(&rows, "tool_result").len(), 1);
         let cp = fourth
@@ -2310,6 +3797,20 @@ mod tests {
             cp.last_offset,
             baseline.last_offset + 1,
             "poll sequence advances once for the relevant change, not per WAL touch"
+        );
+
+        // The emitting scan cleared the volatile entry, so only the *durable*
+        // stat short-circuit can suppress this last poll. It is the arm the
+        // volatile map cannot stand in for.
+        let read_after_fourth = payload_rows(&metrics);
+        let fifth =
+            run_poll_with_state_and_metrics(&work, &checkpoints, &poll_state, &metrics).await;
+        assert!(fifth.is_empty());
+        assert_eq!(
+            payload_rows(&metrics),
+            read_after_fourth,
+            "with no volatile entry left, the durable stat short-circuit is the \
+             only thing that can stop the re-read"
         );
 
         cleanup(&path);
@@ -2328,12 +3829,15 @@ mod tests {
             !map.should_skip_poll(key, 1, &stat(1)),
             "no volatile state yet"
         );
-        map.record_failed_scan(key);
+        map.record_failed_scan(key, 1);
         assert!(
-            !map.should_skip_poll(key, 1, &stat(1)),
-            "a failed scan without a streak leaves retries unthrottled"
+            map.should_skip_poll(key, 1, &stat(1)),
+            "a first failed scan, with no prior entry, still starts a backoff \
+             (issue #601 §2.5 — this assertion is the inverse of the one it \
+             replaced, which pinned the unthrottled retry as correct)"
         );
 
+        map.clear(key);
         map.record_noop_scan(key, 1, stat(1));
         assert!(
             map.should_skip_poll(key, 1, &stat(1)),
@@ -2355,24 +3859,674 @@ mod tests {
             "a new generation ignores stale volatile state"
         );
 
-        // A failed scan on an established streak refreshes the backoff clock
-        // (streak and coverage untouched), keeping a persistently failing
-        // stat-noisy database on the throttled cadence.
-        map.record_failed_scan(key);
+        // A failed scan on an established streak keeps the database throttled
+        // and drops the covered stat: a failure covered nothing, so claiming
+        // coverage would suppress rescans of an unchanged file permanently
+        // instead of for the backoff window.
+        map.record_failed_scan(key, 1);
         assert!(
             map.should_skip_poll(key, 1, &stat(5)),
             "failed scan keeps the throttle window open"
         );
+        // Asserted on the entry directly, because both a retained coverage
+        // claim and the failure backoff produce the same `should_skip_poll`
+        // answer here — a behavioral assertion could not tell them apart, and
+        // the difference is that the stat-covered arm has no time bound at all.
         assert!(
-            map.should_skip_poll(key, 1, &stat(3)),
-            "failed scan does not invalidate the covered stat"
+            map.lock()
+                .get(key)
+                .expect("failed scan creates an entry")
+                .stat
+                .is_none(),
+            "a failed scan covered nothing, so it must drop any covered stat: \
+             keeping one would suppress rescans of an unchanged file forever \
+             instead of for the backoff window, and an environmental failure \
+             (a lock, a permission) would never recover without a restart"
+        );
+        assert!(
+            !map.failure_retry_due(key, 1),
+            "a fresh failure is not due for another attempt"
+        );
+        assert!(
+            map.failure_retry_due(key, 2),
+            "a new generation is always due"
+        );
+
+        map.record_noop_scan(key, 1, stat(6));
+        assert!(
+            map.failure_retry_due(key, 1),
+            "a successful no-op scan clears the failure streak"
         );
 
         map.clear(key);
         assert!(
+            map.failure_retry_due(key, 1),
+            "an absent entry is always due, so a restart inherits no suppression"
+        );
+        assert!(
             !map.should_skip_poll(key, 1, &stat(4)),
             "a durable checkpoint write clears the throttle"
         );
+    }
+
+    /// Issue #601 §3.2 — the **width** of `record_noop_scan`'s contention
+    /// reset. A clean scan proves the contention passed, so it must clear the
+    /// contention *ladder*, not only the clock the ladder is measured from.
+    ///
+    /// The reset is unobservable at the moment it happens:
+    /// `consecutive_contended_scans` is read in exactly one place —
+    /// `failure_retry_due`'s `Some(last_contended_at)` arm — and that arm is
+    /// unreachable while the clock is `None`. So deleting the reset changes
+    /// nothing until contention returns, at which point `record_contended_scan`
+    /// increments from a **stale** streak and the durable replay barrier
+    /// resumes part-way up the ladder (here: the 60 s ceiling) instead of at
+    /// its 15 s base. A replacement replay of a store that was busy an hour ago
+    /// and is busy again now would wait a minute per attempt from the first
+    /// rejection.
+    ///
+    /// **[DIVERGENT FIXTURE]** the streak is walked to 3 before the clean scan,
+    /// so the base window and the ceiling are distinguishable; from a streak of
+    /// 1 a reset and a stale value give the same answer.
+    ///
+    /// Fails for: dropping `entry.consecutive_contended_scans = 0` from
+    /// `record_noop_scan`.
+    #[test]
+    fn a_clean_scan_resets_the_contention_ladder_not_only_its_clock() {
+        let map = VolatilePollMap::new();
+        let key = "cursor-sqlite-test:contention-ladder-reset";
+        let stat = |db_len: u64| StatFingerprint {
+            db_len,
+            ..Default::default()
+        };
+
+        // Three consecutive rejections: the next barrier window is the 60 s
+        // ceiling, which is what makes a stale streak visible.
+        map.record_contended_scan(key, 1);
+        map.record_contended_scan(key, 1);
+        map.record_contended_scan(key, 1);
+        assert_eq!(map.consecutive_contended_scans(key), 3);
+        map.age_for_tests(key, Duration::from_secs(31));
+        assert!(
+            !map.failure_retry_due(key, 1),
+            "the fixture must sit deep enough in the ladder that the base \
+             window and the ceiling differ, or this guard cannot fail"
+        );
+
+        map.record_noop_scan(key, 1, stat(1));
+        assert_eq!(
+            map.consecutive_contended_scans(key),
+            0,
+            "a scan that completed cleanly resets the ladder, not only its clock"
+        );
+
+        // …so the next rejection is a first rejection, and its window is the
+        // 15 s base rather than the ceiling the stale streak would have kept.
+        map.record_contended_scan(key, 1);
+        assert!(
+            !map.failure_retry_due(key, 1),
+            "a fresh rejection still throttles the durable barrier"
+        );
+        map.age_for_tests(key, Duration::from_secs(16));
+        assert!(
+            map.failure_retry_due(key, 1),
+            "one rejection buys a 15 s window; resuming from a stale streak \
+             would hold the barrier for up to CONTENTION_BACKOFF_MAX instead"
+        );
+    }
+
+    /// Issue #601 §2.1(2) — the **narrowing** width of `retry_blocked_replay`,
+    /// at the Cursor site. Plan §7.2 F2 records the widening (dropping
+    /// `&& !block_reason.is_empty()`); this is the other direction, and it is
+    /// the worse one.
+    ///
+    /// `checkpoint.status == "replaying"` is not covered by the `"error"`
+    /// disjunct: a process that dies between `BeginReplay` and
+    /// `FinalizeReplay` leaves a checkpoint that is `replaying` with **no**
+    /// error status and **no** block reason. Delete the disjunct and that
+    /// checkpoint is treated as an ordinary poll — `replacement_replay` is
+    /// false, the cursor is not reset, no barrier is re-sent, the status is
+    /// quietly rewritten to `active`, and the interrupted replay never
+    /// completes. Since round 8 this predicate also feeds the blocked-replay
+    /// throttle gates, so its width is load-bearing for code this PR adds.
+    ///
+    /// **[DIVERGENT FIXTURE]** the stat is deliberately left unchanged since
+    /// the cold poll, so the cheap short-circuit is armed. That is what a
+    /// crashed replay actually looks like — nothing wrote to the database while
+    /// the process was down — and it is what makes the two behaviours diverge:
+    /// with the disjunct the state is reset and the scan runs, without it the
+    /// unchanged stat returns early.
+    ///
+    /// Fails for: dropping the `checkpoint.status == "replaying"` disjunct from
+    /// `retry_blocked_replay`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_crash_interrupted_replay_resumes_from_its_replaying_status() {
+        let path = unique_db_path("replaying-status-resume");
+        let _db = seed_fixture_db(&path);
+        let work = sqlite_work(&path);
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let poll_state = VolatilePollMap::new();
+
+        run_poll_with_state(&work, &checkpoints, &poll_state).await;
+        let cp_key = checkpoint_key(&work.source_name, &work.path);
+
+        // Exactly what a crash between `BeginReplay` and `FinalizeReplay`
+        // leaves behind: `replaying`, no error, no block reason.
+        {
+            let mut map = checkpoints.write().await;
+            let checkpoint = map
+                .get_mut(&cp_key)
+                .expect("first poll commits a checkpoint");
+            checkpoint.status = "replaying".to_string();
+            checkpoint.block_reason.clear();
+            checkpoint.final_scan_complete = false;
+        }
+
+        run_poll_with_state(&work, &checkpoints, &poll_state).await;
+
+        let after = checkpoints
+            .read()
+            .await
+            .get(&cp_key)
+            .cloned()
+            .expect("checkpoint survives the retry");
+        assert_eq!(
+            after.status, "active",
+            "an interrupted replay must resume and finish, not be relabelled"
+        );
+        assert!(
+            after.final_scan_complete,
+            "a resumed replay finalizes; without the `replaying` disjunct the \
+             poll returns on the unchanged stat and the source is stuck"
+        );
+
+        cleanup(&path);
+    }
+
+    fn scan_failures(metrics: &Arc<Metrics>) -> u64 {
+        metrics
+            .sqlite_scan_failures_total
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Gate G6b, issue #601 §2.5. A database whose **first** scan fails has
+    /// **no prior volatile entry** — precisely the case `record_failed_scan`
+    /// was a no-op for, so the full failed scan re-ran on every reconcile tick
+    /// and every debounced watcher event, forever.
+    ///
+    /// Denominated on an **observed scan count**, never on absence of
+    /// `ingest_errors` rows: those are rate-limited by `state.last_error`, so a
+    /// test asserting on them (as
+    /// `schema_mismatch_emits_one_error_and_preserves_cursor` does) stays green
+    /// no matter how many scans ran.
+    ///
+    /// Fails for: reverting `record_failed_scan` to its `get_mut`-only form, or
+    /// dropping the failure arm from `should_skip_poll`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_scan_backs_off_instead_of_rescanning_every_tick() {
+        let path = unique_db_path("failure-backoff-first-scan");
+        let db = Connection::open(&path).expect("create db");
+        db.execute_batch("CREATE TABLE unrelated (id INTEGER PRIMARY KEY);")
+            .expect("create unrelated table");
+        drop(db);
+
+        let work = sqlite_work(&path);
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let poll_state = VolatilePollMap::new();
+        let metrics = Arc::new(Metrics::default());
+
+        for _ in 0..10 {
+            run_poll_with_state_and_metrics(&work, &checkpoints, &poll_state, &metrics).await;
+        }
+
+        assert!(
+            scan_failures(&metrics) >= 1,
+            "the first tick must actually attempt the scan"
+        );
+        assert!(
+            scan_failures(&metrics) <= 2,
+            "10 ticks against a database whose first scan fails must not run 10 \
+             scans; observed {}",
+            scan_failures(&metrics)
+        );
+
+        cleanup(&path);
+    }
+
+    /// The second shape `record_failed_scan` was a no-op for: a successful
+    /// emitting scan calls `poll_state.clear`, deleting the entry, so a failure
+    /// that follows one starts from no volatile state at all.
+    ///
+    /// Fails for: reverting `record_failed_scan` to its `get_mut`-only form.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failure_after_a_successful_scan_still_backs_off() {
+        let path = unique_db_path("failure-backoff-after-success");
+        let db = seed_fixture_db(&path);
+        let work = sqlite_work(&path);
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let poll_state = VolatilePollMap::new();
+        let metrics = Arc::new(Metrics::default());
+
+        let first =
+            run_poll_with_state_and_metrics(&work, &checkpoints, &poll_state, &metrics).await;
+        assert!(
+            !all_event_rows(&first).is_empty(),
+            "the first poll must emit, so the volatile entry is cleared"
+        );
+        assert_eq!(scan_failures(&metrics), 0);
+
+        // Same inode, so this is a schema failure rather than a replacement.
+        db.execute_batch("DROP TABLE cursorDiskKV;")
+            .expect("drop the relevant table");
+        drop(db);
+
+        for _ in 0..10 {
+            run_poll_with_state_and_metrics(&work, &checkpoints, &poll_state, &metrics).await;
+        }
+
+        assert!(scan_failures(&metrics) >= 1);
+        assert!(
+            scan_failures(&metrics) <= 2,
+            "a failure following an emitting scan must still back off; observed {}",
+            scan_failures(&metrics)
+        );
+
+        cleanup(&path);
+    }
+
+    /// Issue #601 §2.1(2): a durable `BeginReplay` barrier must never be sent
+    /// with no scan behind it. `should_skip_poll` runs *after* the barrier, and
+    /// a blocked-replay retry reuses its generation, so a volatile entry
+    /// covering the current stat could skip the scan while the barrier had
+    /// already been persisted — leaving the source stuck in `replaying`
+    /// forever, one barrier per tick.
+    ///
+    /// **[DIVERGENT FIXTURE]** the volatile entry must genuinely cover the
+    /// current stat; with an uncovered stat the skip never triggers and the two
+    /// behaviors coincide.
+    ///
+    /// Fails for: dropping the `!replacement_replay` guard on the
+    /// `should_skip_poll` call.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn blocked_replay_scans_behind_its_barrier() {
+        let path = unique_db_path("blocked-replay-scan");
+        let _db = seed_fixture_db(&path);
+        let work = sqlite_work(&path);
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let poll_state = VolatilePollMap::new();
+
+        run_poll_with_state(&work, &checkpoints, &poll_state).await;
+        let cp_key = checkpoint_key(&work.source_name, &work.path);
+
+        // Durably block the source, exactly as a failed replacement would.
+        let generation = {
+            let mut map = checkpoints.write().await;
+            let checkpoint = map
+                .get_mut(&cp_key)
+                .expect("first poll commits a checkpoint");
+            checkpoint.status = "error".to_string();
+            checkpoint.block_reason = "seeded blocked replay".to_string();
+            checkpoint.final_scan_complete = false;
+            checkpoint.source_generation
+        };
+
+        // And make the volatile entry claim the current stat as covered, which
+        // is the only state in which the post-barrier skip can fire.
+        let current_stat = stat_fingerprint(&work.path).expect("fixture stat");
+        poll_state.record_noop_scan(&cp_key, generation, current_stat);
+        assert!(
+            poll_state.should_skip_poll(&cp_key, generation, &current_stat),
+            "the fixture must actually reach the skip condition, or this guard \
+             cannot fail"
+        );
+
+        run_poll_with_state(&work, &checkpoints, &poll_state).await;
+
+        let after = checkpoints
+            .read()
+            .await
+            .get(&cp_key)
+            .cloned()
+            .expect("checkpoint survives the retry");
+        assert_eq!(
+            after.status, "active",
+            "a blocked replay retry must run its scan and finalize, not send a \
+             barrier and skip"
+        );
+        assert!(after.final_scan_complete);
+        assert!(after.block_reason.is_empty());
+
+        cleanup(&path);
+    }
+
+    /// Issue #601 §2.5. A replacement replay whose records cannot be normalized
+    /// enters a durably blocked state, and the retry that follows must climb
+    /// the failure ladder like any other repeat failure.
+    ///
+    /// It did not: the block arm ran `clear()` and then `record_failed_scan()`,
+    /// and `clear` deletes the entry so the `or_insert` beneath it restarted
+    /// the streak at 1 every single time. Because the trigger is a record
+    /// failing `normalize_record` — deterministic and content-driven, so it
+    /// recurs on every retry — the path was pinned at the 15 s floor forever:
+    /// a durable `BeginReplay` barrier plus a full re-read of the database,
+    /// every fifteen seconds, indefinitely.
+    ///
+    /// **[DIVERGENT FIXTURE]** an unknown harness makes `normalize_record` fail
+    /// for *every* record, which is what reaches the `replay_block_reason` arm
+    /// rather than the ordinary `Failed` arm; and the volatile clock is
+    /// backdated so the second and third windows are observable without
+    /// sleeping through 15 s + 30 s of real time.
+    ///
+    /// Fails for: restoring the `clear()` before the blocked-replay failure
+    /// record (the third probe becomes due and the retry runs).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn blocked_replay_retries_climb_the_failure_ladder() {
+        let path = unique_db_path("blocked-replay-ladder");
+        let _db = seed_fixture_db(&path);
+        // `normalize_record` rejects an unregistered harness outright, so every
+        // synthesized record fails and a replacement replay blocks durably.
+        let work = WorkItem {
+            harness: "not-a-registered-harness".to_string(),
+            ..sqlite_work(&path)
+        };
+        let cp_key = checkpoint_key(&work.source_name, &work.path);
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let poll_state = VolatilePollMap::new();
+        let metrics = Arc::new(Metrics::default());
+
+        // Cold poll commits a checkpoint under the default exclusion policy.
+        run_poll_with_state_and_metrics(&work, &checkpoints, &poll_state, &metrics).await;
+        assert!(checkpoints.read().await.contains_key(&cp_key));
+
+        // Changing the exclusion set starts a replacement replay, which cannot
+        // finish because nothing normalizes.
+        let mut replaying = moraine_config::AppConfig::default();
+        replaying.ingest.exclude_project_dirs = vec!["/no/such/dir/**".to_string()];
+        let block_poll = |config: moraine_config::AppConfig| {
+            let work = work.clone();
+            let checkpoints = checkpoints.clone();
+            let poll_state = poll_state.clone();
+            let metrics = metrics.clone();
+            async move { run_replay_poll(&config, &work, &checkpoints, &poll_state, &metrics).await }
+        };
+
+        let blocked = block_poll(replaying.clone()).await;
+        assert!(blocked, "the replacement replay must block durably");
+        assert_eq!(
+            poll_state.consecutive_failed_scans(&cp_key),
+            1,
+            "entering the blocked state starts the ladder"
+        );
+
+        // Inside the first 15 s window the retry is suppressed entirely.
+        let scans_before = payload_rows(&metrics);
+        assert!(!block_poll(replaying.clone()).await);
+        assert_eq!(
+            payload_rows(&metrics),
+            scans_before,
+            "throttled, no re-read"
+        );
+        assert_eq!(poll_state.consecutive_failed_scans(&cp_key), 1);
+
+        // 16 s later the first window has expired: the retry runs and the
+        // ladder climbs to 2, which means a 30 s window.
+        poll_state.age_for_tests(&cp_key, Duration::from_secs(16));
+        assert!(block_poll(replaying.clone()).await);
+        assert_eq!(
+            poll_state.consecutive_failed_scans(&cp_key),
+            2,
+            "a repeat block must extend the streak, not restart it"
+        );
+
+        // 16 s is no longer enough. This is the probe a reset-to-1 bug fails:
+        // pinned at the floor, the retry would be due and would run.
+        poll_state.age_for_tests(&cp_key, Duration::from_secs(16));
+        let scans_before = payload_rows(&metrics);
+        assert!(!block_poll(replaying.clone()).await);
+        assert_eq!(
+            payload_rows(&metrics),
+            scans_before,
+            "the second window is 30 s; a blocked replay must not re-read the \
+             whole database every 15 s forever"
+        );
+
+        // And it does recover once the wider window expires.
+        poll_state.age_for_tests(&cp_key, Duration::from_secs(20));
+        assert!(block_poll(replaying).await);
+        assert_eq!(poll_state.consecutive_failed_scans(&cp_key), 3);
+
+        cleanup(&path);
+    }
+
+    /// Runs one poll, acknowledging replay barriers, and reports whether the
+    /// poll sent a `BlockReplay` transition (i.e. whether it actually ran).
+    async fn run_replay_poll(
+        config: &moraine_config::AppConfig,
+        work: &WorkItem,
+        checkpoints: &Arc<RwLock<HashMap<String, Checkpoint>>>,
+        poll_state: &VolatilePollMap,
+        metrics: &Arc<Metrics>,
+    ) -> bool {
+        let (sink_tx, mut sink_rx) = mpsc::channel::<SinkMessage>(64);
+        let process = process_cursor_sqlite_db(
+            config,
+            work,
+            checkpoints.clone(),
+            poll_state,
+            sink_tx,
+            metrics,
+        );
+        tokio::pin!(process);
+        let mut blocked = None;
+        loop {
+            tokio::select! {
+                result = &mut process => {
+                    result.expect("cursor_sqlite replay poll should succeed");
+                    break;
+                }
+                message = sink_rx.recv() => match message.expect("replay sink remains open") {
+                    SinkMessage::Batch(_) => {}
+                    SinkMessage::BlockReplay { transition, ack } => {
+                        blocked = Some(transition.checkpoint.clone());
+                        let _ = ack.send(Ok(crate::publication::ReplayBarrierAck {
+                            checkpoint_revision: 1,
+                            operation_id: transition.checkpoint.operation_id,
+                        }));
+                    }
+                    SinkMessage::BeginReplay { transition, ack }
+                    | SinkMessage::MirrorCaughtUp { transition, ack } => {
+                        let _ = ack.send(Ok(crate::publication::ReplayBarrierAck {
+                            checkpoint_revision: 1,
+                            operation_id: transition.checkpoint.operation_id,
+                        }));
+                    }
+                    SinkMessage::FinalizeReplay { transition: _, ack } => {
+                        let _ = ack.send(Ok(
+                            crate::publication::FinalizeReplayOutcome::Published(
+                                crate::publication::PublicationAck {
+                                    checkpoint_revision: 2,
+                                    publication_revision: 1,
+                                    already_published: false,
+                                },
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+        while let Ok(SinkMessage::Batch(_)) = sink_rx.try_recv() {}
+        if let Some(cp) = blocked.clone() {
+            let key = checkpoint_key(&cp.source_name, &cp.source_file);
+            checkpoints.write().await.insert(key, cp);
+        }
+        blocked.is_some()
+    }
+
+    /// Issue #601 §2.0 / WI-01. Every cost budget in this issue is denominated
+    /// on `ScanLedger.payload_bytes`, so a ledger that charges anywhere other
+    /// than the point SQLite hands the bytes over makes all of them lies.
+    ///
+    /// **[DIVERGENT FIXTURE]** — every convenient proxy for "bytes read" is
+    /// made to disagree with the truth:
+    ///
+    /// - the composer's bulk sits in a field the synthesizer never copies, so
+    ///   emitted bytes are a small fraction of read bytes;
+    /// - one relevant key holds non-JSON ballast, so it is read in full and
+    ///   emits nothing — read rows and emitted rows genuinely differ;
+    /// - the second poll re-reads every byte and emits nothing, so a ledger
+    ///   charged at the emit site (or only on the changed branch) reports zero
+    ///   where the truth is unchanged.
+    ///
+    /// Fails for: charging from emitted records, charging only changed rows,
+    /// charging from a SQL-side `length()` expression, or dropping either the
+    /// row charge or the byte charge.
+    #[test]
+    fn ledger_charges_payload_bytes_at_the_read_site() {
+        let path = unique_db_path("ledger-read-site");
+        let db = create_kv_db(&path);
+
+        // 64 KiB the synthesizer reads and then throws away: `copy_fields`
+        // only lifts a fixed field list, and this is not on it.
+        let composer = json!({
+            "composerId": COMPOSER_ID,
+            "name": "Ledger read-site fixture",
+            "createdAt": 1_780_000_000_000i64,
+            "fullConversationHeadersOnly": [{"bubbleId": USER_BUBBLE_ID, "type": 1}],
+            "unreadBallast": "z".repeat(64 * 1024),
+        });
+        let composer_key = format!("composerData:{COMPOSER_ID}");
+        put(&db, &composer_key, &composer);
+
+        // A relevant key whose value is not JSON at all: read in full,
+        // synthesizes nothing. Emitted rows can never equal read rows here.
+        let junk = format!("not-json-{}", "q".repeat(32 * 1024));
+        let junk_key = format!("bubbleId:{COMPOSER_ID}:{TOOL_BUBBLE_ID}");
+        db.execute(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?1, ?2)",
+            rusqlite::params![junk_key, junk],
+        )
+        .expect("insert non-JSON kv row");
+        drop(db);
+
+        let composer_text = serde_json::to_string(&composer).expect("serialize composer");
+        let expected_bytes =
+            (composer_key.len() + composer_text.len() + junk_key.len() + junk.len()) as u64;
+        let db_path = path.to_string_lossy().to_string();
+
+        let mut ledger = ScanLedger::default();
+        let ScanOutcome::Scanned { new_state, .. } =
+            scan_database(&db_path, &CursorState::fresh(), &mut ledger)
+        else {
+            panic!("cold ledger scan should succeed");
+        };
+
+        assert_eq!(
+            ledger.payload_bytes, expected_bytes,
+            "payload bytes must be the exact key+value length SQLite materialized"
+        );
+        assert_eq!(ledger.payload_rows, 2, "both relevant keys were read");
+        assert_eq!(
+            ledger.rows_emitted, 1,
+            "only the composer synthesizes a record; the ballast key emits nothing"
+        );
+        assert!(
+            ledger.payload_bytes > 90 * 1024,
+            "the fixture must read far more than it emits, or the two axes are \
+             interchangeable and neither is tested"
+        );
+        // The census axis carries exactly one thing today: schema validation.
+        // Cursor *also* runs a census-shaped read on every poll —
+        // `count_relevant_keys` walks both relevant key ranges over the unique
+        // `key` index (0.056 ms / 19 KB / 247 keys on the reference host,
+        // §1.1) — but it is a scalar aggregate, so by the charging rules on
+        // `ScanLedger` it materializes no row and is charged on neither axis.
+        //
+        // That silence is deliberate and it is **not** a claim the aggregate is
+        // free: `cursor_relevant_key_count_is_a_covering_index_scan` is what
+        // keeps it honest. WI-08 replaces the aggregate with a
+        // row-materializing census and retires `MAX_RELEVANT_KEYS`; until it
+        // does, G1a's `census_rows == 201` may not be read as Cursor's total
+        // census cost.
+        let schema_census = {
+            let connection = open_read_only(&db_path).expect("reopen for schema census");
+            expected_schema_census(&connection, &["cursorDiskKV"])
+        };
+        assert!(schema_census.census_rows > 0);
+        assert_eq!(
+            ledger.census_rows, schema_census.census_rows,
+            "schema validation is the only charged census read; the payload \
+             read must not be miscounted as one"
+        );
+        assert_eq!(ledger.census_bytes, schema_census.census_bytes);
+
+        // Nothing changed, so nothing is emitted — but every byte is still
+        // read. This is the assertion an emit-site ledger cannot survive.
+        let mut second = ScanLedger::default();
+        let ScanOutcome::Scanned { .. } = scan_database(&db_path, &new_state, &mut second) else {
+            panic!("warm ledger scan should succeed");
+        };
+        assert_eq!(
+            second.rows_emitted, 0,
+            "an unchanged database emits nothing on the second poll"
+        );
+        assert_eq!(
+            second.payload_bytes, expected_bytes,
+            "an unchanged database is still fully re-read today, and the ledger \
+             must say so"
+        );
+        assert_eq!(second.payload_rows, 2);
+
+        cleanup(&path);
+    }
+
+    /// A bubble's workspace stamp issues a *second* payload read of the parent
+    /// composer blob. It is easy to miss because it hides behind a cache, and
+    /// a ledger that misses it under-reports by a whole composer value
+    /// (2.4 MB on the reference host).
+    #[test]
+    fn ledger_charges_the_composer_workspace_lookup() {
+        let path = unique_db_path("ledger-workspace-lookup");
+        let db = create_kv_db(&path);
+        let composer = json!({
+            "composerId": COMPOSER_ID,
+            "workspaceIdentifier": {"uri": {"fsPath": "/work/ledger"}},
+            "ballast": "w".repeat(16 * 1024),
+        });
+        let composer_key = format!("composerData:{COMPOSER_ID}");
+        put(&db, &composer_key, &composer);
+        let bubble_key = format!("bubbleId:{COMPOSER_ID}:{USER_BUBBLE_ID}");
+        put(&db, &bubble_key, &user_bubble_value());
+        drop(db);
+
+        let composer_text = serde_json::to_string(&composer).expect("serialize composer");
+        let bubble_text = serde_json::to_string(&user_bubble_value()).expect("serialize bubble");
+        // The composer value is materialized twice: once by the prefix scan,
+        // once by the workspace lookup the bubble triggers.
+        let expected_bytes = (composer_key.len()
+            + composer_text.len()
+            + bubble_key.len()
+            + bubble_text.len()
+            + composer_text.len()) as u64;
+
+        let mut ledger = ScanLedger::default();
+        let ScanOutcome::Scanned { records, .. } =
+            scan_database(&path.to_string_lossy(), &CursorState::fresh(), &mut ledger)
+        else {
+            panic!("workspace-lookup scan should succeed");
+        };
+        assert!(
+            records.iter().any(
+                |record| record.record.get("workspacePath").and_then(Value::as_str)
+                    == Some("/work/ledger")
+            ),
+            "the fixture must actually take the lookup path"
+        );
+        assert_eq!(
+            ledger.payload_rows, 3,
+            "two scanned keys plus the composer re-read the workspace lookup performs"
+        );
+        assert_eq!(ledger.payload_bytes, expected_bytes);
+
+        cleanup(&path);
     }
 
     #[tokio::test(flavor = "multi_thread")]
