@@ -360,6 +360,41 @@ bind = "127.0.0.1"
 # ignored. Non-loopback binds require this explicit true value.
 start_on_up = true
 
+[retention]
+# Storage ownership and retention policy (issue #603).
+#
+# EVERY DEFAULT HERE IS A NO-OP FOR USER HISTORY. The two protected-bucket
+# horizons below are ABSENT by default and absence is not a value: the reclaim
+# planner cannot construct deletion authority for canonical or raw/audit data
+# without them, so a config that does not mention them can never prune history.
+# Nothing is deleted by simply naming this section.
+
+# Bucket 3 (rebuildable derived data) safety horizon, in hours: how long a
+# SUPERSEDED derived row must have been superseded before reclamation may claim
+# it. Never applies to a live generation. Floor 24 (not configurable lower).
+derived_horizon_hours = 24.0
+
+# Bucket 4 (operational telemetry) TTL horizon, in days. Migration 039 applies
+# the shipped 30-day TTL to ingest_heartbeats, search_query_log, search_hit_log,
+# and search_interaction_log, anchored so its FIRST application deletes nothing.
+#
+# NOT YET OPERATOR-CONFIGURABLE. The horizon is baked into
+# sql/039_telemetry_retention.sql as static SQL text, so no value written here
+# can change when ClickHouse expires a telemetry row. Rather than accept a
+# number and then report it back as your effective policy, Moraine REFUSES TO
+# LOAD a config that sets this key to anything but 30. Every surface that prints
+# it labels it `default` and says why.
+telemetry_horizon_days = 30
+
+# Bucket 2 (raw / audit source data: raw_events, ingest_errors).
+# ABSENT BY DEFAULT — uncomment ONLY if you want this data pruned. Floor 7 days.
+# raw_audit_horizon_days = 90.0
+
+# Bucket 1 (canonical user history: events).
+# ABSENT BY DEFAULT — uncomment ONLY if you want your history pruned. Export
+# first with `moraine export events --format jsonl`. Floor 7 days.
+# canonical_history_horizon_days = 365.0
+
 [monitor]
 # Monitor HTTP port.
 port = 8080

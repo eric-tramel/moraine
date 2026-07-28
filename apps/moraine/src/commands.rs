@@ -8,9 +8,10 @@ mod up;
 
 use anyhow::{bail, Context, Result};
 use moraine_clickhouse::{
-    ClickHouseClient, CoreIndexAuditOutcome, CoreIndexBackfillProgress, DoctorReport,
+    reclaim, ClickHouseClient, CoreIndexAuditOutcome, CoreIndexBackfillProgress, DoctorReport,
     MigrationProgress, OpenV2PromotionOutcome, PublicationDiagnostics, QueryClass, QueryEnvelope,
-    ReadIndexState, OPEN_V2_PROVENANCE_OPERATOR_PROMOTE, STATE_KEY_CORE_INDEXES, STATE_KEY_OPEN_V2,
+    ReadIndexState, ReclaimPlan, ReclaimScope, ReclaimStatusReport, StorageReport,
+    OPEN_V2_PROVENANCE_OPERATOR_PROMOTE, STATE_KEY_CORE_INDEXES, STATE_KEY_OPEN_V2,
 };
 use moraine_config::{
     AppConfig, OpenReaderMode, OpenReaderResolution, QueryBudgetsConfig, ValidatedQueryBudgets,
@@ -22,7 +23,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::cli::{
     Cli, CliCommand, ClickhouseCommand, ConfigCommand, CoreIndexCommand, DbCommand, ExportCommand,
-    OutputFormat, RunArgs, SchemaCommand,
+    OutputFormat, ReclaimCommand, RunArgs, SchemaCommand,
 };
 use crate::managed_clickhouse::{
     cmd_clickhouse_install, cmd_clickhouse_status, cmd_clickhouse_uninstall,
@@ -32,7 +33,8 @@ use crate::paths::{load_cfg, runtime_paths};
 use crate::process::{require_service_binary, service_args_with_defaults};
 use crate::render::{
     render_clickhouse_status, render_core_index_status, render_db_doctor, render_db_migrate,
-    render_logs, state_label, CliOutput, CoreIndexReport, MigrationOutcome,
+    render_logs, render_reclaim_plan, render_reclaim_refusal, render_reclaim_status, state_label,
+    CliOutput, CoreIndexReport, MigrationOutcome,
 };
 use crate::service::Service;
 
@@ -89,13 +91,23 @@ pub(crate) async fn dispatch(cli: Cli, output: CliOutput) -> Result<ExitCode> {
                 DbCommand::Doctor => {
                     let report = cmd_db_doctor(&cfg).await?;
                     let core_index = gather_core_index_report(&cfg).await;
-                    render_db_doctor(&output, &report, &core_index)?;
+                    let storage = gather_storage_report(&cfg).await;
+                    render_db_doctor(&output, &report, &core_index, storage.as_ref())?;
                     if doctor_is_healthy(&report) {
                         Ok(ExitCode::SUCCESS)
                     } else {
                         Ok(ExitCode::from(1))
                     }
                 }
+                DbCommand::Reclaim(args) => match args.command {
+                    ReclaimCommand::Status(status) => {
+                        let report = gather_reclaim_status(&cfg).await;
+                        render_reclaim_status(&output, &report, status.json)?;
+                        Ok(ExitCode::SUCCESS)
+                    }
+                    ReclaimCommand::Plan(plan) => cmd_db_reclaim_plan(&cfg, &output, plan).await,
+                    ReclaimCommand::Run(run) => cmd_db_reclaim_run(&cfg, &output, run).await,
+                },
                 DbCommand::CoreIndex(args) => match args.command {
                     CoreIndexCommand::Status => {
                         let report = gather_core_index_report(&cfg).await;
@@ -452,6 +464,145 @@ pub(super) async fn gather_core_index_report(cfg: &AppConfig) -> CoreIndexReport
     }
 }
 
+/// Best-effort gather of the issue #603 storage/reclaim surface for operator
+/// display (`status`, `db doctor`, `db reclaim status`).
+///
+/// Never fails: an unreachable ClickHouse yields `available: false` with the
+/// error attached, so the surrounding command still renders. Storage state is
+/// transient and must not fail the doctor exit code — the same contract
+/// `gather_core_index_report` established.
+pub(super) async fn gather_reclaim_status(cfg: &AppConfig) -> ReclaimStatusReport {
+    let Ok(ch) = ClickHouseClient::new(cfg.clickhouse.clone()) else {
+        return unavailable_reclaim_status("ClickHouse client could not be constructed");
+    };
+    let budgets = query_budgets(cfg);
+    ch.reclaim_status(&cfg.retention, &budgets.background, &budgets.administrative)
+        .await
+}
+
+fn unavailable_reclaim_status(message: &str) -> ReclaimStatusReport {
+    ReclaimStatusReport {
+        available: false,
+        storage: None,
+        ledger: Default::default(),
+        reclaimable: Vec::new(),
+        registered_executors: reclaim::registered_executors(),
+        denomination: reclaim::estimated_bytes_note(),
+        error: Some(message.to_string()),
+    }
+}
+
+/// The storage half of the reclaim status, for the `status` panel and the
+/// doctor block. `None` when the backend is unreachable.
+pub(super) async fn gather_storage_report(cfg: &AppConfig) -> Option<StorageReport> {
+    gather_reclaim_status(cfg).await.storage
+}
+
+/// Resolve a `--scope` argument, listing the valid values on a typo rather
+/// than falling back to "all" — silently widening a destructive command's
+/// scope is the one failure this parser must not have.
+fn parse_reclaim_scope(raw: &str) -> Result<ReclaimScope> {
+    ReclaimScope::parse(raw.trim()).ok_or_else(|| {
+        anyhow::anyhow!(
+            "unknown reclaim scope `{raw}`; valid scopes: {}",
+            ReclaimScope::ALL
+                .iter()
+                .map(|scope| scope.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })
+}
+
+async fn cmd_db_reclaim_plan(
+    cfg: &AppConfig,
+    output: &CliOutput,
+    args: crate::cli::ReclaimPlanArgs,
+) -> Result<ExitCode> {
+    let scopes = match args.scope.as_deref() {
+        Some(raw) => vec![parse_reclaim_scope(raw)?],
+        None => ReclaimScope::ALL.to_vec(),
+    };
+    let ch = ClickHouseClient::new(cfg.clickhouse.clone())?;
+    let budgets = query_budgets(cfg);
+    let plan: ReclaimPlan = QueryEnvelope::new_batch(
+        "reclaim-plan",
+        QueryClass::Background,
+        &budgets.background,
+        &budgets.administrative,
+        reclaim::PLAN_STATEMENT_CAP,
+    )
+    .scope(ch.reclaim_plan(&cfg.retention, &scopes))
+    .await?;
+    render_reclaim_plan(output, &plan, args.json)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `moraine db reclaim run`.
+///
+/// Two refusals, in this order:
+///
+/// 1. **Unconfirmed.** The unforced path prints exactly which scope and which
+///    tables would be touched and exits non-zero, following the `--force`
+///    ceremony precedent. `moraine export events --format jsonl` is named as
+///    the pre-destructive safety valve.
+/// 2. **Unauthorized.** A bucket-1/2 scope additionally refuses unless the
+///    matching `[retention]` key is present, and says which key is missing.
+///
+/// In this build every scope then refuses again for a third reason: no
+/// executor is registered. Nothing is deleted by any path.
+///
+/// All three of the ceremony's parts — the `--confirm` gate, the authority
+/// gate reached through `reclaim_run`, and the non-zero exit — are guarded by
+/// `tests::the_unconfirmed_run_ceremony_is_enforced_end_to_end` and
+/// `tests::a_refusal_exits_non_zero`, which drive this function rather than
+/// re-deriving its decisions. `cli::tests::clap_parses_reclaim_subcommands`
+/// proves only that `--confirm` parses and defaults to false; it says nothing
+/// about whether anything reads it.
+async fn cmd_db_reclaim_run(
+    cfg: &AppConfig,
+    output: &CliOutput,
+    args: crate::cli::ReclaimRunArgs,
+) -> Result<ExitCode> {
+    let scope = parse_reclaim_scope(&args.scope)?;
+    if !args.confirm {
+        render_reclaim_refusal(output, scope, args.json)?;
+        return Ok(ExitCode::from(RECLAIM_REFUSAL_EXIT_CODE));
+    }
+    let ch = ClickHouseClient::new(cfg.clickhouse.clone())?;
+    let budgets = query_budgets(cfg);
+    let outcome = QueryEnvelope::new_batch(
+        "reclaim-run",
+        QueryClass::Background,
+        &budgets.background,
+        &budgets.administrative,
+        reclaim::UNIT_STATEMENT_CAP,
+    )
+    .scope(ch.reclaim_run(&cfg.retention, scope))
+    .await?;
+    crate::render::render_reclaim_outcome(output, &outcome, args.json)?;
+    Ok(ExitCode::from(reclaim_run_exit_code(&outcome)))
+}
+
+/// Exit status of a `moraine db reclaim run` that never reached an executor.
+pub(crate) const RECLAIM_REFUSAL_EXIT_CODE: u8 = 1;
+
+/// Exit status for a rendered reclaim outcome.
+///
+/// A refusal is not a success: `NoExecutor` exits non-zero so a script that
+/// expects reclamation to have happened notices that it did not. `Blocked` is
+/// the same case — hazard H9 is precisely that "blocked" and "nothing to do"
+/// were indistinguishable, and an exit code that cannot tell them apart is
+/// that bug at the process boundary.
+pub(crate) fn reclaim_run_exit_code(outcome: &moraine_clickhouse::ReclaimOutcome) -> u8 {
+    match outcome {
+        moraine_clickhouse::ReclaimOutcome::NoExecutor { .. }
+        | moraine_clickhouse::ReclaimOutcome::Blocked { .. } => RECLAIM_REFUSAL_EXIT_CODE,
+        moraine_clickhouse::ReclaimOutcome::Idle { .. }
+        | moraine_clickhouse::ReclaimOutcome::Settled { .. } => 0,
+    }
+}
+
 fn unavailable_core_index_report(configured: OpenReaderMode) -> CoreIndexReport {
     CoreIndexReport {
         available: false,
@@ -793,6 +944,159 @@ mod tests {
             verbose: false,
             unicode: false,
             width: 100,
+        }
+    }
+
+    /// A config whose ClickHouse endpoint is a port nothing listens on, so any
+    /// path that reaches the network fails loudly rather than passing.
+    fn offline_config(retention: moraine_config::RetentionConfig) -> AppConfig {
+        let mut cfg = AppConfig::default();
+        cfg.clickhouse.url = "http://127.0.0.1:1".to_string();
+        cfg.clickhouse.timeout_seconds = 1.0;
+        cfg.retention = retention;
+        cfg
+    }
+
+    fn reclaim_run_args(scope: &str, confirm: bool) -> crate::cli::ReclaimRunArgs {
+        crate::cli::ReclaimRunArgs {
+            scope: scope.to_string(),
+            confirm,
+            json: false,
+        }
+    }
+
+    /// **G-CONFIRM.** Fails for: an unconfirmed `moraine db reclaim run`
+    /// proceeding.
+    /// Denomination: end-to-end behaviour of `cmd_db_reclaim_run`, not a
+    /// re-derivation of its decision.
+    ///
+    /// The probe is `--scope canonical_generation` under a stock config,
+    /// because that is the one scope whose two outcomes are distinguishable
+    /// from outside: refused it returns `Ok`, proceeded it reaches
+    /// `reclaim_run`'s authority check and returns `Err` naming the missing
+    /// key. No stdout capture is needed, and nothing touches the network on
+    /// either path.
+    ///
+    /// MUTATION (executed 2026-07-27): change `if !args.confirm` to
+    /// `if false` in `cmd_db_reclaim_run` => FAILS here (the unconfirmed call
+    /// returns `Err`). Before this test, that mutation left the CLI suite at
+    /// 229/0 and an unconfirmed run against user history proceeded with no
+    /// test noticing. **Lower bound.**
+    ///
+    /// MUTATION (executed 2026-07-27): change it to `if true` (refuse even a
+    /// confirmed run) => FAILS on the confirmed half below, which requires the
+    /// authority refusal to be reached. **Upper bound.**
+    ///
+    /// MUTATION (executed 2026-07-27): change it to `if !args.json` => FAILS
+    /// on both halves. **Width: the gate reads `confirm` and nothing else.**
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_unconfirmed_run_ceremony_is_enforced_end_to_end() {
+        let cfg = offline_config(moraine_config::RetentionConfig::default());
+
+        // Unconfirmed: refused locally, exit non-zero, no authority check and
+        // no client construction.
+        let code = cmd_db_reclaim_run(
+            &cfg,
+            &plain_output(),
+            reclaim_run_args("canonical_generation", false),
+        )
+        .await
+        .expect("an unconfirmed run must refuse, not error");
+        assert_eq!(code, ExitCode::from(RECLAIM_REFUSAL_EXIT_CODE));
+
+        // Confirmed: the gate lets it through to `reclaim_run`, whose S2
+        // authority check refuses this scope under a stock config and names
+        // the key. This is what proves the gate above is `confirm` and not a
+        // blanket refusal.
+        let error = cmd_db_reclaim_run(
+            &cfg,
+            &plain_output(),
+            reclaim_run_args("canonical_generation", true),
+        )
+        .await
+        .expect_err("a confirmed run of an unconfigured bucket-1 scope must refuse");
+        assert!(
+            error
+                .to_string()
+                .contains("retention.canonical_history_horizon_days"),
+            "{error:#}"
+        );
+    }
+
+    /// **G-EXITCODE.** Fails for: a reclaim refusal exiting zero.
+    /// Denomination: the `ExitCode` the command actually returns.
+    ///
+    /// The report's claim — "a script expecting reclamation notices it did not
+    /// happen" — had no test behind it.
+    ///
+    /// MUTATION (executed 2026-07-27): change `ExitCode::from(1)` on the
+    /// unconfirmed path to `ExitCode::SUCCESS` => FAILS in
+    /// `the_unconfirmed_run_ceremony_is_enforced_end_to_end`.
+    ///
+    /// MUTATION (executed 2026-07-27): make `reclaim_run_exit_code` return `0`
+    /// for `NoExecutor` => FAILS here, on the end-to-end call and on the pure
+    /// mapping. **Lower bound.**
+    ///
+    /// MUTATION (executed 2026-07-27): make it return `1` for every variant =>
+    /// FAILS on the `Idle`/`Settled` rows, so "always fail" is not a passing
+    /// "fix". **Upper bound, and width: each variant is named.**
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refusal_exits_non_zero() {
+        // End to end: a confirmed run of an authorized scope still refuses for
+        // the missing executor, and that refusal is not a success.
+        let cfg = offline_config(moraine_config::RetentionConfig::default());
+        let code = cmd_db_reclaim_run(
+            &cfg,
+            &plain_output(),
+            reclaim_run_args("mcp_open_orphan", true),
+        )
+        .await
+        .expect("no executor is a refusal, not an error");
+        assert_eq!(code, ExitCode::from(1));
+        assert_ne!(code, ExitCode::SUCCESS);
+
+        // And the mapping itself, variant by variant.
+        use moraine_clickhouse::ReclaimOutcome;
+        let scope = moraine_clickhouse::ReclaimScope::McpOpenOrphan;
+        assert_eq!(
+            reclaim_run_exit_code(&ReclaimOutcome::NoExecutor {
+                scope,
+                message: String::new()
+            }),
+            1
+        );
+        assert_eq!(
+            reclaim_run_exit_code(&ReclaimOutcome::Blocked {
+                scope,
+                pending_mutations: 3
+            }),
+            1,
+            "H9: a blocked run must not be indistinguishable from a successful one at the process \
+             boundary either"
+        );
+        assert_eq!(reclaim_run_exit_code(&ReclaimOutcome::Idle { scope }), 0);
+        assert_eq!(
+            reclaim_run_exit_code(&ReclaimOutcome::Settled {
+                scope,
+                units: 0,
+                reclaimed_rows: 0,
+                denomination: String::new()
+            }),
+            0
+        );
+    }
+
+    /// An unknown `--scope` must not widen to "everything".
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unknown_scope_is_an_error_rather_than_a_default() {
+        let cfg = offline_config(moraine_config::RetentionConfig::default());
+        let error = cmd_db_reclaim_run(&cfg, &plain_output(), reclaim_run_args("everything", true))
+            .await
+            .expect_err("an unknown scope must not run");
+        let rendered = error.to_string();
+        assert!(rendered.contains("unknown reclaim scope"), "{rendered}");
+        for scope in moraine_clickhouse::ReclaimScope::ALL {
+            assert!(rendered.contains(scope.as_str()), "{rendered}");
         }
     }
 

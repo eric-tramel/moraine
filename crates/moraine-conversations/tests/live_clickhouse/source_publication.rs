@@ -3435,13 +3435,19 @@ pub(super) async fn run(
         );
     }
 
+    // Issue #603 WI-02 repair. This block used to read `system.parts` with NO
+    // `active` filter (only `countIf(active)` for the part count), so `rows`
+    // and `compressed_bytes` summed inactive parts too — a table's numbers
+    // stayed nonzero long after its rows were gone. Combined with an assertion
+    // that checked only that the table NAME LIST was complete, it read like a
+    // storage gate and could not fail on over-deletion.
     let control_storage: Vec<ControlStorageRow> = clickhouse
         .query_rows(
             &format!(
                 "SELECT table, toUInt64(sum(rows)) AS rows, \
-                        toUInt64(countIf(active)) AS active_parts, \
+                        toUInt64(count()) AS active_parts, \
                         toUInt64(sum(data_compressed_bytes)) AS compressed_bytes \
-                 FROM system.parts WHERE database = '{}' AND table IN ( \
+                 FROM system.parts WHERE active AND database = '{}' AND table IN ( \
                    'published_source_generations', 'ingest_checkpoint_transitions', \
                    'source_generation_publication_readiness', 'ingest_append_control', \
                    'mcp_open_publication_headers', \
@@ -3468,6 +3474,43 @@ pub(super) async fn run(
         ]
     {
         bail!("source-publication control-storage evidence is incomplete: {control_tables:?}");
+    }
+
+    // The row-count floor. `system.parts.rows` counts physically present rows,
+    // INCLUDING ones a lightweight DELETE has masked via `_row_exists`, so a
+    // floor taken from the query above could not see a delete until a merge
+    // rewrote the part. The floor therefore reads the tables directly.
+    //
+    // Restricted to the two control relations this test independently proves
+    // non-empty a few lines above: `current_head` bails when
+    // `published_source_generations` has no head row, and `ingest_append_control`
+    // is a startup prerequisite the append path has just exercised. Extending
+    // the floor to the checkpoint/readiness allocators — including the
+    // `max(checkpoint_revision)` invariant a TTL would regress — belongs to the
+    // dedicated `reclaim-truth` gate, not here.
+    //
+    // NOT EXECUTED BY THIS PR. The enclosing gate is `#[ignore]`d and needs a
+    // wrapper-owned live ClickHouse plus destructive opt-in
+    // (`MORAINE_LIVE_TEST_SANDBOX_ID`), so `cargo test --workspace` compiles
+    // this and runs none of it. Treat the floor as reviewed-but-unexercised
+    // until a sandbox run reports it green.
+    for control in ["published_source_generations", "ingest_append_control"] {
+        let live_rows = scalar_u64(
+            clickhouse,
+            database,
+            &format!(
+                "SELECT toUInt64(count()) AS value FROM `{}`.`{control}` FORMAT JSONEachRow",
+                database.as_str(),
+            ),
+        )
+        .await
+        .with_context(|| format!("failed to count live rows in {control}"))?;
+        if live_rows == 0 {
+            bail!(
+                "control relation `{control}` has no live rows; publication truth and the append \
+                 fence may never be emptied by any code path"
+            );
+        }
     }
     let derived_table_storage: Vec<ControlStorageRow> = clickhouse
         .query_rows(

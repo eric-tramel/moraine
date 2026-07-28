@@ -885,6 +885,343 @@ impl ValidatedQueryBudgets {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Issue #603 WI-03 — `[retention]`
+// ---------------------------------------------------------------------------
+
+/// Safety-horizon floor for rebuildable derived data (bucket 3), in hours.
+///
+/// The horizon must exceed (a) the longest legitimate publication-pin
+/// lifetime, which is one request and therefore seconds; (b) the longest
+/// legitimate projection `prepare` window before its header is written; and
+/// (c) an operator's chance to notice a bad publication and roll back. (a) and
+/// (b) argue minutes; (c) argues a day. This is the floor, not just the
+/// default: a config naming a shorter horizon is rejected at load.
+pub const RETENTION_DERIVED_HORIZON_FLOOR_HOURS: f64 = 24.0;
+
+/// Safety-horizon floor for buckets 1 and 2 (canonical history and raw/audit
+/// source data), in days. Deleting user history on a horizon shorter than a
+/// week gives an operator no realistic window to notice and stop it.
+pub const RETENTION_PROTECTED_HORIZON_FLOOR_DAYS: f64 = 7.0;
+
+/// Default safety horizon for bucket 3.
+pub const DEFAULT_RETENTION_DERIVED_HORIZON_HOURS: f64 = 24.0;
+
+/// Default TTL horizon for bucket 4 operational telemetry, in days. The only
+/// reader horizon any code depends on is `search_query_log`'s rolling 7-day
+/// hot-query window, so 30 days carries 4x headroom over it.
+///
+/// **This is currently the only permitted value.** Migration SQL is static
+/// text: `sql/039_telemetry_retention.sql` bakes `INTERVAL 30 DAY` into four
+/// `MODIFY TTL` statements, so nothing an operator writes in `[retention]`
+/// changes when ClickHouse expires a telemetry row. `validate_retention`
+/// therefore rejects any other value rather than accepting a number that has
+/// no effect — see [`RetentionValidationError::TelemetryNotYetConfigurable`].
+pub const DEFAULT_RETENTION_TELEMETRY_HORIZON_DAYS: u32 = 30;
+
+/// Upper bound on any configured horizon, in days (~10 years). A horizon
+/// beyond this is indistinguishable from "never" and is more likely a typo.
+pub const RETENTION_HORIZON_MAX_DAYS: f64 = 3_650.0;
+
+const SECONDS_PER_HOUR: f64 = 3_600.0;
+const SECONDS_PER_DAY: f64 = 86_400.0;
+
+/// `[retention]` — issue #603 §1 ownership model, as configuration.
+///
+/// **Every default in this struct is a no-op for buckets 1 and 2.** The two
+/// protected horizons are `Option` with no serde default and no `Default`
+/// value other than `None`, so a config file that does not mention them cannot
+/// produce deletion authority for canonical or raw/audit data. That is not a
+/// convention: [`RetentionHorizon`] is the only type the reclaimer accepts as
+/// authority for those buckets, it has no `Default` impl and no public
+/// constructor, and its only source is [`RetentionHorizon::from_config`],
+/// which returns `None` for an absent key. A missing setting therefore cannot
+/// *type-check* into deletion authority.
+///
+/// The regression this shape fails for: someone adds
+/// `#[serde(default = "…")]` with a finite horizon to one of the two protected
+/// fields and silently turns on canonical deletion for every existing install
+/// on upgrade. `default_config_grants_no_authority_over_user_history` fails
+/// the moment that edit lands.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetentionConfig {
+    /// Bucket 3 safety horizon in hours: how long a *superseded* derived row
+    /// must have been superseded before reclamation may claim it. Never
+    /// applies to a live generation — the reclaimer contains no predicate over
+    /// liveness at all, only an anti-join against the published heads.
+    #[serde(default = "default_retention_derived_horizon_hours")]
+    pub derived_horizon_hours: f64,
+    /// Bucket 4 TTL horizon in days, applied by migration 039.
+    ///
+    /// **Not yet operator-configurable.** The horizon lives in static
+    /// migration SQL, so this field cannot change what ClickHouse does;
+    /// `validate_retention` rejects every value except
+    /// [`DEFAULT_RETENTION_TELEMETRY_HORIZON_DAYS`], and every reporting
+    /// surface labels it `default`. The field exists so the shipped TTL
+    /// literal has one named home that
+    /// `migration_039_ttl_horizon_matches_the_configured_default` can compare
+    /// against, and so the key keeps its name for the change that makes it
+    /// real.
+    #[serde(default = "default_retention_telemetry_horizon_days")]
+    pub telemetry_horizon_days: u32,
+    /// Bucket 2 retention in days. **Absent by default.** Presence is the
+    /// authority; there is no "0 means forever" sentinel to get wrong.
+    pub raw_audit_horizon_days: Option<f64>,
+    /// Bucket 1 retention in days. **Absent by default.**
+    pub canonical_history_horizon_days: Option<f64>,
+}
+
+fn default_retention_derived_horizon_hours() -> f64 {
+    DEFAULT_RETENTION_DERIVED_HORIZON_HOURS
+}
+
+fn default_retention_telemetry_horizon_days() -> u32 {
+    DEFAULT_RETENTION_TELEMETRY_HORIZON_DAYS
+}
+
+impl Default for RetentionConfig {
+    fn default() -> Self {
+        Self {
+            derived_horizon_hours: DEFAULT_RETENTION_DERIVED_HORIZON_HOURS,
+            telemetry_horizon_days: DEFAULT_RETENTION_TELEMETRY_HORIZON_DAYS,
+            // Deliberately `None`. See the struct doc: this is the mechanism,
+            // not a placeholder waiting for a value.
+            raw_audit_horizon_days: None,
+            canonical_history_horizon_days: None,
+        }
+    }
+}
+
+/// Which protected bucket a [`RetentionHorizon`] is being requested for.
+///
+/// Only buckets 1 and 2 have variants: buckets 3 and 4 need no authority
+/// token, so there is deliberately no way to ask for one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProtectedRetentionBucket {
+    /// Bucket 2 — `raw_events`, `ingest_errors`.
+    RawAudit,
+    /// Bucket 1 — `events`.
+    CanonicalHistory,
+}
+
+impl ProtectedRetentionBucket {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RawAudit => "raw_audit",
+            Self::CanonicalHistory => "canonical_history",
+        }
+    }
+
+    /// The configuration key an operator must set to grant this authority.
+    /// Named so a refusal can say exactly which key is missing.
+    pub fn config_key(self) -> &'static str {
+        match self {
+            Self::RawAudit => "retention.raw_audit_horizon_days",
+            Self::CanonicalHistory => "retention.canonical_history_horizon_days",
+        }
+    }
+}
+
+/// A validated retention horizon for a protected bucket.
+///
+/// **Constructible only from configuration.** No `Default`, no `From<()>`, no
+/// `new`, no public field. The private field means a value cannot be
+/// synthesized outside this module even within this crate's own tests.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RetentionHorizon {
+    seconds: f64,
+    bucket: ProtectedRetentionBucket,
+}
+
+impl RetentionHorizon {
+    /// The horizon configured for `bucket`, or `None` when the key is absent.
+    ///
+    /// `None` is the stock-configuration answer and it is what makes "default
+    /// configuration deletes no raw or canonical user history" a type-level
+    /// property rather than a runtime check someone can forget.
+    pub fn from_config(cfg: &RetentionConfig, bucket: ProtectedRetentionBucket) -> Option<Self> {
+        let days = match bucket {
+            ProtectedRetentionBucket::RawAudit => cfg.raw_audit_horizon_days,
+            ProtectedRetentionBucket::CanonicalHistory => cfg.canonical_history_horizon_days,
+        }?;
+        // Load-time validation already rejected non-finite, non-positive, and
+        // below-floor values; this second check keeps a programmatically
+        // constructed `RetentionConfig` from bypassing the floor.
+        // NaN fails `contains` too, which is the answer we want: an
+        // unrepresentable horizon grants no authority.
+        if !(RETENTION_PROTECTED_HORIZON_FLOOR_DAYS..=RETENTION_HORIZON_MAX_DAYS).contains(&days) {
+            return None;
+        }
+        Some(Self {
+            seconds: days * SECONDS_PER_DAY,
+            bucket,
+        })
+    }
+
+    pub fn seconds(&self) -> f64 {
+        self.seconds
+    }
+
+    pub fn days(&self) -> f64 {
+        self.seconds / SECONDS_PER_DAY
+    }
+
+    pub fn bucket(&self) -> ProtectedRetentionBucket {
+        self.bucket
+    }
+}
+
+impl RetentionConfig {
+    /// Bucket 3 safety horizon in seconds.
+    pub fn derived_horizon_seconds(&self) -> f64 {
+        self.derived_horizon_hours * SECONDS_PER_HOUR
+    }
+
+    /// Whether any protected-bucket retention is configured. `moraine status`
+    /// prints a prominent line when this is true: a destructive policy is
+    /// never invisible.
+    pub fn any_protected_retention_configured(&self) -> bool {
+        self.raw_audit_horizon_days.is_some() || self.canonical_history_horizon_days.is_some()
+    }
+}
+
+/// Typed rejection from `[retention]` validation. Every variant names the
+/// offending key.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RetentionValidationError {
+    NotFinite {
+        key: &'static str,
+    },
+    BelowFloor {
+        key: &'static str,
+        value: f64,
+        floor: f64,
+        unit: &'static str,
+    },
+    AboveMax {
+        key: &'static str,
+        value: f64,
+    },
+    TelemetryZero,
+    /// `retention.telemetry_horizon_days` set to anything other than the
+    /// default.
+    ///
+    /// The TTL that enforces it is baked into `sql/039_telemetry_retention.sql`
+    /// as static text, so a configured value changes nothing. Accepting one
+    /// and then reporting it back as `configured` from `moraine db reclaim
+    /// status`, `moraine db doctor` and `/api/v1/health` would tell an
+    /// operator who wrote 90 that they have 90 days of telemetry while
+    /// ClickHouse deletes at 30 — a silent shortening relative to stated
+    /// intent, on the only surface that states it. Failing the load is the
+    /// honest answer until the horizon is templated into the migration.
+    TelemetryNotYetConfigurable {
+        value: u32,
+    },
+}
+
+impl fmt::Display for RetentionValidationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotFinite { key } => {
+                write!(formatter, "{key} must be a finite number")
+            }
+            Self::BelowFloor {
+                key,
+                value,
+                floor,
+                unit,
+            } => write!(
+                formatter,
+                "{key} must be at least {floor} {unit} (got {value}); the floor is not \
+                 configurable — a shorter safety horizon can retire rows a live request is still \
+                 pinned to"
+            ),
+            Self::AboveMax { key, value } => write!(
+                formatter,
+                "{key} must be at most {RETENTION_HORIZON_MAX_DAYS} days (got {value})"
+            ),
+            Self::TelemetryZero => write!(
+                formatter,
+                "retention.telemetry_horizon_days must be at least 1; zero would mean \
+                 delete-on-write"
+            ),
+            Self::TelemetryNotYetConfigurable { value } => write!(
+                formatter,
+                "retention.telemetry_horizon_days is not yet configurable and must be \
+                 {DEFAULT_RETENTION_TELEMETRY_HORIZON_DAYS} (got {value}). The telemetry TTL is \
+                 baked into sql/039_telemetry_retention.sql as static text, so setting this key \
+                 would report a horizon Moraine does not apply. Remove the key, or set it to \
+                 {DEFAULT_RETENTION_TELEMETRY_HORIZON_DAYS}."
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RetentionValidationError {}
+
+/// Fail-closed `[retention]` validation, run at config load.
+pub fn validate_retention(cfg: &RetentionConfig) -> Result<(), RetentionValidationError> {
+    if !cfg.derived_horizon_hours.is_finite() {
+        return Err(RetentionValidationError::NotFinite {
+            key: "retention.derived_horizon_hours",
+        });
+    }
+    if cfg.derived_horizon_hours < RETENTION_DERIVED_HORIZON_FLOOR_HOURS {
+        return Err(RetentionValidationError::BelowFloor {
+            key: "retention.derived_horizon_hours",
+            value: cfg.derived_horizon_hours,
+            floor: RETENTION_DERIVED_HORIZON_FLOOR_HOURS,
+            unit: "hours",
+        });
+    }
+    if cfg.derived_horizon_hours > RETENTION_HORIZON_MAX_DAYS * 24.0 {
+        return Err(RetentionValidationError::AboveMax {
+            key: "retention.derived_horizon_hours",
+            value: cfg.derived_horizon_hours,
+        });
+    }
+    if cfg.telemetry_horizon_days == 0 {
+        return Err(RetentionValidationError::TelemetryZero);
+    }
+    // Ordered after the zero check so `= 0` keeps its own, more specific
+    // message. Both reject; only the wording differs.
+    if cfg.telemetry_horizon_days != DEFAULT_RETENTION_TELEMETRY_HORIZON_DAYS {
+        return Err(RetentionValidationError::TelemetryNotYetConfigurable {
+            value: cfg.telemetry_horizon_days,
+        });
+    }
+    for (key, value) in [
+        (
+            ProtectedRetentionBucket::RawAudit.config_key(),
+            cfg.raw_audit_horizon_days,
+        ),
+        (
+            ProtectedRetentionBucket::CanonicalHistory.config_key(),
+            cfg.canonical_history_horizon_days,
+        ),
+    ] {
+        let Some(value) = value else {
+            continue;
+        };
+        if !value.is_finite() {
+            return Err(RetentionValidationError::NotFinite { key });
+        }
+        if value < RETENTION_PROTECTED_HORIZON_FLOOR_DAYS {
+            return Err(RetentionValidationError::BelowFloor {
+                key,
+                value,
+                floor: RETENTION_PROTECTED_HORIZON_FLOOR_DAYS,
+                unit: "days",
+            });
+        }
+        if value > RETENTION_HORIZON_MAX_DAYS {
+            return Err(RetentionValidationError::AboveMax { key, value });
+        }
+    }
+    Ok(())
+}
+
 const REDACTED_AUTH_TOKEN: &str = "[REDACTED]";
 
 #[derive(Clone, Deserialize)]
@@ -973,6 +1310,10 @@ pub struct AppConfig {
     pub bm25: Bm25Config,
     #[serde(default)]
     pub query_budgets: QueryBudgetsConfig,
+    /// Issue #603 WI-03. Present with defaults on every load; its two
+    /// protected-bucket horizons stay `None` unless an operator writes them.
+    #[serde(default)]
+    pub retention: RetentionConfig,
     #[serde(default)]
     pub monitor: MonitorConfig,
     #[serde(default)]
@@ -1081,6 +1422,7 @@ impl Default for AppConfig {
             backend: BackendConfig::default(),
             bm25: Bm25Config::default(),
             query_budgets: QueryBudgetsConfig::default(),
+            retention: RetentionConfig::default(),
             monitor: MonitorConfig::default(),
             runtime: RuntimeConfig::default(),
         }
@@ -2033,6 +2375,10 @@ fn normalize_config(mut cfg: AppConfig) -> Result<AppConfig> {
     // never produces a usable AppConfig (issue #600 exit gate 7).
     ValidatedQueryBudgets::from_config(&cfg.query_budgets)
         .map_err(|error| anyhow::anyhow!("{error}"))?;
+
+    // Fail closed on `[retention]` too (issue #603 §4 S2): a horizon below the
+    // non-configurable floor never produces a usable AppConfig.
+    validate_retention(&cfg.retention).map_err(|error| anyhow::anyhow!("{error}"))?;
 
     for (exclude_idx, pattern) in cfg.ingest.exclude_project_dirs.iter_mut().enumerate() {
         *pattern = expand_path(pattern.trim());
@@ -4896,6 +5242,266 @@ watch_root = "~/.pi/agent/sessions"
         assert_eq!(source.tracked_extension(), "jsonl");
     }
 
+    // ---- issue #603 WI-03 `[retention]` --------------------------------
+
+    /// **Half of G-DEFAULT (the config half).** Fails for: a default config
+    /// authorizing canonical or raw/audit deletion.
+    /// Denomination: `Option::is_none` on both protected horizons, plus
+    /// `RetentionHorizon::from_config` returning `None` for both buckets.
+    ///
+    /// The input is an **empty TOML document**, not a config that merely omits
+    /// `[retention]`: an empty document is what a fresh install and an
+    /// upgrading install both present.
+    ///
+    /// **Three document shapes, and they are not interchangeable.** An empty
+    /// document never enters `RetentionConfig`'s own `Deserialize` at all — it
+    /// takes `#[serde(default)]` on `AppConfig::retention`, i.e. the `impl
+    /// Default`. Serde FIELD defaults inside `RetentionConfig` fire only when a
+    /// `[retention]` table is present and the key is missing, which is the
+    /// shape every install that sets `telemetry_horizon_days` has. A guard that
+    /// only checks the empty document therefore cannot see the regression S2
+    /// names.
+    ///
+    /// MUTATION (executed 2026-07-27): add
+    /// `#[serde(default = "…")]` returning `Some(90.0)` to
+    /// `canonical_history_horizon_days`.
+    ///   * against the EMPTY document only => the test still **passed**. That
+    ///     is how this test was originally written, and it is exactly the
+    ///     "guard that cannot fail" shape.
+    ///   * against the present-but-partial `[retention]` document added below
+    ///     => `from_config(.., CanonicalHistory)` returns `Some(_)` and the
+    ///     test FAILS at `canonical authority (partial section)`.
+    ///
+    /// The guard bounds the direction *default or partial config gains
+    /// authority it should not have*; `configured_protected_horizon_grants_authority`
+    /// bounds the opposite direction, so a "fix" that makes `from_config`
+    /// always return `None` does not leave the suite green.
+    #[test]
+    fn default_config_grants_no_authority_over_user_history() {
+        let empty_path = write_temp_config("", "retention-empty-document");
+        let empty = load_config(&empty_path).expect("an empty config document must load");
+        std::fs::remove_file(&empty_path).ok();
+
+        // A `[retention]` section that names only a bucket-4 key. This is the
+        // shape a serde field default actually reaches.
+        let partial_path = write_temp_config(
+            "[retention]\ntelemetry_horizon_days = 30\n",
+            "retention-partial-section",
+        );
+        let partial = load_config(&partial_path).expect("a partial [retention] section must load");
+        std::fs::remove_file(&partial_path).ok();
+
+        for (label, cfg) in [("empty document", &empty), ("partial section", &partial)] {
+            assert_eq!(
+                cfg.retention.raw_audit_horizon_days, None,
+                "raw/audit horizon ({label})"
+            );
+            assert_eq!(
+                cfg.retention.canonical_history_horizon_days, None,
+                "canonical horizon ({label})"
+            );
+            assert!(
+                !cfg.retention.any_protected_retention_configured(),
+                "protected retention ({label})"
+            );
+            assert!(
+                RetentionHorizon::from_config(&cfg.retention, ProtectedRetentionBucket::RawAudit)
+                    .is_none(),
+                "raw/audit authority ({label})"
+            );
+            assert!(
+                RetentionHorizon::from_config(
+                    &cfg.retention,
+                    ProtectedRetentionBucket::CanonicalHistory
+                )
+                .is_none(),
+                "canonical authority ({label})"
+            );
+            // Buckets 3 and 4 do have defaults, and they are the documented ones.
+            assert_eq!(
+                cfg.retention.derived_horizon_hours, 24.0,
+                "derived ({label})"
+            );
+            assert_eq!(
+                cfg.retention.telemetry_horizon_days, 30,
+                "telemetry ({label})"
+            );
+            assert_eq!(
+                cfg.retention.derived_horizon_seconds(),
+                86_400.0,
+                "derived seconds ({label})"
+            );
+            assert_eq!(
+                cfg.retention,
+                RetentionConfig::default(),
+                "retention config ({label})"
+            );
+        }
+
+        // `AppConfig::default()` must agree with both: a programmatically built
+        // config is what most tests and the monitor's fallbacks use.
+        assert_eq!(AppConfig::default().retention, empty.retention);
+    }
+
+    #[test]
+    fn configured_protected_horizon_grants_authority() {
+        let path = write_temp_config(
+            "[retention]\nraw_audit_horizon_days = 90.0\ncanonical_history_horizon_days = 365.0\n",
+            "retention-configured",
+        );
+        let cfg = load_config(&path).expect("configured retention should load");
+        std::fs::remove_file(&path).ok();
+
+        assert!(cfg.retention.any_protected_retention_configured());
+        let raw = RetentionHorizon::from_config(&cfg.retention, ProtectedRetentionBucket::RawAudit)
+            .expect("raw/audit authority must be constructible once configured");
+        assert_eq!(raw.days(), 90.0);
+        assert_eq!(raw.seconds(), 90.0 * 86_400.0);
+        assert_eq!(raw.bucket(), ProtectedRetentionBucket::RawAudit);
+
+        let canonical = RetentionHorizon::from_config(
+            &cfg.retention,
+            ProtectedRetentionBucket::CanonicalHistory,
+        )
+        .expect("canonical authority must be constructible once configured");
+        assert_eq!(canonical.days(), 365.0);
+    }
+
+    #[test]
+    fn retention_floors_are_not_configurable_below_their_values() {
+        for (body, needle) in [
+            (
+                "[retention]\nderived_horizon_hours = 1.0\n",
+                "retention.derived_horizon_hours must be at least 24",
+            ),
+            (
+                "[retention]\nraw_audit_horizon_days = 1.0\n",
+                "retention.raw_audit_horizon_days must be at least 7",
+            ),
+            (
+                "[retention]\ncanonical_history_horizon_days = 0.5\n",
+                "retention.canonical_history_horizon_days must be at least 7",
+            ),
+            (
+                "[retention]\ntelemetry_horizon_days = 0\n",
+                "retention.telemetry_horizon_days must be at least 1",
+            ),
+            (
+                "[retention]\ncanonical_history_horizon_days = 100000.0\n",
+                "must be at most 3650 days",
+            ),
+        ] {
+            let path = write_temp_config(body, "retention-floor");
+            let error = load_config(&path).expect_err("below-floor retention must not load");
+            std::fs::remove_file(&path).ok();
+            let rendered = format!("{error:#}");
+            assert!(
+                rendered.contains(needle),
+                "expected `{needle}` in `{rendered}`"
+            );
+        }
+    }
+
+    /// **G-TELEMETRY-HONESTY (the config half).** Fails for: accepting a
+    /// `retention.telemetry_horizon_days` that Moraine does not apply.
+    /// Denomination: load result, per value, both directions.
+    ///
+    /// The horizon lives in `sql/039_telemetry_retention.sql` as four
+    /// `INTERVAL 30 DAY` literals in static text. Before this guard, an
+    /// operator could set 90, load cleanly, and read "configured, 90 days"
+    /// back from `moraine db reclaim status`, `moraine db doctor` and
+    /// `/api/v1/health` while ClickHouse expired rows at 30. `1` was equally
+    /// ineffective in the other direction. Refusing the load is the honest
+    /// answer until the horizon is templated into the migration; the reporting
+    /// half is `the_telemetry_horizon_never_reports_itself_as_configured`.
+    ///
+    /// MUTATION (executed 2026-07-27): delete the
+    /// `TelemetryNotYetConfigurable` check from `validate_retention` => FAILS
+    /// on the `90` and `7` cases. **Lower bound.**
+    ///
+    /// MUTATION (executed 2026-07-27): change the check to reject every value
+    /// (`if true`) => FAILS on the `30` case, and on
+    /// `default_config_grants_no_authority_over_user_history`, whose partial
+    /// document sets the key explicitly. **Upper bound: the documented default
+    /// must remain writable, because `docs/full-config.toml` ships it.**
+    #[test]
+    fn telemetry_horizon_days_is_not_yet_configurable() {
+        // The documented default is still writable: `docs/full-config.toml`
+        // and `docs/configuration.md` both show the key set to it.
+        let path = write_temp_config(
+            "[retention]\ntelemetry_horizon_days = 30\n",
+            "retention-telemetry-default",
+        );
+        let cfg = load_config(&path).expect("the documented default must load");
+        std::fs::remove_file(&path).ok();
+        assert_eq!(
+            cfg.retention.telemetry_horizon_days,
+            DEFAULT_RETENTION_TELEMETRY_HORIZON_DAYS
+        );
+
+        for value in [1_u32, 7, 29, 31, 90, 3_650] {
+            let path = write_temp_config(
+                &format!("[retention]\ntelemetry_horizon_days = {value}\n"),
+                "retention-telemetry-configured",
+            );
+            let error = load_config(&path)
+                .expect_err("a telemetry horizon Moraine cannot apply must not load");
+            std::fs::remove_file(&path).ok();
+            let rendered = format!("{error:#}");
+            assert!(
+                rendered.contains("not yet configurable"),
+                "expected a `not yet configurable` refusal for {value}, got `{rendered}`"
+            );
+            // The refusal must name the file that actually decides the
+            // horizon, or the operator has no way to check the claim.
+            assert!(
+                rendered.contains("sql/039_telemetry_retention.sql"),
+                "the refusal must name where the horizon really lives: `{rendered}`"
+            );
+        }
+
+        // Zero keeps its own, more specific message rather than being folded
+        // into the generic refusal.
+        let path = write_temp_config(
+            "[retention]\ntelemetry_horizon_days = 0\n",
+            "retention-telemetry-zero",
+        );
+        let error = load_config(&path).expect_err("zero must not load");
+        std::fs::remove_file(&path).ok();
+        assert!(format!("{error:#}").contains("must be at least 1"));
+    }
+
+    #[test]
+    fn retention_rejects_unknown_keys() {
+        let path = write_temp_config(
+            "[retention]\ncanonical_horizon_days = 365.0\n",
+            "retention-unknown-key",
+        );
+        let error = load_config(&path).expect_err("a misspelled retention key must not load");
+        std::fs::remove_file(&path).ok();
+        // A typo silently falling back to "no retention" would be benign; a
+        // typo silently falling back to *some other* default would not, and
+        // `deny_unknown_fields` is what keeps both cases loud.
+        assert!(format!("{error:#}").contains("canonical_horizon_days"));
+    }
+
+    #[test]
+    fn a_programmatic_below_floor_horizon_still_yields_no_authority() {
+        // `validate_retention` runs at load; a config built in code bypasses
+        // it. `from_config` re-checks the floor so the bypass cannot mint an
+        // authority token the loader would have refused.
+        let cfg = RetentionConfig {
+            canonical_history_horizon_days: Some(0.001),
+            raw_audit_horizon_days: Some(f64::NAN),
+            ..RetentionConfig::default()
+        };
+        assert!(
+            RetentionHorizon::from_config(&cfg, ProtectedRetentionBucket::CanonicalHistory)
+                .is_none()
+        );
+        assert!(RetentionHorizon::from_config(&cfg, ProtectedRetentionBucket::RawAudit).is_none());
+    }
+
     #[test]
     fn query_budgets_absent_section_yields_documented_defaults() {
         let path = write_temp_config("[identity]\nauthor = \"\"\n", "query-budgets-absent");
@@ -5100,5 +5706,38 @@ statement_cap = 64
             QueryBudgetsConfig::default(),
             "template [query_budgets] values must not drift from code defaults"
         );
+    }
+
+    /// The shipped template is what every fresh install starts from, so it is
+    /// the one config file whose retention posture must be checked directly
+    /// rather than inferred from `RetentionConfig::default()`.
+    ///
+    /// MUTATION (executed 2026-07-27): append
+    /// `[retention]\ncanonical_history_horizon_days = 365.0` to
+    /// `config/moraine.toml` => this test FAILS on the `raw/audit` and
+    /// `canonical` assertions. Bounds the direction *the shipped template
+    /// gains destructive authority*.
+    #[test]
+    fn shipped_template_grants_no_authority_over_user_history() {
+        let path = write_temp_config(
+            include_str!("../../../config/moraine.toml"),
+            "shipped-template-retention",
+        );
+        let cfg = load_config(&path).expect("shipped template must parse");
+        std::fs::remove_file(&path).ok();
+        assert!(
+            !cfg.retention.any_protected_retention_configured(),
+            "the shipped template must never configure bucket-1/2 retention"
+        );
+        assert!(
+            RetentionHorizon::from_config(&cfg.retention, ProtectedRetentionBucket::RawAudit)
+                .is_none()
+        );
+        assert!(RetentionHorizon::from_config(
+            &cfg.retention,
+            ProtectedRetentionBucket::CanonicalHistory
+        )
+        .is_none());
+        assert_eq!(cfg.retention, RetentionConfig::default());
     }
 }

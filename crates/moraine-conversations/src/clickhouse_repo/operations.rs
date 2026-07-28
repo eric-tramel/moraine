@@ -364,6 +364,12 @@ impl ClickHouseConversationRepository {
             core_index: StoreProbe::Failed {
                 message: "core-index probe not gathered".to_string(),
             },
+            // Placeholder: the storage-ownership probe (issue #603 WI-02) is
+            // gathered and overwritten by `read_store_health` in `repo_impl`,
+            // which owns the `[retention]`-aware accessor read.
+            storage: StoreProbe::Failed {
+                message: "storage probe not gathered".to_string(),
+            },
         })
     }
 

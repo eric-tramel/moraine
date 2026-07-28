@@ -1,5 +1,8 @@
 use anyhow::Result;
-use moraine_clickhouse::{CoreIndexAuditOutcome, DoctorReport};
+use moraine_clickhouse::{
+    reclaim, CoreIndexAuditOutcome, DoctorReport, ReclaimOutcome, ReclaimPlan, ReclaimScope,
+    ReclaimStatusReport, StorageReport,
+};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -106,6 +109,11 @@ pub(crate) struct StatusSnapshot {
     /// on the legacy status paths that do not gather it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) core_index: Option<CoreIndexReport>,
+    /// Storage ownership, bytes, and effective retention policy (issue #603
+    /// WI-02). `None` when ClickHouse was unreachable; the panel then omits
+    /// the line rather than reporting zeroes as facts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) storage: Option<StorageReport>,
 }
 
 /// Canonical read-index (issue #598) readiness surfaced by `moraine status`,
@@ -608,6 +616,19 @@ pub(crate) fn render_status(output: &CliOutput, snapshot: &StatusSnapshot) -> Re
     if output.verbose && !snapshot.doctor.errors.is_empty() {
         doctor_lines.push(format!("  errors: {}", snapshot.doctor.errors.join(" | ")));
     }
+    if let Some(storage) = &snapshot.storage {
+        doctor_lines.push(status_storage_line(storage));
+        // A destructive policy is never invisible, even in the concise view.
+        if let Some(warning) = status_retention_warning_line(storage) {
+            doctor_lines.push(format!("  {warning}"));
+        }
+        if !storage.unclassified_tables().is_empty() {
+            doctor_lines.push(format!(
+                "  unclassified tables: {}",
+                storage.unclassified_tables().join(", ")
+            ));
+        }
+    }
     if let Some(core_index) = &snapshot.core_index {
         doctor_lines.push(status_core_index_line(core_index));
         // Surface a non-silent config override prominently even in the concise
@@ -718,15 +739,18 @@ pub(crate) fn render_db_doctor(
     output: &CliOutput,
     report: &DoctorReport,
     core_index: &CoreIndexReport,
+    storage: Option<&StorageReport>,
 ) -> Result<()> {
     if output.is_json() {
         // Additive: the DoctorReport shape is unchanged; core-index readiness
-        // rides in a sibling object so downlevel JSON consumers are unaffected.
+        // and the issue #603 storage report ride in sibling objects so
+        // downlevel JSON consumers are unaffected.
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "doctor": report,
                 "core_index": core_index,
+                "storage": storage,
             }))?
         );
         return Ok(());
@@ -790,7 +814,328 @@ pub(crate) fn render_db_doctor(
         lines.push(format!("errors: {}", report.errors.join(" | ")));
     }
     lines.extend(core_index_report_lines(core_index));
+    match storage {
+        Some(storage) => lines.extend(storage_report_lines(storage)),
+        None => lines.push(
+            "storage: unavailable (ClickHouse unreachable); storage state is transient and does              not affect the doctor exit code"
+                .to_string(),
+        ),
+    }
     output.section("DB Doctor", &lines);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Issue #603 — storage / reclaim rendering
+// ---------------------------------------------------------------------------
+
+/// Format a byte count for operator display. Deliberately plain: no "frees",
+/// no "recovers", no "partition" — see [`reclaim::FORBIDDEN_DENOMINATION_WORDS`].
+pub(crate) fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} {}", UNITS[0])
+    } else {
+        format!("{value:.2} {}", UNITS[unit])
+    }
+}
+
+fn format_horizon(seconds: f64) -> String {
+    if seconds >= 86_400.0 {
+        format!("{:.0}d", seconds / 86_400.0)
+    } else {
+        format!("{:.0}h", seconds / 3_600.0)
+    }
+}
+
+/// One concise line summarizing storage for the `moraine status` Database
+/// panel: bucket totals and disk headroom.
+pub(crate) fn status_storage_line(report: &StorageReport) -> String {
+    let disk = match report.disk {
+        Some(disk) => format!(
+            "disk free {} of {}",
+            format_bytes(disk.free_bytes),
+            format_bytes(disk.total_bytes)
+        ),
+        None => "disk free unknown".to_string(),
+    };
+    let buckets = report
+        .buckets
+        .iter()
+        .filter(|bucket| bucket.tables > 0)
+        .map(|bucket| {
+            format!(
+                "{} {}",
+                bucket.class.as_str(),
+                format_bytes(bucket.compressed_bytes)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "storage: {}  |  {disk}",
+        if buckets.is_empty() {
+            "no tables".to_string()
+        } else {
+            buckets
+        }
+    )
+}
+
+/// The prominent `moraine status` line shown when configuration authorizes
+/// deleting user history, plus the one-time retention notice.
+///
+/// A destructive policy is never invisible: this returns `Some` exactly when
+/// [`StorageReport::destructive_policies`] is non-empty.
+pub(crate) fn status_retention_warning_line(report: &StorageReport) -> Option<String> {
+    let destructive = report.destructive_policies();
+    if destructive.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "RETENTION CONFIGURED — user history will be deleted: {}",
+        destructive
+            .iter()
+            .map(|entry| {
+                format!(
+                    "{} after {}",
+                    entry.class.as_str(),
+                    entry
+                        .horizon_seconds
+                        .map(format_horizon)
+                        .unwrap_or_else(|| "?".to_string())
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
+}
+
+/// Full per-bucket storage block for `moraine db doctor`.
+pub(crate) fn storage_report_lines(report: &StorageReport) -> Vec<String> {
+    let mut lines = vec![status_storage_line(report)];
+    for bucket in &report.buckets {
+        lines.push(format!(
+            "  {} ({}): {} tables, {} rows, {}",
+            bucket.class.as_str(),
+            bucket.label,
+            bucket.tables,
+            bucket.rows,
+            format_bytes(bucket.compressed_bytes)
+        ));
+    }
+    for entry in &report.policy {
+        lines.push(format!(
+            "  policy {}: {} ({}{}){}",
+            entry.class.as_str(),
+            entry
+                .horizon_seconds
+                .map(format_horizon)
+                .unwrap_or_else(|| "no retention".to_string()),
+            entry.source,
+            match &entry.config_key {
+                Some(key) => format!(", {key}"),
+                None => String::new(),
+            },
+            // A `config_key` printed with no qualification is an invitation to
+            // set it. Bucket 4's key changes nothing an operator can observe,
+            // and this line is where they would otherwise never learn that.
+            match &entry.note {
+                Some(note) => format!(" — {note}"),
+                None => String::new(),
+            }
+        ));
+    }
+    if let Some(warning) = status_retention_warning_line(report) {
+        lines.push(warning);
+    }
+    let unclassified = report.unclassified_tables();
+    if !unclassified.is_empty() {
+        lines.push(format!(
+            "  UNCLASSIFIED TABLES (no reclaim scope may name them): {}",
+            unclassified.join(", ")
+        ));
+    }
+    for note in &report.notes {
+        lines.push(format!("  note: {note}"));
+    }
+    lines
+}
+
+/// Render `moraine db reclaim status`.
+pub(crate) fn render_reclaim_status(
+    output: &CliOutput,
+    report: &ReclaimStatusReport,
+    json: bool,
+) -> Result<()> {
+    if json || output.is_json() {
+        println!("{}", serde_json::to_string_pretty(report)?);
+        return Ok(());
+    }
+    let mut lines = Vec::new();
+    match &report.storage {
+        Some(storage) => lines.extend(storage_report_lines(storage)),
+        None => lines.push(format!(
+            "storage: unavailable{}",
+            match &report.error {
+                Some(error) => format!(" ({error})"),
+                None => String::new(),
+            }
+        )),
+    }
+    lines.push(format!(
+        "ledger: claimed={}, deleting={}, done={}, abandoned={}",
+        report.ledger.claimed, report.ledger.deleting, report.ledger.done, report.ledger.abandoned
+    ));
+    if let Some(blocked) = &report.ledger.blocked_reason {
+        lines.push(format!("ledger blocked: {blocked}"));
+    }
+    lines.push(format!(
+        "registered executors: {}",
+        if report.registered_executors.is_empty() {
+            "none (this build plans and reports only; nothing is deleted)".to_string()
+        } else {
+            report
+                .registered_executors
+                .iter()
+                .map(|scope| scope.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    ));
+    lines.extend(reclaimable_lines(&report.reclaimable));
+    lines.push(report.denomination.clone());
+    output.section("Storage Reclaim", &lines);
+    Ok(())
+}
+
+fn reclaimable_lines(estimates: &[reclaim::ReclaimableEstimate]) -> Vec<String> {
+    estimates
+        .iter()
+        .flat_map(|estimate| {
+            let mut lines = vec![format!(
+                "scope {}: {} units, {} rows, {} ({})",
+                estimate.scope.as_str(),
+                estimate.units,
+                estimate.estimated_rows,
+                format_bytes(estimate.estimated_bytes),
+                reclaim::ESTIMATE_QUALIFIER,
+            )];
+            if let Some(note) = &estimate.note {
+                lines.push(format!("  {note}"));
+            }
+            lines
+        })
+        .collect()
+}
+
+/// Render `moraine db reclaim plan`. Dry run: writes nothing.
+pub(crate) fn render_reclaim_plan(
+    output: &CliOutput,
+    plan: &ReclaimPlan,
+    json: bool,
+) -> Result<()> {
+    if json || output.is_json() {
+        println!("{}", serde_json::to_string_pretty(plan)?);
+        return Ok(());
+    }
+    let mut lines = vec!["dry run: nothing was written".to_string()];
+    lines.extend(reclaimable_lines(&plan.scopes));
+    if plan.pending_redrive > 0 {
+        lines.push(format!(
+            "ledger units awaiting re-drive: {}",
+            plan.pending_redrive
+        ));
+    }
+    lines.push(plan.denomination.clone());
+    output.section("Storage Reclaim Plan", &lines);
+    Ok(())
+}
+
+/// The unforced `moraine db reclaim run` refusal.
+///
+/// Names exactly what would be deleted and points at the export command as the
+/// pre-destructive safety valve, following the `--force` ceremony precedent.
+pub(crate) fn render_reclaim_refusal(
+    output: &CliOutput,
+    scope: ReclaimScope,
+    json: bool,
+) -> Result<()> {
+    let tables: Vec<&str> = scope.tables().iter().map(|table| table.name()).collect();
+    if json || output.is_json() {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "refused": true,
+                "reason": "confirmation required",
+                "scope": scope.as_str(),
+                "describes": scope.describe(),
+                "tables": tables,
+                "rerun_with": format!("moraine db reclaim run --scope {scope} --confirm"),
+                "export_first": "moraine export events --format jsonl",
+            }))?
+        );
+        return Ok(());
+    }
+    output.section(
+        "Storage Reclaim Refused",
+        &[
+            format!("scope: {} — {}", scope.as_str(), scope.describe()),
+            format!("would delete from: {}", tables.join(", ")),
+            "nothing was deleted: --confirm was not given".to_string(),
+            format!("re-run with: moraine db reclaim run --scope {scope} --confirm"),
+            "export first if unsure: moraine export events --format jsonl".to_string(),
+        ],
+    );
+    Ok(())
+}
+
+/// Render the outcome of a confirmed `moraine db reclaim run`.
+pub(crate) fn render_reclaim_outcome(
+    output: &CliOutput,
+    outcome: &ReclaimOutcome,
+    json: bool,
+) -> Result<()> {
+    if json || output.is_json() {
+        println!("{}", serde_json::to_string_pretty(outcome)?);
+        return Ok(());
+    }
+    let lines = match outcome {
+        ReclaimOutcome::NoExecutor { scope, message } => {
+            vec![format!("scope: {}", scope.as_str()), message.clone()]
+        }
+        ReclaimOutcome::Blocked {
+            scope,
+            pending_mutations,
+        } => vec![
+            format!("scope: {}", scope.as_str()),
+            format!(
+                "blocked: {pending_mutations} mutation(s) over this scope's tables are still \
+                 running; nothing was deleted"
+            ),
+        ],
+        ReclaimOutcome::Idle { scope } => {
+            vec![format!("scope: {}: nothing to reclaim", scope.as_str())]
+        }
+        ReclaimOutcome::Settled {
+            scope,
+            units,
+            reclaimed_rows,
+            denomination,
+        } => vec![
+            format!("scope: {}", scope.as_str()),
+            format!("units settled: {units}"),
+            format!("rows reclaimed: {reclaimed_rows}"),
+            denomination.clone(),
+        ],
+    };
+    output.section("Storage Reclaim", &lines);
     Ok(())
 }
 
@@ -1023,5 +1368,250 @@ mod tests {
         assert_eq!(format_age_seconds(125), "2m5s");
         assert_eq!(format_age_seconds(3725), "1h2m");
         assert_eq!(format_age_seconds(90_061), "1d1h");
+    }
+
+    // ---- issue #603 storage / reclaim rendering -------------------------
+
+    fn storage_fixture(retention: moraine_config::RetentionConfig) -> StorageReport {
+        let tables = vec![
+            moraine_clickhouse::StorageTableReport {
+                name: "events".to_string(),
+                class: Some(moraine_clickhouse::TableClass::CanonicalHistory),
+                rows: 1_990_776,
+                compressed_bytes: 4_787_723_965,
+                uncompressed_bytes: 11_420_351_515,
+                active_parts: 24,
+                oldest_retained: Some("2026-02-20T14:16:45Z".to_string()),
+            },
+            moraine_clickhouse::StorageTableReport {
+                name: "mcp_open_turns".to_string(),
+                class: Some(moraine_clickhouse::TableClass::Derived),
+                rows: 234_694,
+                compressed_bytes: 14_356_000_000,
+                uncompressed_bytes: 40_000_000_000,
+                active_parts: 303,
+                oldest_retained: None,
+            },
+        ];
+        StorageReport {
+            buckets: moraine_clickhouse::fold_buckets(&tables),
+            tables,
+            disk: Some(moraine_clickhouse::StorageDiskReport {
+                free_bytes: 11_780_276_224,
+                total_bytes: 994_662_584_320,
+            }),
+            policy: moraine_clickhouse::retention_policy_entries(&retention),
+            notes: Vec::new(),
+        }
+    }
+
+    /// **G-DENOM** (the rendered-string half). Fails for: an operator-facing
+    /// byte number without its qualifier, or any surface promising
+    /// partition-aligned deletion.
+    /// Denomination: rendered string.
+    ///
+    /// MUTATION (executed 2026-07-27): change
+    /// `reclaim::reclaimed_bytes_note()` to `"freed N bytes"` => the library
+    /// test `byte_denominations_carry_their_qualifiers_and_promise_nothing`
+    /// FAILS; this test additionally covers the strings the LIBRARY test
+    /// cannot see, because it renders them.
+    #[test]
+    fn no_rendered_storage_surface_promises_partition_aligned_deletion() {
+        let report = storage_fixture(moraine_config::RetentionConfig::default());
+        let mut rendered = storage_report_lines(&report);
+        rendered.push(status_storage_line(&report));
+        rendered.extend(reclaimable_lines(&[reclaim::ReclaimableEstimate {
+            scope: ReclaimScope::McpOpenOrphan,
+            units: 3,
+            estimated_rows: 10,
+            estimated_bytes: 5_368_709_120,
+            tables: vec!["mcp_open_events".to_string()],
+            note: Some("probe not registered".to_string()),
+        }]));
+        rendered.push(reclaim::estimated_bytes_note());
+        rendered.push(reclaim::reclaimed_bytes_note());
+        for scope in ReclaimScope::ALL {
+            rendered.push(scope.describe().to_string());
+        }
+
+        let joined = rendered.join("\n").to_lowercase();
+        for forbidden in reclaim::FORBIDDEN_DENOMINATION_WORDS {
+            assert!(
+                !joined.contains(forbidden),
+                "a reclaim surface must never say `{forbidden}`:\n{joined}"
+            );
+        }
+        // Any estimate line must carry the qualifier next to the number.
+        let estimate_line = rendered
+            .iter()
+            .find(|line| line.contains("scope mcp_open_orphan"))
+            .expect("estimate line");
+        assert!(
+            estimate_line.contains(reclaim::ESTIMATE_QUALIFIER),
+            "{estimate_line}"
+        );
+        assert!(reclaim::reclaimed_bytes_note().contains(reclaim::MERGE_DEFERRED_QUALIFIER));
+    }
+
+    /// A configured bucket-1/2 horizon must be impossible to miss.
+    ///
+    /// MUTATION (executed 2026-07-27): make
+    /// `RetentionPolicyEntry::is_destructive` drop its `is_protected` guard =>
+    /// the library test `default_retention_surfaces_no_destructive_policy`
+    /// FAILS. Here the direction bounded is the other one: a CONFIGURED
+    /// canonical horizon must produce a warning line, so a "fix" that always
+    /// returns false fails this test.
+    #[test]
+    fn a_configured_canonical_horizon_is_prominent_and_a_default_one_is_absent() {
+        let stock = storage_fixture(moraine_config::RetentionConfig::default());
+        assert_eq!(status_retention_warning_line(&stock), None);
+        assert!(!storage_report_lines(&stock)
+            .join("\n")
+            .contains("RETENTION CONFIGURED"));
+
+        let configured = storage_fixture(moraine_config::RetentionConfig {
+            canonical_history_horizon_days: Some(365.0),
+            ..moraine_config::RetentionConfig::default()
+        });
+        let warning = status_retention_warning_line(&configured).expect("warning line");
+        assert!(warning.contains("RETENTION CONFIGURED"), "{warning}");
+        assert!(
+            warning.contains("user history will be deleted"),
+            "{warning}"
+        );
+        assert!(warning.contains("canonical_history"), "{warning}");
+        assert!(warning.contains("365d"), "{warning}");
+        assert!(storage_report_lines(&configured)
+            .join("\n")
+            .contains("RETENTION CONFIGURED"));
+    }
+
+    /// The rendered half of G-TELEMETRY-HONESTY. A caveat that lives only in
+    /// a struct field reaches nobody.
+    ///
+    /// MUTATION (executed 2026-07-27): drop the `entry.note` arm from
+    /// `storage_report_lines` => FAILS here. The library test
+    /// `the_telemetry_horizon_never_reports_itself_as_configured` stays green,
+    /// because it can only see the struct.
+    #[test]
+    fn status_lines_render_the_telemetry_horizon_caveat() {
+        let rendered =
+            storage_report_lines(&storage_fixture(moraine_config::RetentionConfig::default()))
+                .join("\n");
+        let telemetry = rendered
+            .lines()
+            .find(|line| line.contains("policy telemetry"))
+            .expect("a telemetry policy line");
+        assert!(telemetry.contains("30d"), "{telemetry}");
+        assert!(telemetry.contains("(default"), "{telemetry}");
+        assert!(
+            telemetry.contains("retention.telemetry_horizon_days"),
+            "{telemetry}"
+        );
+        assert!(
+            telemetry.contains(moraine_clickhouse::TELEMETRY_HORIZON_NOT_CONFIGURABLE_NOTE),
+            "the line names a config key, so it must also say the key does nothing: {telemetry}"
+        );
+
+        // Upper bound: the other policy lines stay clean, so the caveat is a
+        // statement about this key rather than boilerplate on every row.
+        for class in ["canonical_history", "raw_audit", "derived", "never_delete"] {
+            let line = rendered
+                .lines()
+                .find(|line| line.starts_with(&format!("  policy {class}:")))
+                .unwrap_or_else(|| panic!("a `{class}` policy line"));
+            assert!(!line.contains(" — "), "{line}");
+        }
+    }
+
+    #[test]
+    fn the_status_storage_line_reports_buckets_and_disk_headroom() {
+        let line =
+            status_storage_line(&storage_fixture(moraine_config::RetentionConfig::default()));
+        assert!(line.contains("canonical_history 4.46 GiB"), "{line}");
+        assert!(line.contains("derived 13.37 GiB"), "{line}");
+        assert!(line.contains("disk free 10.97 GiB of 926.35 GiB"), "{line}");
+        // Empty buckets are omitted from the concise line but never invented.
+        assert!(!line.contains("telemetry"), "{line}");
+    }
+
+    /// The `--confirm` refusal **text**. Fails for: a refusal that does not
+    /// say what would be deleted, or that omits the pre-destructive safety
+    /// valve.
+    ///
+    /// This test renders `render_reclaim_refusal` directly, so it bounds
+    /// exactly one direction: the refusal stays actionable, because a refusal
+    /// naming no table is a refusal an operator cannot act on.
+    ///
+    /// It does **not** cover whether anything calls it. An earlier revision of
+    /// this docstring claimed the mutation "drop `args.confirm` from the guard
+    /// in `cmd_db_reclaim_run`" was compensated by
+    /// `clap_parses_reclaim_subcommands`; a reviewer ran that mutation and the
+    /// CLI suite stayed at 229/0. `clap_parses_reclaim_subcommands` proves the
+    /// flag parses and defaults to false, and nothing more. The gate itself is
+    /// now bounded by
+    /// `commands::tests::the_unconfirmed_run_ceremony_is_enforced_end_to_end`,
+    /// and its exit code by `commands::tests::a_refusal_exits_non_zero`.
+    #[test]
+    fn the_unconfirmed_refusal_names_every_table_and_the_export_valve() {
+        let output = CliOutput {
+            mode: OutputMode::Plain,
+            verbose: false,
+            unicode: false,
+            width: 100,
+        };
+        for scope in ReclaimScope::ALL {
+            // Rendering must not panic for any scope, and the JSON form must
+            // carry the same table list as the human form.
+            render_reclaim_refusal(&output, scope, false).expect("refusal renders");
+        }
+
+        // The canonical scope is the one whose refusal matters most.
+        let scope = ReclaimScope::CanonicalGeneration;
+        let tables: Vec<&str> = scope.tables().iter().map(|table| table.name()).collect();
+        assert!(tables.contains(&"events"));
+        assert!(tables.contains(&"raw_events"));
+        assert!(scope.describe().contains("USER HISTORY"));
+    }
+
+    #[test]
+    fn a_run_with_no_registered_executor_renders_as_deleting_nothing() {
+        let output = CliOutput {
+            mode: OutputMode::Plain,
+            verbose: false,
+            unicode: false,
+            width: 100,
+        };
+        let outcome = ReclaimOutcome::NoExecutor {
+            scope: ReclaimScope::McpOpenOrphan,
+            message: "no executor is registered for scope `mcp_open_orphan`; WI-05 adds it. \
+                      Nothing was deleted."
+                .to_string(),
+        };
+        render_reclaim_outcome(&output, &outcome, false).expect("outcome renders");
+        assert!(!outcome.deleted_anything());
+
+        // A blocked run is a distinct, counted outcome — not an indistinguishable
+        // "nothing to do".
+        let blocked = ReclaimOutcome::Blocked {
+            scope: ReclaimScope::McpOpenOrphan,
+            pending_mutations: 3,
+        };
+        assert!(!blocked.deleted_anything());
+        assert_ne!(
+            blocked,
+            ReclaimOutcome::Idle {
+                scope: ReclaimScope::McpOpenOrphan
+            }
+        );
+        render_reclaim_outcome(&output, &blocked, false).expect("blocked renders");
+    }
+
+    #[test]
+    fn byte_formatting_is_stable_across_unit_boundaries() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(1023), "1023 B");
+        assert_eq!(format_bytes(1024), "1.00 KiB");
+        assert_eq!(format_bytes(4_787_723_965), "4.46 GiB");
     }
 }

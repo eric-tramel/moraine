@@ -561,6 +561,9 @@ pub(super) async fn cmd_status(
     // a direct-DB read that yields "unavailable" when ClickHouse is unreachable,
     // so it never blocks or fails the status snapshot.
     let core_index = super::gather_core_index_report(cfg).await;
+    // Storage ownership and effective retention policy (issue #603 WI-02).
+    // Same best-effort contract: `None` when ClickHouse is unreachable.
+    let storage = super::gather_storage_report(cfg).await;
 
     Ok(StatusSnapshot {
         services,
@@ -577,6 +580,7 @@ pub(super) async fn cmd_status(
         doctor: report,
         heartbeat,
         core_index: Some(core_index),
+        storage,
     })
 }
 

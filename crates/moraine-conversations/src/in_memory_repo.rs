@@ -842,6 +842,9 @@ mod tests {
                 backfill_cursor_age_ms: Some(1_500),
                 audit_outcome: None,
             }),
+            storage: StoreProbe::Failed {
+                message: "storage probe not gathered".to_string(),
+            },
         };
         let diagnostics = StoreDiagnostics {
             healthy: true,

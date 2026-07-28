@@ -14,7 +14,7 @@ All canonical routes are `GET` routes and successful responses use JSON.
 | Route | Query | Purpose |
 | --- | --- | --- |
 | `/api/v1/capabilities` | none | Describe this server build, its observed schema migration level, and available HTTP feature groups. |
-| `/api/v1/health` | none | Probe ClickHouse health and report compact publication-readiness, query-budget, and ingest-heartbeat summaries. |
+| `/api/v1/health` | none | Probe ClickHouse health and report compact publication-readiness, storage, query-budget, and ingest-heartbeat summaries. |
 | `/api/v1/status` | none | Return the diagnostic ClickHouse, publication, database, table, connection, and ingestor snapshot used by the status dashboard, plus `known_harnesses`. |
 | `/api/v1/analytics` | `range` | Return token, turn, and concurrent-session time series for a supported window. |
 | `/api/v1/tables` | none | List tables with engine, temporary-table marker, and estimated row count. |
@@ -425,6 +425,80 @@ rows. They do not use `null` to mean an empty collection.
 
 Clients must distinguish a diagnostic value inside an HTTP `200` response from
 an endpoint failure represented by a non-2xx status.
+
+## Health Storage Block
+
+`GET /api/v1/health` carries an additive `storage` object describing what is on
+disk and the retention policy in force. It is present on both the `200` and the
+`503` shape, and like every other probe it degrades independently: a backend
+that cannot report storage yields `{"available": false, "error": "..."}` while
+the rest of the response is unaffected.
+
+```json
+{
+  "storage": {
+    "available": true,
+    "buckets": [
+      {
+        "class": "canonical_history",
+        "label": "canonical user history",
+        "tables": 1,
+        "rows": 1990776,
+        "compressed_bytes": 4787723965
+      }
+    ],
+    "total_compressed_bytes": 19143723965,
+    "disk": { "free_bytes": 11780276224, "total_bytes": 994662584320, "used_bytes": 982882308096 },
+    "policy": [
+      {
+        "class": "canonical_history",
+        "horizon_seconds": null,
+        "source": "default",
+        "config_key": "retention.canonical_history_horizon_days",
+        "destructive": false,
+        "note": null
+      }
+    ],
+    "destructive_policies": [],
+    "unclassified_tables": [],
+    "notes": []
+  }
+}
+```
+
+Field semantics:
+
+- `buckets` reports **per storage class**, not per table, so the response size
+  does not grow with the table count. `class` is one of `canonical_history`,
+  `raw_audit`, `derived`, `telemetry`, `never_delete`; every class appears even
+  at zero tables.
+- `total_compressed_bytes` is the sum over buckets. A table the server does not
+  classify contributes to **no** bucket and is named in `unclassified_tables`
+  instead — it is never folded into `derived`.
+- `disk` is `null` when `system.disks` could not be read; `notes` then explains
+  why. `notes` also names any unclassified table.
+- `policy[].source` is `default` or `configured`. `policy[].destructive` is
+  `true` exactly when configuration authorizes deleting user history for that
+  class, and `destructive_policies` lists those classes. An empty
+  `destructive_policies` means default configuration deletes no raw or
+  canonical history.
+- `horizon_seconds` is `null` for a class with no horizon (`never_delete`) and
+  for an unconfigured protected bucket. `null` is "no retention", never "zero".
+- `policy[].note` is `null` except on `telemetry`, whose horizon lives in
+  static migration SQL (`sql/039_telemetry_retention.sql`) rather than in
+  configuration. Its `config_key` is reported for discoverability, but the key
+  is not yet operator-configurable — the server refuses to load a config that
+  sets it to anything but the default — so `source` is always `default` and the
+  note says why. A client that surfaces `config_key` should surface `note` with
+  it.
+
+Every byte figure here describes what is stored **now**. The block carries no
+reclaimable estimate: estimates are available only from
+`moraine db reclaim plan`, where they are labelled as estimates, because
+nothing is partitioned by source generation and a lightweight `DELETE` returns
+bytes only when a background merge rewrites the part.
+
+Clients must treat the block as additive and tolerate new keys inside it.
 
 ## Errors and Status Codes
 

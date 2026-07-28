@@ -119,6 +119,9 @@ fn repository_config(cfg: &AppConfig, session_scope: Option<SessionOriginScope>)
         bm25_default_min_should_match: cfg.bm25.default_min_should_match,
         bm25_max_query_terms: cfg.bm25.max_query_terms,
         session_scope,
+        // Issue #603 WI-03: carry the effective policy so `/api/v1/health`
+        // reports what the operator configured, not the built-in default.
+        retention: cfg.retention,
     }
 }
 

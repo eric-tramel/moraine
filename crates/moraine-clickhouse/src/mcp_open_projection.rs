@@ -124,7 +124,12 @@ struct SupersededGenerationRow {
 
 /// Bounds a reclaim DELETE's literal (session, generation) list far below the
 /// 8 MiB request payload cap.
-const RECLAIM_DELETE_CHUNK: usize = 1000;
+///
+/// `pub(crate)` because [`crate::reclaim::RECLAIM_DELETE_CHUNK`] is *defined
+/// as* this value rather than restating `1000`: the #603 driver's claim that
+/// the two reclaim paths "have one shape" has to be a compile-time fact, not a
+/// comment that survives one of the two being tuned.
+pub(crate) const RECLAIM_DELETE_CHUNK: usize = 1000;
 
 /// Superseded (session, generation) snapshot heads reclaimed because a newer
 /// generation exists in the same source-head lineage and the published

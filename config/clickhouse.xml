@@ -34,10 +34,35 @@
   <uncompressed_cache_size>536870912</uncompressed_cache_size>
   <mark_cache_size>536870912</mark_cache_size>
 
+  <!-- System-log retention (issue #603 WI-08).
+
+       This file is rendered as the WHOLE server config and launched with
+       `--config-file`, so ClickHouse's packaged `config.xml` — which ships
+       `<ttl>event_date + INTERVAL 30 DAY DELETE</ttl>` on each of these
+       sections — is never loaded, and these tables had no retention of any
+       kind. Verified empirically on the reference host (ClickHouse 25.12.5.44,
+       2026-07-27): `system.query_log`, `system.metric_log`, and
+       `system.asynchronous_metric_log` all reported an empty TTL clause in
+       `create_table_query`, and no other MergeTree system log existed
+       (`part_log`, `trace_log`, `text_log` are not declared and are off).
+       That closes plan OQ-3 — there is no built-in fallback, so the horizon
+       below is a real bound rather than a restatement of one.
+
+       Measured effect of restoring the packaged 30-day horizon on the
+       reference host: query_log 1.15 GiB, metric_log 647 MiB, and
+       asynchronous_metric_log 202 MiB of rows are older than 30 days —
+       ~2.0 GiB of the 5.1 GiB these three occupy. (The plan's "~5 GiB" is
+       their TOTAL size, not what a 30-day horizon removes.)
+
+       These are ClickHouse's own diagnostics. No `moraine.*` table is named
+       here, so this section cannot delete user history by construction. TTLs
+       for the four Moraine telemetry tables live in `sql/039`, and those are
+       anchored so that their first application deletes nothing. -->
   <query_log>
     <database>system</database>
     <table>query_log</table>
     <flush_interval_milliseconds>7500</flush_interval_milliseconds>
+    <ttl>event_date + INTERVAL 30 DAY DELETE</ttl>
   </query_log>
 
   <metric_log>
@@ -45,11 +70,13 @@
     <table>metric_log</table>
     <collect_interval_milliseconds>1000</collect_interval_milliseconds>
     <flush_interval_milliseconds>7000</flush_interval_milliseconds>
+    <ttl>event_date + INTERVAL 30 DAY DELETE</ttl>
   </metric_log>
 
   <asynchronous_metric_log>
     <database>system</database>
     <table>asynchronous_metric_log</table>
     <flush_interval_milliseconds>7000</flush_interval_milliseconds>
+    <ttl>event_date + INTERVAL 30 DAY DELETE</ttl>
   </asynchronous_metric_log>
 </clickhouse>
