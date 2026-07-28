@@ -62,6 +62,45 @@ async fn store_health_maps_all_successful_probe_facts() {
                 &["FROM system.tables", "mcp_read_index_state"],
                 json!([{"value": "0"}]),
             ),
+            // Storage probe (issue #603 WI-02): exactly two statements — one
+            // `system.parts` aggregate and one `system.disks` read. It touches
+            // no user relation, which is what makes it safe on the health path.
+            ScriptedResponse::rows(
+                &["FROM system.parts", "AND active", "GROUP BY table"],
+                json!([
+                    {
+                        "name": "events",
+                        "rows": 1_990_776_u64,
+                        "compressed_bytes": 4_787_723_965_u64,
+                        "uncompressed_bytes": 11_420_351_515_u64,
+                        "active_parts": 24_u64,
+                        "oldest_retained_unix": 1_771_597_005_i64,
+                        "oldest_retained_text": "2026-02-20T14:16:45Z"
+                    },
+                    {
+                        "name": "mcp_open_turns",
+                        "rows": 234_694_u64,
+                        "compressed_bytes": 14_356_000_000_u64,
+                        "uncompressed_bytes": 40_000_000_000_u64,
+                        "active_parts": 303_u64,
+                        "oldest_retained_unix": 0_i64,
+                        "oldest_retained_text": "1970-01-01T00:00:00Z"
+                    },
+                    {
+                        "name": "mystery_table",
+                        "rows": 1_u64,
+                        "compressed_bytes": 2_u64,
+                        "uncompressed_bytes": 3_u64,
+                        "active_parts": 1_u64,
+                        "oldest_retained_unix": 0_i64,
+                        "oldest_retained_text": "1970-01-01T00:00:00Z"
+                    }
+                ]),
+            ),
+            ScriptedResponse::rows(
+                &["FROM system.disks"],
+                json!([{ "free_bytes": 11_780_276_224_u64, "total_bytes": 994_662_584_320_u64 }]),
+            ),
         ];
         let (repo, state) = build_scripted_repo(responses).await;
 
@@ -106,7 +145,59 @@ async fn store_health_maps_all_successful_probe_facts() {
             "unmigrated core-index probe maps to Available/all-false, got {:?}",
             health.core_index
         );
-        assert_script_consumed(&state, 8);
+        // Storage probe (issue #603 WI-02): buckets are folded from the
+        // classification, the epoch sentinel is reported as "no oldest row"
+        // rather than 1970, and an unclassified table lands in NO bucket and
+        // is surfaced by name.
+        let storage = match &health.storage {
+            StoreProbe::Available(storage) => storage,
+            other => panic!("expected an available storage report, got {other:?}"),
+        };
+        assert_eq!(storage.tables.len(), 3);
+        let events = storage
+            .tables
+            .iter()
+            .find(|table| table.name == "events")
+            .expect("events row");
+        assert_eq!(events.class, Some(TableClass::CanonicalHistory));
+        assert_eq!(
+            events.oldest_retained.as_deref(),
+            Some("2026-02-20T14:16:45Z")
+        );
+        let turns = storage
+            .tables
+            .iter()
+            .find(|table| table.name == "mcp_open_turns")
+            .expect("turns row");
+        assert_eq!(turns.class, Some(TableClass::Derived));
+        assert_eq!(
+            turns.oldest_retained, None,
+            "a hash-partitioned table reports NO oldest row, never the epoch"
+        );
+        assert_eq!(storage.unclassified_tables(), vec!["mystery_table"]);
+        assert!(storage
+            .notes
+            .iter()
+            .any(|note| note.contains("mystery_table")));
+
+        let canonical = storage
+            .bucket(TableClass::CanonicalHistory)
+            .expect("canonical bucket");
+        assert_eq!(canonical.tables, 1);
+        assert_eq!(canonical.rows, 1_990_776);
+        // The unclassified table contributes to no bucket: it must never be
+        // silently folded into "derived".
+        assert_eq!(
+            storage.total_compressed_bytes(),
+            4_787_723_965 + 14_356_000_000
+        );
+        let disk = storage.disk.expect("disk headroom");
+        assert_eq!(disk.free_bytes, 11_780_276_224);
+        assert_eq!(disk.total_bytes, 994_662_584_320);
+        // Stock configuration authorizes deleting nothing.
+        assert!(storage.destructive_policies().is_empty());
+
+        assert_script_consumed(&state, 10);
     })
     .await;
 }
@@ -128,6 +219,9 @@ async fn store_health_keeps_each_probe_failure_independent() {
                 &["FROM system.tables", "mcp_read_index_state"],
                 "health core-index failed",
             ),
+            // The storage probe's first statement fails, so the whole probe
+            // degrades to Failed without failing the health report.
+            ScriptedResponse::failure(&["FROM system.parts"], "health storage failed"),
         ];
         let (repo, state) = build_scripted_repo(responses).await;
 
@@ -160,7 +254,11 @@ async fn store_health_keeps_each_probe_failure_independent() {
             health.core_index,
             StoreProbe::Failed { ref message } if message.contains("health core-index failed")
         ));
-        assert_script_consumed(&state, 6);
+        assert!(matches!(
+            health.storage,
+            StoreProbe::Failed { ref message } if message.contains("health storage failed")
+        ));
+        assert_script_consumed(&state, 7);
     })
     .await;
 }
@@ -276,6 +374,11 @@ async fn diagnostics_maps_doctor_partial_report_and_ping_short_circuit() {
                 "v_live_search_postings",
                 "v_mcp_open_publication_headers",
                 "v_current_mcp_open_generation_readiness",
+                // issue #603 WI-04: migration 038's ledger is part of the
+                // schema handshake, so a database without it reports it
+                // missing rather than silently tolerating a reclaimer with no
+                // durable claim set.
+                "storage_reclaim_ledger",
             ]
         );
         assert_eq!(diagnostics.errors.len(), 2);

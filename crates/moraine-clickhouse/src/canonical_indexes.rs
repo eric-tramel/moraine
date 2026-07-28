@@ -1360,6 +1360,52 @@ fn now_unix_millis() -> i64 {
 #[cfg(test)]
 mod tests {
 
+    /// **G-BYPASS.** Fails for: a table reachable by a delete path that does
+    /// not go through `reclaim::emit_delete_statement` ceasing to be
+    /// `Derived`.
+    /// Denomination: exact class, per table, plus the roster length.
+    ///
+    /// §4 S3 says every `DELETE` is constructed by one function that re-derives
+    /// the table's class. That is not yet true of the tree: this module's
+    /// `reset_canonical_read_indexes` (via `truncate_index_table`) and
+    /// `mcp_open_projection::reclaim_orphan_delete_statements` both emit
+    /// row-removing SQL directly, and both predate #603. Their safety rests
+    /// entirely on the tables they name being bucket 3 — a property nothing
+    /// asserted, so reclassifying one of these three to `RawAudit` (an
+    /// argument someone could make for a read index that is expensive to
+    /// rebuild) would leave an unguarded `TRUNCATE` pointed at protected data
+    /// with the suite green.
+    ///
+    /// MUTATION (executed 2026-07-27), each run separately: reclassify
+    /// `mcp_session_directory` to `RawAudit`; reclassify `mcp_event_locator`
+    /// to `NeverDelete` => FAILS here in both cases. **Lower bound.**
+    ///
+    /// MUTATION (executed 2026-07-27): add a fourth, unclassified name to
+    /// `CANONICAL_INDEX_TABLES` => FAILS on the `classify` unwrap. **Width:
+    /// the roster is the loop's own source, so it cannot grow past its
+    /// coverage.**
+    #[test]
+    fn every_table_the_rebuild_truncates_directly_is_bucket_three() {
+        use crate::storage_class::{classify, TableClass};
+
+        assert_eq!(super::CANONICAL_INDEX_TABLES.len(), 3);
+        for table in super::CANONICAL_INDEX_TABLES {
+            let class = classify(table).unwrap_or_else(|| {
+                panic!("`{table}` is truncated by rebuild and must be classified")
+            });
+            assert_eq!(
+                class,
+                TableClass::Derived,
+                "`{table}` is emptied by `reset_canonical_read_indexes`, which bypasses \
+                 `reclaim::emit_delete_statement`; only bucket 3 may be reached that way"
+            );
+            assert!(
+                !class.is_protected(),
+                "`{table}` must not be protected while an unguarded TRUNCATE names it"
+            );
+        }
+    }
+
     /// The overlap audit must compare DISTINCT uids, never row counts.
     ///
     /// MUTATION: change either `uniqExact(event_uid)` back to `count()`; this

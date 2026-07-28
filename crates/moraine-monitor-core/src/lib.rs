@@ -19,8 +19,8 @@ use moraine_conversations::{
     CanonicalReadOutcome, ConversationListSort, ConversationMode, CoreIndexHealth, IngestHeartbeat,
     IngestHeartbeatRead, McpSessionListFilter, McpSessionListItem, McpSessionOpen, McpTurnCompact,
     PageRequest, PublicationDiagnostics, QueryClass, QueryEnvelope, RepoError, SessionLookback,
-    SessionSearchQuery, StoreConnectionMetrics, StoreHealth, StoreProbe, TablePreviewQuery,
-    TableSummaries,
+    SessionSearchQuery, StorageReport, StoreConnectionMetrics, StoreHealth, StoreProbe,
+    TablePreviewQuery, TableSummaries,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -613,6 +613,10 @@ async fn api_health(Extension(backend): Extension<Arc<BackendRepository>>) -> Re
                     "available": false,
                     "error": "canonical read-index readiness unavailable while store health is unavailable",
                 },
+                "storage": {
+                    "available": false,
+                    "error": "storage report unavailable while store health is unavailable",
+                },
                 "query_budgets": query_budgets_payload(),
             });
             if let Some(code) = code {
@@ -624,6 +628,7 @@ async fn api_health(Extension(backend): Extension<Arc<BackendRepository>>) -> Re
     let connections = connection_payload(&health.connections);
     let publication = publication_payload(&health.publication);
     let core_index = core_index_payload(&health.core_index);
+    let storage = storage_payload(&health.storage);
 
     let ping_ms = match &health.ping {
         StoreProbe::Available(value) => *value,
@@ -634,6 +639,7 @@ async fn api_health(Extension(backend): Extension<Arc<BackendRepository>>) -> Re
                 connections,
                 publication,
                 core_index,
+                storage,
             );
         }
     };
@@ -646,6 +652,7 @@ async fn api_health(Extension(backend): Extension<Arc<BackendRepository>>) -> Re
                 connections,
                 publication,
                 core_index,
+                storage,
             );
         }
     };
@@ -661,6 +668,7 @@ async fn api_health(Extension(backend): Extension<Arc<BackendRepository>>) -> Re
             "connections": connections,
             "publication": publication,
             "core_index": core_index,
+            "storage": storage,
             "query_budgets": query_budgets_payload(),
             "ingestor": health_heartbeat_payload(&heartbeat),
         }),
@@ -674,6 +682,7 @@ fn health_failure_response(
     connections: Value,
     publication: Value,
     core_index: Value,
+    storage: Value,
 ) -> Response {
     json_response(
         json!({
@@ -684,6 +693,7 @@ fn health_failure_response(
             "connections": connections,
             "publication": publication,
             "core_index": core_index,
+            "storage": storage,
             "query_budgets": query_budgets_payload(),
         }),
         StatusCode::SERVICE_UNAVAILABLE,
@@ -765,6 +775,9 @@ fn unavailable_store_health(message: String) -> StoreHealth {
             message: "canonical read-index readiness unavailable while store health is unavailable"
                 .to_string(),
         },
+        storage: StoreProbe::Failed {
+            message: "storage report unavailable while store health is unavailable".to_string(),
+        },
     }
 }
 
@@ -837,6 +850,69 @@ fn publication_payload(probe: &StoreProbe<PublicationDiagnostics>) -> Value {
         StoreProbe::Failed { message } => json!({
             "available": false,
             "healthy": false,
+            "error": message,
+        }),
+    }
+}
+
+/// The `/api/v1/health` `storage` block (issue #603 WI-02).
+///
+/// Per-bucket bytes rather than per-table: a health response must not grow
+/// with the table count, and the bucket is the unit the ownership model is
+/// expressed in. `policy` carries the effective `[retention]` with its
+/// provenance, and `destructive_policies` is a non-empty list exactly when
+/// configuration authorizes deleting user history — a client should never have
+/// to re-derive that from horizons.
+///
+/// No byte figure here is a "reclaimable" estimate: this block reports what
+/// is on disk now. Estimates live behind `moraine db reclaim plan`, where they
+/// carry their qualifier.
+fn storage_payload(probe: &StoreProbe<StorageReport>) -> Value {
+    match probe {
+        StoreProbe::Available(report) => json!({
+            "available": true,
+            "buckets": report
+                .buckets
+                .iter()
+                .map(|bucket| json!({
+                    "class": bucket.class.as_str(),
+                    "label": bucket.label,
+                    "tables": bucket.tables,
+                    "rows": bucket.rows,
+                    "compressed_bytes": bucket.compressed_bytes,
+                }))
+                .collect::<Vec<_>>(),
+            "total_compressed_bytes": report.total_compressed_bytes(),
+            "disk": report.disk.map(|disk| json!({
+                "free_bytes": disk.free_bytes,
+                "total_bytes": disk.total_bytes,
+                "used_bytes": disk.used_bytes(),
+            })),
+            "policy": report
+                .policy
+                .iter()
+                .map(|entry| json!({
+                    "class": entry.class.as_str(),
+                    "horizon_seconds": entry.horizon_seconds,
+                    "source": entry.source,
+                    "config_key": entry.config_key,
+                    "destructive": entry.is_destructive(),
+                    // `config_key` with no qualification reads as an
+                    // invitation to set it. Bucket 4's key is inert, and this
+                    // is the API's only chance to say so.
+                    "note": entry.note,
+                }))
+                .collect::<Vec<_>>(),
+            "destructive_policies": report
+                .destructive_policies()
+                .iter()
+                .map(|entry| entry.class.as_str())
+                .collect::<Vec<_>>(),
+            "unclassified_tables": report.unclassified_tables(),
+            "notes": report.notes,
+        }),
+        StoreProbe::Failed { message } => json!({
+            "available": false,
             "error": message,
         }),
     }
@@ -2049,6 +2125,45 @@ mod tests {
                 backfill_cursor_age_ms: Some(4_200),
                 audit_outcome: None,
             }),
+            storage: StoreProbe::Available(sample_storage_report()),
+        }
+    }
+
+    /// A minimal but non-degenerate storage report: one bucket-1 table, one
+    /// bucket-3 table, real disk numbers, and the default (non-destructive)
+    /// policy. Enough for the `/api/v1/health` shape assertions.
+    fn sample_storage_report() -> StorageReport {
+        let tables = vec![
+            moraine_conversations::StorageTableReport {
+                name: "events".to_string(),
+                class: Some(moraine_conversations::TableClass::CanonicalHistory),
+                rows: 1_990_776,
+                compressed_bytes: 4_787_723_965,
+                uncompressed_bytes: 11_420_351_515,
+                active_parts: 24,
+                oldest_retained: Some("2026-02-20T14:16:45Z".to_string()),
+            },
+            moraine_conversations::StorageTableReport {
+                name: "mcp_open_turns".to_string(),
+                class: Some(moraine_conversations::TableClass::Derived),
+                rows: 234_694,
+                compressed_bytes: 14_356_000_000,
+                uncompressed_bytes: 40_000_000_000,
+                active_parts: 303,
+                oldest_retained: None,
+            },
+        ];
+        StorageReport {
+            buckets: moraine_conversations::fold_buckets(&tables),
+            tables,
+            disk: Some(moraine_conversations::StorageDiskReport {
+                free_bytes: 11_780_276_224,
+                total_bytes: 994_662_584_320,
+            }),
+            policy: moraine_conversations::retention_policy_entries(
+                &moraine_config::RetentionConfig::default(),
+            ),
+            notes: Vec::new(),
         }
     }
 
@@ -4111,6 +4226,106 @@ mod tests {
         // The additive block is present on `/status` with the same shape.
         let status = response_json(api_status(Extension(backend)).await).await;
         assert_eq!(status["core_index"], health["core_index"]);
+    }
+
+    /// Issue #603 WI-02. The `storage` block is additive, per-bucket (so the
+    /// response cannot grow with the table count), and reports a stock
+    /// configuration as authorizing no deletion.
+    #[tokio::test]
+    async fn health_exposes_the_storage_block_with_no_destructive_policy_by_default() {
+        let (backend, _) = fake_backend(InMemoryConversationResponses {
+            read_store_health: Some(Ok(sample_health())),
+            latest_ingest_heartbeat: Some(Ok(sample_heartbeat())),
+            list_table_summaries: Some(Ok(TableSummaries::default())),
+            ..Default::default()
+        })
+        .await;
+
+        let health = response_json(api_health(Extension(backend)).await).await;
+        assert_eq!(health["ok"], json!(true));
+        let storage = &health["storage"];
+        assert_eq!(storage["available"], json!(true));
+
+        // Per-bucket, never per-table: every class is present, even at zero.
+        let buckets = storage["buckets"].as_array().expect("buckets array");
+        assert_eq!(buckets.len(), 5);
+        let canonical = buckets
+            .iter()
+            .find(|bucket| bucket["class"] == json!("canonical_history"))
+            .expect("canonical bucket");
+        assert_eq!(canonical["tables"], json!(1));
+        assert_eq!(canonical["rows"], json!(1_990_776));
+        assert_eq!(canonical["compressed_bytes"], json!(4_787_723_965_u64));
+        let telemetry = buckets
+            .iter()
+            .find(|bucket| bucket["class"] == json!("telemetry"))
+            .expect("telemetry bucket present even at zero");
+        assert_eq!(telemetry["tables"], json!(0));
+
+        assert_eq!(
+            storage["total_compressed_bytes"],
+            json!(4_787_723_965_u64 + 14_356_000_000_u64)
+        );
+        assert_eq!(storage["disk"]["free_bytes"], json!(11_780_276_224_u64));
+        assert_eq!(storage["disk"]["used_bytes"], json!(982_882_308_096_u64));
+
+        // Default configuration authorizes deleting nothing, and the block
+        // says so directly rather than making a client re-derive it.
+        assert_eq!(storage["destructive_policies"], json!([]));
+        let policy = storage["policy"].as_array().expect("policy array");
+        let canonical_policy = policy
+            .iter()
+            .find(|entry| entry["class"] == json!("canonical_history"))
+            .expect("canonical policy");
+        assert_eq!(canonical_policy["horizon_seconds"], Value::Null);
+        assert_eq!(canonical_policy["source"], json!("default"));
+        assert_eq!(canonical_policy["destructive"], json!(false));
+        assert_eq!(
+            canonical_policy["config_key"],
+            json!("retention.canonical_history_horizon_days")
+        );
+        assert_eq!(canonical_policy["note"], Value::Null);
+
+        // The telemetry horizon reports a `config_key` that cannot move it, so
+        // the API must carry the caveat with the key. Without it, a client that
+        // renders `config_key` invites an operator to set a value the server
+        // will refuse — or, before the refusal existed, to set one the server
+        // accepted and never applied.
+        let telemetry_policy = policy
+            .iter()
+            .find(|entry| entry["class"] == json!("telemetry"))
+            .expect("telemetry policy");
+        assert_eq!(telemetry_policy["source"], json!("default"));
+        assert_eq!(telemetry_policy["horizon_seconds"], json!(2_592_000.0));
+        assert_eq!(
+            telemetry_policy["note"],
+            json!(moraine_conversations::TELEMETRY_HORIZON_NOT_CONFIGURABLE_NOTE)
+        );
+        assert_eq!(storage["unclassified_tables"], json!([]));
+    }
+
+    /// The probe degrades independently: an unavailable storage report must not
+    /// take the rest of health down with it.
+    #[tokio::test]
+    async fn health_reports_an_unavailable_storage_probe_without_failing() {
+        let (backend, _) = fake_backend(InMemoryConversationResponses {
+            read_store_health: Some(Ok(StoreHealth {
+                storage: StoreProbe::Failed {
+                    message: "system.parts unreadable".to_string(),
+                },
+                ..sample_health()
+            })),
+            latest_ingest_heartbeat: Some(Ok(sample_heartbeat())),
+            list_table_summaries: Some(Ok(TableSummaries::default())),
+            ..Default::default()
+        })
+        .await;
+
+        let health = response_json(api_health(Extension(backend)).await).await;
+        assert_eq!(health["ok"], json!(true), "storage is not a health gate");
+        assert_eq!(health["storage"]["available"], json!(false));
+        assert_eq!(health["storage"]["error"], json!("system.parts unreadable"));
+        assert_eq!(health["core_index"]["available"], json!(true));
     }
 
     #[tokio::test]

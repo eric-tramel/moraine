@@ -156,6 +156,57 @@ pub(crate) enum DbCommand {
     Doctor,
     /// Inspect and operate the canonical read indexes (issue #598).
     CoreIndex(CoreIndexArgs),
+    /// Inspect storage ownership and plan physical reclamation (issue #603).
+    Reclaim(ReclaimArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct ReclaimArgs {
+    #[command(subcommand)]
+    pub(crate) command: ReclaimCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum ReclaimCommand {
+    /// Print per-bucket storage, disk headroom, the effective retention
+    /// policy, and the reclaim ledger. Never destructive.
+    Status(ReclaimStatusArgs),
+    /// Dry run: the claim set and row/byte ESTIMATES for each scope. Writes
+    /// nothing.
+    Plan(ReclaimPlanArgs),
+    /// Claim and execute a bounded reclaim. Refuses without --confirm, and
+    /// refuses a scope that deletes user history unless the matching
+    /// `[retention]` key is configured.
+    Run(ReclaimRunArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct ReclaimStatusArgs {
+    #[arg(long)]
+    pub(crate) json: bool,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct ReclaimPlanArgs {
+    /// Limit the dry run to one scope (`mcp_open_orphan`,
+    /// `read_index_generation`, `canonical_generation`). Omit for all.
+    #[arg(long)]
+    pub(crate) scope: Option<String>,
+    #[arg(long)]
+    pub(crate) json: bool,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct ReclaimRunArgs {
+    /// The scope to reclaim. Required: there is deliberately no "everything".
+    #[arg(long)]
+    pub(crate) scope: String,
+    /// Acknowledge the deletion. Without it the command prints exactly what
+    /// would be deleted and exits non-zero.
+    #[arg(long)]
+    pub(crate) confirm: bool,
+    #[arg(long)]
+    pub(crate) json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -356,6 +407,69 @@ mod tests {
                     }),
             }) => assert!(args.force),
             _ => panic!("expected forced core-index promote command"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_reclaim_subcommands() {
+        let status = Cli::parse_from(["moraine", "db", "reclaim", "status"]);
+        match status.command {
+            CliCommand::Db(DbArgs {
+                command:
+                    DbCommand::Reclaim(ReclaimArgs {
+                        command: ReclaimCommand::Status(args),
+                    }),
+            }) => assert!(!args.json),
+            _ => panic!("expected reclaim status command"),
+        }
+
+        let plan = Cli::parse_from([
+            "moraine",
+            "db",
+            "reclaim",
+            "plan",
+            "--scope",
+            "mcp_open_orphan",
+            "--json",
+        ]);
+        match plan.command {
+            CliCommand::Db(DbArgs {
+                command:
+                    DbCommand::Reclaim(ReclaimArgs {
+                        command: ReclaimCommand::Plan(args),
+                    }),
+            }) => {
+                assert_eq!(args.scope.as_deref(), Some("mcp_open_orphan"));
+                assert!(args.json);
+            }
+            _ => panic!("expected reclaim plan command"),
+        }
+
+        // `run` must not be invocable without a scope: there is deliberately
+        // no "reclaim everything".
+        assert!(Cli::try_parse_from(["moraine", "db", "reclaim", "run"]).is_err());
+
+        // And --confirm defaults off, so the ceremony cannot be skipped by
+        // omission.
+        let run = Cli::parse_from([
+            "moraine",
+            "db",
+            "reclaim",
+            "run",
+            "--scope",
+            "canonical_generation",
+        ]);
+        match run.command {
+            CliCommand::Db(DbArgs {
+                command:
+                    DbCommand::Reclaim(ReclaimArgs {
+                        command: ReclaimCommand::Run(args),
+                    }),
+            }) => {
+                assert_eq!(args.scope, "canonical_generation");
+                assert!(!args.confirm);
+            }
+            _ => panic!("expected reclaim run command"),
         }
     }
 

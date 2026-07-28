@@ -5,7 +5,7 @@ use moraine_clickhouse::{STATE_KEY_CORE_INDEXES, STATE_KEY_OPEN_V2};
 use super::*;
 use crate::domain::{
     AnalyticsRange, AnalyticsSnapshot, CoreIndexHealth, IngestHeartbeatRead, SessionAnalytics,
-    SessionAnalyticsQuery, StoreDiagnostics, StoreHealth, StoreProbe, TablePreview,
+    SessionAnalyticsQuery, StorageReport, StoreDiagnostics, StoreHealth, StoreProbe, TablePreview,
     TablePreviewQuery, TableSummaries, WebSearchEvent,
 };
 
@@ -64,6 +64,10 @@ impl ConversationRepository for ClickHouseConversationRepository {
         // report, so it degrades to the `Failed` probe variant rather than
         // propagating.
         health.core_index = self.read_core_index_health().await;
+        // Additive storage-ownership probe (issue #603 WI-02). Same
+        // best-effort contract: one `system.parts` aggregate plus one
+        // `system.disks` read, degrading to `Failed` rather than propagating.
+        health.storage = self.read_storage_probe().await;
         Ok(health)
     }
 
@@ -369,6 +373,22 @@ impl ClickHouseConversationRepository {
             Ok(health) => StoreProbe::Available(health),
             Err(error) => StoreProbe::Failed {
                 message: error.to_string(),
+            },
+        }
+    }
+
+    /// Issue #603 WI-02. Reads `system.parts` (active only) and
+    /// `system.disks`; touches no user relation, so it is safe on the health
+    /// path. A backend that cannot report storage yields `Failed` and the rest
+    /// of the health report still renders.
+    async fn read_storage_probe(&self) -> StoreProbe<StorageReport> {
+        match self.ch.storage_report(&self.cfg.retention).await {
+            Ok(report) => StoreProbe::Available(report),
+            // `{:#}` renders the whole anyhow chain: the outer context alone
+            // ("failed to read per-table storage from system.parts") tells an
+            // operator nothing about WHY it failed.
+            Err(error) => StoreProbe::Failed {
+                message: format!("{error:#}"),
             },
         }
     }

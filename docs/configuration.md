@@ -46,6 +46,7 @@ future keys.
 | `[mcp]` | MCP retrieval defaults and shared backend socket settings. |
 | `[bm25]` | Search ranking defaults. |
 | `[query_budgets]` | Per-class ClickHouse query budgets (deadline, memory, spill, read allowances, statement cap) for the mandatory query envelope. |
+| `[retention]` | Storage ownership horizons. Defaults delete no raw or canonical user history. |
 | `[monitor]` | Monitor HTTP port. |
 | `[backend]` | Unified MCP socket and monitor HTTP daemon startup, HTTP bind, and experimental non-loopback guard. |
 | `[runtime]` | Runtime directories and managed ClickHouse settings. |
@@ -927,6 +928,96 @@ them after observing budget-exhaustion telemetry in monitor health/status
 summarized as a `moraine status` note when nonzero); repeated
 `deadline_exceeded` or `resource_exhausted` results indicate either an
 under-provisioned budget or a query-shape problem worth investigating.
+
+## Retention
+
+`[retention]` declares how long each class of stored data is kept. It is the
+configuration half of Moraine's storage ownership model, which sorts every
+physical table into one of five classes:
+
+| Class | Tables | Default |
+| --- | --- | --- |
+| `canonical_history` | `events` | **Kept forever.** Deletion requires an explicit key. |
+| `raw_audit` | `raw_events`, `ingest_errors` | **Kept forever.** Deletion requires an explicit key. |
+| `derived` | the `mcp_open_*` projection, the canonical read indexes, `search_documents`/`search_postings`, `tool_io`, `event_links`, `file_attention_project_roots` | Rebuildable; eligible for automatic reclamation once its replacement is verified. |
+| `telemetry` | `ingest_heartbeats`, `search_query_log`, `search_hit_log`, `search_interaction_log`, and the ClickHouse system logs | Bounded by a default TTL. |
+| `never_delete` | publication truth, revision allocators, control fences, the migration ledger, the reclaim ledger, `search_conversation_terms` | No code path may ever delete it. |
+
+`search_conversation_terms` sits in `never_delete` rather than `derived`
+because it is a `SummingMergeTree` accumulator with no tombstone path: a delete
+never decrements it, so any reclamation naming it would leave the term corpus
+permanently overstated with no way back short of a corpus-wide re-tokenize.
+
+```toml
+[retention]
+derived_horizon_hours = 24.0
+telemetry_horizon_days = 30
+# raw_audit_horizon_days = 90.0            # absent by default
+# canonical_history_horizon_days = 365.0   # absent by default
+```
+
+| Field | Default | Floor | Purpose |
+| --- | --- | --- | --- |
+| `derived_horizon_hours` | `24.0` | `24.0` | How long a **superseded** derived row must have been superseded before reclamation may claim it. It is never a predicate over live data. |
+| `telemetry_horizon_days` | `30` | — | Bucket-4 TTL horizon. **Not yet operator-configurable: `30` is the only accepted value.** |
+| `raw_audit_horizon_days` | *absent* | `7.0` | Retention for `raw_events` and `ingest_errors`. Setting it authorizes deleting them. |
+| `canonical_history_horizon_days` | *absent* | `7.0` | Retention for `events`. Setting it authorizes deleting your conversation history. |
+
+**A missing setting is never permission to delete.** The two protected horizons
+are absent by default and absence is not a value: the reclaim planner cannot
+construct deletion authority for buckets 1 or 2 without them, so an install
+that has never edited this section can never prune user history — including
+across upgrades. Setting either key is the only way to grant that authority,
+and `moraine status` then prints a prominent line naming what will be deleted.
+
+The floors are not configurable below their values. A shorter horizon can
+retire rows that a live request is still pinned to, so a config naming one
+fails to load rather than loading with a value that looks accepted.
+
+Inspect the effective policy and what it would remove:
+
+```
+moraine db reclaim status              # per-bucket bytes, disk headroom, policy, ledger
+moraine db reclaim plan [--scope S]    # dry run: row/byte ESTIMATES; writes nothing
+moraine db reclaim run --scope S --confirm
+```
+
+`run` refuses without `--confirm`, printing exactly which tables the scope
+would touch, and refuses a bucket-1/2 scope unless the matching key above is
+present — naming the missing key. Export before pruning with
+`moraine export events --format jsonl`.
+
+**In this release `run` deletes nothing at all.** No scope has a registered
+executor yet, so every `run` refuses a third time — naming the work item that
+will add one — and exits non-zero. `status` and `plan` are complete and
+useful today; treat `run` as the ceremony being reviewable before it does
+anything.
+
+Two things Moraine deliberately does **not** promise. No table is partitioned
+by source generation, so reclamation is a lightweight `DELETE` rather than a
+partition drop: bytes return only when a background merge rewrites the part.
+Reclaimed **row counts** are exact; the on-disk delta is merge-deferred and is
+reported as such.
+
+Bucket-4 TTLs arrive with migration 039 and are anchored so that their **first
+application deletes nothing**: existing rows are stamped at migration time and
+expire 30 days later, so an upgrade never silently shortens telemetry an
+operator has been keeping.
+
+`telemetry_horizon_days` is **not yet operator-configurable**, and Moraine
+refuses to load a config that sets it to anything but `30`. Migration SQL is
+static text: the horizon is written into `sql/039_telemetry_retention.sql` as
+four `INTERVAL 30 DAY` literals, so a configured `90` would change nothing
+except what `moraine db reclaim status`, `moraine db doctor` and
+`/api/v1/health` report back to you — a horizon shorter than the one they
+state, which is the failure mode the whole `[retention]` design exists to
+prevent. The key keeps its name and its documented value so that the change
+which templates the horizon into the migration does not have to rename
+anything; until then the reported policy is labelled `default` and carries the
+reason inline. The three ClickHouse system logs
+(`query_log`, `metric_log`, `asynchronous_metric_log`) are bounded separately
+by `config/clickhouse.xml`, which restores the 30-day horizon ClickHouse's own
+packaged config ships; those are ClickHouse diagnostics, not Moraine data.
 
 ## Backend Daemon
 

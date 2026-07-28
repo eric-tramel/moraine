@@ -3,6 +3,16 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 
 pub use moraine_clickhouse::{CoreIndexAuditOutcome, PublicationDiagnostics};
+/// Issue #603 WI-02. `StorageReport` is defined in `moraine-clickhouse`
+/// alongside `classify()` and the `system.parts` probe that builds it, because
+/// the CLI reaches it through a bare `ClickHouseClient` (as `db doctor` does)
+/// while the monitor reaches it through this repository. Re-exported here so
+/// boundary crates holding only `Arc<dyn ConversationRepository>` see it in
+/// `domain`, matching how `PublicationDiagnostics` is surfaced.
+pub use moraine_clickhouse::{
+    RetentionPolicyEntry, StorageBucketReport, StorageDiskReport, StorageReport,
+    StorageTableReport, TableClass,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1504,6 +1514,11 @@ pub struct StoreHealth {
     /// unavailable, or a repository that does not source it) yields the
     /// not-configured `Failed` variant.
     pub core_index: StoreProbe<CoreIndexHealth>,
+    /// Additive storage-ownership probe (issue #603 WI-02): per-bucket bytes,
+    /// disk headroom, and the effective retention policy. Read-only, sourced
+    /// from `system.parts`/`system.disks`, and degrades to `Failed` rather
+    /// than failing the health report — storage state is transient.
+    pub storage: StoreProbe<StorageReport>,
 }
 
 impl Default for StoreHealth {
@@ -1526,6 +1541,9 @@ impl Default for StoreHealth {
             },
             core_index: StoreProbe::Failed {
                 message: "core-index probe not configured".to_string(),
+            },
+            storage: StoreProbe::Failed {
+                message: "storage probe not configured".to_string(),
             },
         }
     }
@@ -1570,6 +1588,14 @@ pub struct RepoConfig {
     /// roots. See [`SessionOriginScope`].
     #[serde(default)]
     pub session_scope: Option<SessionOriginScope>,
+    /// Effective `[retention]` (issue #603 WI-03), carried so the store-health
+    /// storage probe reports the policy an operator actually configured rather
+    /// than the built-in defaults. A configured bucket-1/2 horizon is the only
+    /// thing in this repository that can lead to user history being deleted;
+    /// surfacing it through `/api/v1/health` is what keeps it from being
+    /// invisible. Defaults to the no-op policy.
+    #[serde(default)]
+    pub retention: moraine_config::RetentionConfig,
 }
 
 impl Default for RepoConfig {
@@ -1588,6 +1614,7 @@ impl Default for RepoConfig {
             bm25_default_min_should_match: 1,
             bm25_max_query_terms: 16,
             session_scope: None,
+            retention: moraine_config::RetentionConfig::default(),
         }
     }
 }
@@ -1622,6 +1649,9 @@ mod tests {
                 backfill_cursor_age_ms: Some(1_200),
                 audit_outcome: None,
             }),
+            storage: StoreProbe::Failed {
+                message: "storage probe not gathered".to_string(),
+            },
         };
 
         let value = serde_json::to_value(&health).expect("serialize store health");

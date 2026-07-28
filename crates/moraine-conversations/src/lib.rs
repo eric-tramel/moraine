@@ -27,10 +27,11 @@ pub use domain::{
 pub use domain::{
     AnalyticsConcurrencyPoint, AnalyticsRange, AnalyticsSnapshot, AnalyticsTokenPoint,
     AnalyticsTurnPoint, AnalyticsWindow, CoreIndexAuditOutcome, CoreIndexHealth, IngestHeartbeat,
-    IngestHeartbeatRead, PublicationDiagnostics, SessionAnalytics, SessionAnalyticsQuery,
-    SessionLookback, SessionStep, SessionTurn, StoreConnectionMetrics, StoreDiagnostics,
-    StoreHealth, StoreProbe, TableColumn, TablePreview, TablePreviewQuery, TableSummaries,
-    TableSummary, ToolResult, WebSearchEvent,
+    IngestHeartbeatRead, PublicationDiagnostics, RetentionPolicyEntry, SessionAnalytics,
+    SessionAnalyticsQuery, SessionLookback, SessionStep, SessionTurn, StorageBucketReport,
+    StorageDiskReport, StorageReport, StorageTableReport, StoreConnectionMetrics, StoreDiagnostics,
+    StoreHealth, StoreProbe, TableClass, TableColumn, TablePreview, TablePreviewQuery,
+    TableSummaries, TableSummary, ToolResult, WebSearchEvent,
 };
 pub use domain::{
     CanonicalContinuation, CanonicalPageAfter, CanonicalReadAnchor, CanonicalReadOutcome,
@@ -40,6 +41,11 @@ pub use error::{RepoError, RepoResult};
 pub use in_memory_repo::{
     CanonicalSessionPageResponse, InMemoryConversationCalls, InMemoryConversationRepository,
     InMemoryConversationResponses,
+};
+/// Issue #603 WI-02 pure helpers, re-exported so boundary crates can build a
+/// `StorageReport` in tests without depending on `moraine-clickhouse`.
+pub use moraine_clickhouse::storage_report::{
+    fold_buckets, retention_policy_entries, TELEMETRY_HORIZON_NOT_CONFIGURABLE_NOTE,
 };
 // Boundary crates (MCP dispatch, monitor handlers, CLI commands) hold only
 // `Arc<dyn ConversationRepository>` and do not depend on moraine-clickhouse;

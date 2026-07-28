@@ -29,6 +29,23 @@ pub use mcp_open_projection::{
     McpOpenGenerationReadiness, McpOpenHostRevision, McpOpenPublicationRequest, McpOpenSourceHead,
 };
 pub mod mcp_tool_names;
+/// Issue #603 WI-04. Ledger, planner, and authority types. No executor is
+/// registered in this build, so every `run` refuses.
+pub mod reclaim;
+/// Issue #603 WI-01. The ownership model as code: what may ever be deleted.
+pub mod storage_class;
+/// Issue #603 WI-02. Bytes, parts, disk headroom, and the effective policy.
+pub mod storage_report;
+pub use reclaim::{
+    ReclaimAuthority, ReclaimLedgerSummary, ReclaimOutcome, ReclaimPhase, ReclaimPlan,
+    ReclaimPredicate, ReclaimScope, ReclaimStatusReport, ReclaimTable, ReclaimUnit,
+    ReclaimableEstimate,
+};
+pub use storage_class::{classify, ClassifiedTable, TableClass, CLASSIFIED_TABLES};
+pub use storage_report::{
+    fold_buckets, retention_policy_entries, RetentionPolicyEntry, StorageBucketReport,
+    StorageDiskReport, StorageReport, StorageTableReport, TELEMETRY_HORIZON_NOT_CONFIGURABLE_NOTE,
+};
 
 use envelope::{StatementDropGuard, MIN_SERVER_EXECUTION_SECONDS};
 use std::sync::Arc;
@@ -1500,6 +1517,8 @@ pub const REQUIRED_SCHEMA_OBJECTS: &[&str] = &[
     "v_mcp_open_publication_headers",
     "v_current_mcp_open_generation_readiness",
     "v_publication_diagnostics",
+    // issue-603 WI-04 storage reclaim ledger (migration 038).
+    "storage_reclaim_ledger",
     "schema_migrations",
 ];
 
@@ -1689,6 +1708,16 @@ pub fn bundled_migrations() -> Vec<Migration> {
             version: "037",
             name: "037_search_ranking_metadata.sql",
             sql: include_str!("../../../sql/037_search_ranking_metadata.sql"),
+        },
+        Migration {
+            version: "038",
+            name: "038_storage_reclaim_ledger.sql",
+            sql: include_str!("../../../sql/038_storage_reclaim_ledger.sql"),
+        },
+        Migration {
+            version: "039",
+            name: "039_telemetry_retention.sql",
+            sql: include_str!("../../../sql/039_telemetry_retention.sql"),
         },
     ]
 }
@@ -3270,6 +3299,234 @@ mod tests {
         );
     }
 
+    fn migration_sql(version: &str) -> &'static str {
+        bundled_migrations()
+            .into_iter()
+            .find(|migration| migration.version == version)
+            .unwrap_or_else(|| panic!("migration {version} must be registered"))
+            .sql
+    }
+
+    /// The four relations migrations 034 and 035 must leave alone.
+    ///
+    /// This restores — shape-aware rather than as a substring match on one
+    /// statement form with a required trailing semicolon — the exact coverage
+    /// the two deleted per-migration loops carried. It is NOT subsumed by the
+    /// repo-wide S4 invariant: `search_documents` and `search_postings` are
+    /// `Derived`, and `migration_delete_findings` reports only protected
+    /// tables, so for those two S4 says nothing at all. The repo-wide
+    /// counterpart that does cover them is
+    /// `storage_class::tests::no_bundled_migration_empties_the_search_corpus`;
+    /// `events`/`raw_events` are covered by
+    /// `storage_class::tests::no_bundled_migration_removes_protected_rows`.
+    ///
+    /// MUTATION (executed 2026-07-27): append
+    /// `TRUNCATE TABLE moraine.search_documents;` to
+    /// `sql/034_batched_mcp_open_backfill.sql` => this helper FAILS from
+    /// `migration_034_resets_only_the_incomplete_derived_mcp_model`. Same for
+    /// `ALTER TABLE moraine.search_postings DELETE WHERE 1;`, which the
+    /// deleted substring loop would have missed even before it was deleted.
+    fn assert_migration_preserves_the_four_relations(version: &str, sql: &str) {
+        let removals = crate::storage_class::migration_row_removals(version, sql);
+        assert!(
+            !removals.is_empty(),
+            "{version} does truncate the mcp_open_* family, so a scanner reporting nothing here \
+             is broken rather than reassuring"
+        );
+        for preserved in [
+            "events",
+            "raw_events",
+            "search_documents",
+            "search_postings",
+        ] {
+            assert!(
+                !removals.iter().any(|finding| finding.table == preserved),
+                "{version} must preserve `{preserved}`: {removals:#?}"
+            );
+        }
+    }
+
+    /// Migration 038 installs the ledger and nothing else. The whole safety
+    /// argument for WI-04 is "no user data is touched", so the migration that
+    /// arrives with it must be provably additive.
+    #[test]
+    fn migration_038_installs_only_the_reclaim_ledger() {
+        let sql = migration_sql("038");
+        let statements = split_sql_statements(sql);
+        assert_eq!(
+            statements.len(),
+            1,
+            "038 must be exactly one statement: {statements:#?}"
+        );
+        assert!(statements[0].contains("CREATE TABLE IF NOT EXISTS moraine.storage_reclaim_ledger"));
+        assert!(statements[0].contains("ENGINE = ReplacingMergeTree(ledger_revision)"));
+        assert!(statements[0].contains("ORDER BY (scope, reclaim_id)"));
+        for column in [
+            "reclaim_id",
+            "scope",
+            "source_generation",
+            "candidate_generation",
+            "phase",
+            "estimated_rows",
+            "estimated_bytes",
+            "claimed_at",
+            "ledger_revision",
+        ] {
+            assert!(statements[0].contains(column), "038 must carry `{column}`");
+        }
+        // The ledger is durable state the reclaimer depends on for restart
+        // safety; a partition key would only add merge work.
+        assert!(!statements[0].contains("PARTITION BY"));
+        assert!(REQUIRED_SCHEMA_OBJECTS.contains(&"storage_reclaim_ledger"));
+        assert_eq!(
+            crate::storage_class::classify("storage_reclaim_ledger"),
+            Some(crate::storage_class::TableClass::NeverDelete)
+        );
+    }
+
+    /// **The WI-08 S5 gate.** Fails for: a telemetry TTL whose first
+    /// application deletes rows, **and** for one that deletes nothing ever.
+    /// Denomination: exact statement text, per table, in order.
+    ///
+    /// The three statements are matched by **equality**, not by prefix. That
+    /// is the whole difference between bounding the first application and
+    /// bounding the steady state: with `starts_with`, changing the anchor to
+    /// `DEFAULT now() + INTERVAL 50 YEAR` still matched the expected prefix,
+    /// so every row got an anchor fifty years out, the TTL never fired for any
+    /// row ever, and the suite stayed at 177/0 — with WI-08's entire purpose
+    /// (bounding unbounded telemetry growth on a host at 7.8 GiB free)
+    /// silently defeated. The counterpart live gate for that direction,
+    /// `reclaim-idle`/G-IDLE in plan §7.2, is not implemented, so this is the
+    /// only coverage the steady state has.
+    ///
+    /// MUTATION (executed 2026-07-27): change the four `MODIFY TTL` clauses in
+    /// `sql/039_telemetry_retention.sql` from `retention_anchor + INTERVAL 30
+    /// DAY` to `ts + INTERVAL 30 DAY` => FAILS: `ts` is the row's own
+    /// timestamp and a 30-day TTL on it removes five months of telemetry the
+    /// moment the ALTER materializes. **Lower bound: first application.**
+    ///
+    /// MUTATION (executed 2026-07-27): change the four `ADD COLUMN` defaults
+    /// to `DEFAULT now() + INTERVAL 50 YEAR` => FAILS on the exact-statement
+    /// assertion. **Upper bound: the TTL must still be reachable.**
+    ///
+    /// MUTATION (executed 2026-07-27): change one `INTERVAL 30 DAY` to
+    /// `INTERVAL 3000 DAY` => FAILS here and in
+    /// `migration_039_ttl_horizon_matches_the_configured_default`. **Width:
+    /// the horizon is one token and both tokens are pinned.**
+    ///
+    /// MUTATION (executed 2026-07-27): move the `MATERIALIZE COLUMN`
+    /// statement AFTER its `MODIFY TTL` => FAILS on the ordering assertion,
+    /// because a TTL that lands before the anchor is on disk evaluates an
+    /// unmaterialized `DEFAULT now()`.
+    #[test]
+    fn migration_039_ttls_are_anchored_so_first_application_deletes_nothing() {
+        let sql = migration_sql("039");
+        let statements = split_sql_statements(sql);
+        let telemetry = [
+            "ingest_heartbeats",
+            "search_query_log",
+            "search_hit_log",
+            "search_interaction_log",
+        ];
+        assert_eq!(
+            statements.len(),
+            telemetry.len() * 3,
+            "039 must be exactly add/materialize/modify per table: {statements:#?}"
+        );
+        let normalized: Vec<String> = statements
+            .iter()
+            .map(|statement| statement.split_whitespace().collect::<Vec<_>>().join(" "))
+            .collect();
+
+        for table in telemetry {
+            // `DEFAULT now()` and nothing else. An anchor that is not the wall
+            // clock at insert time makes the TTL unreachable for every FUTURE
+            // row, which no ordering or column-name assertion can see.
+            let add = format!(
+                "ALTER TABLE moraine.{table} ADD COLUMN IF NOT EXISTS retention_anchor DateTime \
+                 DEFAULT now()"
+            );
+            let materialize = format!(
+                "ALTER TABLE moraine.{table} MATERIALIZE COLUMN retention_anchor SETTINGS \
+                 mutations_sync = 1"
+            );
+            let modify = format!(
+                "ALTER TABLE moraine.{table} MODIFY TTL retention_anchor + INTERVAL 30 DAY DELETE"
+            );
+
+            let add_at = normalized
+                .iter()
+                .position(|statement| *statement == add)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "039 must add {table}'s anchor as exactly `{add}`. An anchor whose default \
+                         is anything other than `now()` — `now() + INTERVAL 50 YEAR`, say — leaves \
+                         the TTL unreachable forever: {normalized:#?}"
+                    )
+                });
+            let materialize_at = normalized
+                .iter()
+                .position(|statement| *statement == materialize)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "039 must stamp {table}'s anchor synchronously as exactly \
+                         `{materialize}`: {normalized:#?}"
+                    )
+                });
+            let modify_at = normalized
+                .iter()
+                .position(|statement| *statement == modify)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "039's TTL for {table} must be exactly `{modify}` — anchored on \
+                         `retention_anchor`, never on the row's own timestamp, and at the \
+                         configured horizon: {normalized:#?}"
+                    )
+                });
+
+            assert!(
+                add_at < materialize_at && materialize_at < modify_at,
+                "{table}: the anchor must be added, then stamped, then consumed by the TTL — a \
+                 TTL applied before the stamp evaluates an unmaterialized DEFAULT now()"
+            );
+        }
+
+        // Bounded in the other direction: 039 must not name a bucket-1/2 or
+        // never-delete table at all, and must remove nothing.
+        for protected in ["events", "raw_events", "ingest_errors", "search_documents"] {
+            assert!(
+                !sql.contains(&format!("moraine.{protected}")),
+                "039 must not name `{protected}`"
+            );
+        }
+        assert!(crate::storage_class::migration_delete_findings("039", sql).is_empty());
+        for statement in &statements {
+            assert!(!statement.contains("DROP"));
+            assert!(!statement.contains("TRUNCATE"));
+            assert!(!statement.to_uppercase().contains(" DELETE WHERE"));
+        }
+    }
+
+    /// The shipped TTL literal and the `[retention]` default must not drift.
+    /// Migration SQL is static text, so the horizon is baked in; this is what
+    /// keeps `moraine status`'s reported policy honest about what was applied.
+    #[test]
+    fn migration_039_ttl_horizon_matches_the_configured_default() {
+        let sql = migration_sql("039");
+        let expected = format!(
+            "INTERVAL {} DAY DELETE",
+            moraine_config::DEFAULT_RETENTION_TELEMETRY_HORIZON_DAYS
+        );
+        // Executable body only: the header comment quotes the clause too.
+        let body = split_sql_statements(sql).join(";\n");
+        assert_eq!(
+            body.matches(expected.as_str()).count(),
+            4,
+            "all four telemetry TTLs must use the `retention.telemetry_horizon_days` default \
+             ({expected})"
+        );
+    }
+
     #[test]
     fn migration_033_keeps_candidate_headers_and_children_independent() {
         let migration = bundled_migrations()
@@ -3348,17 +3605,7 @@ mod tests {
                 "034 must reset derived relation {derived}"
             );
         }
-        for canonical in [
-            "events",
-            "raw_events",
-            "search_documents",
-            "search_postings",
-        ] {
-            assert!(
-                !sql.contains(&format!("TRUNCATE TABLE moraine.{canonical};")),
-                "034 must preserve canonical relation {canonical}"
-            );
-        }
+        assert_migration_preserves_the_four_relations("034", sql);
         assert!(sql.contains("VALUES ('global', 0, generateSnowflakeID(), '')"));
         assert!(
             sql.find("VALUES ('global', 0, generateSnowflakeID(), '')")
@@ -3390,17 +3637,7 @@ mod tests {
                 "035 must reset derived relation {derived}"
             );
         }
-        for canonical in [
-            "events",
-            "raw_events",
-            "search_documents",
-            "search_postings",
-        ] {
-            assert!(
-                !sql.contains(&format!("TRUNCATE TABLE moraine.{canonical};")),
-                "035 must preserve canonical relation {canonical}"
-            );
-        }
+        assert_migration_preserves_the_four_relations("035", sql);
         assert!(
             sql.find("VALUES ('global', 0, generateSnowflakeID(), '')")
                 < sql.find("TRUNCATE TABLE moraine.mcp_open_events;"),
