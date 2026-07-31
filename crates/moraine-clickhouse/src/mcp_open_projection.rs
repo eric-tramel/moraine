@@ -217,6 +217,14 @@ impl BackfillPhase {
     }
 }
 
+/// `BackfillPhase::Complete`, for the #603 orphan probe's plan exclusion.
+///
+/// The enum is private to this module; the probe needs the one literal it
+/// compares against, and derives it *from* the variant so the two cannot drift
+/// — see
+/// `reclaim_mcp_open::tests::the_backfill_exclusion_uses_the_projections_own_complete_phase`.
+pub(crate) const BACKFILL_PHASE_COMPLETE_VALUE: u8 = BackfillPhase::Complete.value();
+
 fn projection_session_ids<I, S>(session_ids: I) -> BTreeSet<String>
 where
     I: IntoIterator<Item = S>,
@@ -2285,8 +2293,10 @@ mod tests {
     use super::{
         backfill_facts_sql, backfill_phase_advance_sql, batch_projected_events_sql,
         batch_projected_turns_sql, canonical_source_heads, pending_reclaim_mutations_sql,
-        projection_ctes, projection_session_ids, publish_legacy_candidate_heads_sql,
-        session_source_heads_for_snapshot_sql, session_source_revision_sql, source_head_filter,
+        projected_events_insert_sql, projected_turns_insert_sql, projection_ctes,
+        projection_session_ids, publish_legacy_candidate_heads_sql,
+        session_source_heads_for_snapshot_sql, session_source_revision_sql,
+        single_projected_events_sql, single_projected_turns_sql, source_head_filter,
         source_heads_fingerprint, superseded_snapshot_delete_statements,
         superseded_snapshot_set_sql, BackfillPhase, BackfillPhaseGuard, McpOpenHostRevision,
         McpOpenSourceHead, SourceHeadRow, SupersededGenerationRow,
@@ -2352,6 +2362,106 @@ mod tests {
         ));
         assert!(projection_source
             .contains("event_uid, source_host, {slot}, {generation}, {generation}, session_id"));
+    }
+
+    /// **Every projected child row is written with `candidate_generation =
+    /// generation`, at every insert site.**
+    ///
+    /// This is a *writer* invariant that two readers depend on and neither
+    /// states — the shape issue #603's P6 work exists to remove, left standing
+    /// two files away unless it is pinned here:
+    ///
+    /// * `mcp_open_read.rs::load_projected_event_candidates` restricts the
+    ///   `LIMIT 64` candidate window by matching the child's
+    ///   **`candidate_generation`** against a header's `generation`, while
+    ///   `open.rs::get_mcp_event_impl` authorizes the surviving row by
+    ///   comparing its **`generation`** against the session pointer's.
+    ///   Different columns.
+    /// * `reclaim_mcp_open::orphan_candidate_sql` runs the same equation the
+    ///   other way — it rolls children up by `candidate_generation` and
+    ///   anti-joins against header `generation` — and
+    ///   `mcp_open_unit_predicates` then *deletes* by `candidate_generation`.
+    ///
+    /// They agree today only because every insert below writes one expression
+    /// into both columns. Measured read-only on the reference host 2026-07-28:
+    /// **0** `mcp_open_events` rows have `candidate_generation != generation`,
+    /// out of ~22 M. The zero is the load-bearing figure and it is exact; the
+    /// denominator climbs with every projection and is quoted to two
+    /// significant figures for that reason. A writer that decoupled them would let the reader
+    /// authorize a row the orphan probe had already classified as unreachable
+    /// — that is, the collector would delete rows `get_mcp_event` still
+    /// returns.
+    ///
+    /// This is a coupling pin, not a proof that the readers are right to use
+    /// different columns. It cannot see rows written by an older binary, and
+    /// no schema constraint enforces it. If the two are ever meant to diverge,
+    /// both readers and the probe need revisiting first, and failing here is
+    /// how that gets noticed rather than discovered from a deletion.
+    ///
+    /// MUTATION (executed 2026-07-28): change either events insert's SELECT
+    /// list from `{slot}, {generation}, {generation}` to `{slot},
+    /// toUInt64(0), {generation}` => FAILS here. **Lower bound.**
+    ///
+    /// MUTATION (executed 2026-07-28): the same edit to the two *turns* SELECT
+    /// lists => FAILS here. **Width: `reclaim_mcp_open` deletes from
+    /// `mcp_open_turns` by `candidate_generation` too, so the coupling matters
+    /// on both child tables and not only on the one the reader walks.**
+    ///
+    /// MUTATION (executed 2026-07-28): swap the events column list's
+    /// `candidate_generation, generation` for `generation,
+    /// candidate_generation` => FAILS here, because the pin is positional on
+    /// both lists rather than a substring search for either name. **Width.**
+    /// (The two events insert sites carry byte-identical column lists, so a
+    /// substring edit necessarily hits both; there is no single-site form of
+    /// this recipe, and claiming one would be claiming a mutation that cannot
+    /// be performed.)
+    #[test]
+    fn every_projected_child_row_writes_one_generation_into_both_columns() {
+        // Distinguishable markers, so a site that dropped one and duplicated
+        // the other cannot pass.
+        let generation = "toUInt64(777)";
+        let slot = "toUInt8(3)";
+        let sessions: BTreeSet<String> = ["s-1".to_string()].into_iter().collect();
+        let ctes = "WITH x AS (SELECT 1)";
+
+        let sites = [
+            (
+                "single_projected_events_sql",
+                single_projected_events_sql("moraine", ctes, slot, generation),
+                "slot, candidate_generation, generation, session_id",
+                format!("{slot}, {generation}, {generation}, session_id"),
+            ),
+            (
+                "projected_events_insert_sql",
+                projected_events_insert_sql("moraine", ctes, slot, generation),
+                "slot, candidate_generation, generation, session_id",
+                format!("{slot}, {generation}, {generation}, session_id"),
+            ),
+            (
+                "single_projected_turns_sql",
+                single_projected_turns_sql("moraine", ctes, slot, generation),
+                "slot, candidate_generation, generation, turn_seq",
+                format!("{slot}, {generation}, {generation}, turn_seq"),
+            ),
+            (
+                "projected_turns_insert_sql",
+                projected_turns_insert_sql("moraine", ctes, slot, generation, &sessions),
+                "slot, candidate_generation, generation, turn_seq",
+                format!("{slot}, {generation}, {generation}, turn_seq"),
+            ),
+        ];
+
+        for (name, sql, columns, values) in sites {
+            assert!(
+                sql.contains(columns),
+                "`{name}` no longer writes `{columns}` in that order: {sql}"
+            );
+            assert!(
+                sql.contains(&values),
+                "`{name}` no longer writes one expression into both generation columns; \
+                 expected `{values}`: {sql}"
+            );
+        }
     }
 
     #[test]

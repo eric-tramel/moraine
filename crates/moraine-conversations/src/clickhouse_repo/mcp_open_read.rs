@@ -1,5 +1,12 @@
 use super::*;
 
+/// Candidate rows one `get_mcp_event` may consider for a single `event_uid`.
+///
+/// Named rather than inlined so the guard that keeps the window meaningful —
+/// the header restriction in [`ClickHouseConversationRepository::load_projected_event_candidates`]
+/// — has something to be asserted against.
+pub(super) const MCP_OPEN_EVENT_CANDIDATE_WINDOW: usize = 64;
+
 pub(super) struct ProjectedSession {
     pub(super) row: McpOpenSessionRow,
     pub(super) metadata: SessionMetadata,
@@ -266,11 +273,92 @@ FORMAT JSONEachRow",
             .collect()
     }
 
+    /// Candidate `(session, slot, generation)` rows for one `event_uid`,
+    /// **restricted to generations a publication header exists for**.
+    ///
+    /// [`Self::get_mcp_event_impl`](super::open) walks these in order, loads
+    /// each candidate's header with [`Self::load_projected_session`], and keeps
+    /// the first whose `(slot, generation)` matches that header — so a row
+    /// whose generation has no header row is
+    /// guaranteed to be skipped. Filtering it out here therefore changes no
+    /// answer — it changes only which rows are allowed to occupy the `LIMIT 64`
+    /// window, and that is the point.
+    ///
+    /// ## The unstated writer invariant this rests on
+    ///
+    /// **The filter below matches on the child's `candidate_generation`; the
+    /// authorization it is claimed not to change matches on the child's
+    /// `generation`.** Those are two different columns of `mcp_open_events`,
+    /// and nothing in the schema relates them. "Changes no answer" is
+    /// therefore true only while every child row satisfies
+    /// `candidate_generation = generation`.
+    ///
+    /// It does today, because both projector insert sites write one expression
+    /// into both columns (`mcp_open_projection::single_projected_events_sql`
+    /// and `::projected_events_insert_sql`), and measured read-only on the
+    /// reference host 2026-07-28, **0** `mcp_open_events` rows diverge out of
+    /// ~22 M. The zero is the load-bearing figure and it is exact; the
+    /// denominator climbs with every projection and is quoted to two
+    /// significant figures for that reason. That coupling is now pinned where it is
+    /// written, by
+    /// `mcp_open_projection::tests::every_projected_child_row_writes_one_generation_into_both_columns`
+    /// — this docstring is the read-side statement of the same fact, not a
+    /// second guard.
+    ///
+    /// The consequence of a decoupling is not confined to this query.
+    /// #603's orphan probe runs the identical equation — children rolled up by
+    /// `candidate_generation`, anti-joined against header `generation` — so a
+    /// writer that separated them would have the collector *delete* exactly the
+    /// rows this reader still authorizes. Neither the reader nor the probe can
+    /// detect that; only the writer can prevent it.
+    ///
+    /// **The window is a correctness surface, not a performance one** (issue
+    /// #603, OQ-8b). `mcp_open_events` has no per-uid bound: a session
+    /// re-projected N times contributes N rows for every uid it holds.
+    ///
+    /// Sampled read-only on the reference host 2026-07-28 over ~1.83 M uids.
+    /// **These are dated counts, not a stable property** — every re-projection
+    /// adds rows, so two reads on the same day disagree by hundreds and a read
+    /// next month will be larger. What is load-bearing is the direction and the
+    /// order of magnitude, and those are scale-free:
+    ///
+    /// | | uids over the 64-row window | worst uid |
+    /// |---|---|---|
+    /// | without this restriction | ~32 900 | 815 rows |
+    /// | with it | ~31 400 | 250 rows |
+    ///
+    /// **So this narrows the hazard; it does not remove it.** Tens of thousands
+    /// of uids still overflow the window, and the reason no answer changes today is
+    /// the same "property of the current data, not of the query" caveat the
+    /// unrestricted state carries: for every one of those uids the pointer
+    /// generation is the maximum *header-backed* generation, so the
+    /// authorized row still sorts into the window. Nothing in this query
+    /// enforces that, and a real bound on the window is still open work.
+    ///
+    /// What the restriction does buy is that the rows competing for the window
+    /// are now only rows a reader could in principle have used. Without it, a
+    /// prepare that crashed *after* writing children left a headerless
+    /// generation strictly newer than the live one, and 65 of those for one
+    /// uid pushed the authorized row out of the window and turned
+    /// `get_mcp_event` into `ReadModelChanged`/`None` — an unbounded,
+    /// crash-driven failure mode with no operator action that could clear it.
+    /// With it, overflow needs 65 genuinely header-backed generations to
+    /// outrank the live one. #603's orphan collector removes the
+    /// accumulation; this removes the mechanism.
+    ///
+    /// The header relation is small — of order 4 800 rows on the reference
+    /// host, three orders of magnitude below the child table — and is read
+    /// without `FINAL`
+    /// deliberately: `(session_id, candidate_publication_id) → generation` is
+    /// functional, so a stale duplicate cannot remove a pair, and a non-`FINAL`
+    /// read can only *admit* extra candidates, which is the fail-open direction
+    /// for a filter whose omission is the status quo.
     pub(super) async fn load_projected_event_candidates(
         &self,
         event_uid: &str,
     ) -> RepoResult<Vec<McpOpenEventLookupRow>> {
         let events = self.table_ref("mcp_open_events");
+        let headers = self.table_ref("mcp_open_publication_headers");
         let query = format!(
             "SELECT
   source_host,
@@ -279,11 +367,14 @@ FORMAT JSONEachRow",
   toUInt8(slot) AS slot,
   toUInt64(generation) AS generation
 FROM {events} FINAL
-WHERE event_uid = {}
+WHERE event_uid = {uid}
+  AND (session_id, candidate_generation) IN (
+    SELECT session_id, generation FROM {headers}
+  )
 ORDER BY generation DESC, source_host ASC, session_id ASC
-LIMIT 64
+LIMIT {MCP_OPEN_EVENT_CANDIDATE_WINDOW}
 FORMAT JSONEachRow",
-            sql_quote(event_uid),
+            uid = sql_quote(event_uid),
         );
         self.map_backend(self.query_rows(&query, None).await)
     }

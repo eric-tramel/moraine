@@ -21,3 +21,9 @@ uuid = { version = "1.11", features = ["v4"] }
 moraine-config = { path = "../../crates/moraine-config" }
 moraine-clickhouse = { path = "../../crates/moraine-clickhouse" }
 moraine-conversations = { path = "../../crates/moraine-conversations" }
+
+[dev-dependencies]
+# `net`, for the ClickHouse stand-in the reclaim CLI guards drive. tokio is
+# already a dependency of this crate, so this adds no package edge to
+# `Cargo.lock` and `--locked` still resolves.
+tokio = { version = "1.40", features = ["net"] }

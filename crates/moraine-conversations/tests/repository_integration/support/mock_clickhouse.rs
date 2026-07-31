@@ -655,8 +655,14 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
             return (StatusCode::OK, json_each_row(json!([{ "ready": 1_u8 }])));
         }
 
+        // `load_projected_session`, identified by its own alias rather than by
+        // the table name alone: since #603 the candidate-lookup query names
+        // `mcp_open_publication_headers` too (in a subquery that bounds its
+        // `LIMIT 64` window), so a bare table-name match routed it here and
+        // answered a candidate lookup with a session row.
         if query.contains("FROM `moraine`.`mcp_open_publication_headers`")
             && query.contains("FINAL")
+            && query.contains("s.session_id = '")
             && !query.contains("toUInt8(0) AS row_kind")
             && !query.contains("candidate_heads AS")
             && !query.contains("current_headers AS")
@@ -3225,6 +3231,34 @@ pub(crate) async fn build_scripted_repo(
         },
     )
     .await
+}
+
+/// [`build_scripted_repo`] with a non-stock `[retention]`.
+///
+/// `RepoConfig::retention` exists so the store-health storage probe reports the
+/// policy an operator configured rather than the built-in defaults; nothing
+/// drove it, so `read_storage_probe` passing `&RetentionConfig::default()`
+/// instead of `&self.cfg.retention` was green across the workspace.
+pub(crate) async fn build_scripted_repo_with_retention(
+    scripted_responses: Vec<ScriptedResponse>,
+    retention: moraine_config::RetentionConfig,
+) -> (ClickHouseConversationRepository, Arc<MockState>) {
+    let (base_url, state) = spawn_mock_server(MockOptions {
+        scripted_responses,
+        ..MockOptions::default()
+    })
+    .await;
+    let client =
+        ClickHouseClient::new(test_clickhouse_config(base_url)).expect("valid clickhouse client");
+    let repo = ClickHouseConversationRepository::new(
+        client,
+        RepoConfig {
+            max_results: 100,
+            retention,
+            ..RepoConfig::default()
+        },
+    );
+    (repo, state)
 }
 
 /// [`build_scripted_repo`] with the issue-598 readiness verdict declared, so

@@ -1,10 +1,14 @@
 use super::*;
 
-#[tokio::test(flavor = "multi_thread")]
-async fn store_health_maps_all_successful_probe_facts() {
-    scoped(async {
-        let responses = vec![
-            ScriptedResponse::raw(&["SELECT 1"], "1\n"),
+/// The ten statements a fully successful `read_store_health()` issues, in
+/// order. Extracted so more than one test can drive the same healthy backend:
+/// the storage probe's contents are asserted by
+/// `store_health_maps_all_successful_probe_facts` and its `[retention]` policy
+/// by `the_storage_probe_reports_the_operators_retention_policy`, and a script
+/// copied into two places is a script the two can disagree about.
+fn healthy_probe_script() -> Vec<ScriptedResponse> {
+    vec![
+        ScriptedResponse::raw(&["SELECT 1"], "1\n"),
             ScriptedResponse::raw(
                 &["SELECT version() AS version"],
                 json_envelope(json!([{ "version": "25.8.1.1" }])),
@@ -101,8 +105,13 @@ async fn store_health_maps_all_successful_probe_facts() {
                 &["FROM system.disks"],
                 json!([{ "free_bytes": 11_780_276_224_u64, "total_bytes": 994_662_584_320_u64 }]),
             ),
-        ];
-        let (repo, state) = build_scripted_repo(responses).await;
+    ]
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn store_health_maps_all_successful_probe_facts() {
+    scoped(async {
+        let (repo, state) = build_scripted_repo(healthy_probe_script()).await;
 
         let health = repo
             .read_store_health()
@@ -201,6 +210,76 @@ async fn store_health_maps_all_successful_probe_facts() {
     })
     .await;
 }
+
+/// **G-HEALTH-RETENTION.** The store-health storage probe reports the
+/// **operator's** `[retention]` policy, not the built-in defaults.
+/// Denomination: the policy entries on the returned `StorageReport`.
+///
+/// `RepoConfig::retention` exists for exactly this and says so — "carried so
+/// the store-health storage probe reports the policy an operator actually
+/// configured rather than the built-in defaults \[…\] surfacing it through
+/// `/api/v1/health` is what keeps it from being invisible". Nothing drove it.
+/// Found by the round-6 sweep of every entry point that reaches `storage_report`
+/// / `reclaim_*`, after the same defect was closed at four CLI call sites; this
+/// is the fifth instance and the only one outside `apps/moraine`.
+///
+/// This surface deletes nothing and authorizes nothing — that is why it is a
+/// reporting guard rather than a safety one. What it protects is an operator's
+/// only way to confirm from outside the process that a configured bucket-1
+/// horizon took effect. A monitor that always answers "default" for a host
+/// configured to prune history is worse than one that does not answer.
+///
+/// MUTATION (executed 2026-07-28): pass `&RetentionConfig::default()` to
+/// `storage_report` from `ClickHouseConversationRepository::read_storage_probe`
+/// => FAILS here, and only here: with this one test skipped the same mutation
+/// leaves the remaining 1601 workspace tests green. **Lower bound, and the
+/// finding.**
+#[tokio::test(flavor = "multi_thread")]
+async fn the_storage_probe_reports_the_operators_retention_policy() {
+    scoped(async {
+        // A configured bucket-1 horizon: the one class of policy that can lead
+        // to user history being deleted, and absent on a stock config.
+        let retention = moraine_config::RetentionConfig {
+            canonical_history_horizon_days: Some(30.0),
+            ..moraine_config::RetentionConfig::default()
+        };
+        let (repo, state) =
+            build_scripted_repo_with_retention(healthy_probe_script(), retention).await;
+
+        let health = repo
+            .read_store_health()
+            .await
+            .expect("health probes succeed");
+        let storage = match &health.storage {
+            StoreProbe::Available(storage) => storage,
+            other => panic!("expected an available storage report, got {other:?}"),
+        };
+
+        let destructive = storage.destructive_policies();
+        assert_eq!(
+            destructive.len(),
+            1,
+            "a configured canonical horizon must surface as destructive: {:#?}",
+            storage.policy
+        );
+        let entry = destructive[0];
+        assert_eq!(entry.class, TableClass::CanonicalHistory);
+        assert_eq!(
+            entry.horizon_seconds,
+            Some(30.0 * 24.0 * 60.0 * 60.0),
+            "the reported horizon must be the configured one"
+        );
+        assert_eq!(
+            entry.source,
+            moraine_clickhouse::storage_report::POLICY_SOURCE_CONFIGURED,
+            "a configured horizon reported as `default` is the defect this guards"
+        );
+
+        assert_script_consumed(&state, 10);
+    })
+    .await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn store_health_keeps_each_probe_failure_independent() {
     scoped(async {

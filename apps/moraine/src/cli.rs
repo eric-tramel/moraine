@@ -189,7 +189,8 @@ pub(crate) struct ReclaimStatusArgs {
 #[derive(Debug, Args)]
 pub(crate) struct ReclaimPlanArgs {
     /// Limit the dry run to one scope (`mcp_open_orphan`,
-    /// `read_index_generation`, `canonical_generation`). Omit for all.
+    /// `mcp_open_retired_lineage`, `read_index_generation`,
+    /// `canonical_generation`). Omit for all.
     #[arg(long)]
     pub(crate) scope: Option<String>,
     #[arg(long)]
@@ -198,7 +199,9 @@ pub(crate) struct ReclaimPlanArgs {
 
 #[derive(Debug, Args)]
 pub(crate) struct ReclaimRunArgs {
-    /// The scope to reclaim. Required: there is deliberately no "everything".
+    /// The scope to reclaim (`mcp_open_orphan`, `mcp_open_retired_lineage`,
+    /// `read_index_generation`, `canonical_generation`). Required: there is
+    /// deliberately no "everything".
     #[arg(long)]
     pub(crate) scope: String,
     /// Acknowledge the deletion. Without it the command prints exactly what
@@ -407,6 +410,63 @@ mod tests {
                     }),
             }) => assert!(args.force),
             _ => panic!("expected forced core-index promote command"),
+        }
+    }
+
+    /// The `--scope` help lists **every** scope, not the ones that happened to
+    /// exist when it was written.
+    ///
+    /// `ReclaimScope::parse` accepts all of `ReclaimScope::ALL`, so a scope
+    /// missing from this list is runnable and undiscoverable: an operator
+    /// reading `--help` cannot find it. That is how
+    /// `mcp_open_retired_lineage` came to be a registered, default-on executor
+    /// with a header table entry in `docs/configuration.md` and no mention in
+    /// the one place an operator looks first.
+    ///
+    /// Asserted against the enum rather than a literal list, so registering a
+    /// scope and forgetting the help text fails here rather than shipping.
+    ///
+    /// **Both `--scope`-bearing subcommands, because `run` is the one that
+    /// deletes.** The previous revision of this test walked `plan` only while
+    /// claiming the enum-driven guarantee for the whole surface — the same
+    /// defect one level up: a guard whose *name* is broader than what it
+    /// drives. `run --help` named **zero** scopes and stayed green, so the
+    /// destructive subcommand was the undiscoverable one.
+    ///
+    /// MUTATION (executed 2026-07-28): drop `mcp_open_retired_lineage` from
+    /// `ReclaimPlanArgs::scope`'s doc comment => FAILS here on `plan`.
+    /// **Lower bound.**
+    ///
+    /// MUTATION (executed 2026-07-28): restore `ReclaimRunArgs::scope`'s doc
+    /// comment to `The scope to reclaim. Required: there is deliberately no
+    /// "everything".` => FAILS here on `run`, and passed the whole workspace
+    /// before this test drove `run`. **Width.**
+    #[test]
+    fn the_scope_help_names_every_reclaim_scope() {
+        use clap::CommandFactory;
+
+        // The help an operator actually reads, not the root's: `render_long_help`
+        // does not recurse into subcommands.
+        for subcommand in [
+            ["db", "reclaim", "plan"].as_slice(),
+            ["db", "reclaim", "run"].as_slice(),
+        ] {
+            let mut root = Cli::command();
+            let leaf = subcommand.iter().fold(&mut root, |command, name| {
+                command
+                    .find_subcommand_mut(*name)
+                    .unwrap_or_else(|| panic!("`{name}` subcommand exists"))
+            });
+            let path = subcommand.join(" ");
+            let help = leaf.render_long_help().to_string();
+            for scope in moraine_clickhouse::ReclaimScope::ALL {
+                assert!(
+                    help.contains(scope.as_str()),
+                    "`moraine {path} --help` never names `{}`, so an operator cannot \
+                     discover a scope this build will happily run",
+                    scope.as_str()
+                );
+            }
         }
     }
 

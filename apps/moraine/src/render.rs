@@ -1106,7 +1106,20 @@ pub(crate) fn render_reclaim_outcome(
         println!("{}", serde_json::to_string_pretty(outcome)?);
         return Ok(());
     }
-    let lines = match outcome {
+    output.section("Storage Reclaim", &reclaim_outcome_lines(outcome));
+    Ok(())
+}
+
+/// The operator-facing lines for a reclaim outcome.
+///
+/// Split out of [`render_reclaim_outcome`] so a test can read them. Plan §7.4
+/// recorded this as a residual — *"`render_reclaim_outcome` builds its lines
+/// in-function and writes them to stdout, so no test reads them … the fix is
+/// one line and the guard waits for the outcome to become reachable"* — and
+/// WI-05 is where `Blocked` and `Settled` became reachable, because they
+/// require a registered executor.
+pub(crate) fn reclaim_outcome_lines(outcome: &ReclaimOutcome) -> Vec<String> {
+    match outcome {
         ReclaimOutcome::NoExecutor { scope, message } => {
             vec![format!("scope: {}", scope.as_str()), message.clone()]
         }
@@ -1120,23 +1133,64 @@ pub(crate) fn render_reclaim_outcome(
                  running; nothing was deleted"
             ),
         ],
+        ReclaimOutcome::LowDisk {
+            scope,
+            free_bytes,
+            required_bytes,
+        } => vec![
+            format!("scope: {}", scope.as_str()),
+            format!(
+                // Not "before any merge frees space": `frees` is in
+                // `FORBIDDEN_DENOMINATION_WORDS`, and the whole point of that
+                // list is that no reclaim line may put that verb next to a
+                // byte figure — including when the sentence is explaining why
+                // the run declined.
+                "declined: {free_bytes} free byte(s), {required_bytes} required. A reclaim delete \
+                 writes row masks first and returns bytes only when a background merge rewrites \
+                 the part, so it needs headroom to start. Nothing was deleted."
+            ),
+        ],
         ReclaimOutcome::Idle { scope } => {
             vec![format!("scope: {}: nothing to reclaim", scope.as_str())]
         }
         ReclaimOutcome::Settled {
             scope,
             units,
-            reclaimed_rows,
+            estimated_rows,
+            redriven,
+            failed,
+            abandoned,
             denomination,
-        } => vec![
-            format!("scope: {}", scope.as_str()),
-            format!("units settled: {units}"),
-            format!("rows reclaimed: {reclaimed_rows}"),
-            denomination.clone(),
-        ],
-    };
-    output.section("Storage Reclaim", &lines);
-    Ok(())
+        } => {
+            let mut lines = vec![
+                format!("scope: {}", scope.as_str()),
+                format!("units settled: {units}"),
+                // Deliberately not "rows reclaimed": this is the claim-time
+                // probe estimate for the units this run claimed, and a
+                // re-driven unit contributes zero because its rows were never
+                // re-counted. The old label promised a measurement nothing
+                // took.
+                format!("rows (claim-time estimate): {estimated_rows}"),
+            ];
+            if *redriven > 0 {
+                lines.push(format!("units completed by re-drive: {redriven}"));
+            }
+            // A wedged or abandoned unit must not be invisible inside a
+            // success rendering; that is how a poison unit goes unnoticed.
+            if *failed > 0 {
+                lines.push(format!(
+                    "units still unsettled after re-drive: {failed} (retried next run)"
+                ));
+            }
+            if *abandoned > 0 {
+                lines.push(format!(
+                    "units abandoned after exceeding the unsettled bound: {abandoned}"
+                ));
+            }
+            lines.push(denomination.clone());
+            lines
+        }
+    }
 }
 
 /// Render the `moraine db core-index status` report.
@@ -1583,9 +1637,9 @@ mod tests {
             width: 100,
         };
         let outcome = ReclaimOutcome::NoExecutor {
-            scope: ReclaimScope::McpOpenOrphan,
-            message: "no executor is registered for scope `mcp_open_orphan`; WI-05 adds it. \
-                      Nothing was deleted."
+            scope: ReclaimScope::ReadIndexGeneration,
+            message: "no executor is registered for scope `read_index_generation`; WI-07 adds \
+                      it. Nothing was deleted."
                 .to_string(),
         };
         render_reclaim_outcome(&output, &outcome, false).expect("outcome renders");
@@ -1605,6 +1659,202 @@ mod tests {
             }
         );
         render_reclaim_outcome(&output, &blocked, false).expect("blocked renders");
+    }
+
+    /// **G-DENOM** (the rendered half) and plan §7.4's `Blocked`-string
+    /// residual, now that a registered executor makes both outcomes reachable.
+    /// Fails for: an operator-facing reclaim line that promises immediate
+    /// bytes, claims partition-aligned deletion, or renders a blocked run
+    /// indistinguishably from an idle one.
+    /// Denomination: the rendered lines, per variant.
+    ///
+    /// MUTATION (executed 2026-07-28): change the `Settled` arm to drop
+    /// `denomination` => FAILS on the merge-deferred assertion. **Lower
+    /// bound.**
+    ///
+    /// MUTATION (executed 2026-07-28): change the `Blocked` arm's text to
+    /// `format!("nothing to reclaim; {pending_mutations} skipped")` => FAILS on
+    /// the idle-phrase assertion. **Width: hazard H9 at the operator surface,
+    /// not only in the type.** The bare `"nothing to reclaim"` — round 2's
+    /// recipe, which its own assertion could not catch — was executed too and
+    /// also FAILS here.
+    ///
+    /// The previous revision asserted `assert_ne!(blocked, idle)` for this, and
+    /// **that assertion cannot fail for any text change**: `Blocked` renders
+    /// two lines and `Idle` renders one, so the vectors differ on length
+    /// whatever the strings say. The realistic regression — a "blocked" line
+    /// that opens with the idle phrase and buries the count — was green. The
+    /// phrase is pinned as a literal here rather than read from the `Idle` arm,
+    /// because an expectation derived from the subject cannot fail for the
+    /// subject changing.
+    ///
+    /// MUTATION (executed 2026-07-28): replace the whole `LowDisk` arm with
+    /// `ReclaimOutcome::LowDisk { scope, .. } => {
+    /// vec![format!("scope: {}: nothing to reclaim", scope.as_str())] }` =>
+    /// FAILS on the low-disk assertions. **Width: `LowDisk` is the state an
+    /// operator most needs distinguished from "nothing to do", and no test read
+    /// those lines at all.** The `..` is load-bearing in the recipe, not
+    /// cosmetic: keeping the destructuring while dropping the bindings' uses
+    /// is an unused-variable warning, so a recipe that says only "collapse the
+    /// arm" does not describe something that compiles.
+    ///
+    /// MUTATION (executed 2026-07-28): change `if *failed > 0` in the `Settled`
+    /// arm to `if false` => FAILS on the poison-unit assertion. **Width: a
+    /// wedged unit must not be invisible inside a success rendering, which is
+    /// what the arm's own comment says and nothing checked.**
+    ///
+    /// MUTATION (executed 2026-07-28): reword `reclaimed_bytes_note` to
+    /// `"frees N bytes on disk"` => FAILS on the forbidden-word scan.
+    /// **Width.**
+    ///
+    /// *Every* is meant literally: all five `ReclaimOutcome` variants are
+    /// driven. A previous revision skipped `NoExecutor` — the only variant
+    /// whose text this function does not itself write, and therefore the only
+    /// one where the forbidden-word scan had something to find. Its message is
+    /// read from `reclaim::no_executor_message` rather than rebuilt here,
+    /// because a scan over a copy of the string cannot fail for the string
+    /// changing.
+    ///
+    /// MUTATION (executed 2026-07-28): reword `no_executor_message` to
+    /// `"no executor for `{scope}`; a later work item frees this space."` =>
+    /// FAILS here on the forbidden-word scan, and passed the whole workspace
+    /// before `NoExecutor` was driven. **Width.**
+    #[test]
+    fn every_rendered_reclaim_line_carries_its_denomination() {
+        /// The phrase that means "this run had nothing to do". Pinned, not
+        /// read from the `Idle` arm.
+        const IDLE_PHRASE: &str = "nothing to reclaim";
+
+        let scope = ReclaimScope::McpOpenOrphan;
+        let settled = reclaim_outcome_lines(&ReclaimOutcome::Settled {
+            scope,
+            units: 7,
+            estimated_rows: 4_096,
+            redriven: 0,
+            failed: 0,
+            abandoned: 0,
+            denomination: moraine_clickhouse::reclaim::reclaimed_bytes_note(),
+        });
+        assert!(
+            settled
+                .iter()
+                .any(|line| line.contains(moraine_clickhouse::reclaim::MERGE_DEFERRED_QUALIFIER)),
+            "{settled:?}"
+        );
+        assert!(settled
+            .iter()
+            .any(|line| line.contains("rows (claim-time estimate): 4096")));
+        assert!(
+            !settled.iter().any(|line| line.contains("rows reclaimed")),
+            "the estimate must never be rendered as a count of rows removed: {settled:?}"
+        );
+
+        // A run that settled some units and left one wedged is not a clean
+        // success, and the count must survive to the operator's terminal.
+        let poisoned = reclaim_outcome_lines(&ReclaimOutcome::Settled {
+            scope,
+            units: 7,
+            estimated_rows: 4_096,
+            redriven: 2,
+            failed: 1,
+            abandoned: 3,
+            denomination: moraine_clickhouse::reclaim::reclaimed_bytes_note(),
+        });
+        for (needle, what) in [
+            ("units completed by re-drive: 2", "the re-drive count"),
+            ("unsettled after re-drive: 1", "the wedged unit"),
+            ("bound: 3", "the abandoned units"),
+        ] {
+            assert!(
+                poisoned.iter().any(|line| line.contains(needle)),
+                "{what} never reached the operator: {poisoned:?}"
+            );
+        }
+
+        // The fifth variant, and the only one whose text is not a literal in
+        // the function under test: `NoExecutor` renders a `String` built two
+        // crates away. "Every rendered line" is not true of a scan that skips
+        // the one line this function does not itself write.
+        let no_executor = reclaim_outcome_lines(&ReclaimOutcome::NoExecutor {
+            scope,
+            message: moraine_clickhouse::reclaim::no_executor_message(scope),
+        });
+        assert!(
+            no_executor
+                .iter()
+                .any(|line| line.contains("Nothing was deleted")),
+            "a refusal must say it deleted nothing: {no_executor:?}"
+        );
+
+        let idle = reclaim_outcome_lines(&ReclaimOutcome::Idle { scope });
+        assert!(
+            idle.iter().any(|line| line.contains(IDLE_PHRASE)),
+            "the idle phrase moved; every assertion below is written against it: {idle:?}"
+        );
+
+        let blocked = reclaim_outcome_lines(&ReclaimOutcome::Blocked {
+            scope,
+            pending_mutations: 3,
+        });
+        assert!(
+            blocked.iter().any(|line| line.contains('3')),
+            "the blocked line must carry the count: {blocked:?}"
+        );
+
+        // The `LowDisk` refusal: both figures, and an explanation of why more
+        // free space is needed to free space.
+        let low_disk = reclaim_outcome_lines(&ReclaimOutcome::LowDisk {
+            scope,
+            free_bytes: 1_073_741_824,
+            required_bytes: 10_737_418_240,
+        });
+        for needle in ["1073741824", "10737418240"] {
+            assert!(
+                low_disk.iter().any(|line| line.contains(needle)),
+                "the low-disk refusal must carry `{needle}`: {low_disk:?}"
+            );
+        }
+        assert!(
+            low_disk
+                .iter()
+                .any(|line| line.to_lowercase().contains("nothing was deleted")),
+            "a refusal must say it deleted nothing: {low_disk:?}"
+        );
+
+        // H9, at the operator surface: neither refusal may read as "there was
+        // nothing to do".
+        for (variant, lines) in [
+            ("blocked", &blocked),
+            ("low disk", &low_disk),
+            ("no executor", &no_executor),
+        ] {
+            assert!(
+                !lines
+                    .iter()
+                    .any(|line| line.to_lowercase().contains(IDLE_PHRASE)),
+                "`{variant}` renders as idle, which is how a stalled reclaimer stays \
+                 invisible: {lines:?}"
+            );
+        }
+
+        for lines in [
+            &settled,
+            &poisoned,
+            &blocked,
+            &idle,
+            &low_disk,
+            &no_executor,
+        ] {
+            for line in lines.iter() {
+                let lowered = line.to_lowercase();
+                for forbidden in moraine_clickhouse::reclaim::FORBIDDEN_DENOMINATION_WORDS {
+                    assert!(
+                        !lowered.contains(forbidden),
+                        "`{forbidden}` promises something no table's layout supports: {line}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

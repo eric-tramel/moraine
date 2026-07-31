@@ -471,6 +471,12 @@ pub(super) async fn gather_core_index_report(cfg: &AppConfig) -> CoreIndexReport
 /// error attached, so the surrounding command still renders. Storage state is
 /// transient and must not fail the doctor exit code — the same contract
 /// `gather_core_index_report` established.
+///
+/// `&cfg.retention`, never a default: `reclaim_status` reports the effective
+/// `[retention]` policy *and* plans every scope through it, so a defaulted
+/// config here makes the status panel disagree with the run in both the policy
+/// block and the unit counts. Guarded by
+/// `tests::the_status_report_uses_the_operators_retention_horizon`.
 pub(super) async fn gather_reclaim_status(cfg: &AppConfig) -> ReclaimStatusReport {
     let Ok(ch) = ClickHouseClient::new(cfg.clickhouse.clone()) else {
         return unavailable_reclaim_status("ClickHouse client could not be constructed");
@@ -525,15 +531,13 @@ async fn cmd_db_reclaim_plan(
     };
     let ch = ClickHouseClient::new(cfg.clickhouse.clone())?;
     let budgets = query_budgets(cfg);
-    let plan: ReclaimPlan = QueryEnvelope::new_batch(
-        "reclaim-plan",
-        QueryClass::Background,
-        &budgets.background,
-        &budgets.administrative,
-        reclaim::PLAN_STATEMENT_CAP,
-    )
-    .scope(ch.reclaim_plan(&cfg.retention, &scopes))
-    .await?;
+    // `&cfg.retention`, never a default: the horizon the planner reports must
+    // be the horizon the run deletes at, or the unit count an operator reads
+    // is not the unit count the run claims. Guarded by
+    // `tests::the_planner_uses_the_operators_retention_horizon`.
+    let plan: ReclaimPlan = reclaim::plan_envelope(&budgets.background, &budgets.administrative)
+        .scope(ch.reclaim_plan(&cfg.retention, &scopes))
+        .await?;
     render_reclaim_plan(output, &plan, args.json)?;
     Ok(ExitCode::SUCCESS)
 }
@@ -559,6 +563,14 @@ async fn cmd_db_reclaim_plan(
 /// re-deriving its decisions. `cli::tests::clap_parses_reclaim_subcommands`
 /// proves only that `--confirm` parses and defaults to false; it says nothing
 /// about whether anything reads it.
+///
+/// The two arguments this function chooses for the reclaimer — the retention
+/// config and the trigger — are each observed by a guard that drives this
+/// function against a stand-in server and reads what reached it:
+/// `tests::the_operator_run_uses_the_operators_retention_horizon` and
+/// `tests::the_operators_run_is_not_gated_on_free_disk`. The envelope is built
+/// by `reclaim::run_preamble_envelope`, so its cap is not an argument here at
+/// all.
 async fn cmd_db_reclaim_run(
     cfg: &AppConfig,
     output: &CliOutput,
@@ -571,15 +583,29 @@ async fn cmd_db_reclaim_run(
     }
     let ch = ClickHouseClient::new(cfg.clickhouse.clone())?;
     let budgets = query_budgets(cfg);
-    let outcome = QueryEnvelope::new_batch(
-        "reclaim-run",
-        QueryClass::Background,
-        &budgets.background,
-        &budgets.administrative,
-        reclaim::UNIT_STATEMENT_CAP,
-    )
-    .scope(ch.reclaim_run(&cfg.retention, scope))
-    .await?;
+    // The preamble runs here; each claimed unit opens its own
+    // `UNIT_STATEMENT_CAP` envelope inside (plan §3.7: one envelope per unit,
+    // so a deadline caps one unit rather than a 64-unit sweep).
+    let outcome = reclaim::run_preamble_envelope(&budgets.background, &budgets.administrative)
+        // `&cfg.retention`, never a default: the horizon is the only thing
+        // separating this collector from a prepare in flight, because
+        // `prepare` writes children first and the header last. An operator who
+        // widened `retention.derived_horizon_hours` because their host
+        // publishes slowly must get *their* horizon here, not the stock 24h.
+        //
+        // `Operator`: this path is reached only after `--confirm`, by somebody
+        // looking at the host. It is deliberately **not** subject to the
+        // free-disk refusal the maintenance tick applies — an operator may
+        // need to reclaim precisely because the disk is full, and refusing
+        // them here would leave no way forward.
+        .scope(ch.reclaim_run(
+            &cfg.retention,
+            scope,
+            reclaim::ReclaimTrigger::Operator,
+            &budgets.background,
+            &budgets.administrative,
+        ))
+        .await?;
     crate::render::render_reclaim_outcome(output, &outcome, args.json)?;
     Ok(ExitCode::from(reclaim_run_exit_code(&outcome)))
 }
@@ -596,8 +622,14 @@ pub(crate) const RECLAIM_REFUSAL_EXIT_CODE: u8 = 1;
 /// that bug at the process boundary.
 pub(crate) fn reclaim_run_exit_code(outcome: &moraine_clickhouse::ReclaimOutcome) -> u8 {
     match outcome {
+        // `LowDisk` joins the refusals for the same reason `Blocked` does:
+        // reclamation did not happen, and a script that assumed it did must
+        // notice. It is unreachable from this command today — the CLI runs as
+        // `Operator`, which does not check free space — and is matched here so
+        // that stays a deliberate decision rather than a wildcard's accident.
         moraine_clickhouse::ReclaimOutcome::NoExecutor { .. }
-        | moraine_clickhouse::ReclaimOutcome::Blocked { .. } => RECLAIM_REFUSAL_EXIT_CODE,
+        | moraine_clickhouse::ReclaimOutcome::Blocked { .. }
+        | moraine_clickhouse::ReclaimOutcome::LowDisk { .. } => RECLAIM_REFUSAL_EXIT_CODE,
         moraine_clickhouse::ReclaimOutcome::Idle { .. }
         | moraine_clickhouse::ReclaimOutcome::Settled { .. } => 0,
     }
@@ -965,6 +997,235 @@ mod tests {
         }
     }
 
+    // ---- a ClickHouse stand-in for the reclaim CLI paths -----------------
+    //
+    // The guards below must observe **what reached the server**. Every
+    // mutation they exist for leaves this file's own decisions intact and
+    // changes only an argument handed to the reclaimer, so a test that re-reads
+    // `cfg.retention` next to the call site passes for all of them — that is
+    // exactly how four free arguments survived three sweeps of the janitor's
+    // call sites.
+    //
+    // Deliberately not the `axum` stand-in the library crates use: adding
+    // `axum` to this binary's dev-dependencies would add a package edge to
+    // `Cargo.lock`, and `--locked` is part of the gate. The two transport
+    // profiles `ClickHouseClient` uses are the whole protocol surface these
+    // paths need — the statement arrives in the URL `query` parameter for short
+    // reads and in the body for anything longer (the candidate probes are all
+    // body-carried), and every read here is answered from `system.disks` or
+    // with an empty result set.
+
+    /// Records the statement of every request; answers `system.disks` with a
+    /// configurable free-space row, which is the one server answer any reclaim
+    /// CLI path branches on.
+    #[derive(Clone)]
+    struct ReclaimServerMock {
+        statements: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        free_bytes: u64,
+    }
+
+    impl ReclaimServerMock {
+        fn with_free_bytes(free_bytes: u64) -> Self {
+            Self {
+                statements: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                free_bytes,
+            }
+        }
+
+        /// Comfortably above `RECLAIM_MIN_FREE_BYTES`, so nothing in the path
+        /// declines for headroom.
+        fn roomy() -> Self {
+            Self::with_free_bytes(moraine_clickhouse::reclaim::RECLAIM_MIN_FREE_BYTES * 4)
+        }
+
+        fn statements(&self) -> Vec<String> {
+            self.statements
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+
+        fn count(&self, needle: &str) -> usize {
+            self.statements()
+                .iter()
+                .filter(|statement| statement.contains(needle))
+                .count()
+        }
+
+        fn answer(&self, statement: &str) -> String {
+            if statement.contains("system.disks") {
+                format!(
+                    "{{\"free_bytes\":{},\"total_bytes\":{}}}\n",
+                    self.free_bytes,
+                    self.free_bytes.saturating_mul(2)
+                )
+            } else {
+                String::new()
+            }
+        }
+    }
+
+    async fn spawn_reclaim_server_mock(mock: ReclaimServerMock) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind reclaim stand-in listener");
+        let addr = listener.local_addr().expect("reclaim stand-in addr");
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let mock = mock.clone();
+                tokio::spawn(async move { serve_reclaim_request(stream, mock).await });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    async fn serve_reclaim_request(mut stream: tokio::net::TcpStream, mock: ReclaimServerMock) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut buf = Vec::new();
+        let mut chunk = [0_u8; 8192];
+        let header_end = loop {
+            if let Some(end) = buf
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .map(|start| start + 4)
+            {
+                break end;
+            }
+            match stream.read(&mut chunk).await {
+                Ok(0) | Err(_) => return,
+                Ok(read) => buf.extend_from_slice(&chunk[..read]),
+            }
+        };
+        let head = String::from_utf8_lossy(&buf[..header_end]).into_owned();
+        let content_length = head
+            .lines()
+            .skip(1)
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.trim()
+                    .eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())?
+            })
+            .unwrap_or(0);
+        while buf.len() < header_end + content_length {
+            match stream.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(read) => buf.extend_from_slice(&chunk[..read]),
+            }
+        }
+
+        let target = head
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .unwrap_or("/")
+            .to_string();
+        let from_url = url_query_param(&target, "query").unwrap_or_default();
+        let statement = if from_url.trim().is_empty() {
+            String::from_utf8_lossy(&buf[header_end..])
+                .trim()
+                .to_string()
+        } else {
+            from_url.trim().to_string()
+        };
+
+        let body = mock.answer(&statement);
+        mock.statements
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(statement);
+
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=UTF-8\r\nContent-Length: \
+             {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = stream.write_all(response.as_bytes()).await;
+        let _ = stream.shutdown().await;
+    }
+
+    fn url_query_param(target: &str, name: &str) -> Option<String> {
+        let (_, query) = target.split_once('?')?;
+        query.split('&').find_map(|pair| {
+            let (key, value) = pair.split_once('=')?;
+            (key == name).then(|| percent_decode(value))
+        })
+    }
+
+    fn percent_decode(raw: &str) -> String {
+        let bytes = raw.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut index = 0;
+        while index < bytes.len() {
+            match bytes[index] {
+                b'+' => {
+                    out.push(b' ');
+                    index += 1;
+                }
+                b'%' if index + 3 <= bytes.len() => {
+                    match u8::from_str_radix(&raw[index + 1..index + 3], 16) {
+                        Ok(byte) => {
+                            out.push(byte);
+                            index += 3;
+                        }
+                        Err(_) => {
+                            out.push(bytes[index]);
+                            index += 1;
+                        }
+                    }
+                }
+                byte => {
+                    out.push(byte);
+                    index += 1;
+                }
+            }
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// A config pointed at the stand-in, carrying `retention` verbatim.
+    fn mock_config(url: String, retention: moraine_config::RetentionConfig) -> AppConfig {
+        let mut cfg = AppConfig::default();
+        cfg.clickhouse.url = url;
+        cfg.clickhouse.timeout_seconds = 10.0;
+        cfg.retention = retention;
+        cfg
+    }
+
+    /// A `[retention]` whose derived horizon differs from the stock one, so a
+    /// defaulted config cannot pass by coincidence.
+    fn widened_retention() -> moraine_config::RetentionConfig {
+        moraine_config::RetentionConfig {
+            derived_horizon_hours: 72.0,
+            ..moraine_config::RetentionConfig::default()
+        }
+    }
+
+    fn horizon_seconds(retention: &moraine_config::RetentionConfig) -> u64 {
+        retention.derived_horizon_seconds().max(0.0) as u64
+    }
+
+    /// The configured and stock horizons, asserted distinct: without this the
+    /// "a default did not reach the server" half of every horizon guard below
+    /// is vacuous.
+    fn distinct_horizons(retention: &moraine_config::RetentionConfig) -> (u64, u64) {
+        let configured = horizon_seconds(retention);
+        let stock = horizon_seconds(&moraine_config::RetentionConfig::default());
+        assert_ne!(
+            configured, stock,
+            "the test horizon must differ from the default, or a defaulted config passes"
+        );
+        (configured, stock)
+    }
+
+    /// Statement fragment unique to each registered scope's candidate probe —
+    /// the same signatures `sink::tests::RECLAIM_PROBE_SIGNATURES` uses, so
+    /// "the probe was issued" means the same thing on both surfaces.
+    const ORPHAN_PROBE_SIGNATURE: &str = "child.candidate_generation";
+    const RETIRED_PROBE_SIGNATURE: &str = "l.live_fingerprint";
+
     /// **G-CONFIRM.** Fails for: an unconfirmed `moraine db reclaim run`
     /// proceeding.
     /// Denomination: end-to-end behaviour of `cmd_db_reclaim_run`, not a
@@ -1040,15 +1301,33 @@ mod tests {
     /// MUTATION (executed 2026-07-27): make it return `1` for every variant =>
     /// FAILS on the `Idle`/`Settled` rows, so "always fail" is not a passing
     /// "fix". **Upper bound, and width: each variant is named.**
+    ///
+    /// MUTATION (executed 2026-07-28): move `LowDisk` to the `0` arm => FAILS
+    /// on the low-disk row. **Width: the variant is unreachable from this
+    /// command today — the CLI runs as `Operator`, which skips the free-space
+    /// check — so its arm was matched deliberately and asserted by nothing. A
+    /// later trigger change makes it reachable, and the silent-success
+    /// mapping it would have inherited is precisely what
+    /// `RECLAIM_REFUSAL_EXIT_CODE` exists to prevent.**
     #[tokio::test(flavor = "multi_thread")]
     async fn a_refusal_exits_non_zero() {
-        // End to end: a confirmed run of an authorized scope still refuses for
-        // the missing executor, and that refusal is not a success.
+        // End to end: a confirmed run of an authorized scope with no
+        // registered executor refuses, and that refusal is not a success.
+        // `mcp_open_orphan` is no longer such a scope — WI-05 registered it —
+        // so this drives one that still is. Naming a registered scope here
+        // would assert that a run reaches the network, which is the opposite
+        // of the ceremony this gate is about.
         let cfg = offline_config(moraine_config::RetentionConfig::default());
+        let unregistered = moraine_clickhouse::ReclaimScope::ALL
+            .into_iter()
+            .find(|scope| {
+                moraine_clickhouse::reclaim::executor_for(*scope).is_none() && scope.is_default_on()
+            })
+            .expect("at least one default-on scope still awaits its executor");
         let code = cmd_db_reclaim_run(
             &cfg,
             &plain_output(),
-            reclaim_run_args("mcp_open_orphan", true),
+            reclaim_run_args(unregistered.as_str(), true),
         )
         .await
         .expect("no executor is a refusal, not an error");
@@ -1074,12 +1353,25 @@ mod tests {
             "H9: a blocked run must not be indistinguishable from a successful one at the process \
              boundary either"
         );
+        assert_eq!(
+            reclaim_run_exit_code(&ReclaimOutcome::LowDisk {
+                scope,
+                free_bytes: 1,
+                required_bytes: 2
+            }),
+            RECLAIM_REFUSAL_EXIT_CODE,
+            "a run that declined for free disk reclaimed nothing, and a script that assumed it \
+             did must notice"
+        );
         assert_eq!(reclaim_run_exit_code(&ReclaimOutcome::Idle { scope }), 0);
         assert_eq!(
             reclaim_run_exit_code(&ReclaimOutcome::Settled {
                 scope,
                 units: 0,
-                reclaimed_rows: 0,
+                estimated_rows: 0,
+                redriven: 0,
+                failed: 0,
+                abandoned: 0,
                 denomination: String::new()
             }),
             0
@@ -1098,6 +1390,225 @@ mod tests {
         for scope in moraine_clickhouse::ReclaimScope::ALL {
             assert!(rendered.contains(scope.as_str()), "{rendered}");
         }
+    }
+
+    /// **G-CLI-RUN-RETENTION.** The operator's `run` drives the reclaimer with
+    /// the **operator's** `[retention]` config, observed by the horizon that
+    /// reached the candidate probe.
+    /// Denomination: the `toIntervalSecond(…)` literal on the issued probe.
+    ///
+    /// This is the destructive path: `run --confirm` is the one call site that
+    /// deletes on demand. `sink::tests::the_unattended_janitor_uses_the_
+    /// operators_retention_horizon` closes exactly this for the janitor and
+    /// states the consequence, which is identical here: the horizon is the only
+    /// thing separating the orphan collector from a prepare in flight, because
+    /// `prepare` writes children first and the header last. An operator who
+    /// widens `retention.derived_horizon_hours` because their host publishes
+    /// slowly would have got the stock 24h on `reclaim run --confirm`, and the
+    /// collector would have deleted the children of every prepare between 24h
+    /// and their configured horizon.
+    ///
+    /// MUTATION (executed 2026-07-28): pass `&RetentionConfig::default()` to
+    /// `reclaim_run` from `cmd_db_reclaim_run` => FAILS here, and **only**
+    /// here: re-run with this one test skipped, the same mutation leaves the
+    /// remaining 1601 workspace tests green. **Lower bound, and the finding.**
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_operator_run_uses_the_operators_retention_horizon() {
+        let retention = widened_retention();
+        let (configured, stock) = distinct_horizons(&retention);
+        let mock = ReclaimServerMock::roomy();
+        let cfg = mock_config(spawn_reclaim_server_mock(mock.clone()).await, retention);
+
+        let code = cmd_db_reclaim_run(
+            &cfg,
+            &plain_output(),
+            reclaim_run_args("mcp_open_orphan", true),
+        )
+        .await
+        .expect("a confirmed run of a registered bucket-3 scope reaches the server");
+        assert_eq!(
+            code,
+            ExitCode::SUCCESS,
+            "nothing to reclaim is not a refusal"
+        );
+
+        assert!(
+            mock.count(ORPHAN_PROBE_SIGNATURE) > 0,
+            "the run never issued its candidate probe"
+        );
+        assert_eq!(
+            mock.count(&format!("toIntervalSecond({configured})")),
+            1,
+            "the run's probe must carry the configured horizon, not a default"
+        );
+        assert_eq!(
+            mock.count(&format!("toIntervalSecond({stock})")),
+            0,
+            "a defaulted horizon reached the server"
+        );
+    }
+
+    /// **G-CLI-TRIGGER.** The operator's `run` is an *attended* one, observed by
+    /// what it did on a nearly-full disk rather than by reading the token at
+    /// the call site.
+    /// Denomination: the statements the command issued after the disk read.
+    ///
+    /// `ReclaimTrigger::Operator` is a single token in `cmd_db_reclaim_run`,
+    /// and it is the entire "an operator may need to reclaim precisely because
+    /// the disk is full" story this module repeats in four places.
+    /// `reclaim::tests::only_the_unattended_trigger_refuses_to_start_on_a_full_disk`
+    /// proves the two triggers differ, but it calls `reclaim_run` directly with
+    /// each one — nothing asserted which token the **operator's** tick passes.
+    /// It is the exact mirror of the janitor finding `sink::tests::the_
+    /// unattended_janitor_declines_to_reclaim_on_a_nearly_full_disk` closed.
+    ///
+    /// Fail-closed in direction — the mutation refuses rather than deletes —
+    /// which is why it needs a test rather than an incident: it silently
+    /// removes the only reclamation route left on a host that has run out of
+    /// disk.
+    ///
+    /// MUTATION (executed 2026-07-28): change `cmd_db_reclaim_run`'s
+    /// `ReclaimTrigger::Operator` to `Maintenance` => FAILS here twice: the
+    /// probe is never issued and the command exits `RECLAIM_REFUSAL_EXIT_CODE`.
+    /// With this one test skipped the same mutation leaves the remaining 1601
+    /// workspace tests green. **Lower bound, and the finding.**
+    ///
+    /// MUTATION (executed 2026-07-28): raise the stand-in's free space above
+    /// `RECLAIM_MIN_FREE_BYTES` => FAILS here, which is the point: this test
+    /// distinguishes "ran despite the disk" from "the disk was never low", and
+    /// `the_operator_run_uses_the_operators_retention_horizon` above holds the
+    /// roomy-disk side. **Width.**
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_operators_run_is_not_gated_on_free_disk() {
+        // One gigabyte free: below the 10 GiB the unattended trigger requires.
+        let mock = ReclaimServerMock::with_free_bytes(1024 * 1024 * 1024);
+        assert!(
+            mock.free_bytes < moraine_clickhouse::reclaim::RECLAIM_MIN_FREE_BYTES,
+            "the stand-in must report less headroom than the unattended gate demands"
+        );
+        let cfg = mock_config(
+            spawn_reclaim_server_mock(mock.clone()).await,
+            moraine_config::RetentionConfig::default(),
+        );
+
+        let code = cmd_db_reclaim_run(
+            &cfg,
+            &plain_output(),
+            reclaim_run_args("mcp_open_orphan", true),
+        )
+        .await
+        .expect("a confirmed operator run must not error on a full disk");
+
+        // It got as far as the free-space read — otherwise this would pass for
+        // a run that never reached the preamble at all.
+        assert!(
+            mock.count("system.disks") > 0,
+            "the reclaim preamble never read free space"
+        );
+        assert!(
+            mock.count(ORPHAN_PROBE_SIGNATURE) > 0,
+            "the operator's run declined for free disk"
+        );
+        assert_eq!(
+            code,
+            ExitCode::SUCCESS,
+            "a run that reached an empty candidate set is not a refusal"
+        );
+    }
+
+    /// **G-CLI-PLAN-RETENTION.** The dry-run planner is driven with the
+    /// operator's `[retention]` config, observed by the horizon that reached
+    /// the probe.
+    /// Denomination: the `toIntervalSecond(…)` literal on the issued probe.
+    ///
+    /// The planner is not a lesser surface for being read-only: `plan` and
+    /// `run` probe through the same `reclaim_candidates` call precisely so the
+    /// plan an operator reads is the plan a run claims. A plan computed at the
+    /// stock horizon while the run deletes at the configured one reports a unit
+    /// count the run does not claim, which is the one thing a dry run exists
+    /// not to do.
+    ///
+    /// MUTATION (executed 2026-07-28): pass `&RetentionConfig::default()` to
+    /// `reclaim_plan` from `cmd_db_reclaim_plan` => FAILS here, and only here:
+    /// with this one test skipped the same mutation leaves the remaining 1601
+    /// workspace tests green. **Lower bound, and the finding.**
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_planner_uses_the_operators_retention_horizon() {
+        let retention = widened_retention();
+        let (configured, stock) = distinct_horizons(&retention);
+        let mock = ReclaimServerMock::roomy();
+        let cfg = mock_config(spawn_reclaim_server_mock(mock.clone()).await, retention);
+
+        let code = cmd_db_reclaim_plan(
+            &cfg,
+            &plain_output(),
+            crate::cli::ReclaimPlanArgs {
+                scope: None,
+                json: false,
+            },
+        )
+        .await
+        .expect("a full-scope plan reaches the server");
+        assert_eq!(code, ExitCode::SUCCESS);
+
+        // Every scope with a registered executor probes; the rest issue no
+        // statement at all, so this is the number of probes a plan can carry a
+        // horizon on today.
+        let registered = moraine_clickhouse::reclaim::registered_executors().len();
+        assert!(mock.count(ORPHAN_PROBE_SIGNATURE) > 0);
+        assert!(mock.count(RETIRED_PROBE_SIGNATURE) > 0);
+        assert_eq!(
+            mock.count(&format!("toIntervalSecond({configured})")),
+            registered,
+            "every registered scope's probe must carry the configured horizon"
+        );
+        assert_eq!(
+            mock.count(&format!("toIntervalSecond({stock})")),
+            0,
+            "a defaulted horizon reached the server"
+        );
+    }
+
+    /// **G-CLI-STATUS-RETENTION.** `moraine db reclaim status` — and the
+    /// `status` panel and `db doctor` block that share `gather_reclaim_status`
+    /// — are driven with the operator's `[retention]` config.
+    /// Denomination: the `toIntervalSecond(…)` literal on the issued probes,
+    /// plus the report's own availability.
+    ///
+    /// `reclaim_status` reports the effective retention policy *and* plans
+    /// every scope through it, so a defaulted config here makes the panel
+    /// disagree with the run twice over: in the policy block an operator reads
+    /// to confirm their config took effect, and in the unit counts.
+    ///
+    /// MUTATION (executed 2026-07-28): pass `&RetentionConfig::default()` to
+    /// `reclaim_status` from `gather_reclaim_status` => FAILS here, and only
+    /// here: with this one test skipped the same mutation leaves the remaining
+    /// 1601 workspace tests green. **Lower bound, and the finding.**
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_status_report_uses_the_operators_retention_horizon() {
+        let retention = widened_retention();
+        let (configured, stock) = distinct_horizons(&retention);
+        let mock = ReclaimServerMock::roomy();
+        let cfg = mock_config(spawn_reclaim_server_mock(mock.clone()).await, retention);
+
+        let report = gather_reclaim_status(&cfg).await;
+        assert!(
+            report.available,
+            "status did not complete: {:?}",
+            report.error
+        );
+
+        let registered = moraine_clickhouse::reclaim::registered_executors().len();
+        assert_eq!(
+            mock.count(&format!("toIntervalSecond({configured})")),
+            registered,
+            "every registered scope's probe must carry the configured horizon"
+        );
+        assert_eq!(
+            mock.count(&format!("toIntervalSecond({stock})")),
+            0,
+            "a defaulted horizon reached the server"
+        );
     }
 
     #[test]

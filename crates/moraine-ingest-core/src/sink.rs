@@ -17,7 +17,10 @@ use crate::{
 };
 use anyhow::Context;
 use chrono::{DateTime, Utc};
-use moraine_clickhouse::{is_oversized_json_each_row_insert_error, ClickHouseClient};
+use moraine_clickhouse::{
+    is_oversized_json_each_row_insert_error, ClickHouseClient, ReclaimOutcome, ReclaimScope,
+    ReclaimTrigger,
+};
 use moraine_config::ValidatedQueryBudgets;
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -295,6 +298,29 @@ const MAINTENANCE_STATEMENT_OVERHEAD: u32 = 16;
 /// bounded by the debt page size known at envelope creation.
 const MAINTENANCE_STATEMENTS_PER_SESSION: u32 = 4;
 
+/// Issue #603 scopes the maintenance tick drives, in order — **and only when
+/// `retention.storage_reclaim_maintenance` is `true`, which it is not by
+/// default.**
+///
+/// Only the bucket-3 `mcp_open` scopes: both are `default-on`, both are
+/// authorized by the stock `DerivedOnly` token, and neither can reach a
+/// bucket-1/2 table — `ReclaimScope::tables` decides that, and
+/// `the_default_reachable_table_set_excludes_all_user_history` pins it.
+/// `canonical_generation` is deliberately absent and must stay absent: plan
+/// §3.7 runs bucket-1/2 reclamation **only** from the explicit CLI, so an
+/// operator who configures a retention horizon does not thereby hand the
+/// background janitor permission to prune their history.
+///
+/// Which scopes the janitor *may* drive and whether it drives them at all are
+/// two separate decisions, and only the first belongs in a `const`. This list
+/// stayed a hard-coded constant with no config key while defaulting to on,
+/// which meant a stock install had no way to stop an unattended delete loop
+/// short of editing the binary.
+const STORAGE_RECLAIM_MAINTENANCE_SCOPES: [ReclaimScope; 2] = [
+    ReclaimScope::McpOpenOrphan,
+    ReclaimScope::McpOpenRetiredLineage,
+];
+
 /// The batch size one flush cycle's statement cap is derived from
 /// (amendment A7): `FLUSH_STATEMENT_OVERHEAD + FLUSH_STATEMENTS_PER_ITEM *
 /// items`, never a global constant a legitimate batch can exceed.
@@ -324,12 +350,21 @@ impl Drop for MaintenanceSlot {
 
 /// Background projection maintenance, at most one run at a time per sink:
 /// reseed durable projection debt (dirty sessions that outlived a restart or
-/// were dropped from the in-memory pending set) into `discovered`, then
-/// reclaim superseded snapshots. Mutations are server-side durable, so a lost
+/// were dropped from the in-memory pending set) into `discovered`, reclaim
+/// superseded snapshots, then drive the issue #603 ledger for the two
+/// registered `mcp_open` scopes. Mutations are server-side durable, so a lost
 /// response only delays accounting until the next tick.
+///
+/// The #603 driver runs **last**, after the projector has had its turn, and
+/// runs under the same single-flight `MaintenanceSlot`. Its first act on every
+/// tick is to re-drive any unit the ledger left unsettled, so the first tick
+/// after a process restart is also the startup recovery pass — there is no
+/// separate startup path to forget to call, which is the shape the existing
+/// reclaimer's stranded children came from.
 fn spawn_projection_maintenance(
     clickhouse: &ClickHouseClient,
     budgets: ValidatedQueryBudgets,
+    retention: moraine_config::RetentionConfig,
     in_flight: &Arc<AtomicBool>,
     discovered: &Arc<Mutex<BTreeSet<String>>>,
 ) {
@@ -376,6 +411,71 @@ fn spawn_projection_maintenance(
                     Ok(_) => {}
                     Err(error) => {
                         warn!("superseded mcp open snapshot reclaim failed: {error:#}");
+                    }
+                }
+                // Opt-in. On a stock config the janitor issues no reclaim
+                // statement at all — not the probe, not the ledger read.
+                if retention.storage_reclaim_maintenance {
+                    for scope in STORAGE_RECLAIM_MAINTENANCE_SCOPES {
+                        match clickhouse
+                            .reclaim_run(
+                                &retention,
+                                scope,
+                                ReclaimTrigger::Maintenance,
+                                &budgets.background,
+                                &budgets.administrative,
+                            )
+                            .await
+                        {
+                            Ok(ReclaimOutcome::Settled {
+                                units,
+                                estimated_rows,
+                                redriven,
+                                failed,
+                                abandoned,
+                                ..
+                            }) => info!(
+                                scope = scope.as_str(),
+                                units,
+                                estimated_rows,
+                                redriven,
+                                failed,
+                                abandoned,
+                                "reclaimed legacy open-projection storage (row count is a \
+                                 claim-time estimate; on-disk delta is merge-deferred)"
+                            ),
+                            // Hazard H9: "blocked" and "nothing to do" must not be
+                            // the same log line, or a permanently stuck mutation
+                            // disables reclamation with no operator signal.
+                            Ok(ReclaimOutcome::Blocked {
+                                pending_mutations, ..
+                            }) => warn!(
+                                scope = scope.as_str(),
+                                pending_mutations,
+                                "storage reclaim is blocked behind an unfinished mutation"
+                            ),
+                            // Nor may "not enough disk to reclaim safely" look
+                            // like "nothing to do": it is the state where an
+                            // operator most needs to know the janitor stopped.
+                            Ok(ReclaimOutcome::LowDisk {
+                                free_bytes,
+                                required_bytes,
+                                ..
+                            }) => warn!(
+                                scope = scope.as_str(),
+                                free_bytes,
+                                required_bytes,
+                                "storage reclaim declined: too little free disk for the row masks \
+                                 it would write before merges reclaim anything"
+                            ),
+                            Ok(ReclaimOutcome::Idle { .. }) => {}
+                            Ok(ReclaimOutcome::NoExecutor { ref message, .. }) => {
+                                warn!(scope = scope.as_str(), "{message}")
+                            }
+                            Err(error) => {
+                                warn!(scope = scope.as_str(), "storage reclaim failed: {error:#}")
+                            }
+                        }
                     }
                 }
             })
@@ -1315,6 +1415,7 @@ pub(crate) fn spawn_sink_task(
                     spawn_projection_maintenance(
                         &clickhouse,
                         budgets,
+                        config.retention,
                         &reclaim_in_flight,
                         &projection_worker.discovered,
                     );
@@ -2802,6 +2903,11 @@ mod tests {
         /// failing/slow MCP-open projection refresh (whose statements read/write
         /// only `mcp_open_*` and never `INSERT INTO events`).
         fail_query_needles: Arc<Mutex<Vec<String>>>,
+        /// What `system.disks` reports, when a test wants the free-disk gate
+        /// to be reachable. `None` answers the read with an empty body, which
+        /// is what every pre-#603 test expects and what leaves
+        /// `StorageReport::disk` at `None`.
+        disk_free_bytes: Arc<Mutex<Option<u64>>>,
     }
 
     impl MockClickHouseState {
@@ -2951,10 +3057,19 @@ mod tests {
         Query(params): Query<HashMap<String, String>>,
         body: String,
     ) -> (StatusCode, String) {
-        let query = params
-            .get("query")
-            .map(String::as_str)
-            .unwrap_or(body.as_str());
+        // A blank `query` parameter is not "no statement": the mutation
+        // transport (`mutation_request_text_with_params_and_timeout`, which is
+        // how every #603 ledger insert and reclaim delete is sent) puts an
+        // empty `query` in the URL and the statement in the body. Taking the
+        // parameter whenever the key is merely *present* recorded those as the
+        // empty string, so any assertion over the statements a reclaim run
+        // issued was measuring nothing.
+        let from_url = params.get("query").map(String::as_str).unwrap_or_default();
+        let query = if from_url.trim().is_empty() {
+            body.as_str()
+        } else {
+            from_url
+        };
         state
             .queries
             .lock()
@@ -3065,6 +3180,30 @@ mod tests {
         }
         if query.contains("existing_count") {
             return (StatusCode::OK, "{\"existing_count\":0}\n".to_string());
+        }
+        if query.contains("FROM system.disks") {
+            let free_bytes = *state
+                .disk_free_bytes
+                .lock()
+                .expect("mock disk_free_bytes mutex poisoned");
+            return (
+                StatusCode::OK,
+                match free_bytes {
+                    Some(free_bytes) => format!(
+                        "{{\"free_bytes\":{free_bytes},\"total_bytes\":{}}}\n",
+                        free_bytes.saturating_mul(2)
+                    ),
+                    None => String::new(),
+                },
+            );
+        }
+        // The two body-carried #603 statement kinds. Accepted rather than
+        // 400'd so that "the janitor claimed / deleted nothing" is a statement
+        // about the driver and not about the mock refusing to model it.
+        if query.starts_with("DELETE FROM")
+            || query.starts_with("INSERT INTO `moraine`.storage_reclaim_ledger")
+        {
+            return (StatusCode::OK, String::new());
         }
         if query.contains("SELECT") && !query.contains("INSERT INTO") {
             return (StatusCode::OK, String::new());
@@ -3292,7 +3431,13 @@ mod tests {
             spawn_mock_clickhouse_with_state(MockClickHouseState::default()).await;
         let in_flight = Arc::new(AtomicBool::new(false));
         let discovered = Arc::new(Mutex::new(BTreeSet::new()));
-        spawn_projection_maintenance(&clickhouse, test_budgets(), &in_flight, &discovered);
+        spawn_projection_maintenance(
+            &clickhouse,
+            test_budgets(),
+            moraine_config::RetentionConfig::default(),
+            &in_flight,
+            &discovered,
+        );
 
         timeout(Duration::from_secs(5), async {
             loop {
@@ -3306,6 +3451,333 @@ mod tests {
         .expect("maintenance cycle completes");
 
         assert_enveloped(&state, "ingest-maintenance", Some(1));
+    }
+
+    /// A statement fragment that appears in **exactly one** scope's #603
+    /// candidate probe and nowhere else in the tree.
+    ///
+    /// Deliberately not `required_heads_fingerprint` or
+    /// `mcp_open_backfill_plans FINAL`: the pre-existing
+    /// `reclaim_superseded_mcp_open_snapshots` path and the projector's own
+    /// plan reads both use those, so a count of them measures the wrong
+    /// janitor. These two aliases exist only inside the #603 probes.
+    const RECLAIM_PROBE_SIGNATURES: [(ReclaimScope, &str); 2] = [
+        (ReclaimScope::McpOpenOrphan, "child.candidate_generation"),
+        (ReclaimScope::McpOpenRetiredLineage, "l.live_fingerprint"),
+    ];
+
+    /// Three tests below drive their per-scope loops off
+    /// [`RECLAIM_PROBE_SIGNATURES`], so it is the subject of none of them and
+    /// the expectation of all of them — the same shape that made the janitor's
+    /// scope-list assertion vacuous twice, one level removed. Its arity is
+    /// fixed by its type, but replacing the second entry with a duplicate of
+    /// the first compiles and leaves every one of those loops checking
+    /// `mcp_open_orphan` twice while claiming per-scope coverage. So the
+    /// scopes it names are pinned here, once, against literals.
+    ///
+    /// MUTATION (executed 2026-07-28): replace the retired-lineage entry with
+    /// a second `McpOpenOrphan` row => FAILS here. **Lower bound.**
+    #[test]
+    fn the_probe_signature_table_names_both_janitor_scopes() {
+        assert_eq!(
+            RECLAIM_PROBE_SIGNATURES.map(|(scope, _)| scope),
+            [
+                ReclaimScope::McpOpenOrphan,
+                ReclaimScope::McpOpenRetiredLineage
+            ],
+        );
+        let [(_, first), (_, second)] = RECLAIM_PROBE_SIGNATURES;
+        assert_ne!(
+            first, second,
+            "two scopes identified by the same fragment identify one scope"
+        );
+    }
+
+    /// Drive one maintenance cycle to completion and hand back what it issued.
+    async fn run_maintenance_cycle(
+        retention: moraine_config::RetentionConfig,
+    ) -> (MockClickHouseState, Arc<AtomicBool>) {
+        run_maintenance_cycle_with_state(retention, MockClickHouseState::default()).await
+    }
+
+    /// [`run_maintenance_cycle`] against a prepared server state.
+    async fn run_maintenance_cycle_with_state(
+        retention: moraine_config::RetentionConfig,
+        state: MockClickHouseState,
+    ) -> (MockClickHouseState, Arc<AtomicBool>) {
+        let (clickhouse, state) = spawn_mock_clickhouse_with_state(state).await;
+        let in_flight = Arc::new(AtomicBool::new(false));
+        let discovered = Arc::new(Mutex::new(BTreeSet::new()));
+        spawn_projection_maintenance(
+            &clickhouse,
+            test_budgets(),
+            retention,
+            &in_flight,
+            &discovered,
+        );
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if !in_flight.load(Ordering::SeqCst) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("maintenance cycle completes");
+        (state, in_flight)
+    }
+
+    /// A stock config's janitor issues **no** issue #603 statement at all.
+    ///
+    /// This is the V4 default, and it is the whole reason
+    /// `retention.storage_reclaim_maintenance` exists. A reclaim delete is a
+    /// server-side mutation that writes `_row_exists` masks *before* any merge
+    /// frees space, and the delete against `mcp_open_events` cannot be
+    /// index-pruned at all — `EXPLAIN indexes = 1` reports `Condition: true`
+    /// and reads every active part and every granule, because `session_id`
+    /// appears in neither that table's partition key nor its primary key
+    /// (sampled 2026-07-28: 452/452 parts, 9 692/9 692 granules over 9.66 GiB;
+    /// the counts move with merges, the shape does not). Defaulting that into
+    /// a 60-second unattended tick on a host with no headroom is how disk
+    /// pressure becomes an outage.
+    ///
+    /// MUTATION (executed 2026-07-28): change the `Default` impl's
+    /// `storage_reclaim_maintenance` to `true` => FAILS here. **Upper bound,
+    /// and the one that matters: it is the difference between shipping an
+    /// opt-in and shipping a default-on delete loop.**
+    ///
+    /// MUTATION (executed 2026-07-28): delete the
+    /// `if retention.storage_reclaim_maintenance` guard from
+    /// `spawn_projection_maintenance` => FAILS here. **Lower bound.**
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_maintenance_tick_is_opt_in_on_a_stock_config() {
+        let stock = moraine_config::RetentionConfig::default();
+        assert!(
+            !stock.storage_reclaim_maintenance,
+            "the unattended reclaim janitor must be off on a stock install"
+        );
+        let (state, _) = run_maintenance_cycle(stock).await;
+        // Statements only the #603 driver issues. The pre-existing
+        // `reclaim_superseded_mcp_open_snapshots` path has its own
+        // `system.mutations` probe and still runs, so a bare
+        // "FROM system.mutations" count would be measuring the wrong janitor.
+        assert_eq!(
+            state.query_count("storage_reclaim_ledger"),
+            0,
+            "a stock janitor must not touch the reclaim ledger at all"
+        );
+        assert_eq!(
+            state.query_count("toUInt64(count()) AS pending"),
+            0,
+            "a stock janitor must not issue the #603 pending-mutation probe"
+        );
+        for signature in RECLAIM_PROBE_SIGNATURES.map(|(_, signature)| signature) {
+            assert_eq!(
+                state.query_count(signature),
+                0,
+                "a stock janitor must not run a #603 candidate probe (`{signature}`)"
+            );
+        }
+    }
+
+    /// **G-MAINT.** Fails for: the issue #603 driver being written but never
+    /// called from the janitor, which is the difference between an executor
+    /// that exists and one that runs.
+    /// Denomination: the statements the maintenance cycle actually issued,
+    /// **counted per scope**.
+    ///
+    /// The previous revision asserted two *global* counters inside a
+    /// `for scope in …` loop, so both assertions were satisfied by the first
+    /// scope's statements and dropping `McpOpenRetiredLineage` from the list
+    /// left it green — the per-scope claim in its name was vacuous. Here each
+    /// scope is identified by the one statement only it issues: its own
+    /// candidate probe, matched on a fragment unique to that probe.
+    ///
+    /// MUTATION (executed 2026-07-28): delete the
+    /// `for scope in STORAGE_RECLAIM_MAINTENANCE_SCOPES` loop from
+    /// `spawn_projection_maintenance` => FAILS on both scopes. **Lower
+    /// bound.**
+    ///
+    /// MUTATION (executed 2026-07-28): replace `McpOpenRetiredLineage` in
+    /// `STORAGE_RECLAIM_MAINTENANCE_SCOPES` with a second `McpOpenOrphan` =>
+    /// FAILS on the retired-lineage probe count. **Width: per scope, which is
+    /// what the name claims.** *Dropping* the entry rather than replacing it
+    /// is not the mutation: the constant is `[ReclaimScope; 2]`, so a
+    /// one-element initialiser does not compile and the assertion is never
+    /// reached. The replacement preserves the arity and is the same defect —
+    /// a janitor that never drives the second scope.
+    ///
+    /// MUTATION (executed 2026-07-28): replace `McpOpenOrphan` in
+    /// `STORAGE_RECLAIM_MAINTENANCE_SCOPES` with
+    /// `ReclaimScope::CanonicalGeneration` => FAILS on the bucket assertion:
+    /// the background janitor must never reach user history, and plan §3.7
+    /// runs bucket-1/2 reclamation only from the explicit CLI. **Upper
+    /// bound.** Again arity-preserving for the same reason — *adding* a third
+    /// scope to a `[ReclaimScope; 2]` does not compile, so the recipe that
+    /// says "add" tests nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn projection_maintenance_drives_the_storage_reclaim_ledger() {
+        let retention = moraine_config::RetentionConfig {
+            storage_reclaim_maintenance: true,
+            ..moraine_config::RetentionConfig::default()
+        };
+        let (state, _) = run_maintenance_cycle(retention).await;
+
+        // Pinned, **not** read from the list under test. Iterating
+        // `STORAGE_RECLAIM_MAINTENANCE_SCOPES` here is what made the previous
+        // revision vacuous, and it stayed vacuous after a first repair:
+        // replacing `McpOpenRetiredLineage` with a second `McpOpenOrphan`
+        // left the loop checking one scope twice and the whole test green.
+        // A test that derives its expectation from its subject cannot fail
+        // for the subject changing.
+        assert_eq!(
+            STORAGE_RECLAIM_MAINTENANCE_SCOPES,
+            [
+                ReclaimScope::McpOpenOrphan,
+                ReclaimScope::McpOpenRetiredLineage
+            ],
+            "the janitor's scope list changed; that is a deliberate decision, not a refactor"
+        );
+        for (scope, signature) in RECLAIM_PROBE_SIGNATURES {
+            assert!(
+                state.query_count(signature) > 0,
+                "`{scope}` never issued its own candidate probe"
+            );
+            assert!(
+                state.query_count(&format!("scope = '{}'", scope.as_str())) > 0,
+                "`{scope}` never read the ledger for its own unsettled units"
+            );
+            // Bucket-3 only. The janitor may not reach user history, whatever
+            // an operator has configured.
+            for table in scope.tables() {
+                assert_eq!(
+                    moraine_clickhouse::classify(table.name()),
+                    Some(moraine_clickhouse::TableClass::Derived),
+                    "the background janitor reached `{}` under `{scope}`",
+                    table.name()
+                );
+            }
+        }
+        assert_enveloped(&state, "ingest-maintenance", Some(1));
+    }
+
+    /// **G-MAINT-TRIGGER.** The janitor's run is an *unattended* one, observed
+    /// by what the run did on a nearly-full disk rather than by reading the
+    /// token at the call site.
+    /// Denomination: the statements the cycle issued after the disk read.
+    ///
+    /// `ReclaimTrigger::Maintenance` is a single token in
+    /// `spawn_projection_maintenance`, and it is the entire "Default
+    /// configuration on a host with <10 GiB free" safety story: `Operator`
+    /// skips the free-disk check, because a person at the console may need to
+    /// reclaim *because* the disk is full.
+    /// `reclaim::tests::only_the_unattended_trigger_refuses_to_start_on_a_full_disk`
+    /// proves the two triggers differ, but it calls `reclaim_run` directly with
+    /// each one — **nothing asserted which token the unattended tick passes**,
+    /// so swapping it to `Operator` left the whole workspace green and turned
+    /// the background janitor into an unbounded delete loop on exactly the
+    /// hosts the gate exists for.
+    ///
+    /// MUTATION (executed 2026-07-28): change the janitor's
+    /// `ReclaimTrigger::Maintenance` to `ReclaimTrigger::Operator` => FAILS
+    /// here: the run proceeds past the disk gate and issues its candidate
+    /// probes. **Lower bound, and the finding.**
+    ///
+    /// MUTATION (executed 2026-07-28): raise the mock's free space above
+    /// `RECLAIM_MIN_FREE_BYTES` => FAILS here, which is the point: this test
+    /// distinguishes "declined for the disk" from "did nothing", and
+    /// `projection_maintenance_drives_the_storage_reclaim_ledger` above holds
+    /// the other side. **Width.**
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_unattended_janitor_declines_to_reclaim_on_a_nearly_full_disk() {
+        let state = MockClickHouseState::default();
+        // One gigabyte free: below the 10 GiB the unattended trigger requires.
+        *state
+            .disk_free_bytes
+            .lock()
+            .expect("mock disk_free_bytes mutex poisoned") = Some(1024 * 1024 * 1024);
+        let retention = moraine_config::RetentionConfig {
+            storage_reclaim_maintenance: true,
+            ..moraine_config::RetentionConfig::default()
+        };
+        let (state, _) = run_maintenance_cycle_with_state(retention, state).await;
+
+        // It got as far as the free-space read — otherwise this would pass for
+        // a janitor that was never called at all.
+        assert!(
+            state.query_count("FROM system.disks") > 0,
+            "the reclaim preamble never read free space"
+        );
+        for (scope, signature) in RECLAIM_PROBE_SIGNATURES {
+            assert_eq!(
+                state.query_count(signature),
+                0,
+                "`{scope}` probed for candidates on a disk with no headroom"
+            );
+        }
+        assert_eq!(
+            state.query_count("INSERT INTO `moraine`.storage_reclaim_ledger"),
+            0,
+            "a declined run must claim nothing"
+        );
+        assert_eq!(
+            state.query_count("DELETE FROM"),
+            0,
+            "a declined run must delete nothing"
+        );
+    }
+
+    /// **G-MAINT-RETENTION.** The janitor drives the reclaimer with the
+    /// **operator's** `[retention]` config, observed by the horizon that
+    /// reached the probe statement.
+    /// Denomination: the `toIntervalSecond(…)` literal on the issued probes.
+    ///
+    /// `spawn_projection_maintenance` passing `RetentionConfig::default()`
+    /// instead of `&retention` was green everywhere: the two bucket-3 scopes
+    /// are authorized by the stock `DerivedOnly` token either way, so the only
+    /// observable difference is the safety horizon — and the horizon is the
+    /// only thing separating the orphan collector from a prepare in flight,
+    /// since `prepare` writes children first and the header last. An operator
+    /// who widens the horizon because their host publishes slowly would have
+    /// been silently ignored by the unattended tick and only the unattended
+    /// tick.
+    ///
+    /// MUTATION (executed 2026-07-28): pass `&RetentionConfig::default()` to
+    /// `reclaim_run` from the janitor => FAILS here. **Lower bound.**
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_unattended_janitor_uses_the_operators_retention_horizon() {
+        let retention = moraine_config::RetentionConfig {
+            storage_reclaim_maintenance: true,
+            derived_horizon_hours: 72.0,
+            ..moraine_config::RetentionConfig::default()
+        };
+        let configured = retention.derived_horizon_seconds().max(0.0) as u64;
+        let stock = moraine_config::RetentionConfig::default()
+            .derived_horizon_seconds()
+            .max(0.0) as u64;
+        assert_ne!(
+            configured, stock,
+            "the test horizon must differ from the default, or a defaulted config passes"
+        );
+
+        let (state, _) = run_maintenance_cycle(retention).await;
+        for (scope, signature) in RECLAIM_PROBE_SIGNATURES {
+            assert!(
+                state.query_count(signature) > 0,
+                "`{scope}` never issued its own candidate probe"
+            );
+            assert_eq!(
+                state.query_count(&format!("toIntervalSecond({configured})")),
+                RECLAIM_PROBE_SIGNATURES.len(),
+                "the janitor's probes must carry the configured horizon, not a default"
+            );
+            assert_eq!(
+                state.query_count(&format!("toIntervalSecond({stock})")),
+                0,
+                "a defaulted horizon reached the server under `{scope}`"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]

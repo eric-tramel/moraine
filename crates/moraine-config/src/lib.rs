@@ -970,6 +970,31 @@ pub struct RetentionConfig {
     pub raw_audit_horizon_days: Option<f64>,
     /// Bucket 1 retention in days. **Absent by default.**
     pub canonical_history_horizon_days: Option<f64>,
+    /// Whether the ingest maintenance tick drives issue #603 storage
+    /// reclamation for the two bucket-3 `mcp_open` scopes.
+    ///
+    /// **`false` by default, and that default is the point of the key.**
+    ///
+    /// A reclaim delete is a server-side mutation that writes a `_row_exists`
+    /// mask into every part it touches, so the disk grows before background
+    /// merges shrink it — and the delete against `mcp_open_events` cannot be
+    /// index-pruned at all. That table is `PARTITION BY cityHash64(event_uid)
+    /// % 64 PRIMARY KEY (event_uid, slot)` while the unit key is
+    /// `(session_id, candidate_generation)`, so `EXPLAIN indexes = 1` reports
+    /// `Condition: true` and reads every active part and every granule. That is
+    /// a property of the sort key and holds on any day; the size of the scan is
+    /// not, and is of order 10 GiB on the reference host (sampled 2026-07-28:
+    /// 452/452 parts, 9 692/9 692 granules over 9.66 GiB — the counts move with
+    /// every background merge, the shape does not). Defaulting a 60-second tick
+    /// into that on a host with no headroom turns disk pressure into an
+    /// outage.
+    ///
+    /// `moraine db reclaim run --confirm` is always available and is **not**
+    /// gated on this key: an operator watching the host can reclaim whenever
+    /// they choose. This key only decides whether the *unattended* janitor
+    /// does it too.
+    #[serde(default)]
+    pub storage_reclaim_maintenance: bool,
 }
 
 fn default_retention_derived_horizon_hours() -> f64 {
@@ -989,6 +1014,10 @@ impl Default for RetentionConfig {
             // not a placeholder waiting for a value.
             raw_audit_horizon_days: None,
             canonical_history_horizon_days: None,
+            // Deliberately `false`. The background janitor does not delete on
+            // a stock install; see the field doc and
+            // `the_maintenance_tick_is_opt_in_on_a_stock_config`.
+            storage_reclaim_maintenance: false,
         }
     }
 }
