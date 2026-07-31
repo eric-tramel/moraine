@@ -29,17 +29,20 @@ pub use mcp_open_projection::{
     McpOpenGenerationReadiness, McpOpenHostRevision, McpOpenPublicationRequest, McpOpenSourceHead,
 };
 pub mod mcp_tool_names;
-/// Issue #603 WI-04. Ledger, planner, and authority types. No executor is
-/// registered in this build, so every `run` refuses.
+/// Issue #603 WI-04/WI-05. Ledger, planner, authority types, and the §3.2
+/// claim/re-drive/settle driver.
 pub mod reclaim;
+/// Issue #603 WI-05. The two `mcp_open_*` candidate probes and the delete
+/// predicates they authorize.
+mod reclaim_mcp_open;
 /// Issue #603 WI-01. The ownership model as code: what may ever be deleted.
 pub mod storage_class;
 /// Issue #603 WI-02. Bytes, parts, disk headroom, and the effective policy.
 pub mod storage_report;
 pub use reclaim::{
     ReclaimAuthority, ReclaimLedgerSummary, ReclaimOutcome, ReclaimPhase, ReclaimPlan,
-    ReclaimPredicate, ReclaimScope, ReclaimStatusReport, ReclaimTable, ReclaimUnit,
-    ReclaimableEstimate,
+    ReclaimPredicate, ReclaimRedriveReport, ReclaimScope, ReclaimStatusReport, ReclaimTable,
+    ReclaimTrigger, ReclaimUnit, ReclaimableEstimate,
 };
 pub use storage_class::{classify, ClassifiedTable, TableClass, CLASSIFIED_TABLES};
 pub use storage_report::{

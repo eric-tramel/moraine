@@ -987,17 +987,63 @@ would touch, and refuses a bucket-1/2 scope unless the matching key above is
 present — naming the missing key. Export before pruning with
 `moraine export events --format jsonl`.
 
-**In this release `run` deletes nothing at all.** No scope has a registered
-executor yet, so every `run` refuses a third time — naming the work item that
-will add one — and exits non-zero. `status` and `plan` are complete and
-useful today; treat `run` as the ceremony being reviewable before it does
-anything.
+Two scopes delete in this release, both bucket 3 and both over the legacy
+open-projection tables:
+
+| Scope | What it collects |
+|---|---|
+| `mcp_open_orphan` | Child rows whose `(session, candidate generation)` has **no publication header**. No reader can authorize them on either engine, so this is safe independently of the canonical-read cutover. |
+| `mcp_open_retired_lineage` | Complete snapshots in a source lineage the session has left, once a newer lineage is published *and* live for that session and the old one is unselectable by any request. |
+
+`read_index_generation` and `canonical_generation` still have no executor:
+`run` refuses them a third time — naming the work item that will add one — and
+exits non-zero. `canonical_generation` is additionally excluded from the
+automatic tick by design, so configuring a retention horizon grants the
+explicit CLI permission to prune history and never grants it to a background
+task.
+
+Each unit is written to the reclaim ledger *before* its first delete and
+settled after its last, and every run finishes the ledger's unsettled units
+before planning new ones. A process killed mid-unit therefore resumes rather
+than stranding rows — which is the defect this machinery exists to fix, and
+the reason the reference host carries roughly 11 million unreachable
+projection rows written by the path that had no ledger. A unit that fails
+repeatedly is retried on later runs and marked `abandoned` after 24 hours
+unsettled, so one bad unit cannot stall its scope indefinitely.
+
+### `storage_reclaim_maintenance` — the unattended janitor is off by default
+
+```toml
+[retention]
+storage_reclaim_maintenance = true   # default: false
+```
+
+`moraine db reclaim run --confirm` is always available. This key decides only
+whether the ingest maintenance tick *also* reclaims the two `mcp_open` scopes
+on its own, roughly once a minute.
+
+**It defaults to `false`, deliberately.** Reclamation makes a disk fuller
+before it makes it emptier: ClickHouse rewrites these `DELETE`s into mutations
+that mark rows with a `_row_exists` mask, and the space returns only when a
+background merge rewrites the affected parts. The delete against
+`mcp_open_events` also cannot use an index — that table is ordered by
+`event_uid` while a reclaim unit is keyed by `(session_id,
+candidate_generation)`, so every part is read. Running that unattended on a
+host with no headroom turns disk pressure into an outage.
+
+When enabled, the tick claims at most 8 units per scope per pass and declines
+entirely — with a warning, not silently — when free disk is under 10 GiB. The
+explicit CLI has no such refusal: an operator may need to reclaim precisely
+because the disk is full.
 
 Two things Moraine deliberately does **not** promise. No table is partitioned
-by source generation, so reclamation is a lightweight `DELETE` rather than a
-partition drop: bytes return only when a background merge rewrites the part.
-Reclaimed **row counts** are exact; the on-disk delta is merge-deferred and is
-reported as such.
+by source generation, so reclamation cannot be a partition drop; and the
+`DELETE` it issues is not as cheap as its name suggests — on the ClickHouse
+version Moraine ships, `lightweight_delete_mode` defaults to `alter_update`,
+so the server records a mutation and the bytes return only when a background
+merge rewrites the part. Reported **row counts are an estimate** taken when
+the unit was claimed, not a count of rows removed, and the on-disk delta is
+merge-deferred. Both are labelled as such wherever they appear.
 
 Bucket-4 TTLs arrive with migration 039 and are anchored so that their **first
 application deletes nothing**: existing rows are stamped at migration time and

@@ -2121,6 +2121,25 @@ async fn get_mcp_event_returns_full_content_and_navigation_refs() {
             .find(|query| query.contains("ORDER BY generation DESC, source_host ASC"))
             .expect("host-qualified MCP event lookup query");
         assert!(lookup_query.contains("SELECT\n  source_host,\n  event_uid"));
+        // Issue #603 OQ-8b. The candidate window is a correctness surface: a
+        // uid carrying more headerless generations than the window is wide
+        // resolves to `ReadModelChanged`/`None` however healthy its authorized
+        // row is. Restricting the window to header-backed generations changes
+        // no answer — `get_mcp_event_impl` already skips a candidate no
+        // header matches — and makes that failure unreachable whether or not a
+        // reclaim has run.
+        //
+        // MUTATION (executed 2026-07-28): delete the
+        // `AND (session_id, candidate_generation) IN (…)` clause from
+        // `load_projected_event_candidates` => FAILS here.
+        assert!(
+            lookup_query.contains(
+                "AND (session_id, candidate_generation) IN (\n    SELECT session_id, generation \
+                 FROM `moraine`.`mcp_open_publication_headers`\n  )"
+            ),
+            "the candidate window must admit only header-backed generations: {lookup_query}"
+        );
+        assert!(lookup_query.contains("\nLIMIT 64\n"), "{lookup_query}");
         let event_query = queries
             .iter()
             .find(|query| query.contains("previous_event_uid"))
