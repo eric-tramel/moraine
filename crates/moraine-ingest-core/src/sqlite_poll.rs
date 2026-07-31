@@ -28,7 +28,7 @@ use crate::dispatch::source_inode_for_file;
 use crate::model::{Checkpoint, RowBatch};
 use crate::normalize::normalize_record;
 use crate::sources::shared::format_record_ts;
-use crate::{Metrics, SinkMessage, WorkItem};
+use crate::{Metrics, SinkMessage, WorkItem, WorkTrigger};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use moraine_config::{AppConfig, SOURCE_FORMAT_CURSOR_SQLITE};
@@ -39,7 +39,7 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, warn};
 
@@ -55,9 +55,6 @@ pub(crate) use opencode::process_opencode_sqlite_db;
 /// `ItemTable` — which holds live auth tokens) is deliberately out of scope
 /// for v1; see issue #361 and the field census in PR discussion.
 const RELEVANT_PREFIXES: &[&str] = &["bubbleId:", "composerData:"];
-
-/// Issue #361: bail out rather than persist an oversized checkpoint payload.
-const MAX_RELEVANT_KEYS: usize = 10_000;
 
 /// Strings longer than this inside tool params/results are elided before the
 /// synthetic record is built. Cursor stores base64 screenshots (~1.2 MB each)
@@ -76,9 +73,29 @@ pub(crate) const SCAN_PAGE_MAX_BYTES: usize = 32 * 1024 * 1024;
 
 const CURSOR_STATE_VERSION: u32 = 1;
 
+/// Ceiling on the serialized Cursor cursor payload (issue #601 §2.3), the
+/// successor to `MAX_RELEVANT_KEYS`' hard latch. Enforced by **eviction** of
+/// the oldest kv hashes, never by failing the scan: an evicted key re-detects
+/// as never-read and is re-read (and re-emitted) by a later poll, which is
+/// safe because Cursor records are content-addressed at stable logical
+/// coordinates (§6). The bound matters beyond memory: `cursor_json` is
+/// persisted on every persisting poll and hashed into the #602 transition
+/// digest (§2.6), so without it the payload grows with the keyspace up to
+/// `fast_path_max_census_rows` entries — tens of MB at the 250 k default.
+const MAX_CURSOR_CHECKPOINT_BYTES: usize = 8 * 1024 * 1024;
+
 const ERROR_KIND_OPEN: &str = "sqlite_open_error";
 const ERROR_KIND_SCHEMA: &str = "sqlite_schema_mismatch";
+/// Retired from every scan path by issue #601 §2.3: history size is now a
+/// degradation (`coverage_degraded`), never a failure. The constant remains
+/// because `record_scan_failure_outcome`'s routing width is pinned per kind
+/// (`each_error_kind_routes_to_exactly_one_backoff_clock`) and because
+/// historical `ingest_errors` rows carry it.
 const ERROR_KIND_TOO_LARGE: &str = "sqlite_cursor_too_large";
+/// One genuinely un-processable single row (issue #601 §2.3): larger than
+/// `SCAN_PAGE_MAX_BYTES`. Reported as one `ingest_errors` row for that row
+/// alone; the scan skips it and advances past it — never fails.
+pub(crate) const ERROR_KIND_ROW_TOO_LARGE: &str = "sqlite_row_too_large";
 const ERROR_KIND_SCAN: &str = "sqlite_scan_error";
 const ERROR_KIND_MIXED_SNAPSHOT: &str = "sqlite_mixed_snapshot";
 
@@ -109,6 +126,22 @@ struct CursorState {
     /// mode once instead of once per reconcile tick.
     #[serde(default)]
     last_error: String,
+    /// Durable reconciliation-sweep cursor (issue #601 §2.2). Additive to the
+    /// payload — skipped while default, so `cursor_json` stays byte-identical
+    /// for sources that have never swept, and structural-deterministic, so it
+    /// rides the #602 transition digest safely (§2.6).
+    #[serde(default, skip_serializing_if = "SweepState::is_default")]
+    sweep: SweepState,
+    /// True while some censused key has never been read in this generation
+    /// (a budget/census-cap remainder) — §2.3's persisted resume marker. The
+    /// cheap stat short-circuit must not fire while this is set, or a quiet
+    /// database's cold-ingest remainder is hidden forever: nothing will move
+    /// the stat, so nothing would ever scan again. Structural and
+    /// deterministic (a function of the committed census vs the committed
+    /// hash map), and skipped while false so `cursor_json` stays
+    /// byte-identical for fully-covered sources (§2.6).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pending_coverage: bool,
 }
 
 impl CursorState {
@@ -137,6 +170,59 @@ impl CursorState {
 
     fn serialize(&self) -> String {
         serde_json::to_string(self).unwrap_or_default()
+    }
+
+    /// Evict the oldest kv hashes until the serialized payload fits
+    /// `max_bytes`, returning how many were dropped (issue #601 §2.3). The
+    /// mirror of `NacState::evict_to_fit`: the ceiling degrades — an evicted
+    /// key re-detects as never-read, so a later poll re-reads and re-emits it
+    /// (safe under §6's content-addressed identity) — instead of latching the
+    /// whole database the way `MAX_RELEVANT_KEYS` did.
+    ///
+    /// "Oldest" is §2.3's adapter recency ordering, `rowid`, as this poll's
+    /// census saw it: entries the census did not cover evict first (their age
+    /// is unknowable here, and a truncated census's uncovered tail is where
+    /// carried-forward entries come from), then ascending `rowid`, then key
+    /// for determinism. The persisted state carries no rowid until WI-08's
+    /// `KvEntry { hash, rowid }`, which owns replacing this census-scoped
+    /// view with a durable one. Removal is in batches of one-eighth of the
+    /// map per round, so a pathological many-small-entries payload does not
+    /// re-serialize per entry.
+    fn evict_to_fit(&mut self, max_bytes: usize, census: &[CensusRow]) -> u64 {
+        // As in `NacState::evict_to_fit`: measured through `serde_json`
+        // directly, because `self.serialize()` on a `&mut self` receiver
+        // resolves to serde's blanket `impl Serialize for &mut T` before the
+        // inherent method.
+        let raw_len = |state: &Self| {
+            serde_json::to_string(state)
+                .map(|raw| raw.len())
+                .unwrap_or(0)
+        };
+        let mut evicted = 0u64;
+        if raw_len(self) <= max_bytes {
+            return evicted;
+        }
+        let rowid_by_key: HashMap<&str, i64> = census
+            .iter()
+            .map(|row| (row.key.as_str(), row.rowid))
+            .collect();
+        loop {
+            if raw_len(self) <= max_bytes || self.kv_hashes.is_empty() {
+                return evicted;
+            }
+            // `None` sorts before `Some`, so un-censused entries evict first.
+            let mut by_age: Vec<(Option<i64>, String)> = self
+                .kv_hashes
+                .keys()
+                .map(|key| (rowid_by_key.get(key.as_str()).copied(), key.clone()))
+                .collect();
+            by_age.sort();
+            let batch = (self.kv_hashes.len().div_ceil(8)).max(1);
+            for (_, key) in by_age.into_iter().take(batch) {
+                self.kv_hashes.remove(&key);
+                evicted += 1;
+            }
+        }
     }
 }
 
@@ -292,6 +378,11 @@ struct VolatilePollEntry {
     /// it exists at all — see `failure_retry_due`.
     last_contended_at: Option<Instant>,
     consecutive_contended_scans: u32,
+    /// When this database last committed a sweep slice (issue #601 §2.2,
+    /// eligibility condition 2). Volatile on purpose: losing it on restart
+    /// costs at most one early slice per database, while persisting it would
+    /// put a wall clock in `cursor_json` (the §2.6 trap).
+    last_sweep_at: Option<Instant>,
 }
 
 /// Base delay after one failed scan, doubling per consecutive failure.
@@ -442,6 +533,7 @@ impl VolatilePollMap {
                 last_scan_at: Instant::now(),
                 last_contended_at: None,
                 consecutive_contended_scans: 0,
+                last_sweep_at: None,
             });
         entry.source_generation = source_generation;
         entry.stat = Some(stat);
@@ -471,8 +563,40 @@ impl VolatilePollMap {
     /// crash recovery must never be suppressed by stale volatile state.
     /// Error-marker checkpoints deliberately do not clear — the failure path
     /// keeps the entry and refreshes its clock via `record_failed_scan`.
+    ///
+    /// **The sweep interval clock survives the wipe.** `last_sweep_at` is not
+    /// scan coverage — it is §2.2's minimum-interval clock — and every
+    /// persisting scan lands here, so a clock that lived and died with the
+    /// entry was erased by any emitting poll between slices: the next quiet
+    /// reconcile poll saw no entry, `sweep_slice_due` answered `true`, and a
+    /// database with interleaved writes (the typical agent-session shape, and
+    /// every multi-poll cold ingest) swept at up to the reconcile cadence —
+    /// up to ~10× the configured minimum — instead of the §4 interval. The
+    /// skeleton an armed clock leaves behind is inert to every other reader:
+    /// `stat` is `None` and the streaks are zero, so `should_skip_poll`
+    /// answers `false` and `failure_retry_due` answers `true`
+    /// (`failure_backoff(0)` and `contention_backoff(0)` are both
+    /// `Duration::ZERO`), exactly as they do for a missing entry. NAC and
+    /// OpenCode share this call site and never arm the clock (no sweep until
+    /// WI-06/WI-07), so their entries still clear whole.
+    /// `a_second_reconcile_poll_inside_the_sweep_interval_attaches_no_slice`
+    /// fails on its emitting-poll interleave if the carry goes.
     fn clear(&self, cp_key: &str) {
-        self.lock().remove(cp_key);
+        let mut map = self.lock();
+        let keep_sweep_clock = map
+            .get(cp_key)
+            .is_some_and(|entry| entry.last_sweep_at.is_some());
+        if !keep_sweep_clock {
+            map.remove(cp_key);
+            return;
+        }
+        if let Some(entry) = map.get_mut(cp_key) {
+            entry.stat = None;
+            entry.consecutive_noop_scans = 0;
+            entry.consecutive_failed_scans = 0;
+            entry.consecutive_contended_scans = 0;
+            entry.last_contended_at = None;
+        }
     }
 
     /// Entering a durably blocked replay is a scan failure for backoff
@@ -574,6 +698,7 @@ impl VolatilePollMap {
                 last_scan_at: Instant::now(),
                 last_contended_at: None,
                 consecutive_contended_scans: 0,
+                last_sweep_at: None,
             });
         entry.source_generation = source_generation;
         entry.stat = None;
@@ -612,11 +737,60 @@ impl VolatilePollMap {
                 last_scan_at: Instant::now(),
                 last_contended_at: None,
                 consecutive_contended_scans: 0,
+                last_sweep_at: None,
             });
         entry.source_generation = source_generation;
         entry.stat = None;
         entry.consecutive_contended_scans = entry.consecutive_contended_scans.saturating_add(1);
         entry.last_contended_at = Some(Instant::now());
+    }
+
+    /// True when `cp_key` is due another sweep slice: no slice has ever been
+    /// recorded (fresh process — one early slice per restart is the accepted
+    /// price of keeping this clock volatile), the generation changed, or the
+    /// configured minimum interval has elapsed since the last committed slice.
+    fn sweep_slice_due(
+        &self,
+        cp_key: &str,
+        source_generation: u32,
+        min_interval: Duration,
+    ) -> bool {
+        let map = self.lock();
+        let Some(entry) = map.get(cp_key) else {
+            return true;
+        };
+        if entry.source_generation != source_generation {
+            return true;
+        }
+        match entry.last_sweep_at {
+            Some(at) => at.elapsed() >= min_interval,
+            None => true,
+        }
+    }
+
+    /// Record a committed sweep slice for `cp_key`, starting the interval
+    /// clock. Called **after** the durable-persist path's `clear` — a slice
+    /// always persists a checkpoint, and until the first slice arms the clock
+    /// `clear` removes the entry whole, so arming before it would be wiped
+    /// and every slice would restart the interval empty
+    /// (`a_second_reconcile_poll_inside_the_sweep_interval_attaches_no_slice`
+    /// fails if this call or its ordering goes). Once armed, the clock also
+    /// survives `clear` itself — see `clear` for why that carry is
+    /// load-bearing on databases with interleaved writes.
+    fn record_sweep_slice(&self, cp_key: &str, source_generation: u32) {
+        let mut map = self.lock();
+        let entry = map.entry(cp_key.to_string()).or_insert(VolatilePollEntry {
+            source_generation,
+            stat: None,
+            consecutive_noop_scans: 0,
+            consecutive_failed_scans: 0,
+            last_scan_at: Instant::now(),
+            last_contended_at: None,
+            consecutive_contended_scans: 0,
+            last_sweep_at: None,
+        });
+        entry.source_generation = source_generation;
+        entry.last_sweep_at = Some(Instant::now());
     }
 
     /// Consecutive failed scans recorded for `cp_key`; zero when no entry
@@ -656,6 +830,11 @@ impl VolatilePollMap {
             // vice versa).
             entry.last_contended_at = entry
                 .last_contended_at
+                .map(|at| at.checked_sub(by).unwrap_or(at));
+            // The sweep clock too: an interval test that could not age it
+            // would have to really sleep through the configured interval.
+            entry.last_sweep_at = entry
+                .last_sweep_at
                 .map(|at| at.checked_sub(by).unwrap_or(at));
         }
     }
@@ -706,11 +885,26 @@ pub(crate) struct ScanLedger {
     pub(crate) payload_bytes: u64,
     /// Synthetic records produced by the scan.
     pub(crate) rows_emitted: u64,
-    // `sweep_rows` / `sweep_bytes` deliberately do **not** exist yet. Nothing
-    // charges a sweep until WI-04 introduces one, so a field carrying a
-    // permanent zero would be a field G6a could assert on and never fail —
-    // the exact unfailable-guard shape this issue is removing. WI-04 adds them
-    // together with the code that charges them.
+    /// Subset of `payload_rows` attributable to a reconciliation sweep slice.
+    /// Charged only through `absorb_sweep_slice`, which is the slice driver's
+    /// single commit point — a sweep read is a payload read *and* a sweep
+    /// read, never one or the other.
+    pub(crate) sweep_rows: u64,
+    /// Subset of `payload_bytes` attributable to a sweep slice.
+    pub(crate) sweep_bytes: u64,
+    /// True when this poll committed less than full coverage of its source:
+    /// a work budget bound first, a census was truncated, or checkpoint state
+    /// was evicted to fit its ceiling (issue #601 §2.3). Never an error — the
+    /// remainder is covered by later polls and by the sweep.
+    pub(crate) coverage_degraded: bool,
+    /// Rows the scan knew about and deliberately did not read this poll.
+    pub(crate) skipped_rows: u64,
+    /// Payload bytes known to have been skipped. Zero when the skipped size is
+    /// unknowable without decoding (Cursor values: §1.1 finding 2 — `length()`
+    /// is not a cheap probe), which under-reports rather than fabricates.
+    pub(crate) skipped_bytes: u64,
+    /// Checkpoint-state entries evicted to fit a state ceiling (§2.3).
+    pub(crate) evicted_entries: u64,
 }
 
 impl ScanLedger {
@@ -738,6 +932,230 @@ impl ScanLedger {
     pub(crate) fn charge_aggregate_payload_bytes(&mut self, bytes: u64) {
         self.payload_bytes = self.payload_bytes.saturating_add(bytes);
     }
+
+    /// Record deliberately-skipped coverage (§2.3): a budget bound before the
+    /// scan finished, or a census was truncated. Charged where the skip is
+    /// decided, with whatever counts are known there.
+    pub(crate) fn mark_degraded(&mut self, skipped_rows: u64, skipped_bytes: u64) {
+        self.coverage_degraded = true;
+        self.skipped_rows = self.skipped_rows.saturating_add(skipped_rows);
+        self.skipped_bytes = self.skipped_bytes.saturating_add(skipped_bytes);
+    }
+
+    /// Record checkpoint-state eviction (§2.3): entries dropped to fit a state
+    /// ceiling. Eviction is degraded coverage — the evicted entries are
+    /// re-covered (and re-emitted) by a later poll.
+    pub(crate) fn mark_evicted(&mut self, evicted_entries: u64) {
+        if evicted_entries == 0 {
+            return;
+        }
+        self.coverage_degraded = true;
+        self.evicted_entries = self.evicted_entries.saturating_add(evicted_entries);
+    }
+
+    /// Fold one committed sweep slice's ledger into the poll's ledger. This is
+    /// the **only** writer of the sweep axes: the slice's reads charge its own
+    /// slice-scoped ledger at the read site (through the same sanctioned
+    /// helpers as every other read), and this fold states that those payload
+    /// rows/bytes were sweep work. Payload axes are folded too — a sweep read
+    /// is still a payload read, and hiding it from the payload axes would let
+    /// a sweep evade every fast-path budget assertion.
+    pub(crate) fn absorb_sweep_slice(&mut self, slice: &ScanLedger) {
+        self.payload_rows = self.payload_rows.saturating_add(slice.payload_rows);
+        self.payload_bytes = self.payload_bytes.saturating_add(slice.payload_bytes);
+        self.census_rows = self.census_rows.saturating_add(slice.census_rows);
+        self.census_bytes = self.census_bytes.saturating_add(slice.census_bytes);
+        self.sweep_rows = self.sweep_rows.saturating_add(slice.payload_rows);
+        self.sweep_bytes = self.sweep_bytes.saturating_add(slice.payload_bytes);
+        // `rows_emitted` is deliberately not folded: the slice driver pushes
+        // its synthetic records into the scan's shared `records` vec, so the
+        // slice-scoped ledger never charges the field, and the scan assigns
+        // `ledger.rows_emitted = records.len()` wholesale after the slice —
+        // a fold here would be dead on one end and double-counted on the
+        // other the moment either of those facts changed.
+    }
+}
+
+/// One poll's read budget (issue #601 §2.1/§2.2), instantiated per scan from
+/// `[ingest.sqlite]`. Exhaustion is never an error: the caller commits what it
+/// has and records `coverage_degraded`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ScanBudget {
+    pub(crate) max_payload_bytes: u64,
+    pub(crate) max_payload_rows: u64,
+}
+
+impl ScanBudget {
+    pub(crate) fn fast_path(config: &moraine_config::SqliteIngestConfig) -> Self {
+        Self {
+            max_payload_bytes: config.fast_path_max_payload_bytes,
+            max_payload_rows: config.fast_path_max_payload_rows,
+        }
+    }
+
+    pub(crate) fn sweep_slice(config: &moraine_config::SqliteIngestConfig) -> Self {
+        Self {
+            max_payload_bytes: config.sweep_slice_max_payload_bytes,
+            max_payload_rows: config.sweep_slice_max_payload_rows,
+        }
+    }
+
+    /// The replacement-replay budget: none. A budget-degraded replay would
+    /// finalize an incomplete generation through #602's publication path —
+    /// see `CursorScanPlan::unbudgeted` for the argument. Ordinary polls
+    /// must never take this.
+    pub(crate) fn unbounded() -> Self {
+        Self {
+            max_payload_bytes: u64::MAX,
+            max_payload_rows: u64::MAX,
+        }
+    }
+
+    /// True when the charged work has reached either axis of this budget.
+    /// `>=` on both axes on purpose: a budget of N rows means the N-th row is
+    /// the last one read, and a byte budget binds the moment it is met — the
+    /// row that crossed it was still committed (§2.1: commit what was read).
+    pub(crate) fn is_exhausted_by(&self, payload_rows: u64, payload_bytes: u64) -> bool {
+        payload_rows >= self.max_payload_rows || payload_bytes >= self.max_payload_bytes
+    }
+
+    /// True when at least half of either axis is consumed — sweep-eligibility
+    /// condition 3 (§2.2): a database whose fast path is doing real work does
+    /// not also pay sweep cost this poll. `>=`, so the exact midpoint already
+    /// binds — one half is the threshold, not the last admissible value.
+    pub(crate) fn is_half_consumed_by(&self, payload_rows: u64, payload_bytes: u64) -> bool {
+        payload_rows.saturating_mul(2) >= self.max_payload_rows
+            || payload_bytes.saturating_mul(2) >= self.max_payload_bytes
+    }
+}
+
+/// Durable reconciliation-sweep cursor (issue #601 §2.2), persisted inside the
+/// adapter's `cursor_json`. Structural, deterministic state only — every field
+/// advances exactly when a slice commits work, so it rides the #602 transition
+/// digest safely (§2.6). Poll health/telemetry must NOT be added here.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub(crate) struct SweepState {
+    /// Resume position in the adapter's sweep ordering (Cursor: kv key).
+    /// Empty = start of a cycle.
+    #[serde(default)]
+    pub(crate) cursor: String,
+    /// Unix ms at which the in-progress cycle started.
+    #[serde(default)]
+    pub(crate) cycle_started_unix_ms: u64,
+    /// Unix ms at which the last *complete* cycle finished. 0 = never.
+    #[serde(default)]
+    pub(crate) last_complete_unix_ms: u64,
+    /// Completed cycles since the generation began.
+    #[serde(default)]
+    pub(crate) completed_cycles: u64,
+    /// Payload bytes covered so far by the in-progress cycle.
+    #[serde(default)]
+    pub(crate) cycle_payload_bytes: u64,
+    /// Payload bytes the last completed cycle covered — the denominator of
+    /// `projected_full_sweep_seconds` (§2.2's published interval).
+    #[serde(default)]
+    pub(crate) last_cycle_payload_bytes: u64,
+}
+
+impl SweepState {
+    /// True for a state no slice has ever advanced; used to keep `cursor_json`
+    /// byte-identical for sources that have never swept.
+    pub(crate) fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+
+    /// §2.2's published maximum complete-sweep interval — a projection from
+    /// the last completed cycle, `None` until one exists. The *observed*
+    /// interval (`last_complete_unix_ms`) is surfaced alongside it by WI-09,
+    /// because the projection is a model and the observation is the truth.
+    pub(crate) fn projected_full_sweep_seconds(
+        &self,
+        slice_max_payload_bytes: u64,
+        slice_min_interval_seconds: u64,
+    ) -> Option<u64> {
+        if self.completed_cycles == 0 || slice_max_payload_bytes == 0 {
+            return None;
+        }
+        let slices = self
+            .last_cycle_payload_bytes
+            .div_ceil(slice_max_payload_bytes)
+            // An empty (or sub-slice) cycle still costs one slice.
+            .max(1);
+        Some(slices.saturating_mul(slice_min_interval_seconds))
+    }
+}
+
+/// One processed item in an adapter's sweep ordering.
+pub(crate) struct SweepItem {
+    /// This item's position; becomes the resume cursor once processed.
+    pub(crate) position: String,
+    /// Payload bytes the item charged, accumulated into the cycle total.
+    pub(crate) payload_bytes: u64,
+}
+
+/// What one driven slice did, for the caller to commit. Cycle completion is
+/// readable off the state itself (`cursor` wrapped to empty, `completed_cycles`
+/// advanced), so the report carries no separate flag to drift from it.
+pub(crate) struct SweepSliceReport {
+    pub(crate) state: SweepState,
+}
+
+/// The shared slice driver (issue #601 §2.2, WI-04): owns budget binding,
+/// forward progress, cursor advancement and cycle bookkeeping, so every
+/// adapter's sweep obeys one set of rules. The adapter supplies `next_item`,
+/// which reads (and charges to `slice`) the first item strictly after the
+/// given position in its sweep ordering, or `None` at the end of the ordering.
+///
+/// Rules, each load-bearing:
+/// - **Budget binds between items, never before the first** — a slice always
+///   makes forward progress, so a single item larger than the whole byte
+///   budget is processed and the cursor advances past it (G6c). The same rule
+///   makes `max_millis = 0` mean "one item per slice", not "no progress".
+/// - **A cycle ends the slice.** On wrap the cursor resets to empty, the cycle
+///   stamps advance, and the slice stops — cycle completion is the durable
+///   commit point G5b counts.
+/// - The driver never touches the cursor except through processed items, so a
+///   rejected scan (mixed snapshot) discards the whole advance with the rest
+///   of the scan's state.
+pub(crate) fn drive_sweep_slice<E>(
+    prior: &SweepState,
+    budget: &ScanBudget,
+    max_millis: u64,
+    now_unix_ms: u64,
+    slice: &mut ScanLedger,
+    mut next_item: impl FnMut(&str, &mut ScanLedger) -> std::result::Result<Option<SweepItem>, E>,
+) -> std::result::Result<SweepSliceReport, E> {
+    let started = Instant::now();
+    let mut state = prior.clone();
+    if state.cursor.is_empty() {
+        state.cycle_started_unix_ms = now_unix_ms;
+        state.cycle_payload_bytes = 0;
+    }
+    let mut items = 0u64;
+    loop {
+        if items > 0
+            && (budget.is_exhausted_by(slice.payload_rows, slice.payload_bytes)
+                || started.elapsed() >= Duration::from_millis(max_millis))
+        {
+            break;
+        }
+        match next_item(&state.cursor, slice)? {
+            Some(item) => {
+                items += 1;
+                state.cursor = item.position;
+                state.cycle_payload_bytes =
+                    state.cycle_payload_bytes.saturating_add(item.payload_bytes);
+            }
+            None => {
+                state.last_cycle_payload_bytes = state.cycle_payload_bytes;
+                state.last_complete_unix_ms = now_unix_ms;
+                state.completed_cycles = state.completed_cycles.saturating_add(1);
+                state.cursor = String::new();
+                break;
+            }
+        }
+    }
+    Ok(SweepSliceReport { state })
 }
 
 /// The only sanctioned way to materialize a variable-length payload column:
@@ -832,6 +1250,26 @@ pub(crate) fn record_scan_ledger(metrics: &Arc<Metrics>, ledger: &ScanLedger) {
     metrics
         .sqlite_poll_census_bytes_total
         .fetch_add(ledger.census_bytes, std::sync::atomic::Ordering::Relaxed);
+    metrics
+        .sqlite_sweep_rows_total
+        .fetch_add(ledger.sweep_rows, std::sync::atomic::Ordering::Relaxed);
+    metrics
+        .sqlite_sweep_bytes_total
+        .fetch_add(ledger.sweep_bytes, std::sync::atomic::Ordering::Relaxed);
+    if ledger.coverage_degraded {
+        metrics
+            .sqlite_coverage_degraded_scans_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// One committed sweep slice. Counted at the commit site — after the slice's
+/// checkpoint persisted — never where the slice merely ran, so a slice whose
+/// scan lost the mixed-snapshot bracket is not counted as coverage.
+pub(crate) fn record_sweep_slice_committed(metrics: &Arc<Metrics>) {
+    metrics
+        .sqlite_sweep_slices_total
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Reads one table's `CREATE TABLE` text out of `sqlite_master`, charging it
@@ -936,9 +1374,15 @@ pub struct SyntheticRecord {
 enum ScanOutcome {
     Scanned {
         records: Vec<SyntheticRecord>,
-        new_state: CursorState,
+        /// Boxed so the `Failed` variant is not forced to carry a
+        /// `CursorState`'s footprint.
+        new_state: Box<CursorState>,
         schema_fingerprint: u64,
         relevant_keys: u64,
+        /// True when this scan ran a sweep slice whose advance is carried in
+        /// `new_state.sweep`. The caller commits it (metrics + interval
+        /// clock) only after the checkpoint persists.
+        swept: bool,
     },
     Failed {
         error_kind: &'static str,
@@ -1218,7 +1662,16 @@ pub(crate) async fn process_cursor_sqlite_db(
     // disjunct is added; `a_contended_replacement_replay_throttles_its_barrier`
     // bounds the other direction (the durable barrier *is* throttled). See the
     // deviation record in `plans/601-delta-sqlite.md` §7 WI-10.
-    if state.stat == current_stat && state.last_error.is_empty() {
+    //
+    // The `!state.pending_coverage` conjunct is §2.3's "continue next poll":
+    // while a cold-ingest remainder exists, an unchanged stat must not end
+    // the poll, because a quiet database's stat never changes again and the
+    // remainder would be unreachable forever. The resume terminates — every
+    // resumed scan reads never-read keys first, so the debt strictly shrinks
+    // and the flag clears durably with the covering scan's checkpoint
+    // (`a_degraded_cold_ingest_completes_without_new_writes` fails if this
+    // conjunct or the never-read-first ordering goes).
+    if state.stat == current_stat && state.last_error.is_empty() && !state.pending_coverage {
         return Ok(());
     }
 
@@ -1232,11 +1685,35 @@ pub(crate) async fn process_cursor_sqlite_db(
         return Ok(());
     }
 
+    // Sweep eligibility, conditions 1, 2 and 4 (issue #601 §2.2/§2.4): only a
+    // `Reconcile`-triggered poll — the provenance WI-03 established, including
+    // the owed-tick upgrades `arm_owed_reconcile` performs — of a database
+    // that is not replaying and whose per-database interval clock has expired
+    // requests a slice. Condition 3 (a quiet, cheap fast path) is decided
+    // inside the scan, where this poll's ledger exists.
+    let sweep_requested = work.trigger == WorkTrigger::Reconcile
+        && !replacement_replay
+        && poll_state.sweep_slice_due(
+            &cp_key,
+            checkpoint.source_generation,
+            Duration::from_secs(config.ingest.sqlite.sweep_slice_min_interval_seconds),
+        );
+    // A replacement replay is unbudgeted (see `CursorScanPlan::unbudgeted`):
+    // its finalize publishes the generation whole, so degrading it would
+    // publish a hole.
+    let plan = if replacement_replay {
+        CursorScanPlan::unbudgeted()
+    } else {
+        CursorScanPlan::from_config(
+            config,
+            sweep_requested.then(|| SweepPlan::from_config(config)),
+        )
+    };
     let scan_db_path = source_file.clone();
     let scan_state = state.clone();
     let (outcome, ledger) = tokio::task::spawn_blocking(move || {
         let mut ledger = ScanLedger::default();
-        let outcome = scan_database(&scan_db_path, &scan_state, &mut ledger);
+        let outcome = scan_database(&scan_db_path, &scan_state, &plan, &mut ledger);
         (outcome, ledger)
     })
     .await
@@ -1249,6 +1726,7 @@ pub(crate) async fn process_cursor_sqlite_db(
             mut new_state,
             schema_fingerprint,
             relevant_keys,
+            swept,
         } => {
             new_state.stat = current_stat;
             new_state.last_error = String::new();
@@ -1270,7 +1748,7 @@ pub(crate) async fn process_cursor_sqlite_db(
                 && !retry_blocked_replay
                 && records.is_empty()
                 && checkpoint.status == "active"
-                && new_state == prior_state_covered
+                && *new_state == prior_state_covered
                 && schema_fingerprint == checkpoint.schema_fingerprint
                 && relevant_keys == checkpoint.last_line_no;
             if scan_is_noop {
@@ -1370,7 +1848,7 @@ pub(crate) async fn process_cursor_sqlite_db(
                 } else {
                     "active".to_string()
                 },
-                cursor_json: new_state.serialize(),
+                cursor_json: (*new_state).serialize(),
                 source_fingerprint: inode,
                 schema_fingerprint,
                 policy_fingerprint: policy_fingerprint.clone(),
@@ -1417,6 +1895,26 @@ pub(crate) async fn process_cursor_sqlite_db(
                 .await?;
             }
             poll_state.clear(&cp_key);
+            if swept {
+                // Commit the slice only now — after its checkpoint persisted
+                // and after `clear` wiped the entry — so the interval clock
+                // survives the wipe and a slice whose scan failed or lost the
+                // mixed-snapshot bracket is neither counted nor throttling
+                // the retry.
+                poll_state.record_sweep_slice(&cp_key, checkpoint.source_generation);
+                record_sweep_slice_committed(metrics);
+                debug!(
+                    "{}:{} sweep slice committed (cursor {:?}, cycles {}, projected full sweep {:?}s)",
+                    work.source_name,
+                    source_file,
+                    new_state.sweep.cursor,
+                    new_state.sweep.completed_cycles,
+                    new_state.sweep.projected_full_sweep_seconds(
+                        config.ingest.sqlite.sweep_slice_max_payload_bytes,
+                        config.ingest.sqlite.sweep_slice_min_interval_seconds,
+                    ),
+                );
+            }
 
             if emitted > 0 {
                 debug!(
@@ -1522,12 +2020,98 @@ pub(crate) async fn process_cursor_sqlite_db(
     }
 }
 
-/// Blocking phase: open the database read-only, validate schema, scan the
-/// relevant key ranges, and synthesize records for new/changed keys.
+/// Per-scan work plan for the Cursor adapter (issue #601 §2.1/§2.2): the
+/// fast-path budget, the census cap, and — on sweep-eligible polls only — the
+/// sweep slice request. Built once per poll from `[ingest.sqlite]` in
+/// `process_cursor_sqlite_db` and passed whole into the blocking scan, so
+/// every budget the scan enforces arrived through one auditable argument.
+pub(crate) struct CursorScanPlan {
+    fast_budget: ScanBudget,
+    max_census_rows: u64,
+    /// Ceiling on the serialized cursor payload (§2.3), enforced by eviction
+    /// after the scan's reads — a *state* bound, never a work budget, which
+    /// is why `unbudgeted()` keeps it.
+    max_checkpoint_bytes: usize,
+    sweep: Option<SweepPlan>,
+}
+
+impl CursorScanPlan {
+    pub(crate) fn from_config(config: &AppConfig, sweep: Option<SweepPlan>) -> Self {
+        Self {
+            fast_budget: ScanBudget::fast_path(&config.ingest.sqlite),
+            max_census_rows: config.ingest.sqlite.fast_path_max_census_rows,
+            max_checkpoint_bytes: MAX_CURSOR_CHECKPOINT_BYTES,
+            sweep,
+        }
+    }
+
+    /// The replacement-replay plan: no budget, no census cap, no sweep.
+    ///
+    /// A replay's `FinalizeReplay` publishes the new generation over the old
+    /// one, so a budget-degraded replay would publish an *incomplete*
+    /// generation — a transient data loss #602's old-complete/new-complete
+    /// contract exists to forbid. The replay therefore pays the pre-#601
+    /// cost, once, per genuine replacement; ordinary polls never take this
+    /// plan. `a_replacement_replay_reads_past_the_fast_path_budget` fails if
+    /// a budget sneaks back in.
+    ///
+    /// The checkpoint ceiling **does** apply here: it is a *state* bound
+    /// enforced by eviction after the replay's reads and emissions, so it
+    /// bounds what is persisted without un-reading anything — the no-hole
+    /// argument above is about reads, not state size, and an evicted key's
+    /// records were already emitted by this replay.
+    pub(crate) fn unbudgeted() -> Self {
+        Self {
+            fast_budget: ScanBudget::unbounded(),
+            max_census_rows: u64::MAX,
+            max_checkpoint_bytes: MAX_CURSOR_CHECKPOINT_BYTES,
+            sweep: None,
+        }
+    }
+}
+
+/// One requested sweep slice: its budget, wall-clock cap, and the unix-ms
+/// stamp its cycle bookkeeping commits (§2.2).
+pub(crate) struct SweepPlan {
+    budget: ScanBudget,
+    max_millis: u64,
+    now_unix_ms: u64,
+}
+
+impl SweepPlan {
+    pub(crate) fn from_config(config: &AppConfig) -> Self {
+        Self {
+            budget: ScanBudget::sweep_slice(&config.ingest.sqlite),
+            max_millis: config.ingest.sqlite.sweep_slice_max_millis,
+            now_unix_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+        }
+    }
+}
+
+/// Blocking phase: open the database read-only, validate schema, census the
+/// relevant keyspace, and materialize candidate payloads newest-first under
+/// the fast-path budget.
 ///
 /// The caller owns `ledger` so that every early return — including each
 /// failure arm — still reports the bytes this scan had already paid for.
-fn scan_database(db_path: &str, prior: &CursorState, ledger: &mut ScanLedger) -> ScanOutcome {
+///
+/// **Ceiling degradation (issue #601 §2.3).** This scan has no history-size
+/// failure mode: `MAX_RELEVANT_KEYS` and its `sqlite_cursor_too_large` error
+/// are retired. What bounds a poll is per-poll work — `plan.fast_budget` on
+/// the payload axes and `plan.max_census_rows` on the census — and exceeding
+/// either commits what was read (newest-first, by `rowid DESC`: §1.1 shows
+/// rowid is a sound recency ordering even though it is not a watermark),
+/// records `coverage_degraded`, and leaves the rest to later polls and the
+/// sweep.
+fn scan_database(
+    db_path: &str,
+    prior: &CursorState,
+    plan: &CursorScanPlan,
+    ledger: &mut ScanLedger,
+) -> ScanOutcome {
     let connection = match open_read_only(db_path) {
         Ok(connection) => connection,
         Err(exc) => {
@@ -1560,24 +2144,38 @@ fn scan_database(db_path: &str, prior: &CursorState, ledger: &mut ScanLedger) ->
         }
     };
 
-    match count_relevant_keys(&connection) {
-        Ok(count) if count > MAX_RELEVANT_KEYS => {
-            return ScanOutcome::Failed {
-                error_kind: ERROR_KIND_TOO_LARGE,
-                error_text: format!(
-                    "{count} relevant keys exceed the {MAX_RELEVANT_KEYS} checkpoint ceiling; \
-                     use Cursor agent transcripts (JSONL) for this history"
-                ),
-            };
-        }
-        Ok(_) => {}
+    // The census: `(rowid, key)` over both relevant ranges, covering-index
+    // backed (§1.1: ~0.1 ms / ~19 KB for the whole reference keyspace). It is
+    // the exact change detector for inserts and deletes and the recency
+    // ordering for the candidate read below.
+    let (census, truncation) = match census_relevant_keys(&connection, plan.max_census_rows, ledger)
+    {
+        Ok(result) => result,
         Err(exc) => {
             return ScanOutcome::Failed {
                 error_kind: ERROR_KIND_SCAN,
                 error_text: format!("{exc:#}"),
-            };
+            }
+        }
+    };
+    if truncation.is_some() {
+        // Best-effort size of the un-censused remainder, so the degradation
+        // is quantified rather than merely flagged. The count is a covering
+        // index aggregate (charged on neither axis per the ledger rules).
+        match count_relevant_keys(&connection) {
+            Ok(total) => {
+                let skipped = (total as u64).saturating_sub(census.len() as u64);
+                ledger.mark_degraded(skipped, 0);
+            }
+            Err(exc) => {
+                return ScanOutcome::Failed {
+                    error_kind: ERROR_KIND_SCAN,
+                    error_text: format!("{exc:#}"),
+                }
+            }
         }
     }
+    let relevant_keys = census.len() as u64;
 
     let mut new_state = CursorState {
         version: CURSOR_STATE_VERSION,
@@ -1586,44 +2184,175 @@ fn scan_database(db_path: &str, prior: &CursorState, ledger: &mut ScanLedger) ->
         project_exclusions_hash: prior.project_exclusions_hash,
         kv_hashes: BTreeMap::new(),
         last_error: String::new(),
+        sweep: prior.sweep.clone(),
+        pending_coverage: false,
     };
     let mut records = Vec::<SyntheticRecord>::new();
-    let mut relevant_keys = 0u64;
     let mut workspace_cache = HashMap::<String, Option<String>>::new();
 
-    for prefix in RELEVANT_PREFIXES {
-        let scan = scan_prefix(
-            &connection,
-            prefix,
-            &prior.kv_hashes,
-            &mut new_state.kv_hashes,
-            &mut records,
-            &mut workspace_cache,
-            ledger,
-        );
-        match scan {
-            Ok(seen) => relevant_keys += seen,
+    // Candidate read: never-read keys first, then `rowid DESC` within each
+    // class. `rowid DESC` is the §2.3 recency heuristic — it chooses ORDER
+    // only. Skipping is justified solely by the budget below, and every
+    // skipped key stays covered (prior hash carried) or re-detected (new key
+    // stays absent from the state) on later polls.
+    //
+    // Never-read-first is what makes a budget-degraded ingest *converge*: a
+    // plain recency order re-reads the same newest slice on every poll, so a
+    // database larger than one budget would keep its cold tail forever. With
+    // unknown keys ahead of re-verification, each resumed poll retires at
+    // least one budget's worth of never-read debt, and recency is undisturbed
+    // where it matters — a genuinely new key has no prior hash, so it is in
+    // the first class already, newest first.
+    let mut candidates = census;
+    candidates.sort_by(|a, b| {
+        let known_a = prior.kv_hashes.contains_key(&a.key);
+        let known_b = prior.kv_hashes.contains_key(&b.key);
+        known_a.cmp(&known_b).then_with(|| b.rowid.cmp(&a.rowid))
+    });
+    for idx in 0..candidates.len() {
+        if plan
+            .fast_budget
+            .is_exhausted_by(ledger.payload_rows, ledger.payload_bytes)
+        {
+            // Commit what was read (§2.1): the remainder keeps its prior
+            // hash — "unread this poll", never "deleted" — and new keys stay
+            // absent so the next poll re-detects them, newest-first again.
+            // Skipped bytes are unknowable without decoding (§1.1 finding 2),
+            // so rows are counted and bytes honestly under-reported as zero.
+            let remaining = &candidates[idx..];
+            ledger.mark_degraded(remaining.len() as u64, 0);
+            for skipped in remaining {
+                if let Some(hash) = prior.kv_hashes.get(&skipped.key) {
+                    new_state
+                        .kv_hashes
+                        .insert(skipped.key.clone(), hash.clone());
+                }
+            }
+            break;
+        }
+        let key = &candidates[idx].key;
+        let value = match read_value_for_key(&connection, key, ledger) {
+            Ok(Some(value)) => value,
+            // The row vanished between census and read: a mid-scan commit the
+            // data_version bracket below will reject; nothing to record here.
+            Ok(None) => continue,
             Err(exc) => {
                 return ScanOutcome::Failed {
                     error_kind: ERROR_KIND_SCAN,
                     error_text: format!("{exc:#}"),
-                };
+                }
+            }
+        };
+        let bytes = value.unwrap_or_default();
+        let hash = format!("{:016x}", hash_bytes(&bytes));
+        let unchanged = prior.kv_hashes.get(key) == Some(&hash);
+        if !unchanged && !bytes.is_empty() {
+            if let Some(mut record) = synthesize_cursor_sqlite_record(key, &bytes) {
+                stamp_bubble_workspace(&connection, &mut workspace_cache, &mut record, ledger);
+                records.push(record);
             }
         }
-        // Re-check the ceiling against what the scan actually saw: the count
-        // ran in its own read transaction, so keys written in between could
-        // otherwise grow cursor_json past the checkpoint payload budget.
-        if new_state.kv_hashes.len() > MAX_RELEVANT_KEYS {
-            return ScanOutcome::Failed {
-                error_kind: ERROR_KIND_TOO_LARGE,
-                error_text: format!(
-                    "{} relevant keys exceed the {MAX_RELEVANT_KEYS} checkpoint ceiling; \
-                     use Cursor agent transcripts (JSONL) for this history",
-                    new_state.kv_hashes.len()
-                ),
-            };
+        new_state.kv_hashes.insert(key.clone(), hash);
+    }
+
+    if let Some(truncation) = &truncation {
+        // Deletion pruning is exact only against a complete census. Carry
+        // every prior entry beyond the truncation point so an un-censused key
+        // reads "unverified this poll", never silently "deleted".
+        for (key, hash) in &prior.kv_hashes {
+            if !census_covered(truncation, key) {
+                new_state
+                    .kv_hashes
+                    .entry(key.clone())
+                    .or_insert_with(|| hash.clone());
+            }
         }
     }
+
+    // Optional sweep slice (§2.2). Conditions 1 (reconcile trigger), 2
+    // (interval clock) and 4 (not replaying) were decided by the caller —
+    // `plan.sweep` exists only when they held. Condition 3 is decided here,
+    // where the fast path's cost is known: a poll that emitted anything, was
+    // budget-degraded, or consumed half its budget does not also pay sweep
+    // cost. The slice runs inside the data_version bracket, so a mixed
+    // snapshot discards its advance with the rest of the scan.
+    let mut swept = false;
+    if let Some(sweep_plan) = &plan.sweep {
+        // §2.2 condition 3, with one deliberate widening: a *degraded* poll is
+        // sweep-eligible even though it consumed its whole budget. On a source
+        // larger than one fast-path budget every poll is degraded and every
+        // poll consumes the full budget, so the plan's literal half-budget
+        // clause would block the sweep on exactly the sources whose tail only
+        // the sweep can cover — §0's coverage guarantee outranks §2.2's
+        // politeness. The emission clause is kept: an emitting poll defers its
+        // slice to the next quiet reconcile tick.
+        let eligible = records.is_empty()
+            && (ledger.coverage_degraded
+                || !plan
+                    .fast_budget
+                    .is_half_consumed_by(ledger.payload_rows, ledger.payload_bytes));
+        if eligible {
+            let mut slice = ScanLedger::default();
+            let driven = drive_sweep_slice(
+                &prior.sweep,
+                &sweep_plan.budget,
+                sweep_plan.max_millis,
+                sweep_plan.now_unix_ms,
+                &mut slice,
+                |after, slice| {
+                    next_cursor_sweep_item(
+                        &connection,
+                        after,
+                        &mut new_state.kv_hashes,
+                        &mut records,
+                        &mut workspace_cache,
+                        slice,
+                    )
+                },
+            );
+            // The slice's reads are paid whether or not it completed; fold
+            // them before inspecting the outcome so a failure arm still
+            // reports them.
+            ledger.absorb_sweep_slice(&slice);
+            match driven {
+                Ok(report) => {
+                    new_state.sweep = report.state;
+                    swept = true;
+                }
+                Err(exc) => {
+                    return ScanOutcome::Failed {
+                        error_kind: ERROR_KIND_SCAN,
+                        error_text: format!("sweep slice failed: {exc:#}"),
+                    }
+                }
+            }
+        }
+    }
+
+    // The checkpoint-state ceiling (issue #601 §2.3): evict the oldest kv
+    // hashes until the persisted payload fits — never fail the scan. This is
+    // `MAX_RELEVANT_KEYS`' replacement, and the bound that keeps
+    // `cursor_json` (hashed into the #602 transition digest, §2.6) from
+    // growing with the keyspace. It runs after the sweep slice so it bounds
+    // everything this poll would persist, and before the resume marker below
+    // so an evicted *censused* key re-opens `pending_coverage` structurally —
+    // censused-but-absent is exactly what the marker scans for. (An evicted
+    // key the census did not cover only exists when the census truncated, and
+    // `truncation.is_some()` already holds the marker open.)
+    let evicted = new_state.evict_to_fit(plan.max_checkpoint_bytes, &candidates);
+    ledger.mark_evicted(evicted);
+
+    // §2.3's persisted resume marker, computed after the sweep slice so keys
+    // the slice just read count as covered. A censused key absent from the
+    // hash map has never been read in this generation; a truncated census may
+    // hide more of them. Either keeps the cheap stat short-circuit open until
+    // a scan covers everything (see the conjunct in
+    // `process_cursor_sqlite_db`), at which point the flag clears with that
+    // scan's checkpoint.
+    new_state.pending_coverage = truncation.is_some()
+        || candidates
+            .iter()
+            .any(|row| !new_state.kv_hashes.contains_key(&row.key));
 
     let data_version_after = match sqlite_data_version(&connection) {
         Ok(value) => value,
@@ -1684,9 +2413,10 @@ fn scan_database(db_path: &str, prior: &CursorState, ledger: &mut ScanLedger) ->
     ledger.rows_emitted = records.len() as u64;
     ScanOutcome::Scanned {
         records,
-        new_state,
+        new_state: Box::new(new_state),
         schema_fingerprint,
         relevant_keys,
+        swept,
     }
 }
 
@@ -1806,18 +2536,21 @@ fn validate_schema(
     Ok(hash_str(&schema_sql))
 }
 
-/// The relevant-key census, shared with the plan assertion in
-/// `cursor_relevant_key_count_is_a_covering_index_scan` so the statement that
-/// test certifies is the statement this adapter actually runs. A copy in the
+/// The two census statements, shared with the plan assertion in
+/// `cursor_relevant_key_count_is_a_covering_index_scan` so the statements that
+/// test certifies are the statements this adapter actually runs. A copy in the
 /// test would let the two drift and the certification would mean nothing.
 ///
-/// Strictly greater, matching `scan_prefix`'s seed of the bare prefix — a key
-/// exactly equal to the prefix is never scanned and must not count toward the
-/// ceiling. The projection stays `count(*)` over indexed columns only: adding
-/// any reference to `value` costs the covering index and turns a 0.056 ms /
-/// 19 KB read into a 55 ms / 48 MB one (§1.1).
+/// Strictly greater, matching the census seed of the bare prefix — a key
+/// exactly equal to the prefix is never scanned and must not be counted. Both
+/// projections touch indexed columns only (`rowid` rides inside the unique
+/// `key` index): adding any reference to `value` costs the covering index and
+/// turns a 0.1 ms / 19 KB read into a 55 ms / 48 MB one (§1.1).
 const CURSOR_RELEVANT_KEY_COUNT_SQL: &str =
     "SELECT count(*) FROM cursorDiskKV WHERE key > ?1 AND key < ?2";
+
+const CURSOR_CENSUS_SQL: &str =
+    "SELECT rowid, key FROM cursorDiskKV WHERE key > ?1 AND key < ?2 ORDER BY key LIMIT ?3";
 
 fn count_relevant_keys(connection: &Connection) -> Result<usize> {
     let mut total = 0usize;
@@ -1834,90 +2567,184 @@ fn count_relevant_keys(connection: &Connection) -> Result<usize> {
     Ok(total)
 }
 
-/// Pages through one key prefix, recording content hashes for every key and
-/// synthesizing records for keys that are new or changed. Paging keeps each
-/// implicit read transaction short (issue #361 decision 4), and synthesizing
-/// page-by-page keeps raw value bytes from accumulating: sanitization
-/// (toolCallBinary drop, long-string elision) shrinks the retained record by
-/// orders of magnitude for media-heavy bubbles, so the scan's peak raw-byte
-/// buffer is one page, additionally capped by `SCAN_PAGE_MAX_BYTES`.
-fn scan_prefix(
-    connection: &Connection,
-    prefix: &str,
-    prior_hashes: &BTreeMap<String, String>,
-    new_hashes: &mut BTreeMap<String, String>,
-    records: &mut Vec<SyntheticRecord>,
-    workspace_cache: &mut HashMap<String, Option<String>>,
-    ledger: &mut ScanLedger,
-) -> Result<u64> {
-    let range_end = prefix_range_end(prefix);
-    let mut last_key = prefix.to_string();
-    let mut seen = 0u64;
+/// One censused relevant row: its key and the recency hint the candidate read
+/// orders by. `rowid` is a sound positive mutation signal and a usable recency
+/// ordering, **not** a watermark (§1.1) — nothing here skips on it.
+struct CensusRow {
+    rowid: i64,
+    key: String,
+}
 
-    loop {
-        let mut page: Vec<(String, Option<Vec<u8>>)> = Vec::new();
-        let mut page_bytes = 0usize;
-        {
+/// Where a capped census stopped, in walk order: the index of the prefix
+/// being walked and the last key actually included. Everything at or before
+/// this point was censused; everything after was not.
+struct CensusTruncation {
+    prefix_idx: usize,
+    last_key: String,
+}
+
+/// True when `key` falls inside the region a truncated census did cover, i.e.
+/// its absence from the census genuinely means deletion.
+fn census_covered(truncation: &CensusTruncation, key: &str) -> bool {
+    let Some(idx) = RELEVANT_PREFIXES
+        .iter()
+        .position(|prefix| key.starts_with(prefix))
+    else {
+        // A stale entry from a key family this adapter no longer tracks: a
+        // complete census would drop it, so a truncated one does too.
+        return true;
+    };
+    idx < truncation.prefix_idx
+        || (idx == truncation.prefix_idx && key <= truncation.last_key.as_str())
+}
+
+/// Walks both relevant key ranges over the covering `key` index, charging one
+/// census row per key. Stops at `max_census_rows` — the §2.1 guard against
+/// pathological keyspaces — returning the truncation point so the caller can
+/// degrade coverage instead of failing.
+///
+/// `RELEVANT_PREFIXES` is walked in declaration order, which is also
+/// lexicographic order of the ranges; the sweep ordering
+/// (`next_cursor_sweep_item`) depends on the two agreeing.
+fn census_relevant_keys(
+    connection: &Connection,
+    max_census_rows: u64,
+    ledger: &mut ScanLedger,
+) -> Result<(Vec<CensusRow>, Option<CensusTruncation>)> {
+    let mut census = Vec::new();
+    for (prefix_idx, prefix) in RELEVANT_PREFIXES.iter().enumerate() {
+        let range_end = prefix_range_end(prefix);
+        let mut last_key = prefix.to_string();
+        loop {
+            let mut page_rows = 0usize;
             let mut stmt = connection
-                .prepare_cached(
-                    "SELECT key, value FROM cursorDiskKV \
-                     WHERE key > ?1 AND key < ?2 ORDER BY key LIMIT ?3",
-                )
-                .context("failed to prepare prefix scan")?;
+                .prepare_cached(CURSOR_CENSUS_SQL)
+                .context("failed to prepare census scan")?;
             let mut rows = stmt
                 .query(rusqlite::params![
                     last_key,
                     range_end,
                     SCAN_PAGE_SIZE as i64
                 ])
-                .context("prefix scan query failed")?;
-            while let Some(row) = rows.next().context("prefix scan row failed")? {
-                // This projection includes `value`, so the whole row is a
-                // payload read: the key bytes are materialized alongside it
-                // and are charged on the same axis. Cursor has no census read
-                // today (issue #601 §3.3 Change 1 adds one), so `census_rows`
-                // stays zero here rather than borrowing this read's rows.
-                ledger.charge_payload_row();
-                let key = take_payload_required_string(ledger, row, 0)
-                    .context("prefix scan key failed")?;
-                // Cursor writes JSON documents as TEXT even though the
-                // column is declared BLOB; accept any storage class instead
-                // of trusting the declared affinity.
-                let value =
-                    take_payload_blob(ledger, row, 1).context("prefix scan value failed")?;
-                page_bytes += value.as_ref().map_or(0, Vec::len);
-                page.push((key, value));
-                if page_bytes >= SCAN_PAGE_MAX_BYTES {
-                    break;
+                .context("census scan query failed")?;
+            while let Some(row) = rows.next().context("census scan row failed")? {
+                let rowid: i64 = row.get(0).context("census rowid failed")?;
+                let key: String = row.get(1).context("census key failed")?;
+                // The key was materialized either way; charge it before the
+                // cap decides whether it is included.
+                ledger.charge_census_row(key.len());
+                page_rows += 1;
+                if census.len() as u64 >= max_census_rows {
+                    return Ok((
+                        census,
+                        Some(CensusTruncation {
+                            prefix_idx,
+                            last_key,
+                        }),
+                    ));
                 }
+                last_key = key.clone();
+                census.push(CensusRow { rowid, key });
             }
-        }
-
-        // A row-capped page may have more rows behind it; so may a
-        // byte-capped one.
-        let more = page.len() == SCAN_PAGE_SIZE || page_bytes >= SCAN_PAGE_MAX_BYTES;
-
-        for (key, value) in page {
-            seen += 1;
-            let bytes = value.unwrap_or_default();
-            let hash = format!("{:016x}", hash_bytes(&bytes));
-            let unchanged = prior_hashes.get(&key) == Some(&hash);
-            if !unchanged && !bytes.is_empty() {
-                if let Some(mut record) = synthesize_cursor_sqlite_record(&key, &bytes) {
-                    stamp_bubble_workspace(connection, workspace_cache, &mut record, ledger);
-                    records.push(record);
-                }
+            if page_rows < SCAN_PAGE_SIZE {
+                break;
             }
-            new_hashes.insert(key.clone(), hash);
-            last_key = key;
-        }
-
-        if !more {
-            break;
         }
     }
+    Ok((census, None))
+}
 
-    Ok(seen)
+/// The candidate point read: one key's value, charged on the payload axis at
+/// the read site. `Ok(None)` means the row vanished between census and read —
+/// a mid-scan commit the data_version bracket rejects.
+fn read_value_for_key(
+    connection: &Connection,
+    key: &str,
+    ledger: &mut ScanLedger,
+) -> Result<Option<Option<Vec<u8>>>> {
+    let mut row_ledger = ScanLedger::default();
+    let read = {
+        let mut stmt = connection
+            .prepare_cached("SELECT value FROM cursorDiskKV WHERE key = ?1")
+            .context("failed to prepare candidate read")?;
+        stmt.query_row(rusqlite::params![key], |row| {
+            row_ledger.charge_payload_row();
+            take_payload_blob(&mut row_ledger, row, 0)
+        })
+    };
+    // Charged unconditionally: a row that materialized bytes and then failed
+    // still cost them.
+    ledger.payload_rows = ledger.payload_rows.saturating_add(row_ledger.payload_rows);
+    ledger.payload_bytes = ledger
+        .payload_bytes
+        .saturating_add(row_ledger.payload_bytes);
+    match read {
+        Ok(value) => Ok(Some(value)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(exc) => Err(exc).context("candidate read failed"),
+    }
+}
+
+/// The Cursor adapter's sweep reader: the first relevant key strictly after
+/// `after` in key order, read in full, verified against this poll's hash view,
+/// and re-emitted when it disagrees (§2.2). With today's exhaustive fast path
+/// the disagreement arm is reachable only through hashes carried forward by an
+/// earlier degraded poll; WI-08's census fast path makes it the sweep's whole
+/// job (G5d), and the driver contract here does not change when it does.
+fn next_cursor_sweep_item(
+    connection: &Connection,
+    after: &str,
+    hashes: &mut BTreeMap<String, String>,
+    records: &mut Vec<SyntheticRecord>,
+    workspace_cache: &mut HashMap<String, Option<String>>,
+    slice: &mut ScanLedger,
+) -> Result<Option<SweepItem>> {
+    for prefix in RELEVANT_PREFIXES {
+        let range_end = prefix_range_end(prefix);
+        if after >= range_end.as_str() {
+            continue;
+        }
+        let start = if after < *prefix { prefix } else { after };
+        let read = {
+            let mut stmt = connection
+                .prepare_cached(
+                    "SELECT key, value FROM cursorDiskKV \
+                     WHERE key > ?1 AND key < ?2 ORDER BY key LIMIT 1",
+                )
+                .context("failed to prepare sweep read")?;
+            stmt.query_row(rusqlite::params![start, range_end], |row| {
+                // This projection includes `value`, so the whole row is a
+                // payload read charged to the slice at the read site.
+                slice.charge_payload_row();
+                let key = take_payload_required_string(slice, row, 0)?;
+                let value = take_payload_blob(slice, row, 1)?;
+                Ok((key, value))
+            })
+        };
+        match read {
+            Ok((key, value)) => {
+                let bytes = value.unwrap_or_default();
+                let payload_bytes = bytes.len() as u64;
+                let hash = format!("{:016x}", hash_bytes(&bytes));
+                if hashes.get(&key) != Some(&hash) {
+                    if !bytes.is_empty() {
+                        if let Some(mut record) = synthesize_cursor_sqlite_record(&key, &bytes) {
+                            stamp_bubble_workspace(connection, workspace_cache, &mut record, slice);
+                            records.push(record);
+                        }
+                    }
+                    hashes.insert(key.clone(), hash);
+                }
+                return Ok(Some(SweepItem {
+                    position: key,
+                    payload_bytes,
+                }));
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => continue,
+            Err(exc) => return Err(exc).context("sweep read failed"),
+        }
+    }
+    Ok(None)
 }
 
 /// Builds the synthetic record for one changed kv row, or `None` when the row
@@ -2325,6 +3152,12 @@ mod tests {
         std::env::temp_dir().join(format!("moraine-sqlite-poll-{name}-{suffix}.vscdb"))
     }
 
+    /// The shipped-default scan plan, no sweep: what a non-reconcile poll of
+    /// a production config runs with.
+    fn default_scan_plan() -> CursorScanPlan {
+        CursorScanPlan::from_config(&moraine_config::AppConfig::default(), None)
+    }
+
     fn create_kv_db(path: &PathBuf) -> Connection {
         let connection = Connection::open(path).expect("create fixture db");
         connection
@@ -2457,6 +3290,81 @@ mod tests {
         }
     }
 
+    fn reconcile_work(path: &Path) -> WorkItem {
+        WorkItem {
+            trigger: WorkTrigger::Reconcile,
+            ..sqlite_work(path)
+        }
+    }
+
+    static TOUCH_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    /// Move the database's stat fingerprint without touching any relevant key
+    /// — the production shape of Cursor's constant `ItemTable` churn — so a
+    /// test can drive repeated polls past the cheap stat short-circuit.
+    fn touch_irrelevant(path: &Path) {
+        let sequence = TOUCH_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let connection = Connection::open(path).expect("open fixture for irrelevant touch");
+        connection
+            .execute(
+                "INSERT INTO ItemTable (key, value) VALUES (?1, ?2)",
+                rusqlite::params![format!("touch-{sequence}"), "x"],
+            )
+            .expect("insert irrelevant row");
+    }
+
+    /// `count` relevant keys whose values are deliberately non-JSON, so every
+    /// scan of them emits nothing: the quiet-database shape sweep eligibility
+    /// condition 3 requires, with real payload bytes for the slices to read.
+    /// Keys are zero-padded so key order equals numeric order.
+    fn seed_junk_fixture(path: &PathBuf, count: usize, value_bytes: usize) -> Vec<String> {
+        let db = create_kv_db(path);
+        let mut keys = Vec::new();
+        for idx in 0..count {
+            let key = format!("bubbleId:{COMPOSER_ID}:k{idx:03}");
+            // Exactly `value_bytes` per value, so byte-denominated assertions
+            // (cycle totals, projections) stay arithmetic rather than fuzzy.
+            let prefix = format!("junk-{idx:03}-");
+            let value = format!("{prefix}{}", "j".repeat(value_bytes - prefix.len()));
+            db.execute(
+                "INSERT INTO cursorDiskKV (key, value) VALUES (?1, ?2)",
+                rusqlite::params![key, value],
+            )
+            .expect("insert junk kv row");
+            keys.push(key);
+        }
+        keys
+    }
+
+    fn sweep_slices(metrics: &Arc<Metrics>) -> u64 {
+        metrics
+            .sqlite_sweep_slices_total
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn sweep_rows(metrics: &Arc<Metrics>) -> u64 {
+        metrics
+            .sqlite_sweep_rows_total
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn degraded_scans(metrics: &Arc<Metrics>) -> u64 {
+        metrics
+            .sqlite_coverage_degraded_scans_total
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The persisted sweep cursor for `work`'s committed checkpoint.
+    async fn persisted_sweep(
+        checkpoints: &Arc<RwLock<HashMap<String, Checkpoint>>>,
+        work: &WorkItem,
+    ) -> SweepState {
+        let cp_key = checkpoint_key(&work.source_name, &work.path);
+        let map = checkpoints.read().await;
+        let checkpoint = map.get(&cp_key).expect("committed checkpoint");
+        CursorState::parse(&checkpoint.cursor_json).sweep
+    }
+
     async fn drain_batches(rx: &mut mpsc::Receiver<SinkMessage>) -> Vec<RowBatch> {
         let mut out = Vec::new();
         while let Ok(Some(SinkMessage::Batch(batch))) =
@@ -2497,10 +3405,28 @@ mod tests {
         poll_state: &VolatilePollMap,
         metrics: &Arc<Metrics>,
     ) -> Vec<RowBatch> {
-        let config = moraine_config::AppConfig::default();
+        run_poll_with_config(
+            &moraine_config::AppConfig::default(),
+            work,
+            checkpoints,
+            poll_state,
+            metrics,
+        )
+        .await
+    }
+
+    /// The fully-parameterized runner: budget and sweep tests inject their
+    /// `[ingest.sqlite]` values here, exactly as an operator's config would.
+    async fn run_poll_with_config(
+        config: &moraine_config::AppConfig,
+        work: &WorkItem,
+        checkpoints: &Arc<RwLock<HashMap<String, Checkpoint>>>,
+        poll_state: &VolatilePollMap,
+        metrics: &Arc<Metrics>,
+    ) -> Vec<RowBatch> {
         let (sink_tx, mut sink_rx) = mpsc::channel::<SinkMessage>(64);
         let process = process_cursor_sqlite_db(
-            &config,
+            config,
             work,
             checkpoints.clone(),
             poll_state,
@@ -2939,7 +3865,12 @@ mod tests {
         let db_path = path.to_string_lossy().to_string();
         contention_injection::arm(&db_path, 1);
         let mut ledger = ScanLedger::default();
-        let outcome = scan_database(&db_path, &CursorState::fresh(), &mut ledger);
+        let outcome = scan_database(
+            &db_path,
+            &CursorState::fresh(),
+            &default_scan_plan(),
+            &mut ledger,
+        );
         assert!(
             matches!(
                 outcome,
@@ -2965,7 +3896,12 @@ mod tests {
         // database succeeds, so nothing leaks into another test.
         let mut clean = ScanLedger::default();
         assert!(matches!(
-            scan_database(&db_path, &CursorState::fresh(), &mut clean),
+            scan_database(
+                &db_path,
+                &CursorState::fresh(),
+                &default_scan_plan(),
+                &mut clean
+            ),
             ScanOutcome::Scanned { .. }
         ));
 
@@ -3195,30 +4131,42 @@ mod tests {
         let db = seed_fixture_db(&path);
 
         for prefix in RELEVANT_PREFIXES {
-            let plan: Vec<String> = {
-                let mut stmt = db
-                    .prepare(&format!(
-                        "EXPLAIN QUERY PLAN {CURSOR_RELEVANT_KEY_COUNT_SQL}"
-                    ))
-                    .expect("prepare explain");
-                let rows = stmt
-                    .query_map(rusqlite::params![prefix, prefix_range_end(prefix)], |row| {
+            for (statement, uses_limit) in [
+                (CURSOR_RELEVANT_KEY_COUNT_SQL, false),
+                // The row census projects `(rowid, key)`: rowid rides inside
+                // the unique key index, so it must stay covering too.
+                (CURSOR_CENSUS_SQL, true),
+            ] {
+                let plan: Vec<String> = {
+                    let mut stmt = db
+                        .prepare(&format!("EXPLAIN QUERY PLAN {statement}"))
+                        .expect("prepare explain");
+                    let mut params: Vec<rusqlite::types::Value> = vec![
+                        rusqlite::types::Value::from((*prefix).to_string()),
+                        rusqlite::types::Value::from(prefix_range_end(prefix)),
+                    ];
+                    if uses_limit {
+                        params.push(rusqlite::types::Value::from(SCAN_PAGE_SIZE as i64));
+                    }
+                    stmt.query_map(rusqlite::params_from_iter(params), |row| {
                         row.get::<_, String>(3)
                     })
-                    .expect("query plan");
-                rows.map(|row| row.expect("plan detail")).collect()
-            };
-            let detail = plan.join("; ");
-            assert!(
-                detail.contains("COVERING INDEX"),
-                "the relevant-key census must stay index-covered for {prefix}; \
-                 plan was: {detail}"
-            );
-            assert!(
-                !detail.contains("SCAN cursorDiskKV"),
-                "the census must never degrade to a table scan for {prefix}; \
-                 plan was: {detail}"
-            );
+                    .expect("query plan")
+                    .map(|row| row.expect("plan detail"))
+                    .collect()
+                };
+                let detail = plan.join("; ");
+                assert!(
+                    detail.contains("COVERING INDEX"),
+                    "the relevant-key census must stay index-covered for {prefix}; \
+                     plan was: {detail}"
+                );
+                assert!(
+                    !detail.contains("SCAN cursorDiskKV"),
+                    "the census must never degrade to a table scan for {prefix}; \
+                     plan was: {detail}"
+                );
+            }
         }
 
         drop(db);
@@ -4408,20 +5356,27 @@ mod tests {
         drop(db);
 
         let composer_text = serde_json::to_string(&composer).expect("serialize composer");
-        let expected_bytes =
-            (composer_key.len() + composer_text.len() + junk_key.len() + junk.len()) as u64;
+        // Keys are census material now (§3.3 Change 1): the change detector
+        // walks `(rowid, key)` over the covering index and only the candidate
+        // point reads materialize values, so the payload axis carries value
+        // bytes alone.
+        let expected_bytes = (composer_text.len() + junk.len()) as u64;
+        let expected_census_key_bytes = (composer_key.len() + junk_key.len()) as u64;
         let db_path = path.to_string_lossy().to_string();
 
         let mut ledger = ScanLedger::default();
-        let ScanOutcome::Scanned { new_state, .. } =
-            scan_database(&db_path, &CursorState::fresh(), &mut ledger)
-        else {
+        let ScanOutcome::Scanned { new_state, .. } = scan_database(
+            &db_path,
+            &CursorState::fresh(),
+            &default_scan_plan(),
+            &mut ledger,
+        ) else {
             panic!("cold ledger scan should succeed");
         };
 
         assert_eq!(
             ledger.payload_bytes, expected_bytes,
-            "payload bytes must be the exact key+value length SQLite materialized"
+            "payload bytes must be the exact value length SQLite materialized"
         );
         assert_eq!(ledger.payload_rows, 2, "both relevant keys were read");
         assert_eq!(
@@ -4433,35 +5388,32 @@ mod tests {
             "the fixture must read far more than it emits, or the two axes are \
              interchangeable and neither is tested"
         );
-        // The census axis carries exactly one thing today: schema validation.
-        // Cursor *also* runs a census-shaped read on every poll —
-        // `count_relevant_keys` walks both relevant key ranges over the unique
-        // `key` index (0.056 ms / 19 KB / 247 keys on the reference host,
-        // §1.1) — but it is a scalar aggregate, so by the charging rules on
-        // `ScanLedger` it materializes no row and is charged on neither axis.
-        //
-        // That silence is deliberate and it is **not** a claim the aggregate is
-        // free: `cursor_relevant_key_count_is_a_covering_index_scan` is what
-        // keeps it honest. WI-08 replaces the aggregate with a
-        // row-materializing census and retires `MAX_RELEVANT_KEYS`; until it
-        // does, G1a's `census_rows == 201` may not be read as Cursor's total
-        // census cost.
+        // The census axis carries schema validation plus the real key census
+        // (§3.3 Change 1): one row per relevant key, charged its key bytes.
+        // The two axes must not bleed into each other — a candidate value read
+        // miscounted as census would deflate every payload budget.
         let schema_census = {
             let connection = open_read_only(&db_path).expect("reopen for schema census");
             expected_schema_census(&connection, &["cursorDiskKV"])
         };
         assert!(schema_census.census_rows > 0);
         assert_eq!(
-            ledger.census_rows, schema_census.census_rows,
-            "schema validation is the only charged census read; the payload \
-             read must not be miscounted as one"
+            ledger.census_rows,
+            schema_census.census_rows + 2,
+            "census rows are schema validation plus one row per relevant key"
         );
-        assert_eq!(ledger.census_bytes, schema_census.census_bytes);
+        assert_eq!(
+            ledger.census_bytes,
+            schema_census.census_bytes + expected_census_key_bytes,
+            "census bytes are the schema text plus the key bytes"
+        );
 
         // Nothing changed, so nothing is emitted — but every byte is still
         // read. This is the assertion an emit-site ledger cannot survive.
         let mut second = ScanLedger::default();
-        let ScanOutcome::Scanned { .. } = scan_database(&db_path, &new_state, &mut second) else {
+        let ScanOutcome::Scanned { .. } =
+            scan_database(&db_path, &new_state, &default_scan_plan(), &mut second)
+        else {
             panic!("warm ledger scan should succeed");
         };
         assert_eq!(
@@ -4499,18 +5451,19 @@ mod tests {
 
         let composer_text = serde_json::to_string(&composer).expect("serialize composer");
         let bubble_text = serde_json::to_string(&user_bubble_value()).expect("serialize bubble");
-        // The composer value is materialized twice: once by the prefix scan,
-        // once by the workspace lookup the bubble triggers.
-        let expected_bytes = (composer_key.len()
-            + composer_text.len()
-            + bubble_key.len()
-            + bubble_text.len()
-            + composer_text.len()) as u64;
+        // The composer value is materialized twice: once by the candidate
+        // read, once by the workspace lookup the bubble triggers. Keys are
+        // census material and charge no payload bytes.
+        let expected_bytes = (composer_text.len() + bubble_text.len() + composer_text.len()) as u64;
+        let _ = (&composer_key, &bubble_key);
 
         let mut ledger = ScanLedger::default();
-        let ScanOutcome::Scanned { records, .. } =
-            scan_database(&path.to_string_lossy(), &CursorState::fresh(), &mut ledger)
-        else {
+        let ScanOutcome::Scanned { records, .. } = scan_database(
+            &path.to_string_lossy(),
+            &CursorState::fresh(),
+            &default_scan_plan(),
+            &mut ledger,
+        ) else {
             panic!("workspace-lookup scan should succeed");
         };
         assert!(
@@ -4881,41 +5834,1407 @@ mod tests {
         cleanup(&path);
     }
 
+    /// Issue #601 §2.3 / gate G4 (Cursor). This REWRITES the retired latch
+    /// test `oversized_key_space_is_skipped_with_an_error`, inverting every
+    /// assertion it made:
+    ///
+    /// - it asserted exactly one `sqlite_cursor_too_large` error row — now
+    ///   zero error rows of any kind, because history size is a degradation,
+    ///   never a failure;
+    /// - it asserted zero events — now the *newest* record must be emitted,
+    ///   because bounded progress is newest-first (`rowid DESC`);
+    /// - it asserted no durable progress — now a checkpoint must persist, so
+    ///   the poll's coverage is committed rather than discarded.
+    ///
+    /// **[DIVERGENT FIXTURE]** (§8 G4): the newest row by `rowid` carries the
+    /// key that sorts LAST, so the old any-order (key-ascending) scan would
+    /// reach it dead last — a budget bolted onto key-order truncation emits
+    /// the oldest keys and misses the newest record, and this test fails.
+    /// Fails for: a budget that fails the scan instead of degrading, bounded
+    /// progress that is not newest-first, and restoring the `TooLarge` arm.
     #[tokio::test(flavor = "multi_thread")]
-    async fn oversized_key_space_is_skipped_with_an_error() {
-        let path = unique_db_path("too-large");
+    async fn a_cursor_keyspace_over_budget_still_ingests_recent_work() {
+        let path = unique_db_path("over-budget-recent");
         let db = create_kv_db(&path);
-        {
-            let tx_value = json!({"type": 1, "text": "x"});
-            let blob = serde_json::to_vec(&tx_value).expect("serialize");
-            let mut stmt = db
-                .prepare("INSERT INTO cursorDiskKV (key, value) VALUES (?1, ?2)")
-                .expect("prepare");
-            db.execute_batch("BEGIN").expect("begin");
-            for idx in 0..(MAX_RELEVANT_KEYS + 1) {
-                stmt.execute(rusqlite::params![
-                    format!("bubbleId:{COMPOSER_ID}:k{idx:05}"),
-                    blob
-                ])
-                .expect("insert");
-            }
-            db.execute_batch("COMMIT").expect("commit");
+        for idx in 0..6 {
+            // Old history: keys sort first, rowids are lowest.
+            let bubble = json!({
+                "_v": 3,
+                "type": 1,
+                "bubbleId": format!("aaaaaaaa-1111-4111-8111-nnnnnnnn{idx:04}"),
+                "createdAt": format!("2026-05-01T02:04:{idx:02}.000Z"),
+                "text": format!("old bubble {idx}"),
+            });
+            put(&db, &format!("bubbleId:{COMPOSER_ID}:a{idx:03}"), &bubble);
         }
+        // The newest row: inserted last (highest rowid), key sorts last.
+        let newest = json!({
+            "_v": 3,
+            "type": 1,
+            "bubbleId": "ffffffff-9999-4999-8999-999999999999",
+            "createdAt": "2026-05-08T02:04:37.835Z",
+            "text": "the newest bubble",
+        });
+        put(&db, &format!("bubbleId:{COMPOSER_ID}:zz-newest"), &newest);
+        drop(db);
+
+        let mut config = moraine_config::AppConfig::default();
+        config.ingest.sqlite.fast_path_max_payload_rows = 2;
 
         let work = sqlite_work(&path);
         let checkpoints = Arc::new(RwLock::new(HashMap::new()));
-        let batches = run_poll(&work, &checkpoints).await;
+        let metrics = Arc::new(Metrics::default());
+        let batches = run_poll_with_config(
+            &config,
+            &work,
+            &checkpoints,
+            &VolatilePollMap::new(),
+            &metrics,
+        )
+        .await;
 
-        let errors: Vec<Value> = batches
+        let rows = all_event_rows(&batches);
+        let texts: Vec<&str> = rows
             .iter()
-            .flat_map(|batch| batch.error_rows.iter().cloned())
+            .filter_map(|row| row.get("text_content").and_then(Value::as_str))
             .collect();
-        assert_eq!(errors.len(), 1);
-        assert_eq!(
-            errors[0].get("error_kind").and_then(Value::as_str),
-            Some(ERROR_KIND_TOO_LARGE)
+        assert!(
+            texts.contains(&"the newest bubble"),
+            "bounded progress must reach the newest record first; got {texts:?}"
         );
+        assert_eq!(
+            rows.len(),
+            2,
+            "a 2-row budget commits exactly the two newest records"
+        );
+        assert!(
+            !texts.contains(&"old bubble 0"),
+            "key-order truncation would emit the oldest key; newest-first must not"
+        );
+        let error_rows: usize = batches.iter().map(|batch| batch.error_rows.len()).sum();
+        assert_eq!(
+            error_rows, 0,
+            "crossing the former ceiling is a degradation, never an error"
+        );
+        assert_eq!(
+            degraded_scans(&metrics),
+            1,
+            "the skipped remainder must be reported as degraded coverage"
+        );
+        let cp_key = checkpoint_key(&work.source_name, &work.path);
+        let map = checkpoints.read().await;
+        let checkpoint = map
+            .get(&cp_key)
+            .expect("degraded poll persists a checkpoint");
+        assert_eq!(checkpoint.status, "active");
+
+        cleanup(&path);
+    }
+
+    /// The runaway side of the same budget (§8 non-negotiable: bounds bound
+    /// from both sides). G4 above proves the budget cannot starve the newest
+    /// record; this proves it cannot be exceeded: the scan reads exactly its
+    /// row budget and accounts for every candidate it skipped.
+    #[test]
+    fn a_cursor_scan_over_budget_reads_no_more_than_its_budget() {
+        let path = unique_db_path("over-budget-upper");
+        seed_junk_fixture(&path, 7, 64);
+
+        let mut config = moraine_config::AppConfig::default();
+        config.ingest.sqlite.fast_path_max_payload_rows = 2;
+        let plan = CursorScanPlan::from_config(&config, None);
+        let mut ledger = ScanLedger::default();
+        let ScanOutcome::Scanned { relevant_keys, .. } = scan_database(
+            &path.to_string_lossy(),
+            &CursorState::fresh(),
+            &plan,
+            &mut ledger,
+        ) else {
+            panic!("an over-budget scan must degrade, not fail");
+        };
+        assert_eq!(relevant_keys, 7, "the census still covers every key");
+        assert_eq!(
+            ledger.payload_rows, 2,
+            "the candidate read stops exactly at its row budget"
+        );
+        assert!(ledger.coverage_degraded);
+        assert_eq!(
+            ledger.skipped_rows, 5,
+            "every unread candidate is accounted for"
+        );
+
+        cleanup(&path);
+    }
+
+    /// §2.1's census cap: a pathological keyspace truncates the census and
+    /// degrades instead of failing, and every prior entry beyond the
+    /// truncation point is carried — "un-censused" must never read "deleted".
+    /// A complete census keeps exact deletion pruning (asserted here too, so
+    /// the carry cannot silently widen into never-pruning).
+    #[test]
+    fn a_census_past_its_cap_truncates_and_degrades_instead_of_failing() {
+        let path = unique_db_path("census-cap");
+        let keys = seed_junk_fixture(&path, 6, 64);
+
+        // Full scan first, so the prior state holds all six hashes.
+        let full_plan = default_scan_plan();
+        let mut full_ledger = ScanLedger::default();
+        let ScanOutcome::Scanned {
+            new_state: full_state,
+            ..
+        } = scan_database(
+            &path.to_string_lossy(),
+            &CursorState::fresh(),
+            &full_plan,
+            &mut full_ledger,
+        )
+        else {
+            panic!("cold scan should succeed");
+        };
+        assert_eq!(full_state.kv_hashes.len(), 6);
+
+        let mut config = moraine_config::AppConfig::default();
+        config.ingest.sqlite.fast_path_max_census_rows = 3;
+        let capped_plan = CursorScanPlan::from_config(&config, None);
+        let mut ledger = ScanLedger::default();
+        let ScanOutcome::Scanned {
+            new_state,
+            relevant_keys,
+            ..
+        } = scan_database(
+            &path.to_string_lossy(),
+            &full_state,
+            &capped_plan,
+            &mut ledger,
+        )
+        else {
+            panic!("a capped census must degrade, not fail");
+        };
+        assert_eq!(relevant_keys, 3, "three keys were censused");
+        assert!(ledger.coverage_degraded);
+        assert_eq!(
+            ledger.skipped_rows, 3,
+            "the un-censused remainder is counted"
+        );
+        assert_eq!(
+            new_state.kv_hashes.len(),
+            6,
+            "prior entries beyond the truncation are carried, not dropped"
+        );
+
+        // A complete census still prunes deletions exactly.
+        let db = Connection::open(&path).expect("reopen fixture");
+        db.execute(
+            "DELETE FROM cursorDiskKV WHERE key = ?1",
+            rusqlite::params![&keys[0]],
+        )
+        .expect("delete one key");
+        drop(db);
+        let mut pruned_ledger = ScanLedger::default();
+        let ScanOutcome::Scanned {
+            new_state: pruned, ..
+        } = scan_database(
+            &path.to_string_lossy(),
+            &full_state,
+            &full_plan,
+            &mut pruned_ledger,
+        )
+        else {
+            panic!("post-delete scan should succeed");
+        };
+        assert!(
+            !pruned.kv_hashes.contains_key(&keys[0]),
+            "a complete census must still detect the deletion exactly"
+        );
+        assert_eq!(pruned.kv_hashes.len(), 5);
+
+        cleanup(&path);
+    }
+
+    /// Issue #601 §2.3 / gate G4 (Cursor checkpoint-state ceiling): crossing
+    /// `max_checkpoint_bytes` evicts the **oldest** kv hashes until the
+    /// payload fits — never fails the scan — and reports the eviction as
+    /// degraded coverage. This is `MAX_RELEVANT_KEYS`' replacement: the old
+    /// bound latched the whole database dead; the ceiling degrades, and the
+    /// evicted key re-detects as never-read on a later poll (§6's
+    /// content-addressed identity makes the re-emission safe). `cursor_json`
+    /// rides the #602 transition digest, so this ceiling is also what keeps
+    /// that digest's input bounded.
+    ///
+    /// MUTATION (executed 2026-07-31): make `evict_to_fit` return 0 without
+    /// evicting — fails (the persisted payload exceeds its ceiling and
+    /// nothing is evicted). Reverse the age sort (evict newest-first) —
+    /// fails (the newest key's hash is dropped instead of the oldest's).
+    #[test]
+    fn a_cursor_state_over_its_ceiling_evicts_the_oldest_keys_instead_of_failing() {
+        let path = unique_db_path("cursor-ceiling-upper");
+        let keys = seed_junk_fixture(&path, 6, 64);
+
+        let full_plan = default_scan_plan();
+        let mut full_ledger = ScanLedger::default();
+        let ScanOutcome::Scanned {
+            new_state: full_state,
+            ..
+        } = scan_database(
+            &path.to_string_lossy(),
+            &CursorState::fresh(),
+            &full_plan,
+            &mut full_ledger,
+        )
+        else {
+            panic!("cold scan should succeed");
+        };
+        let full_len = (*full_state).serialize().len();
+
+        // One byte under the full payload: eviction must fire, and one round
+        // of the one-eighth batch (a single entry at six keys) fits.
+        let ceiling = full_len - 1;
+        let mut plan = default_scan_plan();
+        plan.max_checkpoint_bytes = ceiling;
+        let mut ledger = ScanLedger::default();
+        let ScanOutcome::Scanned { new_state, .. } =
+            scan_database(&path.to_string_lossy(), &full_state, &plan, &mut ledger)
+        else {
+            panic!("a state ceiling must degrade, not fail");
+        };
+        assert_eq!(ledger.evicted_entries, 1, "one round of the oldest eighth");
+        assert!(ledger.coverage_degraded);
+        assert!(
+            !new_state.kv_hashes.contains_key(&keys[0]),
+            "eviction is oldest-first by census rowid"
+        );
+        assert!(
+            new_state.kv_hashes.contains_key(&keys[5]),
+            "the newest key's hash survives"
+        );
+        assert!(
+            (*new_state).serialize().len() <= ceiling,
+            "the persisted payload must fit its ceiling"
+        );
+        assert!(
+            new_state.pending_coverage,
+            "an evicted key is a durable coverage debt"
+        );
+
+        cleanup(&path);
+    }
+
+    /// The starvation side of the Cursor state ceiling: a payload **at** the
+    /// ceiling evicts nothing — the fit check is `<=`, the map is untouched,
+    /// coverage is not degraded, and the serialized payload is byte-identical
+    /// to the un-ceilinged scan's (§2.6: `cursor_json` must stay stable for
+    /// fully-covered sources). The upper test alone cannot see a ceiling that
+    /// over-evicts by one boundary token; this one pins the boundary.
+    ///
+    /// MUTATION (executed 2026-07-31): `<=` → `<` in `evict_to_fit`'s fit
+    /// checks — fails (a payload exactly at its ceiling is evicted).
+    #[test]
+    fn a_cursor_state_at_its_ceiling_evicts_nothing() {
+        let path = unique_db_path("cursor-ceiling-lower");
+        seed_junk_fixture(&path, 6, 64);
+
+        let full_plan = default_scan_plan();
+        let mut full_ledger = ScanLedger::default();
+        let ScanOutcome::Scanned {
+            new_state: full_state,
+            ..
+        } = scan_database(
+            &path.to_string_lossy(),
+            &CursorState::fresh(),
+            &full_plan,
+            &mut full_ledger,
+        )
+        else {
+            panic!("cold scan should succeed");
+        };
+        let full_len = (*full_state).serialize().len();
+
+        let mut plan = default_scan_plan();
+        plan.max_checkpoint_bytes = full_len;
+        let mut ledger = ScanLedger::default();
+        let ScanOutcome::Scanned { new_state, .. } =
+            scan_database(&path.to_string_lossy(), &full_state, &plan, &mut ledger)
+        else {
+            panic!("an at-ceiling scan should succeed");
+        };
+        assert_eq!(ledger.evicted_entries, 0, "at the boundary nothing evicts");
+        assert!(!ledger.coverage_degraded);
+        assert_eq!(new_state.kv_hashes.len(), 6);
+        assert!(!new_state.pending_coverage);
+        assert_eq!(
+            (*new_state).serialize(),
+            (*full_state).serialize(),
+            "the persisted payload is byte-identical at the boundary"
+        );
+
+        cleanup(&path);
+    }
+
+    /// Gate G5a (§8): the sweep cursor is durable. Slices advance it
+    /// mid-keyspace, the process "restarts" (fresh volatile state, only the
+    /// persisted checkpoint survives), and the next slice resumes from the
+    /// persisted position — not from the start of the cycle and not from the
+    /// newest end. Fails for: a volatile-only sweep cursor, or a fast path
+    /// that resets it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sweep_cursor_survives_restart_and_resumes_mid_cycle() {
+        let path = unique_db_path("sweep-restart");
+        let keys = seed_junk_fixture(&path, 6, 64);
+        let work = reconcile_work(&path);
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+
+        let mut config = moraine_config::AppConfig::default();
+        config.ingest.sqlite.sweep_slice_max_payload_rows = 2;
+        config.ingest.sqlite.sweep_slice_min_interval_seconds = 0;
+
+        let poll_state = VolatilePollMap::new();
+        let metrics = Arc::new(Metrics::default());
+        run_poll_with_config(&config, &work, &checkpoints, &poll_state, &metrics).await;
+        touch_irrelevant(&path);
+        run_poll_with_config(&config, &work, &checkpoints, &poll_state, &metrics).await;
+        assert_eq!(sweep_slices(&metrics), 2);
+        assert_eq!(
+            persisted_sweep(&checkpoints, &work).await.cursor,
+            keys[3],
+            "two 2-row slices leave the persisted cursor mid-keyspace"
+        );
+
+        // Restart: only durable state survives. A fresh VolatilePollMap and
+        // fresh metrics stand in for the new process.
+        let restarted_state = VolatilePollMap::new();
+        let restarted_metrics = Arc::new(Metrics::default());
+        touch_irrelevant(&path);
+        run_poll_with_config(
+            &config,
+            &work,
+            &checkpoints,
+            &restarted_state,
+            &restarted_metrics,
+        )
+        .await;
+        assert_eq!(sweep_slices(&restarted_metrics), 1);
+        let resumed = persisted_sweep(&checkpoints, &work).await;
+        assert_eq!(
+            resumed.cursor, keys[5],
+            "the restarted slice must resume at the persisted position: from \
+             {} it covers exactly the fifth and sixth keys — restarting the \
+             cycle would leave the cursor at {}, and starting from the newest \
+             end would leave it at {}",
+            keys[3], keys[1], keys[4],
+        );
+        assert_eq!(resumed.completed_cycles, 0);
+
+        cleanup(&path);
+    }
+
+    /// Gate G5b (§8): a cycle completes in exactly the projected number of
+    /// slices, and `projected_full_sweep_seconds` matches the realized cycle.
+    /// Five 1,000-byte values under a 2-row / 2,000-byte slice budget need
+    /// ceil(5000/2000) = 3 slices; the third slice reads the last key, finds
+    /// the ordering exhausted, and wraps. Fails for: a sweep that revisits or
+    /// skips regions, or a projection that does not match observation. Every
+    /// slice-carrying poll must persist a checkpoint (the durable commit the
+    /// F1 `new_state == prior_state_covered` conjunct guards).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sweep_completes_a_full_cycle_within_the_projected_interval() {
+        let path = unique_db_path("sweep-cycle");
+        seed_junk_fixture(&path, 5, 1000);
+        let work = reconcile_work(&path);
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let cp_key = checkpoint_key(&work.source_name, &work.path);
+
+        let mut config = moraine_config::AppConfig::default();
+        config.ingest.sqlite.sweep_slice_max_payload_rows = 2;
+        config.ingest.sqlite.sweep_slice_max_payload_bytes = 2000;
+        config.ingest.sqlite.sweep_slice_min_interval_seconds = 7;
+
+        let poll_state = VolatilePollMap::new();
+        let metrics = Arc::new(Metrics::default());
+        for slice in 0..3 {
+            if slice > 0 {
+                touch_irrelevant(&path);
+                poll_state.age_for_tests(&cp_key, Duration::from_secs(7));
+            }
+            let batches =
+                run_poll_with_config(&config, &work, &checkpoints, &poll_state, &metrics).await;
+            assert!(
+                batches
+                    .last()
+                    .and_then(|batch| batch.checkpoint.as_ref())
+                    .is_some(),
+                "slice {slice} must persist its advance durably"
+            );
+            assert_eq!(sweep_slices(&metrics), slice + 1);
+        }
+
+        let state = persisted_sweep(&checkpoints, &work).await;
+        assert_eq!(
+            state.completed_cycles, 1,
+            "the third slice completes the cycle"
+        );
+        assert_eq!(state.cursor, "", "a completed cycle wraps to the start");
+        assert_eq!(
+            state.last_cycle_payload_bytes, 5000,
+            "the cycle covered every value byte exactly once"
+        );
+        assert!(state.last_complete_unix_ms > 0);
+        let projected = state
+            .projected_full_sweep_seconds(
+                config.ingest.sqlite.sweep_slice_max_payload_bytes,
+                config.ingest.sqlite.sweep_slice_min_interval_seconds,
+            )
+            .expect("a completed cycle yields a projection");
+        assert_eq!(
+            projected,
+            3 * config.ingest.sqlite.sweep_slice_min_interval_seconds,
+            "the projection must match the realized cycle: 3 slices at the \
+             configured interval"
+        );
+
+        cleanup(&path);
+    }
+
+    /// Gate G6c (§8): a single row larger than the whole slice byte budget is
+    /// still processed and the cursor advances past it — otherwise one
+    /// oversized row is a permanent sweep stall, the same latch class §2.3
+    /// retires. The follow-up slice proves the cursor really moved past it.
+    /// Also the runaway side: the slice's reads are bounded by the budget plus
+    /// that one first row, and both ledger folds (sweep and payload axes) must
+    /// carry them.
+    #[test]
+    fn sweep_slice_stops_at_its_budget_and_still_advances() {
+        let path = unique_db_path("sweep-oversized");
+        let db = create_kv_db(&path);
+        let big_key = format!("bubbleId:{COMPOSER_ID}:a-big");
+        let small_key = format!("bubbleId:{COMPOSER_ID}:z-small");
+        db.execute(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?1, ?2)",
+            rusqlite::params![&big_key, format!("junk-big-{}", "b".repeat(10_000))],
+        )
+        .expect("insert oversized row");
+        db.execute(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?1, ?2)",
+            rusqlite::params![&small_key, "junk-small"],
+        )
+        .expect("insert small row");
+        drop(db);
+        let db_path = path.to_string_lossy().to_string();
+
+        let mut cold_ledger = ScanLedger::default();
+        let ScanOutcome::Scanned {
+            new_state: cold, ..
+        } = scan_database(
+            &db_path,
+            &CursorState::fresh(),
+            &default_scan_plan(),
+            &mut cold_ledger,
+        )
+        else {
+            panic!("cold scan should succeed");
+        };
+
+        let mut config = moraine_config::AppConfig::default();
+        config.ingest.sqlite.sweep_slice_max_payload_bytes = 100;
+        let sweep_plan = SweepPlan::from_config(&config);
+        let plan = CursorScanPlan::from_config(&config, Some(sweep_plan));
+        let mut ledger = ScanLedger::default();
+        let ScanOutcome::Scanned {
+            new_state: after_big,
+            swept,
+            ..
+        } = scan_database(&db_path, &cold, &plan, &mut ledger)
+        else {
+            panic!("sweep scan should succeed");
+        };
+        assert!(swept);
+        assert_eq!(
+            after_big.sweep.cursor, big_key,
+            "the oversized row is processed and the cursor advances past it"
+        );
+        assert_eq!(
+            ledger.sweep_rows, 1,
+            "the slice stops after the row that exhausted its budget"
+        );
+        assert!(
+            ledger.sweep_bytes > 10_000,
+            "the oversized row's bytes are charged to the sweep axis; got {}",
+            ledger.sweep_bytes
+        );
+        assert!(
+            ledger.payload_bytes >= ledger.sweep_bytes,
+            "sweep reads are payload reads too — hiding them from the payload \
+             axes would let a sweep evade every fast-path budget"
+        );
+
+        // The next slice starts strictly after the oversized row: it reads
+        // exactly the one remaining key (never the oversized row again),
+        // discovers the ordering exhausted, and wraps the cycle.
+        let plan = CursorScanPlan::from_config(&config, Some(SweepPlan::from_config(&config)));
+        let mut second = ScanLedger::default();
+        let ScanOutcome::Scanned {
+            new_state: after_small,
+            ..
+        } = scan_database(&db_path, &after_big, &plan, &mut second)
+        else {
+            panic!("second sweep scan should succeed");
+        };
+        assert_eq!(
+            second.sweep_rows, 1,
+            "the follow-up slice reads only the key beyond the oversized row"
+        );
+        assert!(
+            second.sweep_bytes < 1_000,
+            "re-reading the oversized row would show here; got {}",
+            second.sweep_bytes
+        );
+        assert_eq!(after_small.sweep.completed_cycles, 1);
+        assert_eq!(after_small.sweep.cursor, "", "the completed cycle wraps");
+        let _ = small_key;
+
+        cleanup(&path);
+    }
+
+    /// The wall-clock budget's call site, and the starvation side of the
+    /// forward-progress rule: `sweep_slice_max_millis = 0` binds before any
+    /// second item, yet the slice still processes exactly one. Fails for:
+    /// checking the deadline before the first item, or dropping the deadline
+    /// term from the driver.
+    #[test]
+    fn a_zero_millis_sweep_budget_still_makes_forward_progress() {
+        let path = unique_db_path("sweep-zero-millis");
+        let keys = seed_junk_fixture(&path, 3, 64);
+        let db_path = path.to_string_lossy().to_string();
+
+        let mut cold_ledger = ScanLedger::default();
+        let ScanOutcome::Scanned {
+            new_state: cold, ..
+        } = scan_database(
+            &db_path,
+            &CursorState::fresh(),
+            &default_scan_plan(),
+            &mut cold_ledger,
+        )
+        else {
+            panic!("cold scan should succeed");
+        };
+
+        let mut config = moraine_config::AppConfig::default();
+        config.ingest.sqlite.sweep_slice_max_millis = 0;
+        let plan = CursorScanPlan::from_config(&config, Some(SweepPlan::from_config(&config)));
+        let mut ledger = ScanLedger::default();
+        let ScanOutcome::Scanned {
+            new_state, swept, ..
+        } = scan_database(&db_path, &cold, &plan, &mut ledger)
+        else {
+            panic!("sweep scan should succeed");
+        };
+        assert!(swept);
+        assert_eq!(
+            ledger.sweep_rows, 1,
+            "one item per slice at a zero deadline"
+        );
+        assert_eq!(new_state.sweep.cursor, keys[0]);
+
+        cleanup(&path);
+    }
+
+    /// Gate G6a (§8): sweep eligibility is keyed on trigger provenance and on
+    /// nothing else. Watcher polls — however many, however quiet the database
+    /// — never attach a slice; the first reconcile poll does. Denominated on
+    /// the ledger's sweep axes, not on total rows, so a sweep hidden inside a
+    /// fast path would still be caught.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sweep_does_not_run_on_watcher_triggered_polls() {
+        let path = unique_db_path("sweep-watcher");
+        seed_junk_fixture(&path, 3, 64);
+        let watcher = sqlite_work(&path);
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+
+        let mut config = moraine_config::AppConfig::default();
+        config.ingest.sqlite.sweep_slice_min_interval_seconds = 0;
+
+        let cp_key = checkpoint_key(&watcher.source_name, &watcher.path);
+        let poll_state = VolatilePollMap::new();
+        let metrics = Arc::new(Metrics::default());
+        for _ in 0..5 {
+            run_poll_with_config(&config, &watcher, &checkpoints, &poll_state, &metrics).await;
+            touch_irrelevant(&path);
+            // Past the no-op rescan throttle, so every driven poll genuinely
+            // scans — a skipped poll proves nothing about sweep eligibility.
+            poll_state.age_for_tests(&cp_key, Duration::from_secs(16));
+        }
+        assert_eq!(
+            sweep_rows(&metrics),
+            0,
+            "watcher-triggered polls must never attach a sweep slice"
+        );
+        assert_eq!(sweep_slices(&metrics), 0);
+
+        let reconcile = reconcile_work(&path);
+        run_poll_with_config(&config, &reconcile, &checkpoints, &poll_state, &metrics).await;
+        assert!(
+            sweep_rows(&metrics) > 0,
+            "the first reconcile-triggered poll of a quiet database sweeps"
+        );
+        assert_eq!(sweep_slices(&metrics), 1);
+
+        cleanup(&path);
+    }
+
+    /// Eligibility condition 2, upper side: the per-database interval clock
+    /// throttles slices even though every one of these polls is reconcile-
+    /// triggered and the database stays quiet — and the clock **survives an
+    /// emitting poll between slices**. Every persisting scan calls `clear`,
+    /// so a clock that lives and dies with the volatile entry is wiped by the
+    /// first interleaved write, and the next quiet reconcile poll re-sweeps
+    /// at the reconcile cadence — up to ~10× the configured minimum on
+    /// databases with interleaved writes, the typical agent-session shape.
+    /// Noop polls alone cannot see that: they preserve the entry. Fails for:
+    /// dropping the interval term, losing the clock to the slice's own
+    /// checkpoint persist (the `record_sweep_slice` re-arm ordering), or
+    /// losing it to a later emitting poll's persist (`clear`'s clock carry).
+    ///
+    /// MUTATION (executed 2026-07-31): revert `clear` to a bare
+    /// `self.lock().remove(cp_key)` — the post-emission assertion fails
+    /// (slice #2 attaches inside the interval) while the pre-emission half
+    /// stays green, which is why the emitting interleave exists.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_second_reconcile_poll_inside_the_sweep_interval_attaches_no_slice() {
+        let path = unique_db_path("sweep-interval-upper");
+        seed_junk_fixture(&path, 3, 64);
+        let work = reconcile_work(&path);
+        let cp_key = checkpoint_key(&work.source_name, &work.path);
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+
+        let mut config = moraine_config::AppConfig::default();
+        config.ingest.sqlite.sweep_slice_min_interval_seconds = 3600;
+
+        let poll_state = VolatilePollMap::new();
+        let metrics = Arc::new(Metrics::default());
+        run_poll_with_config(&config, &work, &checkpoints, &poll_state, &metrics).await;
+        assert_eq!(sweep_slices(&metrics), 1, "the first slice is immediate");
+        for _ in 0..3 {
+            touch_irrelevant(&path);
+            run_poll_with_config(&config, &work, &checkpoints, &poll_state, &metrics).await;
+        }
+        assert_eq!(
+            sweep_slices(&metrics),
+            1,
+            "no further slice inside the configured interval"
+        );
+
+        // A real bubble arrives: the watcher poll emits and persists its own
+        // checkpoint, which calls `clear`. The interval clock must ride
+        // through that wipe, or the next quiet reconcile poll re-sweeps at
+        // the reconcile cadence. Aged past the no-op rescan throttle first —
+        // three quiet polls made the entry stat-noisy, and a skipped poll
+        // would prove nothing about the clock (16 s is far inside the 3600 s
+        // sweep interval, so this cannot arm the slice by itself).
+        poll_state.age_for_tests(&cp_key, Duration::from_secs(16));
+        {
+            let db = Connection::open(&path).expect("reopen fixture");
+            put(
+                &db,
+                &format!("bubbleId:{COMPOSER_ID}:{USER_BUBBLE_ID}"),
+                &user_bubble_value(),
+            );
+        }
+        let watcher = sqlite_work(&path);
+        let batches =
+            run_poll_with_config(&config, &watcher, &checkpoints, &poll_state, &metrics).await;
+        assert!(
+            !all_event_rows(&batches).is_empty(),
+            "the bubble must actually emit for the interleave to mean anything"
+        );
+        for _ in 0..2 {
+            touch_irrelevant(&path);
+            run_poll_with_config(&config, &work, &checkpoints, &poll_state, &metrics).await;
+        }
+        assert_eq!(
+            sweep_slices(&metrics),
+            1,
+            "an emitting poll between slices must not re-arm the interval clock"
+        );
+
+        cleanup(&path);
+    }
+
+    /// Eligibility condition 2, lower side: once the interval elapses the
+    /// next reconcile poll is armed again — including when the interval was
+    /// spent under continuous **emitting** polls, each of whose checkpoint
+    /// persists called `clear`. Together with the upper test this bounds the
+    /// interval clock from both directions: it must survive every wipe (no
+    /// early slice) and it must still expire (no starvation).
+    ///
+    /// MUTATION (executed 2026-07-31): `sweep_slice_due`'s armed arm
+    /// (`Some(at) => at.elapsed() >= min_interval`) → `Some(_) => false` —
+    /// the final assertion fails (an armed clock never expires) while the
+    /// upper test stays green, which is why the pair exists.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_expired_sweep_interval_arms_the_next_reconcile_poll() {
+        let path = unique_db_path("sweep-interval-lower");
+        seed_junk_fixture(&path, 3, 64);
+        let work = reconcile_work(&path);
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let cp_key = checkpoint_key(&work.source_name, &work.path);
+
+        let mut config = moraine_config::AppConfig::default();
+        config.ingest.sqlite.sweep_slice_min_interval_seconds = 3600;
+
+        let poll_state = VolatilePollMap::new();
+        let metrics = Arc::new(Metrics::default());
+        run_poll_with_config(&config, &work, &checkpoints, &poll_state, &metrics).await;
+        assert_eq!(sweep_slices(&metrics), 1);
+
+        // Continuous emitting polls inside the interval: each edit persists a
+        // checkpoint and calls `clear`, and none of that may starve the sweep
+        // once the interval has genuinely elapsed.
+        let watcher = sqlite_work(&path);
+        for idx in 0..2 {
+            {
+                let db = Connection::open(&path).expect("reopen fixture");
+                let mut value = user_bubble_value();
+                value["text"] = json!(format!("edit {idx}"));
+                put(
+                    &db,
+                    &format!("bubbleId:{COMPOSER_ID}:{USER_BUBBLE_ID}"),
+                    &value,
+                );
+            }
+            let batches =
+                run_poll_with_config(&config, &watcher, &checkpoints, &poll_state, &metrics).await;
+            assert!(
+                !all_event_rows(&batches).is_empty(),
+                "each interleaved poll must actually emit"
+            );
+        }
+        assert_eq!(sweep_slices(&metrics), 1, "still inside the interval");
+
+        poll_state.age_for_tests(&cp_key, Duration::from_secs(3600));
+        touch_irrelevant(&path);
+        run_poll_with_config(&config, &work, &checkpoints, &poll_state, &metrics).await;
+        assert_eq!(
+            sweep_slices(&metrics),
+            2,
+            "an expired interval arms the next reconcile poll even under emitting-poll churn"
+        );
+
+        cleanup(&path);
+    }
+
+    /// Eligibility condition 3 (§2.2): a poll whose fast path emitted records
+    /// does not also pay sweep cost — and the very next quiet reconcile poll
+    /// does, so the block is provably the emission and not something else.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_poll_that_emits_records_attaches_no_sweep_slice() {
+        let path = unique_db_path("sweep-busy");
+        let _db = seed_fixture_db(&path);
+        let work = reconcile_work(&path);
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+
+        let mut config = moraine_config::AppConfig::default();
+        config.ingest.sqlite.sweep_slice_min_interval_seconds = 0;
+
+        let poll_state = VolatilePollMap::new();
+        let metrics = Arc::new(Metrics::default());
+        let batches =
+            run_poll_with_config(&config, &work, &checkpoints, &poll_state, &metrics).await;
+        assert!(
+            !all_event_rows(&batches).is_empty(),
+            "the cold poll must actually emit for this test to mean anything"
+        );
+        assert_eq!(
+            sweep_slices(&metrics),
+            0,
+            "an emitting fast path blocks the slice"
+        );
+
+        touch_irrelevant(&path);
+        run_poll_with_config(&config, &work, &checkpoints, &poll_state, &metrics).await;
+        assert_eq!(
+            sweep_slices(&metrics),
+            1,
+            "the next quiet reconcile poll sweeps"
+        );
+
+        cleanup(&path);
+    }
+
+    /// Eligibility condition 4 (§2.2): a replacement replay never attaches a
+    /// slice. The fixture's relevant keyspace is empty so conditions 1-3 all
+    /// hold and only the replay stands between the poll and a slice — a
+    /// non-empty fixture would block on condition 3 (the replay re-emits
+    /// everything) and this guard could not fail.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_replacement_replay_poll_attaches_no_sweep_slice() {
+        let path = unique_db_path("sweep-replay");
+        {
+            let db = create_kv_db(&path);
+            db.execute(
+                "INSERT INTO ItemTable (key, value) VALUES ('seed', 'x')",
+                [],
+            )
+            .expect("seed irrelevant row");
+        }
+        let work = reconcile_work(&path);
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+
+        let mut config = moraine_config::AppConfig::default();
+        config.ingest.sqlite.sweep_slice_min_interval_seconds = 0;
+
+        let poll_state = VolatilePollMap::new();
+        let metrics = Arc::new(Metrics::default());
+        run_poll_with_config(&config, &work, &checkpoints, &poll_state, &metrics).await;
+        assert_eq!(
+            sweep_slices(&metrics),
+            1,
+            "an empty keyspace sweeps (and wraps) immediately"
+        );
+
+        // A changed exclusion set starts a replacement replay.
+        let mut replaying = config.clone();
+        replaying.ingest.exclude_project_dirs = vec!["/no/such/dir/**".to_string()];
+        touch_irrelevant(&path);
+        run_poll_with_config(&replaying, &work, &checkpoints, &poll_state, &metrics).await;
+        assert_eq!(
+            sweep_slices(&metrics),
+            1,
+            "a replacement replay poll must not attach a slice"
+        );
+
+        cleanup(&path);
+    }
+
+    /// Plan §7.2 F2, the widening direction, at the Cursor call site: an
+    /// `error`-status checkpoint with **no block reason** is an ordinary
+    /// transient failure marker, and the poll it precedes is an ordinary poll.
+    /// Widening `retry_blocked_replay` to a bare `status == "error"` turns it
+    /// into a blocked-replacement retry: the cursor state is reset and every
+    /// unchanged row re-emits behind a fresh `BeginReplay`. The unchanged
+    /// fixture emits nothing on the correct path, so any re-emission fails
+    /// this test.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_error_marker_without_a_block_reason_is_not_retried_as_a_blocked_replay() {
+        let path = unique_db_path("error-marker-width");
+        let _db = seed_fixture_db(&path);
+        let work = sqlite_work(&path);
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let cp_key = checkpoint_key(&work.source_name, &work.path);
+
+        let first = run_poll(&work, &checkpoints).await;
+        assert!(!all_event_rows(&first).is_empty());
+
+        // Rewrite the committed checkpoint into a transient-error marker: the
+        // shape `record_scan_failure_outcome`'s non-replay arm persists.
+        {
+            let mut map = checkpoints.write().await;
+            let checkpoint = map.get_mut(&cp_key).expect("committed checkpoint");
+            checkpoint.status = "error".to_string();
+            checkpoint.block_reason.clear();
+            let mut state = CursorState::parse(&checkpoint.cursor_json);
+            state.last_error = ERROR_KIND_SCAN.to_string();
+            checkpoint.cursor_json = state.serialize();
+        }
+
+        let batches = run_poll(&work, &checkpoints).await;
+        assert!(
+            all_event_rows(&batches).is_empty(),
+            "an ordinary error marker must clear through an ordinary scan; \
+             re-emission means the poll was retried as a blocked replay"
+        );
+        let map = checkpoints.read().await;
+        assert_eq!(
+            map.get(&cp_key).expect("checkpoint").status,
+            "active",
+            "the transient marker clears once a scan succeeds"
+        );
+
+        cleanup(&path);
+    }
+
+    /// §2.2's fairness sentence, literally: "fast-path activity never resets
+    /// the sweep cursor." A slice leaves the cursor mid-cycle; a genuinely
+    /// *emitting* watcher poll then persists a checkpoint of its own, and the
+    /// persisted sweep cursor must ride through it unchanged. This is the only
+    /// test that observes `sweep: prior.sweep.clone()` in the fast path's
+    /// state constructor — every slice-carrying poll overwrites that field
+    /// from the driver's report, so G5a cannot see it.
+    ///
+    /// MUTATION (executed 2026-07-31): `sweep: prior.sweep.clone()` →
+    /// `sweep: SweepState::default()` in `scan_database` — this test fails
+    /// (the emitting poll wipes the mid-cycle cursor) while G5a and G5b stay
+    /// green, which is why this test exists.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fast_path_activity_never_resets_the_sweep_cursor() {
+        let path = unique_db_path("sweep-fastpath-preserves");
+        let keys = seed_junk_fixture(&path, 6, 64);
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+
+        let mut config = moraine_config::AppConfig::default();
+        config.ingest.sqlite.sweep_slice_max_payload_rows = 2;
+        config.ingest.sqlite.sweep_slice_min_interval_seconds = 3600;
+
+        let poll_state = VolatilePollMap::new();
+        let metrics = Arc::new(Metrics::default());
+        let reconcile = reconcile_work(&path);
+        run_poll_with_config(&config, &reconcile, &checkpoints, &poll_state, &metrics).await;
+        assert_eq!(sweep_slices(&metrics), 1);
+        assert_eq!(
+            persisted_sweep(&checkpoints, &reconcile).await.cursor,
+            keys[1],
+            "one 2-row slice leaves the cursor mid-cycle"
+        );
+
+        // A real bubble arrives: the watcher poll emits and persists its own
+        // checkpoint, with no slice attached (interval far in the future).
+        {
+            let db = Connection::open(&path).expect("reopen fixture");
+            put(
+                &db,
+                &format!("bubbleId:{COMPOSER_ID}:{USER_BUBBLE_ID}"),
+                &user_bubble_value(),
+            );
+        }
+        let watcher = sqlite_work(&path);
+        let batches =
+            run_poll_with_config(&config, &watcher, &checkpoints, &poll_state, &metrics).await;
+        assert!(
+            !all_event_rows(&batches).is_empty(),
+            "the bubble must actually emit for this test to mean anything"
+        );
+        assert_eq!(sweep_slices(&metrics), 1, "no slice on the emitting poll");
+        assert_eq!(
+            persisted_sweep(&checkpoints, &reconcile).await.cursor,
+            keys[1],
+            "fast-path activity must never reset the sweep cursor"
+        );
+
+        cleanup(&path);
+    }
+
+    /// Eligibility condition 1's width, the direction G6a cannot see: mutating
+    /// `trigger == Reconcile` to `trigger != Watcher` keeps
+    /// `sweep_does_not_run_on_watcher_triggered_polls` green while making
+    /// every startup poll sweep-eligible — the §2.4 inversion D1c refuses at
+    /// the dispatcher, and the cost plan §7.2 F4 warns the tee/backfill sites
+    /// about. This is F4's closure: eligibility is now denominated on
+    /// something a test observes at the poll itself, so a call site
+    /// re-introducing its own trigger stamp has a named failure here.
+    ///
+    /// MUTATION (executed 2026-07-31): `work.trigger == WorkTrigger::Reconcile`
+    /// → `work.trigger != WorkTrigger::Watcher` in `process_cursor_sqlite_db`
+    /// — this test fails (a startup poll attaches a slice) while G6a stays
+    /// green, which is why this test exists; both RED and green were
+    /// confirmed in a filtered run of the pair, so suite-wide isolation is
+    /// not claimed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_startup_poll_attaches_no_sweep_slice() {
+        let path = unique_db_path("sweep-startup");
+        seed_junk_fixture(&path, 3, 64);
+        let startup = WorkItem {
+            trigger: WorkTrigger::Startup,
+            ..sqlite_work(&path)
+        };
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+
+        let mut config = moraine_config::AppConfig::default();
+        config.ingest.sqlite.sweep_slice_min_interval_seconds = 0;
+
+        let poll_state = VolatilePollMap::new();
+        let metrics = Arc::new(Metrics::default());
+        run_poll_with_config(&config, &startup, &checkpoints, &poll_state, &metrics).await;
+        assert_eq!(
+            sweep_slices(&metrics),
+            0,
+            "a startup poll must never attach a sweep slice"
+        );
+        assert_eq!(sweep_rows(&metrics), 0);
+
+        // The identical poll under a reconcile trigger sweeps, so the block
+        // above is provably the trigger and nothing else.
+        touch_irrelevant(&path);
+        let reconcile = reconcile_work(&path);
+        run_poll_with_config(&config, &reconcile, &checkpoints, &poll_state, &metrics).await;
+        assert_eq!(sweep_slices(&metrics), 1);
+
+        cleanup(&path);
+    }
+
+    /// Eligibility condition 3's budget clause, and the width of its ×2:
+    /// a poll that consumed at least half its fast-path budget — without
+    /// emitting and without degrading — attaches no slice, and the identical
+    /// poll under an ample budget does. Three 64-byte values against a
+    /// 300-byte budget is 192 bytes: over one half, under the whole, so this
+    /// test separates the half-consumed clause from the degraded override
+    /// beside it and from exhaustion.
+    ///
+    /// MUTATION (executed 2026-07-31): drop the `is_half_consumed_by` clause
+    /// from the eligibility check in `scan_database` — fails. Drop the
+    /// `saturating_mul(2)` (making it a full-budget check) — fails, because
+    /// 192 < 300. Each RED was confirmed in a filtered run, so suite-wide
+    /// isolation is not claimed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_poll_that_spent_half_its_budget_attaches_no_sweep_slice() {
+        let path = unique_db_path("sweep-half-budget");
+        seed_junk_fixture(&path, 3, 64);
+        let work = reconcile_work(&path);
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+
+        let mut config = moraine_config::AppConfig::default();
+        config.ingest.sqlite.sweep_slice_min_interval_seconds = 0;
+        config.ingest.sqlite.fast_path_max_payload_bytes = 300;
+
+        let poll_state = VolatilePollMap::new();
+        let metrics = Arc::new(Metrics::default());
+        run_poll_with_config(&config, &work, &checkpoints, &poll_state, &metrics).await;
+        assert_eq!(
+            degraded_scans(&metrics),
+            0,
+            "192 of 300 bytes is not exhaustion"
+        );
+        assert_eq!(
+            sweep_slices(&metrics),
+            0,
+            "a half-spent fast path must not also pay sweep cost"
+        );
+
+        // The same quiet database under the default budget sweeps at once.
+        let ample = moraine_config::AppConfig::default();
+        let mut ample_sqlite = ample;
+        ample_sqlite.ingest.sqlite.sweep_slice_min_interval_seconds = 0;
+        touch_irrelevant(&path);
+        run_poll_with_config(&ample_sqlite, &work, &checkpoints, &poll_state, &metrics).await;
+        assert_eq!(sweep_slices(&metrics), 1);
+
+        cleanup(&path);
+    }
+
+    /// The deliberate widening of condition 3 (recorded in the plan's §7.1):
+    /// a *degraded* poll is sweep-eligible even though it consumed its whole
+    /// budget. On a source larger than one fast-path budget every poll is
+    /// degraded and fully spent, so the literal half-budget clause would
+    /// block the sweep on exactly the sources whose cold tail only the sweep
+    /// can reach — §0's coverage guarantee outranks §2.2's politeness. Here
+    /// the slice covers, in one poll, the very keys the fast path's budget
+    /// skipped.
+    ///
+    /// MUTATION (executed 2026-07-31): drop `ledger.coverage_degraded ||`
+    /// from the eligibility check in `scan_database` — this test fails (no
+    /// slice attaches); RED was confirmed in a filtered run,
+    /// so suite-wide isolation is not claimed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_budget_degraded_poll_still_attaches_its_sweep_slice() {
+        let path = unique_db_path("sweep-degraded");
+        seed_junk_fixture(&path, 4, 64);
+        let work = reconcile_work(&path);
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+
+        let mut config = moraine_config::AppConfig::default();
+        config.ingest.sqlite.sweep_slice_min_interval_seconds = 0;
+        config.ingest.sqlite.fast_path_max_payload_rows = 2;
+
+        let poll_state = VolatilePollMap::new();
+        let metrics = Arc::new(Metrics::default());
+        run_poll_with_config(&config, &work, &checkpoints, &poll_state, &metrics).await;
+        assert_eq!(degraded_scans(&metrics), 1, "two of four keys is degraded");
+        assert_eq!(
+            sweep_slices(&metrics),
+            1,
+            "the degraded poll still sweeps — that is the whole point"
+        );
+        assert!(
+            sweep_rows(&metrics) >= 2,
+            "the slice reads keys the fast path skipped; got {}",
+            sweep_rows(&metrics)
+        );
+        let state = persisted_sweep(&checkpoints, &work).await;
+        assert_eq!(
+            state.completed_cycles, 1,
+            "four small keys fit one slice, so the cycle completes"
+        );
+
+        cleanup(&path);
+    }
+
+    /// §2.3's "persist the resume position, continue next poll", end to end,
+    /// with **no further writes to the database** — the case the cheap stat
+    /// short-circuit would otherwise seal forever. Three properties in one
+    /// deliberate sequence:
+    ///
+    /// 1. **Progress**: each resumed poll reads never-read keys first, so a
+    ///    6-key database under a 2-row budget is fully covered in exactly 3
+    ///    polls (a recency-only order re-reads the same 2 newest keys and
+    ///    never converges).
+    /// 2. **Termination**: once coverage completes, `pending_coverage`
+    ///    clears durably and the next poll short-circuits — the resume
+    ///    cannot become a 30 s busy loop on a quiet database.
+    /// 3. **§2.6 serialization**: while pending, the marker rides
+    ///    `cursor_json`; after completion (never having swept) the payload
+    ///    carries neither `pending_coverage` nor `sweep`, byte-identical to a
+    ///    source that never degraded.
+    ///
+    /// MUTATION (executed 2026-07-31): drop the `!state.pending_coverage`
+    /// conjunct from the cheap short-circuit — fails at the poll-2 coverage
+    /// assertion (the unchanged stat ends every later poll). Drop the
+    /// never-read-first class from the candidate sort (plain `rowid DESC`) —
+    /// fails at the same assertion (polls re-read `k5,k4` forever). Each RED
+    /// was confirmed in a filtered run, so suite-wide isolation is not
+    /// claimed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_degraded_cold_ingest_completes_without_new_writes() {
+        let path = unique_db_path("cold-ingest-converges");
+        seed_junk_fixture(&path, 6, 64);
+        let work = sqlite_work(&path);
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let cp_key = checkpoint_key(&work.source_name, &work.path);
+
+        let mut config = moraine_config::AppConfig::default();
+        config.ingest.sqlite.fast_path_max_payload_rows = 2;
+
+        let poll_state = VolatilePollMap::new();
+        let metrics = Arc::new(Metrics::default());
+        run_poll_with_config(&config, &work, &checkpoints, &poll_state, &metrics).await;
+        {
+            let map = checkpoints.read().await;
+            let checkpoint = map.get(&cp_key).expect("cold poll persists");
+            assert!(
+                checkpoint.cursor_json.contains("pending_coverage"),
+                "the resume marker must be durable, not volatile"
+            );
+            let state = CursorState::parse(&checkpoint.cursor_json);
+            assert_eq!(state.kv_hashes.len(), 2, "the cold poll covered its budget");
+        }
+
+        // No touches: the stat never moves again. Two more polls must still
+        // scan, and must retire never-read debt rather than re-verify.
+        for expected_covered in [4usize, 6] {
+            run_poll_with_config(&config, &work, &checkpoints, &poll_state, &metrics).await;
+            let map = checkpoints.read().await;
+            let checkpoint = map.get(&cp_key).expect("resumed poll persists");
+            let state = CursorState::parse(&checkpoint.cursor_json);
+            assert_eq!(
+                state.kv_hashes.len(),
+                expected_covered,
+                "each resumed poll must retire one budget of never-read keys"
+            );
+        }
+        {
+            let map = checkpoints.read().await;
+            let checkpoint = map.get(&cp_key).expect("covering poll persists");
+            assert!(
+                !checkpoint.cursor_json.contains("pending_coverage"),
+                "completed coverage must clear the marker durably"
+            );
+            assert!(
+                !checkpoint.cursor_json.contains("\"sweep\""),
+                "a never-swept source's cursor_json stays byte-compatible (§2.6)"
+            );
+        }
+
+        // Quiesce: with coverage complete and the stat unchanged, the next
+        // poll must not scan at all.
+        let rows_before = payload_rows(&metrics);
+        let census_before = metrics
+            .sqlite_poll_census_rows_total
+            .load(std::sync::atomic::Ordering::Relaxed);
+        run_poll_with_config(&config, &work, &checkpoints, &poll_state, &metrics).await;
+        assert_eq!(
+            payload_rows(&metrics),
+            rows_before,
+            "a covered, unchanged database must short-circuit"
+        );
+        assert_eq!(
+            metrics
+                .sqlite_poll_census_rows_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            census_before,
+            "not even the census may run"
+        );
+
+        cleanup(&path);
+    }
+
+    /// A replacement replay reads the whole database regardless of the
+    /// fast-path budget: its `FinalizeReplay` publishes the new generation
+    /// over the old one, so a budget-degraded replay would publish a hole —
+    /// the transient data loss #602's old-complete/new-complete contract
+    /// forbids. The replay pays the pre-#601 cost, once, per genuine
+    /// replacement.
+    ///
+    /// MUTATION (executed 2026-07-31): make `process_cursor_sqlite_db` use
+    /// `CursorScanPlan::from_config` for replays too — this test fails (the
+    /// replay covers 2 of 7 keys); RED was confirmed in a filtered run,
+    /// so suite-wide isolation is not claimed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_replacement_replay_reads_past_the_fast_path_budget() {
+        let path = unique_db_path("replay-unbudgeted");
+        seed_junk_fixture(&path, 7, 64);
+        let work = sqlite_work(&path);
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let cp_key = checkpoint_key(&work.source_name, &work.path);
+
+        let mut config = moraine_config::AppConfig::default();
+        config.ingest.sqlite.fast_path_max_payload_rows = 2;
+
+        let poll_state = VolatilePollMap::new();
+        let metrics = Arc::new(Metrics::default());
+        run_poll_with_config(&config, &work, &checkpoints, &poll_state, &metrics).await;
+
+        // A changed exclusion set starts a replacement replay under the same
+        // tight budget. The replay must ignore it.
+        let mut replaying = config.clone();
+        replaying.ingest.exclude_project_dirs = vec!["/no/such/dir/**".to_string()];
+        touch_irrelevant(&path);
+        run_poll_with_config(&replaying, &work, &checkpoints, &poll_state, &metrics).await;
+
+        let map = checkpoints.read().await;
+        let checkpoint = map.get(&cp_key).expect("finalized replay checkpoint");
+        let state = CursorState::parse(&checkpoint.cursor_json);
+        assert_eq!(
+            state.kv_hashes.len(),
+            7,
+            "the replay must cover every key, budget notwithstanding"
+        );
+        assert!(
+            !checkpoint.cursor_json.contains("pending_coverage"),
+            "a finalized replay owes nothing"
+        );
+        assert_eq!(checkpoint.status, "active");
+
+        cleanup(&path);
+    }
+
+    /// The byte axis of the fast-path budget at its exact boundary: two
+    /// 64-byte values against a 128-byte budget stop the scan at precisely
+    /// two rows. `is_exhausted_by` is `>=` on purpose — the row that *meets*
+    /// the budget is the last row read (§2.1: commit what was read) — and
+    /// this fixture sits exactly on the boundary so the one-token narrowing
+    /// to `>` reads a third row and fails here.
+    ///
+    /// MUTATION (executed 2026-07-31): `payload_bytes >= self.max_payload_bytes`
+    /// → `>` — this test fails (3 rows read); the row-axis twin `>=` → `>`
+    /// fails `a_cursor_scan_over_budget_reads_no_more_than_its_budget` (3
+    /// rows against its 2-row budget). Dropping the byte disjunct entirely
+    /// also fails here (all 4 rows read).
+    #[test]
+    fn a_cursor_byte_budget_binds_exactly_at_its_boundary() {
+        let path = unique_db_path("byte-budget-boundary");
+        seed_junk_fixture(&path, 4, 64);
+
+        let mut config = moraine_config::AppConfig::default();
+        config.ingest.sqlite.fast_path_max_payload_bytes = 128;
+        let plan = CursorScanPlan::from_config(&config, None);
+        let mut ledger = ScanLedger::default();
+        let ScanOutcome::Scanned { .. } = scan_database(
+            &path.to_string_lossy(),
+            &CursorState::fresh(),
+            &plan,
+            &mut ledger,
+        ) else {
+            panic!("an over-budget scan must degrade, not fail");
+        };
+        assert_eq!(
+            ledger.payload_rows, 2,
+            "the row that meets the byte budget is the last row read"
+        );
+        assert_eq!(ledger.payload_bytes, 128);
+        assert!(ledger.coverage_degraded);
+        assert_eq!(ledger.skipped_rows, 2);
+
+        cleanup(&path);
+    }
+
+    /// Plan §7.2 F1, the `new_state == prior_state_covered` conjunct of
+    /// `scan_is_noop` — the one whose failure mode is a durable-state change
+    /// suppressed forever. A value mutation that synthesizes no record (junk
+    /// payloads) moves only the hash map: every other conjunct says "no-op",
+    /// and only the structural comparison notices. Suppress it and the
+    /// mutation is re-discovered on every later poll and never durably
+    /// recorded.
+    ///
+    /// MUTATION (executed 2026-07-31): drop `new_state == prior_state_covered`
+    /// from `scan_is_noop` — this test fails (the persisted hash never
+    /// moves); RED was confirmed in a filtered run, so suite-wide isolation
+    /// is not claimed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_changed_value_that_emits_no_records_still_persists_its_checkpoint() {
+        let path = unique_db_path("noop-width-state");
+        let keys = seed_junk_fixture(&path, 2, 64);
+        let work = sqlite_work(&path);
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let cp_key = checkpoint_key(&work.source_name, &work.path);
+
+        run_poll(&work, &checkpoints).await;
+        let hash_before = {
+            let map = checkpoints.read().await;
+            let state = CursorState::parse(&map.get(&cp_key).expect("cold checkpoint").cursor_json);
+            state.kv_hashes.get(&keys[0]).cloned().expect("covered key")
+        };
+
+        // A plain UPDATE to another non-JSON payload: no record synthesizes,
+        // only the content hash moves.
+        {
+            let db = Connection::open(&path).expect("reopen fixture");
+            db.execute(
+                "UPDATE cursorDiskKV SET value = 'junk-mutated' WHERE key = ?1",
+                rusqlite::params![&keys[0]],
+            )
+            .expect("mutate value in place");
+        }
+        let batches = run_poll(&work, &checkpoints).await;
+        assert!(
+            all_event_rows(&batches).is_empty(),
+            "junk payloads must not synthesize records"
+        );
+        let map = checkpoints.read().await;
+        let state = CursorState::parse(&map.get(&cp_key).expect("checkpoint").cursor_json);
+        assert_ne!(
+            state.kv_hashes.get(&keys[0]),
+            Some(&hash_before),
+            "the moved hash must be recorded durably, not re-discovered forever"
+        );
+
+        cleanup(&path);
+    }
+
+    /// Plan §7.2 F1, the `schema_fingerprint == checkpoint.schema_fingerprint`
+    /// conjunct: a schema change with no row changes moves nothing else — no
+    /// records, no state, no census count — so only this conjunct keeps the
+    /// scan from being classed a no-op, and only its checkpoint records the
+    /// new fingerprint durably.
+    ///
+    /// MUTATION (executed 2026-07-31): drop the conjunct from `scan_is_noop`
+    /// — this test fails (the persisted fingerprint never moves); RED was
+    /// confirmed in a filtered run, so suite-wide isolation is not claimed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_schema_change_with_no_row_changes_still_persists_its_checkpoint() {
+        let path = unique_db_path("noop-width-schema");
+        seed_junk_fixture(&path, 1, 64);
+        let work = sqlite_work(&path);
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let cp_key = checkpoint_key(&work.source_name, &work.path);
+
+        run_poll(&work, &checkpoints).await;
+        let fingerprint_before = {
+            let map = checkpoints.read().await;
+            map.get(&cp_key)
+                .expect("cold checkpoint")
+                .schema_fingerprint
+        };
+
+        {
+            let db = Connection::open(&path).expect("reopen fixture");
+            db.execute("ALTER TABLE cursorDiskKV ADD COLUMN moraine_probe TEXT", [])
+                .expect("alter schema without touching rows");
+        }
+        let batches = run_poll(&work, &checkpoints).await;
         assert!(all_event_rows(&batches).is_empty());
+        let map = checkpoints.read().await;
+        assert_ne!(
+            map.get(&cp_key).expect("checkpoint").schema_fingerprint,
+            fingerprint_before,
+            "the new schema fingerprint must be recorded durably"
+        );
 
         cleanup(&path);
     }

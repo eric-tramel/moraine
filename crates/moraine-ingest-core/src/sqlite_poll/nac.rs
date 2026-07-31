@@ -20,18 +20,33 @@ use url::Origin;
 use super::{
     hash_str, open_read_only, record_scan_failure, record_scan_ledger, sqlite_data_version,
     stat_fingerprint, take_payload_nullable_string, take_payload_required_string,
-    take_payload_text, truncate_chars_local, ScanLedger, StatFingerprint, SyntheticRecord,
-    VolatilePollMap, ERROR_KIND_MIXED_SNAPSHOT, ERROR_KIND_OPEN, ERROR_KIND_SCAN,
-    ERROR_KIND_SCHEMA, ERROR_KIND_TOO_LARGE, SCAN_PAGE_MAX_BYTES, SCAN_PAGE_SIZE,
+    take_payload_text, truncate_chars_local, ScanBudget, ScanLedger, StatFingerprint,
+    SyntheticRecord, VolatilePollMap, ERROR_KIND_MIXED_SNAPSHOT, ERROR_KIND_OPEN,
+    ERROR_KIND_ROW_TOO_LARGE, ERROR_KIND_SCAN, ERROR_KIND_SCHEMA, SCAN_PAGE_MAX_BYTES,
+    SCAN_PAGE_SIZE,
 };
 
 const NAC_CURSOR_VERSION: u32 = 1;
-const MAX_NAC_SESSIONS: u64 = 10_000;
-const MAX_NAC_EPISODES: u64 = 100_000;
-const MAX_NAC_SCAN_BYTES: u64 = 256 * 1024 * 1024;
+/// Per-poll cap on synthetic records built. A *degradation* bound, not a
+/// failure (issue #601 §2.3): reaching it stops further reads for this poll
+/// with `coverage_degraded`, and per-session overflow truncates the part list.
 const MAX_NAC_SYNTHETIC_RECORDS: usize = 200_000;
 const ERROR_KIND_NORMALIZED_ROW_TOO_LARGE: &str = "nac_normalized_row_too_large";
+/// One episode referencing a session that exists nowhere in `sessions`.
+/// Reachable in production — the live schema FKs episodes to `threads`, not
+/// `sessions` (§1.3) — and passed exactly once, because `episode_high_water`
+/// advances over it (§3.2).
+const ERROR_KIND_ORPHAN_EPISODE: &str = "nac_orphan_episode";
+/// Ceiling on the serialized cursor payload. Enforced by **eviction** of the
+/// oldest session cursors (issue #601 §2.3), never by failing the scan; an
+/// evicted session re-emits on a later poll, which is safe because NAC
+/// records are content-addressed at stable logical coordinates (§6).
 const MAX_NAC_CHECKPOINT_BYTES: usize = 8 * 1024 * 1024;
+/// `NacSessionCursor.metadata_hash` marker for a session row too large to
+/// process (> `SCAN_PAGE_MAX_BYTES`). Structural state: it suppresses the
+/// per-poll re-emission of the row error while the row stays oversized, and
+/// any real hash differs from it, so a shrunk row re-emits normally.
+const OVERSIZED_SESSION_MARKER: &str = "oversized-row";
 const MAX_NAC_TEXT_CHARS: usize = 200_000;
 
 const REQUIRED_SESSION_COLUMNS: &[&str] = &[
@@ -78,6 +93,15 @@ struct NacState {
     project_exclusions_hash: u64,
     #[serde(default)]
     last_error: String,
+    /// True while some censused session has never been read in this
+    /// generation (a budget remainder or an eviction), or the episode
+    /// watermark trails `max(episodes.id)` — §2.3's persisted resume marker.
+    /// The cheap stat short-circuit must not fire while this is set, or a
+    /// quiet store's cold-ingest remainder is unreachable forever. Skipped
+    /// while false so `cursor_json` stays byte-identical for fully-covered
+    /// stores (§2.6).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pending_coverage: bool,
 }
 
 impl Default for NacState {
@@ -92,6 +116,7 @@ impl Default for NacState {
             worker_threads: BTreeSet::new(),
             project_exclusions_hash: 0,
             last_error: String::new(),
+            pending_coverage: false,
         }
     }
 }
@@ -110,15 +135,37 @@ impl NacState {
     }
 
     fn serialize(&self) -> Result<String> {
-        let raw = serde_json::to_string(self).context("failed to serialize NAC cursor")?;
-        if raw.len() > MAX_NAC_CHECKPOINT_BYTES {
-            anyhow::bail!(
-                "NAC cursor is {} bytes, exceeding the {} byte checkpoint ceiling",
-                raw.len(),
-                MAX_NAC_CHECKPOINT_BYTES
-            );
+        serde_json::to_string(self).context("failed to serialize NAC cursor")
+    }
+
+    /// Evict the oldest session cursors (by `created_at`, then id) until the
+    /// serialized payload fits `max_bytes`, returning how many were dropped
+    /// (issue #601 §2.3). Eviction replaces the old serialize-time failure:
+    /// the ceiling degrades — an evicted session is re-detected and re-emitted
+    /// by a later poll — instead of latching the whole database. Removal is in
+    /// batches of one-eighth of the map per round, so a pathological
+    /// many-small-entries payload does not re-serialize per entry.
+    fn evict_to_fit(&mut self, max_bytes: usize) -> u64 {
+        let mut evicted = 0u64;
+        loop {
+            let raw_len = serde_json::to_string(self)
+                .map(|raw| raw.len())
+                .unwrap_or(0);
+            if raw_len <= max_bytes || self.sessions.is_empty() {
+                return evicted;
+            }
+            let mut by_age: Vec<(String, String)> = self
+                .sessions
+                .iter()
+                .map(|(id, cursor)| (cursor.created_at.clone(), id.clone()))
+                .collect();
+            by_age.sort();
+            let batch = (self.sessions.len().div_ceil(8)).max(1);
+            for (_, id) in by_age.into_iter().take(batch) {
+                self.sessions.remove(&id);
+                evicted += 1;
+            }
         }
-        Ok(raw)
     }
 }
 
@@ -139,7 +186,6 @@ struct NacSessionRow {
     token_usages: Value,
     created_at: String,
     updated_at: String,
-    estimated_bytes: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,6 +212,10 @@ enum NacScanOutcome {
         state: NacState,
         schema_fingerprint: u64,
         relevant_rows: u64,
+        /// Per-row skips (§2.3): an un-processable single row — oversized, or
+        /// an orphan episode — is reported once and advanced past, never
+        /// allowed to fail the scan.
+        row_errors: Vec<NacRowError>,
     },
     Failed {
         error_kind: &'static str,
@@ -275,11 +325,17 @@ pub(crate) async fn process_nac_sqlite_db(
     // throttle for the sweep slice must read the fault ladder alone.
     // `an_ordinary_poll_of_a_contended_nac_store_is_not_throttled` fails if it
     // is added. See `plans/601-delta-sqlite.md` §7 WI-10.
+    // The `!pending_coverage` conjunct is §2.3's "continue next poll": while
+    // a cold-ingest remainder exists an unchanged stat must not end the poll
+    // (a quiet store's stat never moves again). Terminates because resumed
+    // scans read never-read sessions first, so the debt strictly shrinks
+    // (`a_degraded_nac_cold_ingest_completes_without_new_writes`).
     if !starts_replacement
         && !retry_blocked_replay
         && scan_state.stat == current_stat
         && scan_state.schema_fingerprint != 0
         && scan_state.last_error.is_empty()
+        && !scan_state.pending_coverage
     {
         return Ok(());
     }
@@ -291,6 +347,16 @@ pub(crate) async fn process_nac_sqlite_db(
     let scan_path = source_file.clone();
     let scan_source_name = work.source_name.clone();
     let prior_scan_state = scan_state.clone();
+    // The fast-path work budget (issue #601 §2.1), from `[ingest.sqlite]`.
+    // Exceeding it degrades coverage newest-first; it never fails the scan.
+    // A replacement replay is unbudgeted: its finalize publishes the
+    // generation whole, so degrading it would publish a hole through #602
+    // (`a_nac_replacement_replay_reads_past_the_fast_path_budget`).
+    let budget = if replacement_replay {
+        ScanBudget::unbounded()
+    } else {
+        ScanBudget::fast_path(&config.ingest.sqlite)
+    };
     let (mut outcome, ledger) = tokio::task::spawn_blocking(move || {
         let mut ledger = ScanLedger::default();
         let outcome = scan_nac_database(
@@ -300,6 +366,8 @@ pub(crate) async fn process_nac_sqlite_db(
             inode,
             current_stat,
             &prior_scan_state,
+            &budget,
+            MAX_NAC_CHECKPOINT_BYTES,
             &mut ledger,
         );
         (outcome, ledger)
@@ -362,6 +430,7 @@ pub(crate) async fn process_nac_sqlite_db(
             state: mut new_state,
             schema_fingerprint,
             relevant_rows,
+            row_errors,
         } => {
             new_state.project_exclusions_hash = current_exclusions_hash;
             let cursor_json = new_state.serialize()?;
@@ -394,6 +463,23 @@ pub(crate) async fn process_nac_sqlite_db(
             }
 
             let mut batch = RowBatch::default();
+            // Per-row skips (§2.3): one `ingest_errors` row each. Oversized
+            // rows repeat-suppress via their cursor marker; orphan episodes
+            // are one-shot because the watermark advances past them.
+            for row_error in &row_errors {
+                batch.push_error_row(json!({
+                    "source_name": work.source_name,
+                    "harness": work.harness,
+                    "source_file": source_file,
+                    "source_inode": inode,
+                    "source_generation": source_generation,
+                    "source_line_no": row_error.source_line_no,
+                    "source_offset": 0u64,
+                    "error_kind": row_error.error_kind,
+                    "error_text": row_error.error_text,
+                    "raw_fragment": "",
+                }));
+            }
             let mut replay_block_reason = None::<String>;
             for synthetic in &records {
                 if crate::dispatch::record_project_dir_is_excluded(
@@ -604,6 +690,8 @@ fn scan_nac_database(
     expected_inode: u64,
     pre_scan_stat: StatFingerprint,
     prior: &NacState,
+    budget: &ScanBudget,
+    checkpoint_ceiling_bytes: usize,
     ledger: &mut ScanLedger,
 ) -> NacScanOutcome {
     let connection = match open_read_only(db_path) {
@@ -663,20 +751,15 @@ fn scan_nac_database(
         source_generation,
         &schema,
         prior,
+        budget,
         ledger,
     );
-    let (records, mut state, relevant_rows) = match result {
+    let (records, mut state, relevant_rows, row_errors) = match result {
         Ok(value) => value,
         Err(NacScanError::Scan(exc)) => {
             return NacScanOutcome::Failed {
                 error_kind: ERROR_KIND_SCAN,
                 error_text: format!("{exc:#}"),
-            }
-        }
-        Err(NacScanError::TooLarge(error_text)) => {
-            return NacScanOutcome::Failed {
-                error_kind: ERROR_KIND_TOO_LARGE,
-                error_text,
             }
         }
     };
@@ -705,17 +788,22 @@ fn scan_nac_database(
     state.stat = pre_scan_stat;
     state.schema_fingerprint = schema.fingerprint;
     state.last_error.clear();
-    if let Err(exc) = state.serialize() {
-        return NacScanOutcome::Failed {
-            error_kind: ERROR_KIND_TOO_LARGE,
-            error_text: format!("NAC cursor failed size/serialization checks: {exc:#}"),
-        };
+    // The checkpoint-state ceiling degrades by evicting the oldest session
+    // cursors (issue #601 §2.3); it never fails the scan. Evicted sessions are
+    // re-emitted by a later poll — safe under §6's content-addressed identity.
+    // An eviction is a coverage debt by construction (the evicted session is
+    // censused but no longer carried), so the resume marker must reflect it.
+    let evicted = state.evict_to_fit(checkpoint_ceiling_bytes);
+    ledger.mark_evicted(evicted);
+    if evicted > 0 {
+        state.pending_coverage = true;
     }
     NacScanOutcome::Scanned {
         records,
         state,
         schema_fingerprint: schema.fingerprint,
         relevant_rows,
+        row_errors,
     }
 }
 
@@ -763,10 +851,17 @@ fn inspect_schema(
     })
 }
 
+/// One skipped row, destined for a single `ingest_errors` row.
+#[derive(Debug, Clone)]
+struct NacRowError {
+    source_line_no: u64,
+    error_kind: &'static str,
+    error_text: String,
+}
+
 #[derive(Debug)]
 enum NacScanError {
     Scan(anyhow::Error),
-    TooLarge(String),
 }
 
 impl From<anyhow::Error> for NacScanError {
@@ -789,8 +884,9 @@ fn scan_nac_rows(
     source_generation: u32,
     schema: &NacSchema,
     prior: &NacState,
+    budget: &ScanBudget,
     ledger: &mut ScanLedger,
-) -> std::result::Result<(Vec<SyntheticRecord>, NacState, u64), NacScanError> {
+) -> std::result::Result<(Vec<SyntheticRecord>, NacState, u64, Vec<NacRowError>), NacScanError> {
     let canonical_db = std::fs::canonicalize(db_path)
         .unwrap_or_else(|_| std::path::PathBuf::from(db_path))
         .to_string_lossy()
@@ -798,6 +894,7 @@ fn scan_nac_rows(
     let namespace = namespace_prefix(source_name, &canonical_db, source_generation);
     let projection = session_projection(&schema.session_columns);
     let mut records = Vec::new();
+    let mut row_errors = Vec::new();
     let mut next_state = NacState {
         episode_high_water: prior.episode_high_water,
         worker_threads: prior.worker_threads.clone(),
@@ -805,64 +902,139 @@ fn scan_nac_rows(
         ..NacState::default()
     };
     let mut contexts = BTreeMap::<String, NacSessionRow>::new();
-    let mut last_session_id = String::new();
-    let mut total_rows = 0u64;
-    let mut total_bytes = 0u64;
 
-    loop {
-        let sql = format!(
-            "SELECT {projection} FROM sessions WHERE session_id > ?1 ORDER BY session_id LIMIT ?2"
-        );
-        let mut stmt = connection.prepare_cached(&sql)?;
-        let mut rows = stmt.query(params![&last_session_id, SCAN_PAGE_SIZE as i64])?;
-        let mut page_rows = 0usize;
-        while let Some(row) = rows.next()? {
-            let session = read_session_row(row, &schema.session_columns, ledger)?;
-            page_rows += 1;
-            total_rows = total_rows.saturating_add(1);
-            if total_rows > MAX_NAC_SESSIONS {
-                return Err(NacScanError::TooLarge(format!(
-                    "{total_rows} NAC sessions exceed the {MAX_NAC_SESSIONS} session scan ceiling"
-                )));
-            }
-            let row_bytes = estimated_session_bytes(&session);
-            if row_bytes > SCAN_PAGE_MAX_BYTES {
-                return Err(NacScanError::TooLarge(format!(
-                    "NAC session {} is {row_bytes} bytes, exceeding the {SCAN_PAGE_MAX_BYTES} byte row ceiling",
-                    session.raw_session_id
-                )));
-            }
-            total_bytes = total_bytes.saturating_add(row_bytes as u64);
-            if total_bytes > MAX_NAC_SCAN_BYTES {
-                return Err(NacScanError::TooLarge(format!(
-                    "NAC scan bytes exceed the {MAX_NAC_SCAN_BYTES} byte ceiling"
-                )));
-            }
-            let normalized_session_id = format!("{namespace}:{}", session.raw_session_id);
-            let (mut session_records, cursor) = synthesize_session(
-                &session,
-                &normalized_session_id,
-                prior.sessions.get(&session.raw_session_id),
-                MAX_NAC_SYNTHETIC_RECORDS.saturating_sub(records.len()),
+    // Census (issue #601 §3.2): the narrow, `idx_sessions_updated_at`-cheap
+    // read that identifies every session without materializing payloads. It
+    // is the exact deletion detector and the newest-first ordering source;
+    // nothing is ever *skipped* on its say-so alone.
+    let census = {
+        let mut census = Vec::<(String, String)>::new();
+        let mut last_session_id = String::new();
+        loop {
+            let mut stmt = connection.prepare_cached(
+                "SELECT session_id, updated_at FROM sessions \
+                 WHERE session_id > ?1 ORDER BY session_id LIMIT ?2",
             )?;
-            records.append(&mut session_records);
-            next_state
-                .sessions
-                .insert(session.raw_session_id.clone(), cursor);
-            last_session_id = session.raw_session_id.clone();
-            contexts.insert(session.raw_session_id.clone(), session);
-            enforce_record_limit(records.len())?;
+            let mut rows = stmt.query(params![&last_session_id, SCAN_PAGE_SIZE as i64])?;
+            let mut page_rows = 0usize;
+            while let Some(row) = rows.next()? {
+                let session_id: String = row.get(0)?;
+                let updated_at: String = row.get::<_, Option<String>>(1)?.unwrap_or_default();
+                ledger.charge_census_row(session_id.len() + updated_at.len());
+                page_rows += 1;
+                last_session_id = session_id.clone();
+                census.push((session_id, updated_at));
+            }
+            if page_rows < SCAN_PAGE_SIZE {
+                break;
+            }
         }
-        if page_rows < SCAN_PAGE_SIZE {
+        census
+    };
+    let census_ids: BTreeSet<String> = census.iter().map(|(id, _)| id.clone()).collect();
+    let relevant_sessions = census.len() as u64;
+
+    // Candidate read: never-read sessions first, then newest-first by
+    // `updated_at` within each class (§2.3): a heuristic ordering — the
+    // schema has no trigger guaranteeing it (§1.3) — so it chooses priority
+    // only. Never-read-first is what makes a budget-degraded ingest converge
+    // (see the Cursor twin in `scan_database`): a plain recency order
+    // re-reads the same newest sessions on every poll and a store larger
+    // than one budget keeps its cold tail forever. The tie-break on
+    // session_id keeps the order deterministic.
+    let mut candidates = census;
+    candidates.sort_by(|a, b| {
+        let known_a = prior.sessions.contains_key(&a.0);
+        let known_b = prior.sessions.contains_key(&b.0);
+        known_a
+            .cmp(&known_b)
+            .then_with(|| b.1.cmp(&a.1))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    let mut point_read = connection.prepare_cached(&format!(
+        "SELECT {projection} FROM sessions WHERE session_id = ?1"
+    ))?;
+    for idx in 0..candidates.len() {
+        let over_budget = budget.is_exhausted_by(ledger.payload_rows, ledger.payload_bytes);
+        let over_records = records.len() >= MAX_NAC_SYNTHETIC_RECORDS;
+        if over_budget || over_records {
+            // Commit what was read (§2.1/§2.3): every skipped session keeps
+            // its prior cursor — "unread this poll", never "deleted" — and a
+            // skipped new session stays absent so a later poll detects it.
+            let remaining = &candidates[idx..];
+            ledger.mark_degraded(remaining.len() as u64, 0);
+            for (session_id, _) in remaining {
+                if let Some(cursor) = prior.sessions.get(session_id) {
+                    next_state
+                        .sessions
+                        .insert(session_id.clone(), cursor.clone());
+                }
+            }
             break;
         }
+        let session_id = &candidates[idx].0;
+        let session = {
+            let mut rows = point_read.query(params![session_id])?;
+            let Some(row) = rows.next()? else {
+                // Vanished between census and read: a mid-scan commit the
+                // data_version bracket rejects.
+                continue;
+            };
+            match read_session_row(row, &schema.session_columns, ledger)? {
+                NacSessionRead::Row(session) => *session,
+                NacSessionRead::Oversized { estimated_bytes } => {
+                    // An un-processable single row (§2.3): report it once,
+                    // mark it in the cursor so the report does not repeat
+                    // every poll, and keep scanning. A shrunk row hashes
+                    // differently from the marker and re-emits normally.
+                    let marker = NacSessionCursor {
+                        metadata_hash: format!("{OVERSIZED_SESSION_MARKER}:{estimated_bytes}"),
+                        created_at: String::new(),
+                        part_hashes: BTreeMap::new(),
+                    };
+                    if prior.sessions.get(session_id) != Some(&marker) {
+                        row_errors.push(NacRowError {
+                            source_line_no: 0,
+                            error_kind: ERROR_KIND_ROW_TOO_LARGE,
+                            error_text: format!(
+                                "NAC session {session_id} is {estimated_bytes} bytes, exceeding \
+                                 the {SCAN_PAGE_MAX_BYTES} byte row ceiling; row skipped"
+                            ),
+                        });
+                    }
+                    next_state.sessions.insert(session_id.clone(), marker);
+                    continue;
+                }
+            }
+        };
+        let normalized_session_id = format!("{namespace}:{}", session.raw_session_id);
+        let (mut session_records, cursor, parts_truncated) = synthesize_session(
+            &session,
+            &normalized_session_id,
+            prior.sessions.get(&session.raw_session_id),
+            MAX_NAC_SYNTHETIC_RECORDS.saturating_sub(records.len()),
+        )?;
+        if parts_truncated {
+            ledger.mark_degraded(0, 0);
+        }
+        records.append(&mut session_records);
+        next_state
+            .sessions
+            .insert(session.raw_session_id.clone(), cursor);
+        contexts.insert(session.raw_session_id.clone(), session);
     }
+    drop(point_read);
 
+    // Prune worker threads against the census keyset — the complete session
+    // id set — never against the per-poll `contexts` map, which a budget-
+    // bounded read leaves partial (issue #601 §3.2: the prune bug that
+    // resurrected pruned worker rows becomes a deletion bug under budgets).
     next_state.worker_threads.retain(|key| {
         key.split_once('\n')
-            .map(|(session_id, _)| contexts.contains_key(session_id))
+            .map(|(session_id, _)| census_ids.contains(session_id))
             .unwrap_or(false)
     });
+
     let max_episode_id: i64 =
         connection.query_row("SELECT coalesce(max(id), 0) FROM episodes", [], |row| {
             row.get(0)
@@ -874,6 +1046,7 @@ fn scan_nac_rows(
         prior.episode_high_water
     };
     let mut last_episode_id = scan_from;
+    let mut episodes_processed = 0u64;
     let episode_bytes = "length(CAST(COALESCE(thread_name, '') AS BLOB)) + \
         length(CAST(COALESCE(session_id, '') AS BLOB)) + \
         length(CAST(COALESCE(action, '') AS BLOB)) + \
@@ -893,27 +1066,64 @@ fn scan_nac_rows(
         guarded_episode("content"),
         guarded_episode("created_at")
     );
-    loop {
+    'episodes: loop {
         let mut stmt = connection.prepare_cached(&episode_sql)?;
         let mut rows = stmt.query(params![last_episode_id, SCAN_PAGE_SIZE as i64])?;
         let mut page_rows = 0usize;
         while let Some(row) = rows.next()? {
+            // The episode watermark is an exact, durable resume position, so
+            // bounded progress here is oldest-first *of the new tail* with
+            // `episode_high_water` as the committed cursor — not newest-first,
+            // which would tear a hole in the watermark (§2.3's newest-first
+            // rule exists for orderings without a resume position). At least
+            // one episode is processed per poll, so a backlog can never stall.
+            let over_budget = budget.is_exhausted_by(ledger.payload_rows, ledger.payload_bytes);
+            let over_records = records.len() >= MAX_NAC_SYNTHETIC_RECORDS;
+            if episodes_processed > 0 && (over_budget || over_records) {
+                // The row `rows.next()` just handed over was materialized —
+                // the projection includes `content`, so SQLite decoded it
+                // before the budget was consulted — and the ledger's headline
+                // rule charges at the point bytes leave SQLite (the oversize
+                // arm below makes the same call). One row per bound poll, on
+                // the rows axis only: its columns are never taken, so no
+                // bytes are charged. It still counts inside `remaining` — the
+                // watermark did not advance past it, so it is coverage debt
+                // and the next poll materializes it again. Cost and debt are
+                // different axes; one row on both is the honest ledger.
+                ledger.charge_payload_row();
+                let remaining =
+                    u64::try_from(max_episode_id.saturating_sub(last_episode_id)).unwrap_or(0);
+                ledger.mark_degraded(remaining, 0);
+                break 'episodes;
+            }
             // This projection includes `content`, so the whole episode row is
             // charged on the payload axis where SQLite hands it over. The row
-            // charge lands **before** the oversize check, matching
-            // `read_session_row`: SQLite had already decoded every column to
-            // evaluate `estimated_bytes`, so a ceiling arm reporting zero rows
-            // would contradict the ledger's headline guarantee. Bytes are
-            // still not charged from `estimated_bytes` — the guarded
-            // projection hands Rust NULL for an oversized row, and the ledger
-            // reports what was materialized, not what SQLite touched.
+            // charge lands **before** the oversize check: SQLite had already
+            // decoded every column to evaluate `estimated_bytes`, so a skip
+            // arm reporting zero rows would contradict the ledger's headline
+            // guarantee. Bytes are still not charged from `estimated_bytes` —
+            // the guarded projection hands Rust NULL for an oversized row, and
+            // the ledger reports what was materialized.
             let id: i64 = row.get(0)?;
             ledger.charge_payload_row();
+            page_rows += 1;
             let row_bytes = checked_row_bytes(row.get(6)?, "NAC episode", id)?;
             if row_bytes > SCAN_PAGE_MAX_BYTES {
-                return Err(NacScanError::TooLarge(format!(
-                    "NAC episode {id} is {row_bytes} bytes, exceeding the {SCAN_PAGE_MAX_BYTES} byte row ceiling"
-                )));
+                // Un-processable single row (§2.3): one error row, skip it,
+                // advance the watermark past it. The watermark makes the
+                // report one-shot — this episode is never read again.
+                row_errors.push(NacRowError {
+                    source_line_no: id as u64,
+                    error_kind: ERROR_KIND_ROW_TOO_LARGE,
+                    error_text: format!(
+                        "NAC episode {id} is {row_bytes} bytes, exceeding the \
+                         {SCAN_PAGE_MAX_BYTES} byte row ceiling; row skipped"
+                    ),
+                });
+                last_episode_id = id;
+                next_state.episode_high_water = id;
+                episodes_processed += 1;
+                continue;
             }
             // Every one of these is NOT NULL in the live `episodes` schema and
             // load-bearing downstream (thread/session identity, the action tag
@@ -924,25 +1134,41 @@ fn scan_nac_rows(
             let action = take_payload_required_string(ledger, row, 3)?;
             let content = take_payload_required_string(ledger, row, 4)?;
             let created_at_raw = take_payload_required_string(ledger, row, 5)?;
-            page_rows += 1;
-            total_rows = total_rows.saturating_add(1);
-            if total_rows > MAX_NAC_SESSIONS.saturating_add(MAX_NAC_EPISODES) {
-                return Err(NacScanError::TooLarge(format!(
-                    "NAC session and episode rows exceed the {} row ceiling",
-                    MAX_NAC_SESSIONS + MAX_NAC_EPISODES
-                )));
+            // Resolve the parent on demand (issue #601 §3.2): a budget-
+            // bounded session read makes "not in `contexts`" ordinary, and a
+            // point lookup is ~free (§1.3). Only a session absent from the
+            // *database* is an orphan — reported once and advanced past,
+            // because the live schema's FK points at `threads`, not
+            // `sessions`, so this is reachable in production and must never
+            // latch the adapter.
+            if !contexts.contains_key(&raw_session_id) {
+                let mut lookup = connection.prepare_cached(&format!(
+                    "SELECT {projection} FROM sessions WHERE session_id = ?1"
+                ))?;
+                let mut lookup_rows = lookup.query(params![&raw_session_id])?;
+                if let Some(session_row) = lookup_rows.next()? {
+                    match read_session_row(session_row, &schema.session_columns, ledger)? {
+                        NacSessionRead::Row(session) => {
+                            contexts.insert(raw_session_id.clone(), *session);
+                        }
+                        NacSessionRead::Oversized { .. } => {}
+                    }
+                }
             }
-            total_bytes = total_bytes.saturating_add(row_bytes as u64);
-            if total_bytes > MAX_NAC_SCAN_BYTES {
-                return Err(NacScanError::TooLarge(format!(
-                    "NAC scan bytes exceed the {MAX_NAC_SCAN_BYTES} byte ceiling"
-                )));
-            }
-            let parent = contexts.get(&raw_session_id).ok_or_else(|| {
-                NacScanError::Scan(anyhow::anyhow!(
-                    "episode {id} references missing session {raw_session_id}"
-                ))
-            })?;
+            let Some(parent) = contexts.get(&raw_session_id) else {
+                row_errors.push(NacRowError {
+                    source_line_no: id as u64,
+                    error_kind: ERROR_KIND_ORPHAN_EPISODE,
+                    error_text: format!(
+                        "episode {id} references missing session {raw_session_id}; \
+                         episode skipped"
+                    ),
+                });
+                last_episode_id = id;
+                next_state.episode_high_water = id;
+                episodes_processed += 1;
+                continue;
+            };
             let parent_id = format!("{namespace}:{raw_session_id}");
             let worker_id = format!(
                 "{parent_id}:nac-worker:{}",
@@ -985,15 +1211,26 @@ fn scan_nac_rows(
             ));
             last_episode_id = id;
             next_state.episode_high_water = id;
-            enforce_record_limit(records.len())?;
+            episodes_processed += 1;
         }
         if page_rows < SCAN_PAGE_SIZE {
             break;
         }
     }
 
+    // §2.3's persisted resume marker: a censused session absent from the
+    // carried cursor set has never been read in this generation, and an
+    // episode watermark short of `max(episodes.id)` is an unread episode
+    // tail. Either keeps the cheap stat short-circuit open (see the conjunct
+    // in `process_nac_sqlite_db`) until a scan covers everything.
+    next_state.pending_coverage = next_state.episode_high_water < max_episode_id
+        || census_ids
+            .iter()
+            .any(|id| !next_state.sessions.contains_key(id));
+
     ledger.rows_emitted = records.len() as u64;
-    Ok((records, next_state, total_rows))
+    let relevant_rows = relevant_sessions.saturating_add(episodes_processed);
+    Ok((records, next_state, relevant_rows, row_errors))
 }
 
 fn session_projection(columns: &BTreeSet<String>) -> String {
@@ -1075,13 +1312,14 @@ fn read_session_row(
     row: &rusqlite::Row<'_>,
     columns: &BTreeSet<String>,
     ledger: &mut ScanLedger,
-) -> std::result::Result<NacSessionRow, NacScanError> {
+) -> std::result::Result<NacSessionRead, NacScanError> {
     ledger.charge_payload_row();
     let estimated_bytes = checked_row_bytes(row.get(15)?, "NAC session row", 0)?;
     if estimated_bytes > SCAN_PAGE_MAX_BYTES {
-        return Err(NacScanError::TooLarge(format!(
-            "NAC session row is {estimated_bytes} bytes, exceeding the {SCAN_PAGE_MAX_BYTES} byte row ceiling"
-        )));
+        // The guarded projection already NULLed every column, so nothing was
+        // materialized beyond the row itself; the caller skips-and-reports
+        // per §2.3 instead of failing the scan.
+        return Ok(NacSessionRead::Oversized { estimated_bytes });
     }
     // NOT NULL in the live `sessions` schema; a NULL is schema drift and must
     // fail the scan. `session_id` and `created_at`/`updated_at` below feed
@@ -1117,7 +1355,7 @@ fn read_session_row(
             "NAC messages_json must contain an array"
         )));
     }
-    Ok(NacSessionRow {
+    Ok(NacSessionRead::Row(Box::new(NacSessionRow {
         raw_session_id,
         cwd,
         cwd_scope: if !columns.contains("host_id") {
@@ -1147,12 +1385,16 @@ fn read_session_row(
         )?,
         created_at,
         updated_at,
-        estimated_bytes,
-    })
+    })))
 }
 
-fn estimated_session_bytes(session: &NacSessionRow) -> usize {
-    session.estimated_bytes
+/// What one session point read produced: a full row, or the §2.3
+/// un-processable-row marker for a row past the byte ceiling. The row is
+/// boxed so the marker variant is not forced to carry a `NacSessionRow`'s
+/// footprint.
+enum NacSessionRead {
+    Row(Box<NacSessionRow>),
+    Oversized { estimated_bytes: usize },
 }
 
 fn checked_row_bytes(
@@ -1182,35 +1424,36 @@ fn synthesize_session(
     normalized_session_id: &str,
     prior: Option<&NacSessionCursor>,
     record_budget: usize,
-) -> std::result::Result<(Vec<SyntheticRecord>, NacSessionCursor), NacScanError> {
+) -> std::result::Result<(Vec<SyntheticRecord>, NacSessionCursor, bool), NacScanError> {
     let created_at = normalize_nac_timestamp(&session.created_at, true)?;
     let updated_at = normalize_nac_timestamp(&session.updated_at, true)?;
     let metadata = session_metadata_value(session, normalized_session_id, &created_at, &updated_at);
     let metadata_hash = value_hash(&metadata);
     let mut records = Vec::new();
+    let mut truncated = false;
     let created_changed = prior
         .map(|cursor| cursor.created_at != created_at)
         .unwrap_or(true);
     if prior.map(|cursor| cursor.metadata_hash.as_str()) != Some(metadata_hash.as_str()) {
         if records.len() >= record_budget {
-            return Err(NacScanError::TooLarge(format!(
-                "NAC synthetic records exceed the {MAX_NAC_SYNTHETIC_RECORDS} record ceiling"
-            )));
+            truncated = true;
+        } else {
+            records.push(SyntheticRecord {
+                record: metadata,
+                project_dir: project_dir_for(session),
+                source_line_no: 0,
+                source_offset: 0,
+            });
         }
-        records.push(SyntheticRecord {
-            record: metadata,
-            project_dir: project_dir_for(session),
-            source_line_no: 0,
-            source_offset: 0,
-        });
     }
 
-    let logical_parts = logical_message_parts(
+    let (logical_parts, parts_truncated) = logical_message_parts(
         session,
         normalized_session_id,
         &created_at,
         record_budget.saturating_sub(records.len()),
     )?;
+    truncated = truncated || parts_truncated;
     let mut part_hashes = BTreeMap::new();
     for (logical_id, record, line, offset) in logical_parts {
         let hash = value_hash(&record);
@@ -1236,6 +1479,7 @@ fn synthesize_session(
             created_at,
             part_hashes,
         },
+        truncated,
     ))
 }
 
@@ -1277,26 +1521,34 @@ struct ToolRequestContext {
     source_offset: u64,
 }
 
+/// Push one part unless the per-session budget is spent; returns `false` when
+/// the budget bound. A bound is bounded progress, not a failure (issue #601
+/// §2.3): the caller keeps the prefix it built, reports `coverage_degraded`,
+/// and the un-built suffix stays undetected until the budget allows it —
+/// which is degraded coverage, never an unbounded vector and never a latch.
 fn push_logical_part(
     parts: &mut Vec<(String, Value, u64, u64)>,
     part: (String, Value, u64, u64),
     record_budget: usize,
-) -> std::result::Result<(), NacScanError> {
+) -> bool {
     if parts.len() >= record_budget {
-        return Err(NacScanError::TooLarge(format!(
-            "NAC synthetic records exceed the {MAX_NAC_SYNTHETIC_RECORDS} record ceiling"
-        )));
+        return false;
     }
     parts.push(part);
-    Ok(())
+    true
 }
+
+/// The built parts of one session — `(logical_id, record, source_line_no,
+/// source_offset)` each — plus whether the record budget truncated the list
+/// (§2.3: truncation is reported, never silent).
+type LogicalParts = (Vec<(String, Value, u64, u64)>, bool);
 
 fn logical_message_parts(
     session: &NacSessionRow,
     normalized_session_id: &str,
     timestamp: &str,
     record_budget: usize,
-) -> std::result::Result<Vec<(String, Value, u64, u64)>, NacScanError> {
+) -> std::result::Result<LogicalParts, NacScanError> {
     let messages = session
         .messages
         .as_array()
@@ -1362,11 +1614,13 @@ fn logical_message_parts(
                 if let Some(details) = object.get("reasoning_details") {
                     record.insert("reasoning_details".to_string(), bounded_json(details));
                 }
-                push_logical_part(
+                if !push_logical_part(
                     &mut parts,
                     (logical_id, Value::Object(record), 0, offset),
                     record_budget,
-                )?;
+                ) {
+                    return Ok((parts, true));
+                }
             }
         }
 
@@ -1394,11 +1648,13 @@ fn logical_message_parts(
                         }
                     }
                 }
-                push_logical_part(
+                if !push_logical_part(
                     &mut parts,
                     (logical_id, Value::Object(record), 1, offset),
                     record_budget,
-                )?;
+                ) {
+                    return Ok((parts, true));
+                }
             }
         }
 
@@ -1436,11 +1692,13 @@ fn logical_message_parts(
                             source_offset: offset,
                         },
                     );
-                    push_logical_part(
+                    if !push_logical_part(
                         &mut parts,
                         (logical_id, Value::Object(record), source_line_no, offset),
                         record_budget,
-                    )?;
+                    ) {
+                        return Ok((parts, true));
+                    }
                 }
             }
         } else if role == "tool" {
@@ -1488,14 +1746,16 @@ fn logical_message_parts(
                     .and_then(Value::as_bool)
                     .unwrap_or(false)),
             );
-            push_logical_part(
+            if !push_logical_part(
                 &mut parts,
                 (logical_id, Value::Object(record), 3, offset),
                 record_budget,
-            )?;
+            ) {
+                return Ok((parts, true));
+            }
         }
     }
-    Ok(parts)
+    Ok((parts, false))
 }
 
 fn completed_terminal_indices(messages: &[Value]) -> Vec<usize> {
@@ -1729,16 +1989,6 @@ fn project_dir_for(session: &NacSessionRow) -> String {
         session.cwd.clone()
     } else {
         String::new()
-    }
-}
-
-fn enforce_record_limit(records: usize) -> std::result::Result<(), NacScanError> {
-    if records > MAX_NAC_SYNTHETIC_RECORDS {
-        Err(NacScanError::TooLarge(format!(
-            "{records} NAC logical records exceed the {MAX_NAC_SYNTHETIC_RECORDS} record ceiling"
-        )))
-    } else {
-        Ok(())
     }
 }
 
@@ -2263,9 +2513,7 @@ mod tests {
             let error = outcome
                 .err()
                 .unwrap_or_else(|| panic!("a NULL {name} must fail the scan, not become \"\""));
-            let NacScanError::Scan(error) = error else {
-                panic!("a NULL {name} is schema drift, not an oversized row");
-            };
+            let NacScanError::Scan(error) = error;
             assert!(
                 format!("{error:#}").contains("Invalid column type"),
                 "a NULL {name} must surface as a column-type error; got {error:#}"
@@ -2330,6 +2578,8 @@ mod tests {
             inode,
             stat,
             &NacState::default(),
+            &default_nac_budget(),
+            MAX_NAC_CHECKPOINT_BYTES,
             &mut ledger,
         );
         match outcome {
@@ -2376,6 +2626,12 @@ mod tests {
         path
     }
 
+    /// The shipped-default fast-path budget: what a production poll runs
+    /// with when nothing in `[ingest.sqlite]` is overridden.
+    fn default_nac_budget() -> ScanBudget {
+        ScanBudget::fast_path(&moraine_config::SqliteIngestConfig::default())
+    }
+
     fn scan_fixture(path: &Path, prior: &NacState) -> (Vec<SyntheticRecord>, NacState, u64) {
         let (records, state, relevant_rows, _) = scan_fixture_with_ledger(path, prior);
         (records, state, relevant_rows)
@@ -2397,6 +2653,8 @@ mod tests {
             inode,
             stat,
             prior,
+            &default_nac_budget(),
+            MAX_NAC_CHECKPOINT_BYTES,
             &mut ledger,
         ) {
             NacScanOutcome::Scanned {
@@ -2429,7 +2687,6 @@ mod tests {
             token_usages: json!([]),
             created_at: "2026-07-18 12:00:00.000000000".to_string(),
             updated_at: "2026-07-18 12:00:00.000000000".to_string(),
-            estimated_bytes: 0,
         }
     }
 
@@ -2478,6 +2735,8 @@ mod tests {
             inode,
             stat,
             &NacState::default(),
+            &default_nac_budget(),
+            MAX_NAC_CHECKPOINT_BYTES,
             &mut ledger,
         );
         let NacScanOutcome::Failed { error_kind, .. } = outcome else {
@@ -2499,18 +2758,21 @@ mod tests {
         std::fs::remove_file(format!("{}-shm", path.display())).ok();
     }
 
-    /// Issue #601 §2.0, the episode arm. `read_session_row` charges its row
-    /// *before* the oversize check; the episode loop charged it *after*, so the
-    /// `TooLarge` arm reported zero rows and zero bytes for a row SQLite had
-    /// already fully decoded to compute `estimated_bytes` — contradicting the
-    /// headline guarantee on the very ceiling the ledger is meant to denominate.
+    /// Issue #601 §2.0 + §2.3, the episode arm. The row charge lands *before*
+    /// the oversize check — SQLite fully decoded the row to evaluate
+    /// `estimated_bytes` — and the oversized row itself is an un-processable
+    /// single row: one `ingest_errors` row, skipped, watermark advanced past
+    /// it. This REWRITES the old `TooLarge` latch assertions: the scan used to
+    /// fail outright, which stalled `episode_high_water` forever on one bad
+    /// row — the latch class §2.3 retires.
     ///
     /// **[DIVERGENT FIXTURE]** the oversized episode is not the first row read,
     /// so the byte axis is non-zero for reasons independent of the row charge,
     /// and the two axes stay distinguishable.
     ///
     /// Fails for: moving the episode `charge_payload_row` back below the
-    /// ceiling check.
+    /// oversize check, restoring the `TooLarge` failure, or a skip that does
+    /// not advance the watermark.
     #[test]
     fn an_oversized_episode_still_charges_the_row_it_decoded() {
         let path = fixture_db();
@@ -2538,14 +2800,33 @@ mod tests {
             inode,
             stat,
             &NacState::default(),
+            &default_nac_budget(),
+            MAX_NAC_CHECKPOINT_BYTES,
             &mut ledger,
         );
-        let NacScanOutcome::Failed { error_kind, .. } = outcome else {
-            panic!("an episode past the row ceiling must fail the scan");
+        let NacScanOutcome::Scanned {
+            state, row_errors, ..
+        } = outcome
+        else {
+            panic!("an oversized episode degrades per §2.3; it must not fail the scan");
         };
-        assert_eq!(error_kind, ERROR_KIND_TOO_LARGE);
+        assert_eq!(row_errors.len(), 1, "one error row for the skipped episode");
+        assert_eq!(
+            row_errors[0].error_kind,
+            super::super::ERROR_KIND_ROW_TOO_LARGE
+        );
+        let max_episode_id: i64 = {
+            let connection = Connection::open(&path).expect("reopen fixture for counting");
+            connection
+                .query_row("SELECT max(id) FROM episodes", [], |row| row.get(0))
+                .expect("max episode id")
+        };
+        assert_eq!(
+            state.episode_high_water, max_episode_id,
+            "the watermark advances past the skipped row, so the report is one-shot"
+        );
 
-        // Every session, every earlier episode, **and** the rejected episode.
+        // Every session, every earlier episode, **and** the skipped episode.
         let expected_rows = {
             let connection = Connection::open(&path).expect("reopen fixture for counting");
             let sessions: i64 = connection
@@ -2558,8 +2839,8 @@ mod tests {
         };
         assert_eq!(
             ledger.payload_rows, expected_rows,
-            "the rejected episode was decoded in full to evaluate its size, so \
-             the ceiling arm must charge it like any other row"
+            "the skipped episode was decoded in full to evaluate its size, so \
+             the skip arm must charge it like any other row"
         );
         assert!(
             ledger.payload_bytes > 0,
@@ -2612,17 +2893,35 @@ mod tests {
              columns; got {} against {messages_bytes} of messages alone",
             ledger.payload_bytes
         );
-        // Schema validation is the only charged census read today; §3.2's
-        // `updated_at` fast path adds NAC's own. The payload read must not be
-        // miscounted as one.
+        // The census axis carries schema validation plus the §3.2 session
+        // census: one narrow `(session_id, updated_at)` row per session. The
+        // payload read must not be miscounted as census, or every payload
+        // budget deflates.
+        let census_key_bytes: i64 = {
+            let connection = Connection::open(&path).expect("reopen for census bytes");
+            connection
+                .query_row(
+                    "SELECT coalesce(sum(length(CAST(session_id AS BLOB)) +                      length(CAST(coalesce(updated_at, '') AS BLOB))), 0) FROM sessions",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("sum census bytes")
+        };
         let schema_census = {
             let connection =
                 super::open_read_only(&path.to_string_lossy()).expect("reopen for schema census");
             crate::sqlite_poll::expected_schema_census(&connection, &["sessions", "episodes"])
         };
         assert!(schema_census.census_rows > 0);
-        assert_eq!(ledger.census_rows, schema_census.census_rows);
-        assert_eq!(ledger.census_bytes, schema_census.census_bytes);
+        assert_eq!(
+            ledger.census_rows,
+            schema_census.census_rows + sessions as u64,
+            "census rows are schema validation plus one narrow row per session"
+        );
+        assert_eq!(
+            ledger.census_bytes,
+            schema_census.census_bytes + census_key_bytes as u64
+        );
 
         let (second_records, second_state, _, second) = scan_fixture_with_ledger(&path, &state);
         assert!(
@@ -2683,6 +2982,7 @@ mod tests {
             10,
         )
         .expect("synthesize original parts")
+        .0
         .into_iter()
         .map(|(id, _, line, offset)| (id, (line, offset)))
         .collect::<BTreeMap<_, _>>();
@@ -2693,6 +2993,7 @@ mod tests {
             10,
         )
         .expect("synthesize updated parts")
+        .0
         .into_iter()
         .map(|(id, _, line, offset)| (id, (line, offset)))
         .collect::<BTreeMap<_, _>>();
@@ -2701,22 +3002,579 @@ mod tests {
         }
     }
 
+    /// Issue #601 §2.3. REWRITES `logical_part_budget_fails_before_building_
+    /// an_unbounded_vector`, whose `TooLarge` failure latched the whole scan
+    /// on one over-budget session. The budget still bounds the vector — that
+    /// was the old test's live property and it is kept — but overflow now
+    /// truncates: the built prefix is committed and the truncation is
+    /// reported, so the session degrades instead of stopping the adapter.
     #[test]
-    fn logical_part_budget_fails_before_building_an_unbounded_vector() {
+    fn a_logical_part_budget_truncates_the_parts_instead_of_failing() {
         let session = session_with_messages(json!([{
             "role": "assistant",
             "reasoning_text": "reasoning",
             "content": "answer"
         }]));
-        assert!(matches!(
-            logical_message_parts(
-                &session,
-                "nac:stable-session",
-                "2026-07-18T12:00:00.000000000Z",
-                1,
-            ),
-            Err(NacScanError::TooLarge(_))
-        ));
+        let (parts, truncated) = logical_message_parts(
+            &session,
+            "nac:stable-session",
+            "2026-07-18T12:00:00.000000000Z",
+            1,
+        )
+        .expect("an over-budget session truncates, it does not fail");
+        assert_eq!(parts.len(), 1, "the budget still bounds the vector");
+        assert!(truncated, "and the truncation is reported, not silent");
+
+        let (all_parts, untruncated) = logical_message_parts(
+            &session,
+            "nac:stable-session",
+            "2026-07-18T12:00:00.000000000Z",
+            usize::MAX,
+        )
+        .expect("an unbounded budget builds every part");
+        assert!(all_parts.len() > 1);
+        assert!(!untruncated);
+    }
+
+    /// `scan_fixture_with_ledger`, parameterized: the budget/ceiling tests
+    /// inject their `[ingest.sqlite]` values here, exactly as an operator's
+    /// config would arrive through `process_nac_sqlite_db`.
+    #[allow(clippy::type_complexity)]
+    fn scan_fixture_with_budget(
+        path: &Path,
+        prior: &NacState,
+        budget: &ScanBudget,
+        checkpoint_ceiling_bytes: usize,
+    ) -> (Vec<SyntheticRecord>, NacState, Vec<NacRowError>, ScanLedger) {
+        let stat = stat_fingerprint(path.to_str().expect("UTF-8 fixture path"))
+            .expect("fixture stat fingerprint");
+        let metadata = std::fs::metadata(path).expect("fixture metadata");
+        let inode = source_inode_for_file(path.to_str().expect("UTF-8 fixture path"), &metadata);
+        let mut ledger = ScanLedger::default();
+        match scan_nac_database(
+            path.to_str().expect("UTF-8 fixture path"),
+            "nac-fixture",
+            1,
+            inode,
+            stat,
+            prior,
+            budget,
+            checkpoint_ceiling_bytes,
+            &mut ledger,
+        ) {
+            NacScanOutcome::Scanned {
+                records,
+                state,
+                row_errors,
+                ..
+            } => (records, state, row_errors, ledger),
+            NacScanOutcome::Failed {
+                error_kind,
+                error_text,
+            } => panic!("budgeted fixture scan must degrade, not fail: {error_kind}: {error_text}"),
+        }
+    }
+
+    fn cleanup_fixture(path: &Path) {
+        std::fs::remove_file(path).ok();
+        std::fs::remove_file(format!("{}-wal", path.display())).ok();
+        std::fs::remove_file(format!("{}-shm", path.display())).ok();
+    }
+
+    /// Issue #601 §2.3 / gate G4 (NAC work budget — replaces the retired
+    /// `MAX_NAC_SESSIONS` / `MAX_NAC_SCAN_BYTES` ceilings). **[DIVERGENT
+    /// FIXTURE]** (§8 G4): the newest session by `updated_at`
+    /// (`session-remote`) sorts *last* in `session_id` order — the census
+    /// order a broken recency sort would fall back to — so a 1-row budget
+    /// reads it only if newest-first ordering actually works. Episodes are
+    /// watermarked past so the session ordering is observed in isolation.
+    /// Fails for: a budget that fails the scan instead of degrading (the old
+    /// `TooLarge` latch), bounded progress that is not newest-first, and any
+    /// error row minted for history size.
+    ///
+    /// MUTATION (executed 2026-07-31): restore census (`session_id ASC`)
+    /// candidate order by deleting the `sort_by` — fails here (the oldest
+    /// session is read instead). Reverting degradation to a `TooLarge`
+    /// failure fails at the panic in `scan_fixture_with_budget`.
+    #[test]
+    fn a_nac_store_over_budget_still_ingests_the_newest_session_first() {
+        let path = fixture_db();
+        let prior = NacState {
+            episode_high_water: 3,
+            ..NacState::default()
+        };
+        let budget = ScanBudget {
+            max_payload_rows: 1,
+            max_payload_bytes: u64::MAX,
+        };
+        let (records, state, row_errors, ledger) =
+            scan_fixture_with_budget(&path, &prior, &budget, MAX_NAC_CHECKPOINT_BYTES);
+
+        assert!(!records.is_empty(), "the newest session must still emit");
+        let serialized: Vec<String> = records
+            .iter()
+            .map(|record| serde_json::to_string(&record.record).expect("serialize record"))
+            .collect();
+        assert!(
+            serialized.iter().any(|raw| raw.contains("session-remote")),
+            "bounded progress must reach the newest session first"
+        );
+        assert!(
+            !serialized.iter().any(|raw| raw.contains("session-local")),
+            "census-order truncation would emit the oldest session; newest-first must not"
+        );
+        assert!(row_errors.is_empty(), "history size is never an error row");
+        assert!(ledger.coverage_degraded);
+        assert_eq!(
+            ledger.payload_rows, 1,
+            "the read stops exactly at its budget"
+        );
+        assert_eq!(
+            ledger.skipped_rows, 1,
+            "the unread session is accounted for"
+        );
+        assert!(state.sessions.contains_key("session-remote"));
+        assert!(
+            !state.sessions.contains_key("session-local"),
+            "an unread session must stay absent so a later poll detects it"
+        );
+        assert!(state.pending_coverage, "the remainder is a durable debt");
+
+        cleanup_fixture(&path);
+    }
+
+    /// The forward-progress rule of the episode loop, bounded from both
+    /// sides: a poll whose session reads already exhausted the budget still
+    /// processes **exactly one** episode — zero would let a busy session set
+    /// starve the episode watermark forever (the §2.5 latch class), and more
+    /// than one would ignore the budget (the runaway side). The ledger's side
+    /// of the break is pinned too: the row the break leaves unprocessed was
+    /// still materialized (the projection includes `content`), so it is
+    /// charged on the rows axis *and* counted in `skipped_rows` — cost and
+    /// debt are different axes.
+    ///
+    /// MUTATION (executed 2026-07-31): drop `episodes_processed > 0 &&` from
+    /// the episode-loop budget check — fails (high water stays 0). Delete
+    /// the budget break entirely — fails (high water reaches 3). Drop the
+    /// break arm's `charge_payload_row` — fails (`payload_rows` reads 3, not
+    /// 4). Each RED was confirmed in a filtered run, so suite-wide isolation
+    /// is not claimed.
+    #[test]
+    fn an_exhausted_session_budget_still_advances_the_episode_watermark() {
+        let path = fixture_db();
+        let budget = ScanBudget {
+            max_payload_rows: 1,
+            max_payload_bytes: u64::MAX,
+        };
+        let (records, state, row_errors, ledger) = scan_fixture_with_budget(
+            &path,
+            &NacState::default(),
+            &budget,
+            MAX_NAC_CHECKPOINT_BYTES,
+        );
+
+        assert_eq!(
+            state.episode_high_water, 1,
+            "exactly one episode advances per exhausted poll"
+        );
+        assert!(
+            serde_json::to_string(&records.iter().map(|r| &r.record).collect::<Vec<_>>())
+                .expect("serialize records")
+                .contains("worker-a"),
+            "the advanced episode's worker records must emit"
+        );
+        assert!(row_errors.is_empty());
+        assert!(ledger.coverage_degraded);
+        assert_eq!(
+            ledger.skipped_rows, 3,
+            "one unread session and two deferred episodes are accounted for"
+        );
+        assert_eq!(
+            ledger.payload_rows, 4,
+            "one budgeted session read, the processed episode plus its \
+             parent's point lookup, and the episode the break left behind: a \
+             materialized row is charged even when the budget defers it, and \
+             the deferred row also sits inside `skipped_rows` — cost and \
+             debt are different axes"
+        );
+        assert!(state.pending_coverage, "the episode tail is a durable debt");
+
+        cleanup_fixture(&path);
+    }
+
+    /// The **byte** axis of the same budget, at both NAC call sites. The
+    /// rows-axis tests above cannot see a call site that stops feeding the
+    /// byte argument (`is_exhausted_by(ledger.payload_rows, 0)` survives
+    /// them), and the shared-`ScanBudget` boundary test only pins the
+    /// predicate's implementation — this pins NAC's use of it. A 1-byte
+    /// budget binds after the first session *and* after the first episode:
+    /// the same commit/degrade/forward-progress shape as the rows axis.
+    ///
+    /// MUTATION (executed 2026-07-31): pass `0` for the byte argument at the
+    /// session-loop call site — fails (both sessions read). Same at the
+    /// episode-loop call site — fails (every episode read).
+    #[test]
+    fn a_nac_byte_budget_binds_at_both_call_sites() {
+        let path = fixture_db();
+        let budget = ScanBudget {
+            max_payload_rows: u64::MAX,
+            max_payload_bytes: 1,
+        };
+        let (_, state, row_errors, ledger) = scan_fixture_with_budget(
+            &path,
+            &NacState::default(),
+            &budget,
+            MAX_NAC_CHECKPOINT_BYTES,
+        );
+
+        assert_eq!(
+            state.sessions.len(),
+            1,
+            "the byte budget binds after the first session read"
+        );
+        assert!(state.sessions.contains_key("session-remote"));
+        assert_eq!(
+            state.episode_high_water, 1,
+            "one episode still advances, then the byte budget binds"
+        );
+        assert!(ledger.coverage_degraded);
+        assert!(row_errors.is_empty());
+        assert!(state.pending_coverage);
+
+        cleanup_fixture(&path);
+    }
+
+    /// Issue #601 §2.3 / gate G4 (NAC checkpoint-state ceiling): crossing
+    /// `MAX_NAC_CHECKPOINT_BYTES` evicts the **oldest** session cursors until
+    /// the payload fits — never fails the scan — and reports the eviction as
+    /// degraded coverage. Emission happens before eviction, so recent
+    /// sessions still emit; the evicted session is re-covered (and re-emits)
+    /// on a later poll, which §6's content-addressed identity makes safe.
+    ///
+    /// MUTATION (executed 2026-07-31): make `evict_to_fit` a no-op returning
+    /// 0 — fails (the state exceeds its ceiling and nothing is evicted).
+    /// Evict newest-first (`by_age.sort` descending) — fails (the newest
+    /// session is dropped instead of the oldest).
+    #[test]
+    fn a_checkpoint_over_its_ceiling_evicts_the_oldest_sessions_instead_of_failing() {
+        let path = fixture_db();
+        let (_, full_state, _) = scan_fixture(&path, &NacState::default());
+        let full_len = full_state.serialize().expect("serialize full state").len();
+
+        // One byte under the full payload: eviction must fire, and dropping
+        // the single oldest session cursor is enough to fit.
+        let ceiling = full_len - 1;
+        let (records, state, row_errors, ledger) =
+            scan_fixture_with_budget(&path, &NacState::default(), &default_nac_budget(), ceiling);
+
+        assert_eq!(ledger.evicted_entries, 1, "one round of the oldest eighth");
+        assert!(ledger.coverage_degraded);
+        assert!(
+            row_errors.is_empty(),
+            "a state ceiling is never an error row"
+        );
+        assert!(
+            !state.sessions.contains_key("session-local"),
+            "eviction is oldest-first by created_at"
+        );
+        assert!(
+            state.sessions.contains_key("session-remote"),
+            "the newest session's cursor survives"
+        );
+        assert!(
+            state.serialize().expect("serialize evicted state").len() <= ceiling,
+            "the persisted payload must fit its ceiling"
+        );
+        assert!(
+            serde_json::to_string(&records.iter().map(|r| &r.record).collect::<Vec<_>>())
+                .expect("serialize records")
+                .contains("session-local"),
+            "emission precedes eviction: recent work is not withheld"
+        );
+        assert!(
+            state.pending_coverage,
+            "an evicted session is a durable coverage debt"
+        );
+
+        cleanup_fixture(&path);
+    }
+
+    /// §2.3's "continue next poll" for NAC, end to end, with **no further
+    /// writes to the store**: a 1-row budget against two sessions and three
+    /// episodes converges to full coverage across resumed polls — never-read
+    /// sessions first, one episode per poll — then clears the durable marker
+    /// and quiesces on the cheap stat short-circuit.
+    ///
+    /// MUTATION (executed 2026-07-31): drop the `!scan_state.pending_coverage`
+    /// conjunct from the short-circuit — fails at the convergence loop (the
+    /// unchanged stat ends every later poll). Drop the never-read-first
+    /// class from the candidate sort — fails the same way (every poll
+    /// re-reads `session-remote`).
+    #[tokio::test]
+    async fn a_degraded_nac_cold_ingest_completes_without_new_writes() {
+        let path = fixture_db();
+        {
+            // The fixture ships in WAL mode, where the scan's own read-only
+            // open can touch `-shm` and keep the stat moving. Pin DELETE
+            // journal mode so "no further writes" really means an unchanged
+            // stat — otherwise sidecar churn, not the durable resume marker,
+            // would keep the polls alive and this test could not fail.
+            let connection = Connection::open(&path).expect("open fixture for journal change");
+            connection
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+                .expect("checkpoint fixture WAL");
+            connection
+                .query_row("PRAGMA journal_mode = DELETE", [], |_| Ok(()))
+                .expect("switch fixture to DELETE journal mode");
+        }
+        let source_file = path.to_string_lossy().to_string();
+        let work = WorkItem {
+            source_name: "nac-cold-converges".to_string(),
+            harness: "nac".to_string(),
+            format: moraine_config::SourceFormat::NacSqlite,
+            source_glob: source_file.clone(),
+            path: source_file.clone(),
+            trigger: WorkTrigger::Watcher,
+        };
+        let cp_key = checkpoint_key(&work.source_name, &work.path);
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let poll_state = VolatilePollMap::new();
+        let metrics = Arc::new(Metrics::default());
+        let mut config = AppConfig::default();
+        config.ingest.sqlite.fast_path_max_payload_rows = 1;
+
+        let (first, _) =
+            drive_nac_poll_with_metrics(&config, &work, &checkpoints, &poll_state, &metrics).await;
+        let error_rows: usize = first.iter().map(|batch| batch.error_rows.len()).sum();
+        assert_eq!(error_rows, 0, "a work budget is never an error");
+        {
+            let map = checkpoints.read().await;
+            let checkpoint = map.get(&cp_key).expect("cold poll persists");
+            assert_eq!(checkpoint.status, "active");
+            assert!(
+                checkpoint.cursor_json.contains("pending_coverage"),
+                "the resume marker must be durable"
+            );
+        }
+
+        // No touches: convergence must come from the marker alone.
+        let mut polls = 1;
+        loop {
+            drive_nac_poll_with_metrics(&config, &work, &checkpoints, &poll_state, &metrics).await;
+            polls += 1;
+            let map = checkpoints.read().await;
+            let state = NacState::parse(&map.get(&cp_key).expect("checkpoint").cursor_json);
+            if !state.pending_coverage {
+                assert_eq!(state.sessions.len(), 2, "every session covered");
+                assert_eq!(state.episode_high_water, 3, "every episode covered");
+                break;
+            }
+            assert!(
+                polls <= 8,
+                "a 1-row budget against 2 sessions and 3 episodes must converge; \
+                 still pending after {polls} polls"
+            );
+        }
+
+        // Quiesce: coverage complete, stat unchanged — the next poll must
+        // not scan.
+        let rows_before = metrics
+            .sqlite_poll_payload_rows_total
+            .load(std::sync::atomic::Ordering::Relaxed);
+        drive_nac_poll_with_metrics(&config, &work, &checkpoints, &poll_state, &metrics).await;
+        assert_eq!(
+            metrics
+                .sqlite_poll_payload_rows_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            rows_before,
+            "a covered, unchanged store must short-circuit"
+        );
+
+        cleanup_fixture(&path);
+    }
+
+    /// The NAC twin of `a_replacement_replay_reads_past_the_fast_path_budget`:
+    /// a replacement replay ignores the fast-path budget, because its
+    /// finalize publishes the generation whole and a degraded replay would
+    /// publish a hole through #602.
+    ///
+    /// MUTATION (executed 2026-07-31): make `process_nac_sqlite_db` pass the
+    /// fast-path budget on replays too — this test fails (one session and
+    /// one episode covered); RED was confirmed in a filtered run,
+    /// so suite-wide isolation is not claimed.
+    #[tokio::test]
+    async fn a_nac_replacement_replay_reads_past_the_fast_path_budget() {
+        let path = fixture_db();
+        let source_file = path.to_string_lossy().to_string();
+        let work = WorkItem {
+            source_name: "nac-replay-unbudgeted".to_string(),
+            harness: "nac".to_string(),
+            format: moraine_config::SourceFormat::NacSqlite,
+            source_glob: source_file.clone(),
+            path: source_file.clone(),
+            trigger: WorkTrigger::Watcher,
+        };
+        let cp_key = checkpoint_key(&work.source_name, &work.path);
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let poll_state = VolatilePollMap::new();
+        let mut config = AppConfig::default();
+        config.ingest.sqlite.fast_path_max_payload_rows = 1;
+
+        drive_nac_poll(&config, &work, &checkpoints, &poll_state).await;
+
+        // A changed exclusion set starts a replacement replay under the same
+        // tight budget; the replay must ignore it.
+        let mut replaying = config.clone();
+        replaying.ingest.exclude_project_dirs = vec!["/no/such/dir/**".to_string()];
+        let (_, transitions) = drive_nac_poll(&replaying, &work, &checkpoints, &poll_state).await;
+        assert_eq!(transitions.len(), 2, "begin and final replay barriers");
+
+        let map = checkpoints.read().await;
+        let checkpoint = map.get(&cp_key).expect("finalized replay checkpoint");
+        let state = NacState::parse(&checkpoint.cursor_json);
+        assert_eq!(
+            state.sessions.len(),
+            2,
+            "the replay must cover every session, budget notwithstanding"
+        );
+        assert_eq!(state.episode_high_water, 3);
+        assert!(!state.pending_coverage, "a finalized replay owes nothing");
+        assert_eq!(checkpoint.status, "active");
+
+        cleanup_fixture(&path);
+    }
+
+    /// Plan §7.2 F2, the widening direction, at the NAC call site: an
+    /// `error`-status checkpoint with no block reason is an ordinary
+    /// transient failure marker. Widening `retry_blocked_replay` to a bare
+    /// `status == "error"` turns the next poll into a blocked-replacement
+    /// retry — cursor reset, full re-read, every unchanged row re-emitted
+    /// behind a fresh `BeginReplay`. The unchanged fixture emits nothing on
+    /// the correct path, so any re-emission or barrier fails this test.
+    ///
+    /// MUTATION (executed 2026-07-31): drop
+    /// `&& !checkpoint.block_reason.is_empty()` from NAC's
+    /// `retry_blocked_replay` — this test fails (rows re-emit behind a
+    /// barrier); RED was confirmed in a filtered run,
+    /// so suite-wide isolation is not claimed.
+    #[tokio::test]
+    async fn an_error_marker_without_a_block_reason_is_not_retried_as_a_blocked_nac_replay() {
+        let path = fixture_db();
+        let source_file = path.to_string_lossy().to_string();
+        let work = WorkItem {
+            source_name: "nac-error-marker-width".to_string(),
+            harness: "nac".to_string(),
+            format: moraine_config::SourceFormat::NacSqlite,
+            source_glob: source_file.clone(),
+            path: source_file.clone(),
+            trigger: WorkTrigger::Watcher,
+        };
+        let cp_key = checkpoint_key(&work.source_name, &work.path);
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let poll_state = VolatilePollMap::new();
+        let config = AppConfig::default();
+
+        let (first, _) = drive_nac_poll(&config, &work, &checkpoints, &poll_state).await;
+        assert!(!first.last().expect("cold batch").raw_rows.is_empty());
+
+        // Rewrite the committed checkpoint into a transient-error marker:
+        // the shape the non-replay failure arm persists.
+        {
+            let mut map = checkpoints.write().await;
+            let checkpoint = map.get_mut(&cp_key).expect("committed checkpoint");
+            checkpoint.status = "error".to_string();
+            checkpoint.block_reason.clear();
+            let mut state = NacState::parse(&checkpoint.cursor_json);
+            state.last_error = ERROR_KIND_SCAN.to_string();
+            checkpoint.cursor_json = state.serialize().expect("serialize error marker");
+        }
+
+        let (batches, transitions) =
+            drive_nac_poll(&config, &work, &checkpoints, &poll_state).await;
+        assert!(
+            transitions.is_empty(),
+            "an ordinary error marker must not raise a replay barrier"
+        );
+        let raw_rows: usize = batches.iter().map(|batch| batch.raw_rows.len()).sum();
+        assert_eq!(
+            raw_rows, 0,
+            "re-emission means the poll was retried as a blocked replay"
+        );
+        let map = checkpoints.read().await;
+        assert_eq!(
+            map.get(&cp_key).expect("checkpoint").status,
+            "active",
+            "the transient marker clears once a scan succeeds"
+        );
+
+        cleanup_fixture(&path);
+    }
+
+    /// Plan §7.2 F1, the `new_state == prior_state_covered` conjunct of NAC's
+    /// `scan_is_noop`: a session deletion moves the cursor map and nothing
+    /// else — no records, same schema, same stat class — so only the
+    /// structural comparison keeps the deletion's checkpoint from being
+    /// suppressed, re-discovered on every later poll, and never durably
+    /// recorded. The census is the deletion detector (§3.2), so this guard
+    /// belongs to the census's owner.
+    ///
+    /// MUTATION (executed 2026-07-31): drop `new_state == prior_state_covered`
+    /// from NAC's `scan_is_noop` — this test fails (the deleted session's
+    /// cursor survives forever); RED was confirmed in a filtered run,
+    /// so suite-wide isolation is not claimed.
+    #[tokio::test]
+    async fn a_deleted_nac_session_is_dropped_from_the_cursor_durably() {
+        let path = fixture_db();
+        {
+            let connection = Connection::open(&path).expect("open fixture for insert");
+            connection
+                .execute(
+                    "INSERT INTO sessions (session_id, cwd, model, base_url, messages_json, \
+                     created_at, updated_at) VALUES ('zz-observed', '/workspace/zz', 'model-z', \
+                     'https://api.example', '[{\"role\":\"user\",\"content\":\"zz\"}]', \
+                     '2026-07-19 09:00:00', '2026-07-19 09:00:01')",
+                    [],
+                )
+                .expect("insert observed session");
+        }
+        let source_file = path.to_string_lossy().to_string();
+        let work = WorkItem {
+            source_name: "nac-deletion-durable".to_string(),
+            harness: "nac".to_string(),
+            format: moraine_config::SourceFormat::NacSqlite,
+            source_glob: source_file.clone(),
+            path: source_file.clone(),
+            trigger: WorkTrigger::Watcher,
+        };
+        let cp_key = checkpoint_key(&work.source_name, &work.path);
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let poll_state = VolatilePollMap::new();
+        let config = AppConfig::default();
+
+        drive_nac_poll(&config, &work, &checkpoints, &poll_state).await;
+        {
+            let map = checkpoints.read().await;
+            let state = NacState::parse(&map.get(&cp_key).expect("checkpoint").cursor_json);
+            assert!(state.sessions.contains_key("zz-observed"));
+        }
+
+        {
+            let connection = Connection::open(&path).expect("open fixture for delete");
+            connection
+                .execute("DELETE FROM sessions WHERE session_id = 'zz-observed'", [])
+                .expect("delete observed session");
+        }
+        let (batches, _) = drive_nac_poll(&config, &work, &checkpoints, &poll_state).await;
+        let raw_rows: usize = batches.iter().map(|batch| batch.raw_rows.len()).sum();
+        assert_eq!(raw_rows, 0, "a deletion emits nothing — only state moves");
+        let map = checkpoints.read().await;
+        let state = NacState::parse(&map.get(&cp_key).expect("checkpoint").cursor_json);
+        assert!(
+            !state.sessions.contains_key("zz-observed"),
+            "the deletion must be recorded durably, not re-discovered forever"
+        );
+
+        cleanup_fixture(&path);
     }
 
     #[test]
@@ -2820,6 +3678,8 @@ mod tests {
                 inode ^ 1,
                 stat,
                 &NacState::default(),
+                &default_nac_budget(),
+                MAX_NAC_CHECKPOINT_BYTES,
                 &mut ScanLedger::default(),
             ),
             NacScanOutcome::Failed {
