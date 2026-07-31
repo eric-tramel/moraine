@@ -86,11 +86,13 @@ const MAX_CURSOR_CHECKPOINT_BYTES: usize = 8 * 1024 * 1024;
 
 const ERROR_KIND_OPEN: &str = "sqlite_open_error";
 const ERROR_KIND_SCHEMA: &str = "sqlite_schema_mismatch";
-/// Retired from every scan path by issue #601 §2.3: history size is now a
-/// degradation (`coverage_degraded`), never a failure. The constant remains
+/// Retired from every scan path by issue #601 §2.3 (WI-05 for Cursor and NAC,
+/// WI-06 for OpenCode — the last producer): history size is now a degradation
+/// (`coverage_degraded`), never a failure. The constant remains, test-only,
 /// because `record_scan_failure_outcome`'s routing width is pinned per kind
 /// (`each_error_kind_routes_to_exactly_one_backoff_clock`) and because
 /// historical `ingest_errors` rows carry it.
+#[cfg(test)]
 const ERROR_KIND_TOO_LARGE: &str = "sqlite_cursor_too_large";
 /// One genuinely un-processable single row (issue #601 §2.3): larger than
 /// `SCAN_PAGE_MAX_BYTES`. Reported as one `ingest_errors` row for that row
@@ -107,6 +109,14 @@ struct StatFingerprint {
     wal_mtime_ns: u64,
     shm_len: u64,
     shm_mtime_ns: u64,
+}
+
+impl StatFingerprint {
+    /// For `skip_serializing_if`: keeps `cursor_json` byte-identical for
+    /// states that never set an optional fingerprint field (§2.6).
+    pub(crate) fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
 }
 
 /// Persisted poll cursor (the checkpoint's `cursor_json` payload).
@@ -865,11 +875,12 @@ impl VolatilePollMap {
 ///   charged nothing, but an aggregate over a payload column
 ///   (`sum(length(data))`) forces SQLite to decode every byte of that column —
 ///   §1.1 finding 2 measured `length()` on a TEXT-affine column at 48.5 ms /
-///   48 MB, so it is emphatically not a cheap probe — and those bytes are
-///   charged on the payload axis through `charge_aggregate_payload_bytes`.
-///   Without that rule a cold OpenCode scan under-reports its true byte cost by
-///   roughly 2×, and the ledger could be used to argue an aggregate preflight
-///   is free. It is not.
+///   48 MB, so it is emphatically not a cheap probe — and those bytes must be
+///   charged on the payload axis. No such read remains: WI-06 removed the last
+///   one (OpenCode's per-aggregate `sum(length(data))` preflight, which
+///   double-charged a cold scan by ~2×), and with it the ledger's
+///   `charge_aggregate_payload_bytes` helper. Any new payload-column aggregate
+///   must bring the helper back rather than call itself free.
 ///
 /// Both axes are always recorded: rows cannot catch content growth, bytes
 /// cannot catch a full scan of narrow rows.
@@ -923,14 +934,6 @@ impl ScanLedger {
 
     fn charge_payload_bytes(&mut self, bytes: usize) {
         self.payload_bytes = self.payload_bytes.saturating_add(bytes as u64);
-    }
-
-    /// Bytes a scalar aggregate over a payload column forced SQLite to decode.
-    /// No row is charged — none was materialized — but the bytes were really
-    /// paid, so a byte budget must see them. See the aggregate rule on
-    /// `ScanLedger`.
-    pub(crate) fn charge_aggregate_payload_bytes(&mut self, bytes: u64) {
-        self.payload_bytes = self.payload_bytes.saturating_add(bytes);
     }
 
     /// Record deliberately-skipped coverage (§2.3): a budget bound before the

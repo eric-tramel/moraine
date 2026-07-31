@@ -2020,12 +2020,16 @@ PY
   assert_clickhouse_scalar "$clickhouse_url" "nac stat-only no-op writes no raw rows" "SELECT count() FROM ${clickhouse_database}.raw_events WHERE source_name = 'ci-nac'" "$nac_raw_rows_before_noop"
   assert_clickhouse_scalar "$clickhouse_url" "nac stat-only no-op writes no durable checkpoint" "SELECT toString(max(updated_at)) FROM ${clickhouse_database}.ingest_checkpoints WHERE source_name = 'ci-nac'" "$nac_checkpoint_updated_at_before_noop"
 
-  # Removing the highest episode forces a high-water reset. The source-side
-  # deletion is archival: previously indexed remote metadata and durable bodies
-  # remain retrievable.
+  # Removing the highest episode drops max(episodes.id) behind the committed
+  # watermark. With AUTOINCREMENT episode ids the vanished tail can never be
+  # rewritten, so this is a deletion, not a rewind: the poll emits nothing —
+  # no replacement barrier, no new canonical rows, no raw appends — while the
+  # previously indexed remote metadata and durable bodies remain retrievable.
   echo "[e2e] nac sqlite source deletion follows archival policy"
-  local nac_append_control_before_delete
-  nac_append_control_before_delete="$(clickhouse_scalar "$clickhouse_url" "SELECT toUInt64(control_revision) FROM ${clickhouse_database}.v_current_ingest_append_control WHERE host = ''")"
+  local nac_raw_rows_before_delete
+  local nac_heartbeat_before_delete
+  nac_raw_rows_before_delete="$(clickhouse_scalar "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.raw_events WHERE source_name = 'ci-nac'")"
+  nac_heartbeat_before_delete="$(clickhouse_scalar "$clickhouse_url" "SELECT toString(max(ts)) FROM ${clickhouse_database}.ingest_heartbeats")"
   "$python_bin" - "$nac_fixture_file" "$nac_remote_worker_id" <<'PY'
 import sqlite3
 import sys
@@ -2039,17 +2043,15 @@ connection.commit()
 connection.close()
 PY
   sleep 3
+  # A deletion commits no checkpoint and opens no append fence, so there is
+  # no publication event to wait for — an idle heartbeat with an empty queue
+  # after the mutation proves the watcher poll consumed it (the same
+  # quiescence pattern as the stat-only no-op above).
+  wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.ingest_heartbeats WHERE ts > parseDateTime64BestEffort('${nac_heartbeat_before_delete}') AND queue_depth = 0 AND files_active = 0" 120
   assert_clickhouse_count "$clickhouse_url" "nac deleted remote metadata remains archived" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-nac' AND event_kind = 'session_meta' AND JSONExtractString(payload_json, 'cwd_scope') = 'remote'" "2"
   assert_clickhouse_count "$clickhouse_url" "nac deleted remote body remains archived" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-nac' AND (position(text_content, '${nac_remote_keyword}') > 0 OR position(payload_json, '${nac_remote_keyword}') > 0)" "4"
-  # The archival rows can become visible before the ingest pass has committed
-  # its checkpoint/publication tail and before the MCP projector has consumed
-  # the resulting dirty revisions. Later cache assertions require a stable
-  # publication token, so wait for the mutation's own idle heartbeat, append
-  # fence, and projection catch-up rather than relying on a fixed sleep.
-  wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.v_current_ingest_append_control WHERE host = '' AND state = 'idle' AND control_revision > ${nac_append_control_before_delete}" 120
-  local nac_heartbeat_after_delete_commit
-  nac_heartbeat_after_delete_commit="$(clickhouse_scalar "$clickhouse_url" "SELECT toString(max(ts)) FROM ${clickhouse_database}.ingest_heartbeats")"
-  wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.ingest_heartbeats WHERE ts > parseDateTime64BestEffort('${nac_heartbeat_after_delete_commit}') AND queue_depth = 0 AND files_active = 0" 120
+  assert_clickhouse_count "$clickhouse_url" "nac deletion preserves canonical event count" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-nac'" "19"
+  assert_clickhouse_scalar "$clickhouse_url" "nac deletion appends no raw history" "SELECT count() FROM ${clickhouse_database}.raw_events WHERE source_name = 'ci-nac'" "$nac_raw_rows_before_delete"
   wait_for_clickhouse_count "$clickhouse_url" "SELECT toUInt64(count() = 0) FROM (SELECT dirty.session_id FROM ${clickhouse_database}.mcp_open_dirty_sessions AS dirty FINAL ANY INNER JOIN (SELECT DISTINCT session_id FROM ${clickhouse_database}.v_live_events WHERE source_name = 'ci-nac') AS live USING (session_id) ANY LEFT JOIN (SELECT session_id, dirty_revision FROM ${clickhouse_database}.mcp_open_sessions FINAL) AS projected USING (session_id) WHERE dirty.dirty_revision > ifNull(projected.dirty_revision, toUInt64(0)))" 120
 
 
