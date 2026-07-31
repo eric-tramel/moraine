@@ -247,7 +247,7 @@ pub(crate) fn query_budgets(cfg: &AppConfig) -> ValidatedQueryBudgets {
 // while `export` owns a versioned row contract and schema-skew gate. Those paths keep
 // direct ClickHouse access; operational status reads go through ConversationRepository.
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(super) enum DatabaseProgress {
     Migration(MigrationProgress),
     ReconciliationInspecting,
@@ -260,9 +260,37 @@ pub(super) enum DatabaseProgress {
     ReconciliationFinished {
         processed: usize,
     },
+    /// The v1 `mcp_open` read-model backfill failed and startup continued
+    /// degraded. The affected sessions stay durably dirty
+    /// (`mcp_open_dirty_sessions`), so the v1 reader treats them exactly as
+    /// it treats any dirty session; the canonical sweep still runs.
+    /// `dirty_sessions` is a best-effort bounded count (`None` when the
+    /// probe itself failed; capped at [`DIRTY_SESSION_REPORT_LIMIT`]).
+    ReconciliationFailed {
+        dirty_sessions: Option<usize>,
+        error: String,
+    },
     /// Canonical read-index (issue #598) backfill progress. Runs after and
     /// outside the v1 read-model backfill.
     CoreIndex(CoreIndexBackfillProgress),
+}
+
+/// Page bound for the post-failure dirty-session probe behind
+/// [`DatabaseProgress::ReconciliationFailed`]. A bounded read keeps the
+/// diagnostic from repeating the very failure it is reporting on a huge
+/// corpus; [`format_dirty_session_count`] renders a count at this bound as
+/// "N+".
+const DIRTY_SESSION_REPORT_LIMIT: usize = 1_000;
+
+/// Operator-facing rendering of the best-effort dirty-session count carried
+/// by [`DatabaseProgress::ReconciliationFailed`].
+pub(super) fn format_dirty_session_count(count: Option<usize>) -> String {
+    match count {
+        None => "an unknown number of sessions".to_string(),
+        Some(1) => "1 session".to_string(),
+        Some(n) if n >= DIRTY_SESSION_REPORT_LIMIT => format!("{n}+ sessions"),
+        Some(n) => format!("{n} sessions"),
+    }
 }
 
 async fn migrate_database_with_progress<F>(
@@ -288,7 +316,8 @@ where
     // envelopes and is unaffected. A backfill that exceeds this budget fails
     // with a typed error and stays retryable: its cursor is persisted after
     // every page.
-    ch.migration_envelope(&budgets.migration)
+    let reconciliation = ch
+        .migration_envelope(&budgets.migration)
         .scope(async {
             let historical = !ch.mcp_open_read_model_ready().await?;
             on_progress(DatabaseProgress::ReconciliationStarted { historical });
@@ -305,7 +334,37 @@ where
             on_progress(DatabaseProgress::ReconciliationFinished { processed });
             Ok::<_, anyhow::Error>(())
         })
-        .await?;
+        .await;
+
+    // A v1 backfill failure is degradation, not a startup abort. The v1
+    // `mcp_open` read model is the legacy projection: any session whose
+    // re-projection failed stays durably dirty (`mcp_open_dirty_sessions`
+    // survives restarts) and the v1 reader degrades for exactly those
+    // sessions, the same way it does for any dirty session. Aborting here
+    // used to stop `up` BEFORE the issue #598 canonical sweep below — on the
+    // reference host, one giant session's per-session projection INSERT
+    // exceeded the Migration-class memory budget, and the resulting abort
+    // left the stack down with `open_v2` unpublished, blocking the very
+    // cutover that makes this projection obsolete. The budget itself is not
+    // the fix: the class budget is validated against the compile-time
+    // backstop matching the bundled server profile, and raising it past the
+    // server's own limit would only move the failure. So: warn loudly (the
+    // renderers surface the error, the bounded dirty count, and the fact
+    // that the sweep proceeds) and continue. The canonical sweep's own
+    // failures below stay fatal — it is the read path everything is
+    // cutting over to.
+    if let Err(error) = reconciliation {
+        let dirty_sessions = ch
+            .migration_envelope(&budgets.migration)
+            .scope(ch.pending_dirty_mcp_open_sessions(DIRTY_SESSION_REPORT_LIMIT))
+            .await
+            .ok()
+            .map(|sessions| sessions.len());
+        on_progress(DatabaseProgress::ReconciliationFailed {
+            dirty_sessions,
+            error: format!("{error:#}"),
+        });
+    }
 
     // Issue #598 WI-03: sweep the pre-existing corpus into the migration-036
     // canonical read indexes, then audit + publish readiness. This is sequenced
@@ -365,6 +424,20 @@ async fn cmd_db_migrate(cfg: &AppConfig) -> Result<MigrationOutcome> {
             if historical {
                 eprintln!("MCP open read model ready.");
             }
+        }
+        DatabaseProgress::ReconciliationFailed {
+            dirty_sessions,
+            error,
+        } => {
+            eprintln!("warning: failed to backfill the MCP open (v1) read model; continuing startup.");
+            eprintln!("warning:   {error}");
+            eprintln!(
+                "warning:   still dirty: {}; v1 `open` reads for those sessions degrade until reconciled.",
+                format_dirty_session_count(dirty_sessions)
+            );
+            eprintln!(
+                "warning:   the canonical read-index sweep (issue #598) runs next and does not depend on this projection."
+            );
         }
         DatabaseProgress::CoreIndex(event) => match event {
             CoreIndexBackfillProgress::Starting { resuming } => {
@@ -1080,7 +1153,23 @@ mod tests {
     }
 
     async fn serve_reclaim_request(mut stream: tokio::net::TcpStream, mock: ReclaimServerMock) {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let Some(statement) = read_http_statement(&mut stream).await else {
+            return;
+        };
+        let body = mock.answer(&statement);
+        mock.statements
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(statement);
+        write_http_response(&mut stream, 200, &body).await;
+    }
+
+    /// Read one ClickHouse HTTP request off `stream` and return the SQL
+    /// statement it carries (URL `query` parameter for short reads, request
+    /// body for anything longer — the two transport profiles
+    /// `ClickHouseClient` uses).
+    async fn read_http_statement(stream: &mut tokio::net::TcpStream) -> Option<String> {
+        use tokio::io::AsyncReadExt;
 
         let mut buf = Vec::new();
         let mut chunk = [0_u8; 8192];
@@ -1093,7 +1182,7 @@ mod tests {
                 break end;
             }
             match stream.read(&mut chunk).await {
-                Ok(0) | Err(_) => return,
+                Ok(0) | Err(_) => return None,
                 Ok(read) => buf.extend_from_slice(&chunk[..read]),
             }
         };
@@ -1122,22 +1211,23 @@ mod tests {
             .unwrap_or("/")
             .to_string();
         let from_url = url_query_param(&target, "query").unwrap_or_default();
-        let statement = if from_url.trim().is_empty() {
-            String::from_utf8_lossy(&buf[header_end..])
-                .trim()
-                .to_string()
+        if from_url.trim().is_empty() {
+            Some(
+                String::from_utf8_lossy(&buf[header_end..])
+                    .trim()
+                    .to_string(),
+            )
         } else {
-            from_url.trim().to_string()
-        };
+            Some(from_url.trim().to_string())
+        }
+    }
 
-        let body = mock.answer(&statement);
-        mock.statements
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(statement);
+    async fn write_http_response(stream: &mut tokio::net::TcpStream, status: u16, body: &str) {
+        use tokio::io::AsyncWriteExt;
 
+        let reason = if status == 200 { "OK" } else { "Error" };
         let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=UTF-8\r\nContent-Length: \
+            "HTTP/1.1 {status} {reason}\r\nContent-Type: text/plain; charset=UTF-8\r\nContent-Length: \
              {}\r\nConnection: close\r\n\r\n{}",
             body.len(),
             body
@@ -1192,6 +1282,317 @@ mod tests {
         cfg.clickhouse.timeout_seconds = 10.0;
         cfg.retention = retention;
         cfg
+    }
+
+    // ---- a steerable ClickHouse stand-in for the migrate/`up` database path
+
+    /// A steering function: maps one recorded statement to the HTTP status
+    /// and body the stand-in answers with.
+    type StatementAnswer = dyn Fn(&str) -> (u16, String) + Send + Sync;
+
+    /// Statement-steered stand-in for `migrate_database_with_progress`:
+    /// records every statement and lets `respond` choose each answer, so a
+    /// test can let the schema migrations and the canonical sweep succeed
+    /// while exactly one v1 projection statement fails the way the reference
+    /// host's did. Same raw-TCP transport rationale as `ReclaimServerMock`.
+    #[derive(Clone)]
+    struct MigrateServerMock {
+        statements: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        respond: std::sync::Arc<StatementAnswer>,
+    }
+
+    impl MigrateServerMock {
+        fn new<F>(respond: F) -> Self
+        where
+            F: Fn(&str) -> (u16, String) + Send + Sync + 'static,
+        {
+            Self {
+                statements: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                respond: std::sync::Arc::new(respond),
+            }
+        }
+
+        fn count<P>(&self, predicate: P) -> usize
+        where
+            P: Fn(&str) -> bool,
+        {
+            self.statements
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .filter(|statement| predicate(statement))
+                .count()
+        }
+    }
+
+    async fn spawn_migrate_server_mock(mock: MigrateServerMock) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind migrate stand-in listener");
+        let addr = listener.local_addr().expect("migrate stand-in addr");
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let mock = mock.clone();
+                tokio::spawn(async move { serve_migrate_request(stream, mock).await });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    async fn serve_migrate_request(mut stream: tokio::net::TcpStream, mock: MigrateServerMock) {
+        let Some(statement) = read_http_statement(&mut stream).await else {
+            return;
+        };
+        let (status, body) = (mock.respond)(&statement);
+        mock.statements
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(statement);
+        write_http_response(&mut stream, status, &body).await;
+    }
+
+    /// Default stand-in answer: JSONEachRow readers accept an empty body,
+    /// while FORMAT JSON envelope readers (the migration preflight) need an
+    /// empty `data` envelope. Mutations parse nothing.
+    fn empty_result(statement: &str) -> (u16, String) {
+        if statement.trim_start().starts_with("SELECT") && !statement.contains("FORMAT JSONEachRow")
+        {
+            return (200, "{\"data\":[]}".to_string());
+        }
+        (200, String::new())
+    }
+
+    /// The per-session v1 projection INSERT — the statement class whose
+    /// memory rejection took the reference host's startup down.
+    fn is_v1_projection_insert(statement: &str) -> bool {
+        statement.starts_with("INSERT INTO") && statement.contains(".mcp_open_events\n")
+    }
+
+    /// The v1 legacy-head publish that advances a session's dirty pointer in
+    /// `mcp_open_sessions`; its absence after a failure is what "the session
+    /// stays dirty" means on the wire.
+    fn is_v1_legacy_head_publish(statement: &str) -> bool {
+        statement.starts_with("INSERT INTO") && statement.contains(".mcp_open_sessions\n")
+    }
+
+    /// Steering for the reference-host failure: the historical page discovers
+    /// one giant session, its batch facts make it coverable, and its
+    /// per-session projection INSERT is rejected by the server's memory
+    /// backstop. The durable dirty probe afterwards still reports it dirty.
+    /// Everything else answers success with an empty result set.
+    fn giant_session_projection_failure(statement: &str) -> (u16, String) {
+        if is_v1_projection_insert(statement) {
+            return (
+                500,
+                "Code: 241. DB::Exception: Memory limit (for query) exceeded: \
+                 would use 4.02 GiB (attempt to allocate chunk of 134217728 bytes), \
+                 maximum: 4.00 GiB: While executing JoiningTransform. \
+                 (MEMORY_LIMIT_EXCEEDED)"
+                    .to_string(),
+            );
+        }
+        if statement.contains(".v_live_events") && statement.contains("session_id > ''") {
+            return (200, "{\"session_id\":\"sess-giant\"}\n".to_string());
+        }
+        if statement.contains("AS required_source_heads") && statement.contains("groupUniqArray") {
+            return (
+                200,
+                concat!(
+                    "{\"session_id\":\"sess-giant\",\"slot\":0,\"source_revision\":7,",
+                    "\"dirty_revision\":3,\"required_source_heads\":[{\"source_host\":\"host-a\",",
+                    "\"source_name\":\"claude\",\"source_file\":\"sessions/sess-giant.jsonl\",",
+                    "\"source_generation\":1,\"publication_revision\":5}]}\n"
+                )
+                .to_string(),
+            );
+        }
+        if statement.contains("generateSnowflakeID()) AS source_revision") {
+            return (200, "{\"source_revision\":11}\n".to_string());
+        }
+        if statement.contains("d.dirty_revision > ifNull(s.dirty_revision, 0)") {
+            return (200, "{\"session_id\":\"sess-giant\"}\n".to_string());
+        }
+        empty_result(statement)
+    }
+
+    /// The reference host's epic deploy failure, re-driven through the
+    /// command path: the v1 `mcp_open` re-projection of one giant session
+    /// exceeds the server memory budget mid-INSERT. Startup must degrade,
+    /// not abort — the session stays dirty on the wire (no legacy-head
+    /// publish, no v1 ready flag), the operator warning event fires exactly
+    /// once with the bounded dirty count and the server error, and the
+    /// issue #598 canonical sweep still runs and still auto-publishes
+    /// `open_v2`, the cutover this failure used to block.
+    ///
+    /// MUTATION (executed 2026-07-31): restore the fatal `?` on the v1
+    /// reconciliation envelope in `migrate_database_with_progress` (drop
+    /// the catch) — this test fails: the function returns the backfill
+    /// error, no failure event fires, and no canonical readiness statement
+    /// reaches the server.
+    #[tokio::test]
+    async fn a_failed_v1_projection_degrades_and_the_canonical_sweep_still_publishes() {
+        let mock = MigrateServerMock::new(giant_session_projection_failure);
+        let cfg = mock_config(
+            spawn_migrate_server_mock(mock.clone()).await,
+            moraine_config::RetentionConfig::default(),
+        );
+
+        let mut events: Vec<DatabaseProgress> = Vec::new();
+        let outcome = migrate_database_with_progress(&cfg, |event| events.push(event))
+            .await
+            .expect("startup continues past the failed v1 backfill");
+        assert!(!outcome.applied.is_empty(), "schema migrations ran first");
+
+        let failures: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                DatabaseProgress::ReconciliationFailed {
+                    dirty_sessions,
+                    error,
+                } => Some((*dirty_sessions, error.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(failures.len(), 1, "exactly one failure event");
+        assert_eq!(failures[0].0, Some(1), "bounded dirty count observed");
+        assert!(
+            failures[0].1.contains("MEMORY_LIMIT_EXCEEDED"),
+            "event carries the server rejection: {}",
+            failures[0].1
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, DatabaseProgress::ReconciliationFinished { .. })),
+            "the degraded run must not also claim completion"
+        );
+
+        let published: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                DatabaseProgress::CoreIndex(CoreIndexBackfillProgress::Published {
+                    core_indexes,
+                    open_v2,
+                }) => Some((*core_indexes, *open_v2)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            published,
+            vec![(true, true)],
+            "the canonical sweep published, open_v2 auto-flipped"
+        );
+
+        assert_eq!(mock.count(is_v1_projection_insert), 1);
+        assert_eq!(mock.count(is_v1_legacy_head_publish), 0);
+        assert_eq!(
+            mock.count(|statement| statement.contains("mcp_open_projection_state")
+                && statement.contains("('global', 1,")),
+            0,
+            "the v1 ready flag must not be written on failure"
+        );
+        assert_eq!(
+            mock.count(|statement| statement.contains("('core_indexes', 1, generateSnowflakeID()")),
+            1
+        );
+        assert_eq!(
+            mock.count(|statement| statement
+                .contains("('open_v2', 1, generateSnowflakeID(), 'auto-local')")),
+            1
+        );
+    }
+
+    /// The degraded-path catch must not change a clean run: with every
+    /// statement succeeding, the v1 backfill completes (ready flag written
+    /// once, completion event once, no failure event) and the canonical
+    /// sweep publishes as before.
+    #[tokio::test]
+    async fn a_clean_database_sequence_finishes_v1_and_publishes_the_sweep() {
+        let mock = MigrateServerMock::new(empty_result);
+        let cfg = mock_config(
+            spawn_migrate_server_mock(mock.clone()).await,
+            moraine_config::RetentionConfig::default(),
+        );
+
+        let mut events: Vec<DatabaseProgress> = Vec::new();
+        let outcome = migrate_database_with_progress(&cfg, |event| events.push(event))
+            .await
+            .expect("clean sequence succeeds");
+        assert!(!outcome.applied.is_empty(), "schema migrations ran");
+
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, DatabaseProgress::ReconciliationFinished { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, DatabaseProgress::ReconciliationFailed { .. }))
+                .count(),
+            0
+        );
+        let published: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                DatabaseProgress::CoreIndex(CoreIndexBackfillProgress::Published {
+                    core_indexes,
+                    open_v2,
+                }) => Some((*core_indexes, *open_v2)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(published, vec![(true, true)]);
+        assert_eq!(
+            mock.count(|statement| statement.contains("mcp_open_projection_state")
+                && statement.contains("('global', 1,")),
+            1,
+            "the v1 ready flag is written exactly once on success"
+        );
+    }
+
+    /// Steers the canonical readiness publish to a server error while every
+    /// other statement succeeds, so the sweep — not the v1 projection — is
+    /// the thing that fails.
+    fn canonical_publish_failure(statement: &str) -> (u16, String) {
+        if statement.contains("('core_indexes', 1, generateSnowflakeID()") {
+            return (
+                500,
+                "Code: 241. DB::Exception: injected canonical publish failure".to_string(),
+            );
+        }
+        empty_result(statement)
+    }
+
+    /// The non-fatal catch covers the v1 projection ONLY. A canonical-sweep
+    /// failure must still abort startup: the sweep is the read path the
+    /// cutover makes load-bearing, and degrading past it would leave readers
+    /// with neither a fresh v1 projection nor a published canonical index.
+    /// This pins the fatal/non-fatal boundary from the side the two tests
+    /// above cannot see.
+    ///
+    /// MUTATION (executed 2026-07-31): swallow the
+    /// `backfill_canonical_read_indexes` error at its call site in
+    /// `migrate_database_with_progress` (`let _ = ...await;`) — this test
+    /// fails: the function returns Ok and the error context never surfaces.
+    #[tokio::test]
+    async fn a_canonical_sweep_failure_still_aborts_startup() {
+        let mock = MigrateServerMock::new(canonical_publish_failure);
+        let cfg = mock_config(
+            spawn_migrate_server_mock(mock.clone()).await,
+            moraine_config::RetentionConfig::default(),
+        );
+
+        let error = migrate_database_with_progress(&cfg, |_| {})
+            .await
+            .expect_err("a canonical sweep failure must abort, not degrade");
+        let chain = format!("{error:#}");
+        assert!(
+            chain.contains("failed to backfill canonical read indexes"),
+            "the abort must carry the canonical-sweep context, got: {chain}"
+        );
     }
 
     /// A `[retention]` whose derived horizon differs from the stock one, so a

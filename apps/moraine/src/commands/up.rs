@@ -22,8 +22,8 @@ use crate::render::{render_up, CliOutput, MigrationOutcome, StatusSnapshot, UpSn
 use crate::service::Service;
 
 use super::{
-    conversation_repository, doctor_is_healthy, migrate_database_for_up, status::cmd_status,
-    DatabaseProgress,
+    conversation_repository, doctor_is_healthy, format_dirty_session_count,
+    migrate_database_for_up, status::cmd_status, DatabaseProgress,
 };
 
 const PROGRESS_REFRESH: Duration = Duration::from_millis(250);
@@ -121,6 +121,11 @@ impl<W: Write> StartupProgress<W> {
     fn skipped_step(&mut self, label: &str, detail: Option<&str>) {
         self.tree
             .step("–", "[-]", label, detail, Style::new().yellow());
+    }
+
+    fn warning_step(&mut self, label: &str, detail: Option<&str>) {
+        self.tree
+            .step("!", "[warn]", label, detail, Style::new().yellow());
     }
 
     fn clickhouse_wait(&mut self, event: ClickHouseStartupProgress) {
@@ -271,6 +276,21 @@ impl<W: Write> StartupProgress<W> {
                     Some(&format!(
                         "{processed} sessions processed · {:.1}s",
                         elapsed.as_secs_f64()
+                    )),
+                );
+            }
+            DatabaseProgress::ReconciliationFailed {
+                dirty_sessions,
+                error,
+            } => {
+                self.database_activity = None;
+                self.tree.clear_active();
+                self.warning_step("MCP read model (v1) backfill failed", Some(&error));
+                self.info_step(
+                    "Continuing startup degraded",
+                    Some(&format!(
+                        "still dirty: {}; canonical read-index sweep proceeds",
+                        format_dirty_session_count(dirty_sessions)
                     )),
                 );
             }
@@ -726,6 +746,25 @@ mod tests {
         }));
         let rendered = String::from_utf8(progress.into_inner()).expect("progress utf8");
         assert!(rendered.contains("migration 1/1 applied"));
+    }
+
+    /// The degraded v1-backfill event must reach the operator's terminal:
+    /// the warning step carries the server error verbatim, and the follow-up
+    /// step names the dirty count and says the canonical sweep proceeds.
+    #[test]
+    fn a_degraded_v1_backfill_renders_an_operator_visible_warning() {
+        let style = ProgressStyle::from_capabilities(&test_output(OutputMode::Plain, true), true);
+        let mut progress = StartupProgress::new(ProgressTree::new(style, Vec::new()), false);
+        progress.startup_plan(&[]);
+        progress.database_event(DatabaseProgress::ReconciliationFailed {
+            dirty_sessions: Some(1),
+            error: "clickhouse returned 500: MEMORY_LIMIT_EXCEEDED".to_string(),
+        });
+        let rendered = String::from_utf8(progress.into_inner()).expect("progress utf8");
+        assert!(rendered.contains("MCP read model (v1) backfill failed"));
+        assert!(rendered.contains("MEMORY_LIMIT_EXCEEDED"));
+        assert!(rendered.contains("still dirty: 1 session"));
+        assert!(rendered.contains("canonical read-index sweep proceeds"));
     }
 
     #[test]
