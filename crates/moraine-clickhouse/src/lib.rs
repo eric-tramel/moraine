@@ -32,6 +32,10 @@ pub mod mcp_tool_names;
 /// Issue #603 WI-04/WI-05. Ledger, planner, authority types, and the §3.2
 /// claim/re-drive/settle driver.
 pub mod reclaim;
+/// Issue #603 WI-09. The opt-in `canonical_generation` candidate probe and
+/// the delete predicates it authorizes — the one scope that deletes user
+/// history, unreachable without both `[retention]` keys.
+mod reclaim_canonical;
 /// Issue #603 WI-05. The two `mcp_open_*` candidate probes and the delete
 /// predicates they authorize.
 mod reclaim_mcp_open;
@@ -1724,6 +1728,11 @@ pub fn bundled_migrations() -> Vec<Migration> {
             version: "039",
             name: "039_telemetry_retention.sql",
             sql: include_str!("../../../sql/039_telemetry_retention.sql"),
+        },
+        Migration {
+            version: "040",
+            name: "040_decommission_conversation_terms_mv.sql",
+            sql: include_str!("../../../sql/040_decommission_conversation_terms_mv.sql"),
         },
     ]
 }

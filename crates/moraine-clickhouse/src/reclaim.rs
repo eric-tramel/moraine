@@ -9,7 +9,11 @@
 //! two executors, in one change, which is the only order
 //! `no_executor_may_be_registered_before_the_ledger_driver_is_wired` permits.
 //! WI-07 registers the third executor — the canonical read-index scope
-//! (`reclaim_read_index`) — onto the already-wired driver.
+//! (`reclaim_read_index`) — onto the already-wired driver, and WI-09 the
+//! fourth and last: the opt-in `canonical_generation` scope
+//! (`reclaim_canonical`), the one scope that deletes user history and the
+//! reason [`ReclaimAuthority::for_scope`] demands both `[retention]` keys
+//! before the registry is even consulted.
 //!
 //! ## The §3.2 protocol, as implemented
 //!
@@ -542,13 +546,27 @@ pub enum ReclaimPredicate {
     /// unemittable and every *emittable* one name a column the table does not
     /// have — hazard H3, one table over from the pair it was written for.
     SessionHeaderGeneration,
-    /// The row carries no generation. Its liveness is a **uid set** captured
-    /// into the ledger before the parent delete runs, or the rows become
-    /// unreachable the moment their parent goes.
+    /// The row carries no generation. Its liveness is a `(source_host,
+    /// source_name, event_uid)` set **re-derived from the parent `events`
+    /// rows by subquery at execution time** — sound because the unit's
+    /// delete order puts `events` strictly after both uid-set tables, so the
+    /// source of the derivation outlives every statement that needs it,
+    /// across crashes and re-drives alike (`reclaim_canonical`'s module docs
+    /// carry the proof;
+    /// `every_canonical_subquery_source_is_deleted_later_in_the_unit` pins
+    /// the ordering). The set binds the row's own `source_name` as well as
+    /// its host: the uid excludes both discriminators, so one physical line
+    /// reachable through two overlapping source definitions on one host
+    /// carries one uid under two names — the G-DUALUID shape
+    /// (`reclaim_canonical`'s module docs). An earlier revision of this doc
+    /// specified a ledger capture instead; sql/038 has no column able to
+    /// hold a uid set, and the re-derivation needs none.
     UidSet,
     /// The row's own `source_file`/`source_generation` are back-filled type
     /// defaults on the overwhelming majority of rows and must never be
-    /// predicated on. The only safe predicate joins through the **document**.
+    /// predicated on. The only safe predicate joins through the **document**,
+    /// binding the posting's own `source_host` and `source_name` (the two
+    /// discriminators the uid excludes).
     DocumentJoin,
 }
 
@@ -571,7 +589,19 @@ impl ReclaimPredicate {
     /// `generation` — see [`Self::SessionHeaderGeneration`].
     /// `search_postings` has **no** `event_uid` column at all — its link to
     /// the document is `doc_id` — which is why `DocumentJoin` is a separate
-    /// shape rather than `UidSet`.
+    /// shape rather than `UidSet`. Both derived shapes also require
+    /// `source_host` **and** `source_name`: the uid excludes both
+    /// discriminators — the host (sql/032's whole reason for the column) and
+    /// the name (the uid material is
+    /// `file|generation|line|offset|fingerprint|suffix`,
+    /// `sources/shared.rs`) — so two shared-backend hosts, or two
+    /// overlapping source definitions on one host, hold identical uids and
+    /// an unbound delete for one sweeps the other's rows. `source_name` is
+    /// on `tool_io`/`event_links` from sql/001 and on `search_postings`
+    /// from sql/004. Name presence is still not binding (see
+    /// [`emit_delete_statement`]): the canonical predicates name both
+    /// columns inside their derivation subqueries either way, so the exact
+    /// text pin in `reclaim_canonical` is the gate for the outer binds.
     pub fn required_columns(self) -> &'static [&'static str] {
         match self {
             Self::Generation => &[
@@ -582,8 +612,8 @@ impl ReclaimPredicate {
             ],
             Self::SessionGeneration => &["session_id", "candidate_generation"],
             Self::SessionHeaderGeneration => &["session_id", "generation"],
-            Self::UidSet => &["event_uid"],
-            Self::DocumentJoin => &["doc_id"],
+            Self::UidSet => &["source_host", "source_name", "event_uid"],
+            Self::DocumentJoin => &["source_host", "source_name", "doc_id"],
         }
     }
 }
@@ -748,6 +778,49 @@ impl ReclaimAuthority {
                     Self::CanonicalHistory(canonical),
                 ])
             }
+        }
+    }
+}
+
+/// The safety horizon a scope's candidate probe runs at, in seconds.
+///
+/// One computation site for the per-bucket rule (plan §3.5, WI-09):
+///
+/// * the three bucket-3 scopes use `retention.derived_horizon_hours`;
+/// * `CanonicalGeneration` uses the **stricter (larger) of the two protected
+///   horizons**, `max(canonical_history, raw_audit)`. Per bucket: `events`
+///   (bucket 1) is gated by `canonical_history_horizon_days`, `raw_events`/
+///   `ingest_errors` (bucket 2) by `raw_audit_horizon_days` — and because one
+///   generation is one unit and one decision, the unit becomes claimable only
+///   when **both** have passed. The bucket-3 satellites in the unit are
+///   governed by the same protected horizon, never the shorter derived one: a
+///   satellite outliving its canonical parent is the orphan shape the
+///   canonical-last delete order exists to prevent, and both protected keys
+///   carry a 7-day floor that dominates the 24-hour derived default.
+///
+/// A config missing either protected key yields the same [`MissingAuthority`]
+/// the planner and the run refuse with — absence is a refusal, never a
+/// shorter horizon.
+pub fn probe_horizon_seconds(
+    scope: ReclaimScope,
+    retention: &RetentionConfig,
+) -> Result<u64, MissingAuthority> {
+    match scope {
+        ReclaimScope::McpOpenOrphan
+        | ReclaimScope::McpOpenRetiredLineage
+        | ReclaimScope::ReadIndexGeneration => {
+            Ok(retention.derived_horizon_seconds().max(0.0) as u64)
+        }
+        ReclaimScope::CanonicalGeneration => {
+            let seconds = ReclaimAuthority::for_scope(scope, retention)?
+                .into_iter()
+                .filter_map(|authority| match authority {
+                    ReclaimAuthority::RawAudit(horizon)
+                    | ReclaimAuthority::CanonicalHistory(horizon) => Some(horizon.seconds()),
+                    ReclaimAuthority::DerivedOnly | ReclaimAuthority::Telemetry => None,
+                })
+                .fold(0.0_f64, f64::max);
+            Ok(seconds.max(0.0) as u64)
         }
     }
 }
@@ -940,6 +1013,17 @@ pub(crate) struct ReclaimCandidateRow {
     pub(crate) locator_rows: u64,
     #[serde(default)]
     pub(crate) directory_rows: u64,
+    /// `raw_events` rows — the canonical probe's bucket-2 rollup.
+    #[serde(default)]
+    pub(crate) raw_rows: u64,
+    /// `ingest_errors` rows — same.
+    #[serde(default)]
+    pub(crate) error_rows: u64,
+    /// `search_documents` rows. `event_rows` carries the `events` count for
+    /// the canonical probe, exactly as it carries `mcp_open_events` for the
+    /// orphan one: both are "the parent event table's physical rows".
+    #[serde(default)]
+    pub(crate) document_rows: u64,
 }
 
 impl ReclaimCandidateRow {
@@ -950,6 +1034,9 @@ impl ReclaimCandidateRow {
             .saturating_add(self.navigation_rows)
             .saturating_add(self.locator_rows)
             .saturating_add(self.directory_rows)
+            .saturating_add(self.raw_rows)
+            .saturating_add(self.error_rows)
+            .saturating_add(self.document_rows)
     }
 
     /// The claimable unit this candidate describes, or an error naming the
@@ -1314,8 +1401,13 @@ pub struct RegisteredExecutor {
     /// `(database, horizon_seconds, limit) -> candidate probe SQL`. Writes
     /// nothing; this is the entire dry-run path.
     pub(crate) probe: fn(&str, u64, usize) -> String,
-    /// The unit's per-table delete predicates, **children first, parent last**.
-    pub(crate) predicates: fn(&ReclaimUnit) -> Vec<(ReclaimTable, String)>,
+    /// `(database, unit) -> per-table delete predicates`, **children first,
+    /// parent last**. The database travels because a predicate may carry a
+    /// subquery (the canonical scope's document join and uid set), and a
+    /// statement that resolves a table through the request's default database
+    /// is not self-contained — the ledger statements qualify every name, and
+    /// the deletes must too.
+    pub(crate) predicates: fn(&str, &ReclaimUnit) -> Vec<(ReclaimTable, String)>,
 }
 
 impl fmt::Debug for RegisteredExecutor {
@@ -1344,7 +1436,7 @@ pub fn executor_for(scope: ReclaimScope) -> Option<RegisteredExecutor> {
             probe: |database, horizon, limit| {
                 crate::reclaim_mcp_open::orphan_candidate_sql(database, horizon, limit)
             },
-            predicates: crate::reclaim_mcp_open::mcp_open_unit_predicates,
+            predicates: |_database, unit| crate::reclaim_mcp_open::mcp_open_unit_predicates(unit),
         }),
         // WI-05b (plan §0 F4).
         ReclaimScope::McpOpenRetiredLineage => Some(RegisteredExecutor {
@@ -1352,7 +1444,7 @@ pub fn executor_for(scope: ReclaimScope) -> Option<RegisteredExecutor> {
             probe: |database, horizon, limit| {
                 crate::reclaim_mcp_open::retired_lineage_candidate_sql(database, horizon, limit)
             },
-            predicates: crate::reclaim_mcp_open::mcp_open_unit_predicates,
+            predicates: |_database, unit| crate::reclaim_mcp_open::mcp_open_unit_predicates(unit),
         }),
         // WI-07.
         ReclaimScope::ReadIndexGeneration => Some(RegisteredExecutor {
@@ -1360,15 +1452,30 @@ pub fn executor_for(scope: ReclaimScope) -> Option<RegisteredExecutor> {
             probe: |database, horizon, limit| {
                 crate::reclaim_read_index::read_index_candidate_sql(database, horizon, limit)
             },
-            predicates: crate::reclaim_read_index::read_index_unit_predicates,
+            predicates: |_database, unit| {
+                crate::reclaim_read_index::read_index_unit_predicates(unit)
+            },
         }),
-        // WI-09 registers this.
-        ReclaimScope::CanonicalGeneration => None,
+        // WI-09. The registration alone changes nothing for a stock config.
+        // `reclaim_run` consults `ReclaimAuthority::for_scope` before the
+        // registry (G-RUNAUTH), and the plan path refuses in two layers:
+        // `plan_scope`'s own `for_scope` check first — pinned in isolation by
+        // `a_stock_config_plan_refuses_the_canonical_scope_in_its_own_voice`,
+        // whose note-equality only that layer satisfies — and, were it ever
+        // lost, `reclaim_candidates`' horizon computation still refuses with
+        // the same `MissingAuthority` before any statement is issued. Neither
+        // check can mint a token without both `[retention]` keys.
+        ReclaimScope::CanonicalGeneration => Some(RegisteredExecutor {
+            scope,
+            probe: |database, horizon, limit| {
+                crate::reclaim_canonical::canonical_candidate_sql(database, horizon, limit)
+            },
+            predicates: crate::reclaim_canonical::canonical_unit_predicates,
+        }),
     }
 }
 
-/// Every scope with a registered executor. Three in this build — the two
-/// legacy open-projection scopes and the canonical read-index scope; see
+/// Every scope with a registered executor. All four as of WI-09; see
 /// [`executor_for`].
 pub fn registered_executors() -> Vec<ReclaimScope> {
     ReclaimScope::ALL
@@ -1378,6 +1485,12 @@ pub fn registered_executors() -> Vec<ReclaimScope> {
 }
 
 /// The refusal a `run` prints for a scope with no executor.
+///
+/// Unreachable in this build — every scope has an executor as of WI-09 — but
+/// kept, with [`pending_work_item`], for the build states that can reach it
+/// again: a downgrade past a work item, or a future scope landing its enum
+/// variant before its executor (the WI-04→WI-05 order this module was built
+/// in).
 ///
 /// A named function rather than an inline `format!` so the renderer's
 /// denomination scan can read the text this build actually emits, instead of
@@ -1696,7 +1809,12 @@ impl ClickHouseClient {
         let Some(executor) = executor_for(scope) else {
             return Ok(None);
         };
-        let horizon = retention.derived_horizon_seconds().max(0.0) as u64;
+        // Scope-aware: the protected scope probes at the stricter of its two
+        // configured horizons, never the derived one. Both entry points
+        // (`reclaim_run`, `plan_scope`) refuse before reaching here when the
+        // keys are absent, so an error here is a programming error surfaced,
+        // not a reachable operator state.
+        let horizon = probe_horizon_seconds(scope, retention).map_err(anyhow::Error::new)?;
         let sql = (executor.probe)(&self.cfg.database, horizon, limit);
         let rows = self
             .query_json_each_row(&sql, Some(&self.cfg.database))
@@ -1953,7 +2071,7 @@ impl ClickHouseClient {
         .await
         .context("failed to advance a reclaim unit to `deleting`")?;
 
-        for (table, predicate) in (executor.predicates)(unit) {
+        for (table, predicate) in (executor.predicates)(&self.cfg.database, unit) {
             let statement =
                 emit_delete_statement(&self.cfg.database, table, &predicate, &authorities)
                     .map_err(anyhow::Error::new)
@@ -2016,8 +2134,13 @@ impl ClickHouseClient {
     ///    message: deleting that one line lets a run with no `[retention]` key
     ///    proceed. Guarded by
     ///    `reclaim_run_refuses_an_unconfigured_canonical_scope_before_anything_else`.
-    /// 2. **Executor registry.** Guarded by
-    ///    `reclaim_run_refuses_an_unregistered_scope_without_reaching_clickhouse`.
+    /// 2. **Executor registry.** Unreachable as of WI-09 — every scope has an
+    ///    executor, pinned by
+    ///    `this_build_registers_every_scope_including_the_opt_in_canonical_one`
+    ///    — and the arm's refusal text is pinned by
+    ///    `the_no_executor_refusal_names_its_work_item_and_deletes_nothing`
+    ///    for the build states that can reach it again (a downgrade, or a
+    ///    future scope's enum variant landing before its executor).
     /// 3. **Pending mutations** (hazard H9) — a typed `Blocked` carrying the
     ///    count, never `Ok(default)`.
     /// 4. **Free disk**, for an automatic run only (see [`ReclaimTrigger`]).
@@ -2206,6 +2329,20 @@ mod tests {
             .expect("configured retention grants authority")
     }
 
+    /// Registered scopes `retention` authorizes — the scopes whose probe a
+    /// plan or run under that config actually issues. Every scope is
+    /// registered as of WI-09, so the count varies with the config alone:
+    /// three on a stock config, four with both protected keys set.
+    fn authorized_probing_scopes(retention: &RetentionConfig) -> u32 {
+        ReclaimScope::ALL
+            .into_iter()
+            .filter(|scope| {
+                executor_for(*scope).is_some()
+                    && ReclaimAuthority::for_scope(*scope, retention).is_ok()
+            })
+            .count() as u32
+    }
+
     /// A predicate of the shape `table` requires, naming every key column of
     /// the claimed unit.
     ///
@@ -2224,10 +2361,12 @@ mod tests {
             ReclaimPredicate::SessionHeaderGeneration => {
                 "(session_id, generation) IN (('s-1', 99))".to_string()
             }
-            ReclaimPredicate::UidSet => "event_uid IN ('u-1', 'u-2')".to_string(),
-            ReclaimPredicate::DocumentJoin => {
-                "doc_id IN (SELECT event_uid FROM moraine.search_documents)".to_string()
-            }
+            ReclaimPredicate::UidSet => "(source_host, source_name, event_uid) IN \
+                 (('host-a', 'codex', 'u-1'), ('host-a', 'codex', 'u-2'))"
+                .to_string(),
+            ReclaimPredicate::DocumentJoin => "source_host = 'host-a' AND source_name = 'codex' \
+                 AND doc_id IN (SELECT event_uid FROM moraine.search_documents)"
+                .to_string(),
         }
     }
 
@@ -2256,6 +2395,17 @@ mod tests {
                     )
                     .expect("full authority emits every table"),
                 );
+            }
+            // And the statements a registered executor really builds, so the
+            // corpus covers the shipped predicate texts (subqueries included)
+            // and not only the samples above.
+            if let Some(executor) = executor_for(scope) {
+                for (table, predicate) in (executor.predicates)("moraine", &unit(scope)) {
+                    statements.push(
+                        emit_delete_statement("moraine", table, &predicate, &authorities)
+                            .expect("every registered executor's predicates are emittable"),
+                    );
+                }
             }
         }
         statements.push(ledger_summary_sql("moraine"));
@@ -2628,12 +2778,20 @@ mod tests {
         // The shapes' column sets are the documented ones. `search_postings`
         // has no `event_uid` column at all, so `DocumentJoin` is keyed on
         // `doc_id`; asserting that here keeps the hazard visible next to the
-        // guard that enforces it.
+        // guard that enforces it. Both derived shapes also require
+        // `source_host` and `source_name` — the uid excludes both
+        // discriminators, so two shared-backend hosts, or two overlapping
+        // source definitions on one host, hold identical uids and an unbound
+        // delete for one sweeps the other's rows (WI-09 module docs, the
+        // G-DUALUID shape).
         assert_eq!(
             ReclaimPredicate::DocumentJoin.required_columns(),
-            &["doc_id"]
+            &["source_host", "source_name", "doc_id"]
         );
-        assert_eq!(ReclaimPredicate::UidSet.required_columns(), &["event_uid"]);
+        assert_eq!(
+            ReclaimPredicate::UidSet.required_columns(),
+            &["source_host", "source_name", "event_uid"]
+        );
         assert_eq!(
             ReclaimPredicate::SessionGeneration.required_columns(),
             &["session_id", "candidate_generation"]
@@ -3153,33 +3311,25 @@ mod tests {
 
     // ---- executors ------------------------------------------------------
 
-    /// Exactly the two `mcp_open` scopes and the read-index scope execute in
-    /// this build. Names only what it checks: it deliberately does **not**
-    /// call `reclaim_run`, so it is not the guard for anything inside that
-    /// function — see the `reclaim_run_*` tests below, which do.
+    /// Every scope executes in this build, `canonical_generation` included as
+    /// of WI-09. Names only what it checks: it deliberately does **not** call
+    /// `reclaim_run`, so it is not the guard for anything inside that
+    /// function — see the `reclaim_run_*` tests below, which do. What keeps
+    /// the canonical registration safe is not the registry but the authority
+    /// check in front of it, and *that* is guarded by
+    /// `reclaim_run_refuses_an_unconfigured_canonical_scope_before_anything_else`
+    /// and `a_stock_config_canonical_run_issues_no_statement_at_all`.
     ///
-    /// MUTATION (executed 2026-07-31): register `CanonicalGeneration` => FAILS
-    /// here on the exact-set assertion. WI-09 has no probe in this build, so a
-    /// registration would claim units nothing can describe. **Upper bound.**
-    ///
-    /// MUTATION (executed 2026-07-31): unregister `ReadIndexGeneration`
+    /// MUTATION (executed 2026-07-31): unregister `CanonicalGeneration`
     /// (restore its `None` arm) => FAILS here on the exact-set assertion.
-    /// **Lower bound: WI-07's executor is a deliberate entry, and losing it in
-    /// a merge must not be silent.**
+    /// **Lower bound: WI-09's executor is a deliberate entry, and losing it
+    /// in a merge must not be silent.**
+    ///
+    /// MUTATION (executed 2026-07-31): unregister `ReadIndexGeneration` =>
+    /// FAILS here on the exact-set assertion. **Lower bound, WI-07's entry.**
     #[test]
-    fn this_build_registers_exactly_the_three_bucket_three_scopes() {
-        assert_eq!(
-            registered_executors(),
-            vec![
-                ReclaimScope::McpOpenOrphan,
-                ReclaimScope::McpOpenRetiredLineage,
-                ReclaimScope::ReadIndexGeneration
-            ]
-        );
-        assert!(
-            executor_for(ReclaimScope::CanonicalGeneration).is_none(),
-            "`canonical_generation` must not execute before WI-09"
-        );
+    fn this_build_registers_every_scope_including_the_opt_in_canonical_one() {
+        assert_eq!(registered_executors(), ReclaimScope::ALL.to_vec());
     }
 
     /// The grain of every scope's unit, pinned per scope — not derived from
@@ -3293,6 +3443,9 @@ mod tests {
             navigation_rows: 0,
             locator_rows: 0,
             directory_rows: 0,
+            raw_rows: 0,
+            error_rows: 0,
+            document_rows: 0,
         }
     }
 
@@ -3342,7 +3495,7 @@ mod tests {
                 "`{scope}` is registered with no probe"
             );
             assert!(
-                !(executor.predicates)(&unit(scope)).is_empty(),
+                !(executor.predicates)("moraine", &unit(scope)).is_empty(),
                 "`{scope}` is registered with no delete predicates"
             );
         }
@@ -3366,9 +3519,13 @@ mod tests {
     ///
     /// `ReclaimAuthority::for_scope` inside `reclaim_run` is the S2
     /// enforcement point at the command boundary. Deleting it left the suite
-    /// at 177/0, because `this_build_registers_exactly_the_three_bucket_three_scopes`
-    /// — named `this_build_registers_no_executor` when that was written —
-    /// never called `reclaim_run` at all; it asserted over the registry.
+    /// at 177/0, because the registry pin — named
+    /// `this_build_registers_no_executor` when that was written,
+    /// `this_build_registers_exactly_the_three_bucket_three_scopes` after
+    /// WI-05/WI-07, and
+    /// `this_build_registers_every_scope_including_the_opt_in_canonical_one`
+    /// as of WI-09 — never called `reclaim_run` at all; it asserted over the
+    /// registry.
     ///
     /// MUTATION (executed 2026-07-27): delete the
     /// `ReclaimAuthority::for_scope(scope, retention)?;` line from
@@ -3395,65 +3552,124 @@ mod tests {
         assert!(rendered.contains("moraine export events"), "{rendered}");
     }
 
-    /// **G-RUNEXEC.** Fails for: `reclaim_run` proceeding past the executor
-    /// registry.
-    /// Denomination: the returned outcome, and the absence of any I/O.
-    ///
-    /// MUTATION (executed 2026-07-28): delete the
-    /// `if executor_for(scope).is_none() { … }` block from `reclaim_run` =>
-    /// FAILS here: control reaches `reclaim_pending_mutations`, the offline
-    /// client cannot connect, and the call returns `Err` instead of
-    /// `NoExecutor`. **Lower bound, and it is the bound that matters: with an
-    /// authorized scope, that block is all that stands between a run and the
-    /// server.**
-    ///
-    /// The registered scopes are deliberately **not** in this loop. They reach
-    /// the server, by design, and asserting that they refuse locally would be
-    /// asserting the opposite of what WI-05 ships; their behaviour is guarded
-    /// by the two mock-server tests below.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn reclaim_run_refuses_an_unregistered_scope_without_reaching_clickhouse() {
-        let client = offline_client();
-        // Fully authorized, so the authority check cannot be what refuses.
-        let retention = RetentionConfig {
-            canonical_history_horizon_days: Some(365.0),
-            raw_audit_horizon_days: Some(90.0),
-            ..RetentionConfig::default()
-        };
-        let unregistered: Vec<ReclaimScope> = ReclaimScope::ALL
-            .into_iter()
-            .filter(|scope| executor_for(*scope).is_none())
-            .collect();
-        assert!(
-            !unregistered.is_empty(),
-            "this test needs at least one unregistered scope to be about anything"
-        );
-        for scope in unregistered {
-            let outcome = client
-                .reclaim_run(
-                    &retention,
-                    scope,
-                    ReclaimTrigger::Operator,
-                    &crate::envelope::test_budget(30.0, 256, 1_000_000, 1_000_000_000),
-                    &crate::envelope::test_budget(30.0, 256, 1_000_000, 1_000_000_000),
-                )
-                .await
-                .unwrap_or_else(|error| {
-                    panic!("`{scope}` must refuse locally, not by failing to connect: {error:#}")
-                });
-            match outcome {
-                ReclaimOutcome::NoExecutor {
-                    scope: refused,
-                    ref message,
-                } => {
-                    assert_eq!(refused, scope);
-                    assert!(message.contains("Nothing was deleted"), "{message}");
-                    assert!(message.contains(pending_work_item(scope)), "{message}");
-                }
-                other => panic!("`{scope}` produced {other:?}"),
-            }
-            assert!(!outcome.deleted_anything());
+    /// **G-RUNEXEC** (what survives of it in a fully-registered build). The
+    /// `executor_for` check in `reclaim_run` is unreachable as of WI-09 —
+    /// every scope has an executor — so no end-to-end call can drive the
+    /// `NoExecutor` arm any more. What this pins instead is the refusal text
+    /// that arm and the renderer share, per scope, so a downgrade build that
+    /// *can* reach it again says something true and names its work item.
+    #[test]
+    fn the_no_executor_refusal_names_its_work_item_and_deletes_nothing() {
+        for (scope, work_item) in [
+            (ReclaimScope::McpOpenOrphan, "WI-05"),
+            (ReclaimScope::McpOpenRetiredLineage, "WI-05b"),
+            (ReclaimScope::ReadIndexGeneration, "WI-07"),
+            (ReclaimScope::CanonicalGeneration, "WI-09"),
+        ] {
+            let message = no_executor_message(scope);
+            assert!(message.contains("Nothing was deleted"), "{message}");
+            assert!(message.contains(work_item), "{message}");
         }
+    }
+
+    /// The S2 refusal stays load-bearing **after** WI-09's registration: a
+    /// stock config asking for the canonical scope is refused before any
+    /// statement — probe, ledger read, mutation check, anything — reaches
+    /// the server. Before WI-09 the executor registry stood behind the
+    /// authority check as a second local refusal; now the authority check is
+    /// all that separates a stock config from a canonical delete path, which
+    /// is exactly the arrangement §4 S2 specifies — and this test observes
+    /// the server side of it rather than re-deriving the decision.
+    ///
+    /// MUTATION (executed 2026-07-31): delete the
+    /// `ReclaimAuthority::for_scope(scope, retention)?;` line from
+    /// `reclaim_run` => FAILS here: statements reach the mock (and
+    /// `reclaim_run_refuses_an_unconfigured_canonical_scope_before_anything_else`
+    /// fails with it, on the error side). **Lower bound, re-executed at the
+    /// new call site.**
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stock_config_canonical_run_issues_no_statement_at_all() {
+        let mock = ReclaimMock::default();
+        let client = mock_client(spawn_reclaim_mock(mock.clone()).await);
+        let error = crate::envelope::with_test_envelope(client.reclaim_run(
+            &RetentionConfig::default(),
+            ReclaimScope::CanonicalGeneration,
+            ReclaimTrigger::Operator,
+            &crate::envelope::test_budget(30.0, 256, 1_000_000, 1_000_000_000),
+            &crate::envelope::test_budget(30.0, 256, 1_000_000, 1_000_000_000),
+        ))
+        .await
+        .expect_err("a stock config must not authorize the canonical scope");
+        assert!(
+            error
+                .to_string()
+                .contains("retention.canonical_history_horizon_days"),
+            "{error:#}"
+        );
+        assert!(
+            mock.statements().is_empty(),
+            "the refusal must precede every statement: {:?}",
+            mock.statements()
+        );
+    }
+
+    /// The **plan path's** S2 refusal, pinned in isolation. The refusal is
+    /// layered: `plan_scope` consults `ReclaimAuthority::for_scope` first and
+    /// turns the miss into the estimate's note **in its own voice** — the
+    /// `MissingAuthority` rendering verbatim — before `reclaim_candidates` is
+    /// ever called; were that first layer lost, `reclaim_candidates`' horizon
+    /// computation still refuses with the same error before any statement,
+    /// but `plan_scope`'s error arm wraps it as `candidate probe failed: …`.
+    /// The exact-note equality below is therefore what tells the two layers
+    /// apart; the no-statement assertion holds under either and is the part
+    /// a reader of the registration comment actually relies on.
+    ///
+    /// MUTATION (executed 2026-07-31): delete the
+    /// `ReclaimAuthority::for_scope` check from `plan_scope` => no statement
+    /// reaches the mock (the second layer holds) and this test FAILS on the
+    /// note equality, on the wrapped `candidate probe failed:` voice.
+    /// **Lower bound on the first layer alone — the layering is deliberate,
+    /// and this is the only test that can see it.**
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stock_config_plan_refuses_the_canonical_scope_in_its_own_voice() {
+        let mock = ReclaimMock::default();
+        let client = mock_client(spawn_reclaim_mock(mock.clone()).await);
+        let plan = crate::envelope::with_test_envelope(
+            client.reclaim_plan(&RetentionConfig::default(), &ReclaimScope::ALL),
+        )
+        .await
+        .expect("a stock plan succeeds; the canonical scope becomes a refusal note");
+        let canonical = plan
+            .scopes
+            .iter()
+            .find(|estimate| estimate.scope == ReclaimScope::CanonicalGeneration)
+            .expect("every scope is planned");
+        assert_eq!(canonical.units, 0);
+        assert_eq!(canonical.estimated_rows, 0);
+        let expected = ReclaimAuthority::for_scope(
+            ReclaimScope::CanonicalGeneration,
+            &RetentionConfig::default(),
+        )
+        .expect_err("a stock config grants no canonical authority")
+        .to_string();
+        assert_eq!(
+            canonical.note.as_deref(),
+            Some(expected.as_str()),
+            "the plan-side refusal must be `plan_scope`'s own voice, not the probe layer's \
+             `candidate probe failed:` wrap"
+        );
+        // And it precedes every statement: no canonical probe reached the
+        // server. `cg_rollup` is the canonical probe's own CTE — the
+        // read-index probe shares the publication views, so the view names
+        // cannot discriminate.
+        assert!(
+            !mock
+                .statements()
+                .iter()
+                .any(|statement| statement.contains("cg_rollup")),
+            "a stock-config plan must issue no canonical probe: {:?}",
+            mock.statements()
+        );
     }
 
     // ---- denomination ---------------------------------------------------
@@ -3548,12 +3764,43 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
 
-    #[derive(Debug, Clone, PartialEq, Eq)]
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
     struct MockLedgerRow {
         scope: String,
         session_id: String,
         candidate_generation: u64,
+        source_host: String,
+        source_name: String,
+        source_file: String,
+        source_generation: u32,
         phase: String,
+    }
+
+    /// The canonical scope's delete order as **literals**, shared by the mock
+    /// bookkeeping and the driver tests' expectations. Deliberately not
+    /// `ReclaimScope::CanonicalGeneration.tables()`: an expectation derived
+    /// from the subject cannot fail for the subject changing, which is
+    /// exactly the mutation (reordering the arm) the order assertions exist
+    /// to catch.
+    const CANONICAL_TABLE_ORDER: [&str; 7] = [
+        "search_postings",
+        "search_documents",
+        "tool_io",
+        "event_links",
+        "ingest_errors",
+        "raw_events",
+        "events",
+    ];
+
+    /// One retired canonical generation the mock serves and deletes from.
+    /// `counts` is indexed by [`CANONICAL_TABLE_ORDER`].
+    #[derive(Debug, Clone)]
+    struct MockCanonicalUnit {
+        source_host: String,
+        source_name: String,
+        source_file: String,
+        source_generation: u32,
+        counts: [u64; 7],
     }
 
     #[derive(Debug)]
@@ -3561,6 +3808,9 @@ mod tests {
         statements: Vec<String>,
         /// `(session_id, candidate_generation) -> (event_rows, turn_rows, header_rows)`.
         rows: BTreeMap<(String, u64), (u64, u64, u64)>,
+        /// Retired canonical generations, keyed by `source_generation`
+        /// (fixture generations are unique).
+        canonical: BTreeMap<u32, MockCanonicalUnit>,
         ledger: BTreeMap<String, MockLedgerRow>,
         /// Rows each `DELETE` actually removed, in statement order. A replayed
         /// delete appends a `0`, which is what "replay removes zero additional
@@ -3594,6 +3844,7 @@ mod tests {
             Self {
                 statements: Vec::new(),
                 rows: BTreeMap::new(),
+                canonical: BTreeMap::new(),
                 ledger: BTreeMap::new(),
                 deleted: Vec::new(),
                 fail_once_on: None,
@@ -3622,6 +3873,27 @@ mod tests {
                 }
             }
             mock
+        }
+
+        /// One retired canonical generation with per-table row counts in
+        /// [`CANONICAL_TABLE_ORDER`].
+        fn with_retired_canonical_generation(generation: u32, counts: [u64; 7]) -> Self {
+            let mock = Self::default();
+            mock.lock().canonical.insert(
+                generation,
+                MockCanonicalUnit {
+                    source_host: "h-1".to_string(),
+                    source_name: "codex".to_string(),
+                    source_file: "/live.jsonl".to_string(),
+                    source_generation: generation,
+                    counts,
+                },
+            );
+            mock
+        }
+
+        fn canonical_units(&self) -> BTreeMap<u32, MockCanonicalUnit> {
+            self.lock().canonical.clone()
         }
 
         fn lock(&self) -> std::sync::MutexGuard<'_, ReclaimMockState> {
@@ -3711,6 +3983,15 @@ mod tests {
         rest[..end].trim().parse().ok()
     }
 
+    /// The first `toUInt32(<digits>)` argument in `statement` — the
+    /// generation literal every canonical predicate carries.
+    fn first_u32_arg(statement: &str) -> Option<u32> {
+        let start = statement.find("toUInt32(")? + "toUInt32(".len();
+        let rest = &statement[start..];
+        let end = rest.find(')')?;
+        rest[..end].trim().parse().ok()
+    }
+
     /// Reads by URL `query` parameter, writes by body — the two transport
     /// profiles the client actually uses (`query_json_each_row` puts the
     /// statement in the query string; `mutation_request_text_with_params_and_timeout`
@@ -3769,12 +4050,17 @@ mod tests {
                 return (axum::http::StatusCode::BAD_REQUEST, String::new());
             };
             let candidate_generation = first_u64_arg(&statement).unwrap_or_default();
+            let source_generation = first_u32_arg(&statement).unwrap_or_default();
             mock.lock().ledger.insert(
                 reclaim_id.clone(),
                 MockLedgerRow {
                     scope: scope.clone(),
                     session_id: session_id.clone(),
                     candidate_generation,
+                    source_host: literals.get(2).cloned().unwrap_or_default(),
+                    source_name: literals.get(3).cloned().unwrap_or_default(),
+                    source_file: literals.get(4).cloned().unwrap_or_default(),
+                    source_generation,
                     phase: phase.clone(),
                 },
             );
@@ -3784,6 +4070,20 @@ mod tests {
             .strip_prefix("DELETE FROM `moraine`.")
             .and_then(|rest| rest.split('\n').next())
         {
+            let canonical_index = CANONICAL_TABLE_ORDER
+                .iter()
+                .position(|candidate| *candidate == table);
+            if let Some(index) = canonical_index {
+                let generation = first_u32_arg(&statement).unwrap_or_default();
+                let mut state = mock.lock();
+                let removed = state
+                    .canonical
+                    .get_mut(&generation)
+                    .map(|unit| std::mem::take(&mut unit.counts[index]))
+                    .unwrap_or(0);
+                state.deleted.push((table.to_string(), removed));
+                return (axum::http::StatusCode::OK, String::new());
+            }
             let literals = quoted_literals(&statement);
             let session_id = literals.first().cloned().unwrap_or_default();
             let candidate_generation = first_u64_arg(&statement).unwrap_or_default();
@@ -3849,11 +4149,16 @@ mod tests {
                 .filter(|(_, row)| statement.contains(&format!("scope = '{}'", row.scope)))
                 .map(|(reclaim_id, row)| {
                     format!(
-                        "{{\"reclaim_id\":\"{reclaim_id}\",\"scope\":\"{}\",\"source_host\":\"\",\
-                         \"source_name\":\"\",\"source_file\":\"\",\"source_generation\":0,\
-                         \"session_id\":\"{}\",\"candidate_generation\":{},\"phase\":\"{}\",\
+                        "{{\"reclaim_id\":\"{reclaim_id}\",\"scope\":\"{}\",\
+                         \"source_host\":\"{}\",\"source_name\":\"{}\",\"source_file\":\"{}\",\
+                         \"source_generation\":{},\"session_id\":\"{}\",\
+                         \"candidate_generation\":{},\"phase\":\"{}\",\
                          \"estimated_rows\":0,\"estimated_bytes\":0,\"unsettled_seconds\":{}}}",
                         row.scope,
+                        row.source_host,
+                        row.source_name,
+                        row.source_file,
+                        row.source_generation,
                         row.session_id,
                         row.candidate_generation,
                         row.phase,
@@ -3861,6 +4166,37 @@ mod tests {
                     )
                 })
                 .chain(extra)
+                .collect::<Vec<_>>()
+                .join("\n");
+            return (axum::http::StatusCode::OK, format!("{body}\n"));
+        }
+        // The canonical candidate probe: retired generations whose
+        // generation-keyed rollup (events, raw_events, ingest_errors,
+        // search_documents — counts[6], [5], [4], [1] in
+        // `CANONICAL_TABLE_ORDER`) still holds rows (R4).
+        if statement.contains("cg_rollup") {
+            let body = mock
+                .canonical_units()
+                .into_values()
+                .filter(|unit| {
+                    unit.counts[6] + unit.counts[5] + unit.counts[4] + unit.counts[1] > 0
+                })
+                .map(|unit| {
+                    format!(
+                        "{{\"source_host\":\"{}\",\"source_name\":\"{}\",\
+                         \"source_file\":\"{}\",\"source_generation\":{},\
+                         \"event_rows\":{},\"raw_rows\":{},\"error_rows\":{},\
+                         \"document_rows\":{}}}",
+                        unit.source_host,
+                        unit.source_name,
+                        unit.source_file,
+                        unit.source_generation,
+                        unit.counts[6],
+                        unit.counts[5],
+                        unit.counts[4],
+                        unit.counts[1],
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join("\n");
             return (axum::http::StatusCode::OK, format!("{body}\n"));
@@ -3934,6 +4270,259 @@ mod tests {
             &crate::envelope::test_budget(30.0, 256, 1_000_000, 1_000_000_000),
         ))
         .await
+    }
+
+    /// A `[retention]` that authorizes the canonical scope. Canonical is the
+    /// stricter horizon (30 d > 7 d), so the probe must carry 2 592 000 s.
+    fn canonical_retention() -> RetentionConfig {
+        RetentionConfig {
+            canonical_history_horizon_days: Some(30.0),
+            raw_audit_horizon_days: Some(7.0),
+            ..RetentionConfig::default()
+        }
+    }
+
+    async fn run_canonical_reclaim(client: &ClickHouseClient) -> Result<ReclaimOutcome> {
+        crate::envelope::with_test_envelope(client.reclaim_run(
+            &canonical_retention(),
+            ReclaimScope::CanonicalGeneration,
+            ReclaimTrigger::Operator,
+            &crate::envelope::test_budget(30.0, 256, 1_000_000, 1_000_000_000),
+            &crate::envelope::test_budget(30.0, 256, 1_000_000, 1_000_000_000),
+        ))
+        .await
+    }
+
+    /// Per-table row counts for one mock canonical unit, in
+    /// [`CANONICAL_TABLE_ORDER`]: postings 4, documents 3, tool_io 2,
+    /// event_links 1, ingest_errors 1, raw_events 2, events 3.
+    const CANONICAL_UNIT_COUNTS: [u64; 7] = [4, 3, 2, 1, 1, 2, 3];
+
+    /// **G-CG-RUN.** Fails for: an authorized canonical run that claims after
+    /// deleting, deletes in any order other than the pinned canonical-last
+    /// one, skips a table, or settles without finishing.
+    /// Denomination: the recorded statement order against a stateful mock —
+    /// compared against [`CANONICAL_TABLE_ORDER`]'s literals, never against
+    /// `scope.tables()`, because the driver follows `tables()` and an
+    /// expectation derived from the subject cannot fail for the subject
+    /// changing — the per-table deleted counts, and the settled ledger phase.
+    ///
+    /// MUTATION (executed 2026-07-31): reverse the `CanonicalGeneration` arm
+    /// of `ReclaimScope::tables` => FAILS here on the literal order
+    /// assertion (`events` deleted first), and the two order pins in
+    /// `reclaim_canonical` fail with it. **Lower bound: `events` before its
+    /// satellites is the crash window that orphans satellites of deleted
+    /// canonical rows.**
+    ///
+    /// MUTATION (executed 2026-07-31): drop the
+    /// `self.reclaim_ledger_write(&ledger_claim_statement(…))` from
+    /// `reclaim_run`'s claim loop => FAILS here: no `'claimed'` ledger write
+    /// exists at all. **Width: claim-before-delete is what makes the set
+    /// re-derivable.**
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_authorized_canonical_run_deletes_canonical_last_and_settles() {
+        let mock = ReclaimMock::with_retired_canonical_generation(5, CANONICAL_UNIT_COUNTS);
+        let client = mock_client(spawn_reclaim_mock(mock.clone()).await);
+        let outcome = run_canonical_reclaim(&client).await.expect("run completes");
+
+        match outcome {
+            ReclaimOutcome::Settled {
+                scope,
+                units,
+                estimated_rows,
+                ..
+            } => {
+                assert_eq!(scope, ReclaimScope::CanonicalGeneration);
+                assert_eq!(units, 1);
+                // The probe estimates the four generation-keyed tables only
+                // (events 3 + raw 2 + errors 1 + documents 3); the satellite
+                // mass is deliberately absent (module docs, cost shape).
+                assert_eq!(estimated_rows, 9);
+            }
+            other => panic!("expected a settled run: {other:?}"),
+        }
+
+        // Claim before any delete; deletes in the exact pinned
+        // canonical-last order; settle after the last delete.
+        let claimed = mock
+            .first_phase_write(ReclaimPhase::Claimed)
+            .expect("the run claims");
+        let deleting = mock
+            .first_phase_write(ReclaimPhase::Deleting)
+            .expect("the run advances");
+        let done = mock
+            .first_phase_write(ReclaimPhase::Done)
+            .expect("the run settles");
+        let mut previous = deleting;
+        assert!(claimed < deleting, "claim must precede the phase advance");
+        for table in CANONICAL_TABLE_ORDER {
+            let position = mock
+                .first_index(&format!("DELETE FROM `moraine`.{table}\n"))
+                .unwrap_or_else(|| panic!("`{table}` was never deleted"));
+            assert!(
+                position > previous,
+                "`{table}` deleted out of order (position {position}, previous {previous})"
+            );
+            previous = position;
+        }
+        assert!(done > previous, "settle must follow the last delete");
+
+        // Every table's rows left, in order, and the probe carried the
+        // stricter protected horizon (30 d), not the derived default.
+        let expected: Vec<(String, u64)> = CANONICAL_TABLE_ORDER
+            .iter()
+            .zip(CANONICAL_UNIT_COUNTS)
+            .map(|(table, count)| (table.to_string(), count))
+            .collect();
+        assert_eq!(mock.deleted(), expected);
+        assert!(mock.first_index("toIntervalSecond(2592000)").is_some());
+        let ledger = mock.ledger();
+        assert_eq!(ledger.len(), 1);
+        assert!(ledger.values().all(|row| row.phase == "done"));
+    }
+
+    /// **G-CG-RESTART (the in-process half; the `clickhouse local` fixture's
+    /// `canonical_interrupt.sql` → `canonical_delete.sql` sequence is the
+    /// semantic half, and the `reclaim-restart` live gate remains sandbox
+    /// work).** Fails for: a canonical unit interrupted **between the
+    /// satellite deletes and the canonical deletes** that the next run does
+    /// not complete, completes out of order, or whose replayed satellite
+    /// deletes remove additional rows.
+    /// Denomination: per-table deleted counts across both runs, the ledger
+    /// phase after each, and the surviving canonical rows between them.
+    ///
+    /// This is the exact crash window the canonical-last ordering exists
+    /// for: after run one the satellites are gone and every bucket-1/2 row
+    /// is intact — the re-derivable half-state — and the uid-set predicates
+    /// the re-drive rebuilds still find their `events` source rows because
+    /// `events` is deleted last.
+    ///
+    /// MUTATION (executed 2026-07-31): replace the `reclaim_redrive` call in
+    /// `reclaim_run` with `ReclaimRedriveReport::default()` => FAILS here on
+    /// the claim-count assertion: run two completes the unit only by
+    /// re-claiming it **through the probe** (its canonical rows still
+    /// exist), writing a second `'claimed'` ledger row — the re-drive path
+    /// completes the existing claim and writes none. The distinction is the
+    /// work item: a unit whose canonical rows were already gone (a crash
+    /// after the `events` delete) has nothing for a probe to find, and only
+    /// the re-drive can ever settle it. **Lower bound.**
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_canonical_unit_interrupted_before_its_canonical_deletes_is_redriven() {
+        let mock = ReclaimMock::with_retired_canonical_generation(5, CANONICAL_UNIT_COUNTS);
+        // Refuse the first bucket-2 delete once: the crash lands after the
+        // four satellite deletes, before any canonical row is touched.
+        mock.fail_once_on("DELETE FROM `moraine`.ingest_errors");
+        let client = mock_client(spawn_reclaim_mock(mock.clone()).await);
+
+        run_canonical_reclaim(&client)
+            .await
+            .expect_err("the interrupted run must surface its failure");
+        {
+            let ledger = mock.ledger();
+            assert_eq!(ledger.len(), 1);
+            assert!(
+                ledger.values().all(|row| row.phase == "deleting"),
+                "the interrupted unit must stay unsettled: {ledger:?}"
+            );
+            let units = mock.canonical_units();
+            let unit = units.values().next().expect("the unit survives");
+            assert_eq!(
+                unit.counts,
+                [0, 0, 0, 0, 1, 2, 3],
+                "the half-state must be satellites-gone, canonical-intact — the safe \
+                 direction: {unit:?}"
+            );
+        }
+
+        let outcome = run_canonical_reclaim(&client).await.expect("re-drive run");
+        assert!(
+            matches!(outcome, ReclaimOutcome::Settled { .. }),
+            "{outcome:?}"
+        );
+        let ledger = mock.ledger();
+        assert!(
+            ledger.values().all(|row| row.phase == "done"),
+            "the re-driven unit must settle: {ledger:?}"
+        );
+        assert!(
+            mock.canonical_units()
+                .values()
+                .all(|unit| unit.counts == [0; 7]),
+            "the re-drive must finish every table"
+        );
+        // The replayed satellite deletes removed zero additional rows — the
+        // §3.2 idempotence claim, measured. Run two's deletes are the last
+        // seven recorded: four zero-row satellite replays, then the three
+        // canonical deletes.
+        let deleted = mock.deleted();
+        let replay = &deleted[deleted.len() - 7..];
+        let expected: Vec<(String, u64)> = CANONICAL_TABLE_ORDER
+            .iter()
+            .zip([0, 0, 0, 0, 1, 2, 3])
+            .map(|(table, count)| (table.to_string(), count))
+            .collect();
+        assert_eq!(replay, expected.as_slice());
+
+        // And the completion came from the RE-DRIVE, not from a fresh claim:
+        // one `'claimed'` ledger write across both runs. A driver that lost
+        // its re-drive pass could still settle THIS unit by re-claiming it
+        // through the probe — but only because its canonical rows happened to
+        // survive the crash; the claim count is what tells the two apart.
+        let claim_writes = mock
+            .statements()
+            .iter()
+            .filter(|statement| {
+                statement.starts_with("INSERT INTO `moraine`.storage_reclaim_ledger")
+                    && statement.contains("'claimed'")
+            })
+            .count();
+        assert_eq!(
+            claim_writes, 1,
+            "the interrupted unit must be completed from its existing claim, never re-claimed"
+        );
+    }
+
+    /// The library half of the canonical horizon wiring: the probe a
+    /// configured run and plan actually issue carries the **stricter of the
+    /// two protected horizons** — `probe_horizon_seconds`' rule — and never
+    /// the derived default.
+    ///
+    /// MUTATION (executed 2026-07-31): make `reclaim_candidates` use
+    /// `retention.derived_horizon_seconds()` for every scope (restore the
+    /// pre-WI-09 line) => FAILS here: the canonical probe arrives carrying
+    /// 86 400 s instead of 2 592 000 s. **Lower bound — this is the wiring
+    /// the unit-level rule test cannot see.**
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_canonical_probe_carries_the_stricter_protected_horizon() {
+        let mock = ReclaimMock::with_retired_canonical_generation(5, CANONICAL_UNIT_COUNTS);
+        let client = mock_client(spawn_reclaim_mock(mock.clone()).await);
+        run_canonical_reclaim(&client).await.expect("run completes");
+        crate::envelope::with_test_envelope(
+            client.reclaim_plan(&canonical_retention(), &ReclaimScope::ALL),
+        )
+        .await
+        .expect("plan completes");
+
+        let canonical_probes: Vec<String> = mock
+            .statements()
+            .into_iter()
+            .filter(|statement| statement.contains("cg_rollup"))
+            .collect();
+        assert!(
+            canonical_probes.len() >= 2,
+            "expected the run's probe plus the plan's: {canonical_probes:?}"
+        );
+        let derived = canonical_retention().derived_horizon_seconds().max(0.0) as u64;
+        for probe in &canonical_probes {
+            assert!(
+                probe.contains("toIntervalSecond(2592000)"),
+                "the canonical probe must carry the stricter protected horizon: {probe}"
+            );
+            assert!(
+                !probe.contains(&format!("toIntervalSecond({derived})")),
+                "the derived horizon must never gate user history: {probe}"
+            );
+        }
     }
 
     /// **G-RESTART (the in-process half).** Fails for: a run that does not
@@ -4350,10 +4939,12 @@ mod tests {
     /// assert is the tighter of the two.
     #[tokio::test(flavor = "multi_thread")]
     async fn every_statement_cap_covers_what_its_phase_issues() {
-        // Scopes with no registered executor issue no probe, so a plan today
-        // costs less than a fully-registered one. The cap must cover the
-        // fully-registered case.
-        let unprobed = ReclaimScope::ALL.len() as u32 - registered_executors().len() as u32;
+        // A scope the config does not authorize issues no probe — under a
+        // stock config that is the canonical scope — so a stock plan costs
+        // less than a fully-configured one. The cap must cover the
+        // fully-configured case.
+        let unprobed =
+            ReclaimScope::ALL.len() as u32 - authorized_probing_scopes(&RetentionConfig::default());
 
         // ---- plan -------------------------------------------------------
         let plan_mock = ReclaimMock::with_orphans(&[("s-plan", 100, 3, 2)]);
@@ -4365,7 +4956,7 @@ mod tests {
             .await
             .expect("a full-scope plan fits its own cap");
         let plan_issued = envelope_statements(&statements_per_envelope(&plan_mock), "reclaim-plan");
-        let probing_scopes = registered_executors().len() as u32;
+        let probing_scopes = authorized_probing_scopes(&RetentionConfig::default());
         assert_eq!(
             plan_issued,
             PLAN_STMT_LEDGER_SUMMARY
@@ -4681,6 +5272,7 @@ mod tests {
                         session_id: "wedged".to_string(),
                         candidate_generation: 1,
                         phase: "deleting".to_string(),
+                        ..MockLedgerRow::default()
                     },
                 );
                 state.unsettled_seconds = age;
@@ -4771,6 +5363,7 @@ mod tests {
                     session_id: "poison".to_string(),
                     candidate_generation: 9,
                     phase: "deleting".to_string(),
+                    ..MockLedgerRow::default()
                 },
             );
             // Every delete naming the poison unit is refused, forever.
@@ -5099,10 +5692,11 @@ mod tests {
             })
             .count();
         assert_eq!(
-            probes,
-            1 + registered_executors().len(),
-            "expected the run's candidate probe plus one per registered scope from the plan, \
-             or a call site this test cannot see stayed unbounded: {issued:?}"
+            probes as u32,
+            1 + authorized_probing_scopes(&RetentionConfig::default()),
+            "expected the run's candidate probe plus one per authorized scope from the plan \
+             (the stock config authorizes the three bucket-3 scopes and refuses the canonical \
+             one), or a call site this test cannot see stayed unbounded: {issued:?}"
         );
 
         // The V4 mitigation, re-derived from the wire: one unit is one

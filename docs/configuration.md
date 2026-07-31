@@ -947,6 +947,12 @@ physical table into one of five classes:
 because it is a `SummingMergeTree` accumulator with no tombstone path: a delete
 never decrements it, so any reclamation naming it would leave the term corpus
 permanently overstated with no way back short of a corpus-wide re-tokenize.
+As of migration 040 it is **decommissioned rather than reconciled**: it has no
+reader anywhere, so the materialized view that fed it is dropped — ending the
+per-insert write amplification and freezing the table as a historical artifact
+that claims nothing about the live corpus. The frozen table keeps this class
+(nothing may delete it, canonical reclamation included) until a later release
+drops it together with the other retired search relations.
 
 ```toml
 [retention]
@@ -987,19 +993,31 @@ would touch, and refuses a bucket-1/2 scope unless the matching key above is
 present — naming the missing key. Export before pruning with
 `moraine export events --format jsonl`.
 
-Three scopes delete in this release, all bucket 3:
+Four scopes delete in this release:
 
 | Scope | What it collects |
 |---|---|
 | `mcp_open_orphan` | Child rows whose `(session, candidate generation)` has **no publication header**. No reader can authorize them on either engine, so this is safe independently of the canonical-read cutover. |
 | `mcp_open_retired_lineage` | Complete snapshots in a source lineage the session has left, once a newer lineage is published *and* live for that session and the old one is unselectable by any request. |
 | `read_index_generation` | Canonical read-index rows (`mcp_session_directory`, `mcp_event_locator`, `mcp_event_navigation`) belonging to **retired** source generations: generations publication history records as published and that a later publication has displaced from the current head, once that supersession is older than `derived_horizon_hours`. The three tables are content-free and rebuildable with `moraine db core-index rebuild`; see [canonical read indexes](operations/canonical-read-indexes.md#reclaiming-superseded-generations) for the rollback caveat this horizon is the window for. |
+| `canonical_generation` | **User history — buckets 1 and 2, opt-in only.** Superseded source generations in `events`, `raw_events` and `ingest_errors`, together with their derived satellites (`search_documents`, `search_postings`, `tool_io`, `event_links`). Retirement is the same publication-truth notion as `read_index_generation`, but the horizon is the **stricter (larger)** of the two protected keys: `events` is gated by `canonical_history_horizon_days`, the two audit tables by `raw_audit_horizon_days`, and one generation is one unit, so it becomes claimable only when **both** horizons have passed; the satellites go with the unit, because a satellite that outlived its canonical parent would be a permanent orphan. Deletes run satellites first and `events` last, so an interruption leaves rebuildable derived gaps, never orphaned derived rows. |
 
-`canonical_generation` still has no executor: `run` refuses it — naming the
-work item that will add one — and exits non-zero. It is additionally excluded
-from the automatic tick by design, so configuring a retention horizon grants
-the explicit CLI permission to prune history and never grants it to a
-background task.
+`canonical_generation` runs **only** from the explicit CLI: it requires both
+protected keys (`run` refuses naming the missing one) plus `--confirm`, and
+the background tick's scope roster excludes it permanently — configuring a
+retention horizon grants the explicit CLI permission to prune history and
+never grants it to a background task. Even an interrupted canonical unit is
+re-driven only by the next explicit `run`, never by the janitor; until then
+it rests in the safe half-state (derived rows missing, canonical rows
+intact). **A generation pruned by this scope is gone from Moraine**: unlike
+the read indexes there is no rebuild, and recovering it afterwards requires
+the original source file on disk or a prior
+`moraine export events --format jsonl`.
+
+Rows written before migration 032 carry an empty `source_host` and are
+deliberately unreachable by this scope (publication truth names real hosts),
+as are generations that were never published at all: both are bounded
+residues, never candidates.
 
 Each unit is written to the reclaim ledger *before* its first delete and
 settled after its last, and every run finishes the ledger's unsettled units

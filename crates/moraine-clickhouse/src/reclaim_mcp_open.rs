@@ -1135,10 +1135,15 @@ mod tests {
             retired_sql.contains("required_heads_fingerprint"),
             "the retirement probe is about lineage: {retired_sql}"
         );
-        assert!(
-            crate::reclaim::executor_for(ReclaimScope::CanonicalGeneration).is_none(),
-            "`canonical_generation` has no probe in this build and must not be registered"
-        );
+        // `canonical_generation` is registered as of WI-09; its probe is a
+        // different statement entirely (its own module pins it verbatim), and
+        // what keeps its registration safe is the authority check in front of
+        // the registry, not the registry itself.
+        let canonical = crate::reclaim::executor_for(ReclaimScope::CanonicalGeneration)
+            .expect("WI-09 registers the canonical executor");
+        let canonical_sql = (canonical.probe)("moraine", 86_400, 8);
+        assert_ne!(canonical_sql, orphan_sql);
+        assert_ne!(canonical_sql, retired_sql);
     }
 
     /// The `clickhouse local` fixture's files hold **this build's statements,

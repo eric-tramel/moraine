@@ -291,14 +291,16 @@ pub const CLASSIFIED_TABLES: &[ClassifiedTable] = &[
     ClassifiedTable {
         name: "search_conversation_terms",
         class: TableClass::NeverDelete,
-        rationale: "Hazard H5. A SummingMergeTree accumulator with NO tombstone path: a delete \
-                    never decrements, so any reclaim naming it leaves the corpus permanently \
-                    overstated, and §1 marks it `never (pending OQ-1)` because OQ-1 records that \
-                    removal `is not reversible without a corpus-wide re-tokenize`. Whether it is \
-                    dropped or rebuilt is OQ-1 and blocks WI-09; until that is answered the safe \
-                    class is the one no authority token can unlock, not the one the stock \
-                    `DerivedOnly` token authorizes. Migration 010 truncates it on install and is \
-                    allowlisted for exactly that.",
+        rationale: "Hazard H5, resolved by OQ-1's answer in WI-09: the accumulator is DEAD (zero \
+                    readers repo-wide, in the monitor UI, and in the Python bindings — checked \
+                    2026-07-31) and DECOMMISSIONED — migration 040 drops its feeding MV, so it \
+                    is a frozen historical artifact claiming nothing about the live corpus and \
+                    canonical reclamation owes it no reconciliation. It keeps this class — a \
+                    SummingMergeTree with no tombstone path, unlockable by no authority token — \
+                    until WI-10's batched schema cleanup drops the table itself. Migration 010 \
+                    truncates it on install and is allowlisted for exactly that; the resolution \
+                    gate is `reclaim_canonical::tests::\
+                    oq1_search_conversation_terms_is_decommissioned_not_reclaimed`.",
     },
     // ---- Bucket 3 — rebuildable derived data -----------------------------
     ClassifiedTable {
