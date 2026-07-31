@@ -1637,8 +1637,8 @@ mod tests {
             width: 100,
         };
         let outcome = ReclaimOutcome::NoExecutor {
-            scope: ReclaimScope::ReadIndexGeneration,
-            message: "no executor is registered for scope `read_index_generation`; WI-07 adds \
+            scope: ReclaimScope::CanonicalGeneration,
+            message: "no executor is registered for scope `canonical_generation`; WI-09 adds \
                       it. Nothing was deleted."
                 .to_string(),
         };

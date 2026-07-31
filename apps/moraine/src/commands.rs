@@ -1313,17 +1313,22 @@ mod tests {
     async fn a_refusal_exits_non_zero() {
         // End to end: a confirmed run of an authorized scope with no
         // registered executor refuses, and that refusal is not a success.
-        // `mcp_open_orphan` is no longer such a scope — WI-05 registered it —
-        // so this drives one that still is. Naming a registered scope here
-        // would assert that a run reaches the network, which is the opposite
-        // of the ceremony this gate is about.
-        let cfg = offline_config(moraine_config::RetentionConfig::default());
+        // Every default-on scope has an executor as of WI-07, so the one
+        // scope still awaiting its executor is bucket-1 `canonical_generation`
+        // — authorize it explicitly so the refusal under test is the registry,
+        // not the missing `[retention]` key (that refusal has its own gate
+        // above). Naming a registered scope here would assert that a run
+        // reaches the network, which is the opposite of the ceremony this
+        // gate is about.
+        let cfg = offline_config(moraine_config::RetentionConfig {
+            canonical_history_horizon_days: Some(365.0),
+            raw_audit_horizon_days: Some(90.0),
+            ..moraine_config::RetentionConfig::default()
+        });
         let unregistered = moraine_clickhouse::ReclaimScope::ALL
             .into_iter()
-            .find(|scope| {
-                moraine_clickhouse::reclaim::executor_for(*scope).is_none() && scope.is_default_on()
-            })
-            .expect("at least one default-on scope still awaits its executor");
+            .find(|scope| moraine_clickhouse::reclaim::executor_for(*scope).is_none())
+            .expect("at least one scope still awaits its executor");
         let code = cmd_db_reclaim_run(
             &cfg,
             &plain_output(),

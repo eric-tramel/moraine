@@ -60,24 +60,6 @@ use crate::reclaim::{ReclaimTable, ReclaimUnit};
 pub(crate) const BACKFILL_PHASE_COMPLETE: u8 =
     crate::mcp_open_projection::BACKFILL_PHASE_COMPLETE_VALUE;
 
-/// Row shape both probes return.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
-pub(crate) struct McpOpenCandidateRow {
-    pub(crate) session_id: String,
-    pub(crate) candidate_generation: u64,
-    pub(crate) event_rows: u64,
-    pub(crate) turn_rows: u64,
-    pub(crate) header_rows: u64,
-}
-
-impl McpOpenCandidateRow {
-    pub(crate) fn estimated_rows(&self) -> u64 {
-        self.event_rows
-            .saturating_add(self.turn_rows)
-            .saturating_add(self.header_rows)
-    }
-}
-
 /// The two child tables, aggregated to `(session_id, candidate_generation)`
 /// with their newest write, as one relation.
 ///
@@ -1153,15 +1135,10 @@ mod tests {
             retired_sql.contains("required_heads_fingerprint"),
             "the retirement probe is about lineage: {retired_sql}"
         );
-        for scope in [
-            ReclaimScope::ReadIndexGeneration,
-            ReclaimScope::CanonicalGeneration,
-        ] {
-            assert!(
-                crate::reclaim::executor_for(scope).is_none(),
-                "`{scope}` has no probe in this build and must not be registered"
-            );
-        }
+        assert!(
+            crate::reclaim::executor_for(ReclaimScope::CanonicalGeneration).is_none(),
+            "`canonical_generation` has no probe in this build and must not be registered"
+        );
     }
 
     /// The `clickhouse local` fixture's files hold **this build's statements,
