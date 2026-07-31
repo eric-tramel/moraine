@@ -151,8 +151,9 @@ impl ClickHouseConversationRepository {
 
         let limit_plus = query.max_rows.saturating_add(1);
         let max_execution_time = query.execution_budget_secs.max(1).to_string();
+        let exact_query_id = format!("{}-exact", query.cancellation_token);
         let params = [
-            ("query_id", query.cancellation_token.as_str()),
+            ("query_id", exact_query_id.as_str()),
             ("max_execution_time", max_execution_time.as_str()),
             ("join_use_nulls", "1"),
         ];
@@ -462,8 +463,9 @@ SELECT {}, arrayJoin([{roots}]), toUInt64(toUnixTimestamp64Milli(now64(3)))",
 
         let limit_plus = query.max_rows.saturating_add(1);
         let max_execution_time = query.execution_budget_secs.max(1).to_string();
+        let suffix_query_id = format!("{}-suffix", query.cancellation_token);
         let params = [
-            ("query_id", query.cancellation_token.as_str()),
+            ("query_id", suffix_query_id.as_str()),
             ("max_execution_time", max_execution_time.as_str()),
             ("join_use_nulls", "1"),
         ];
