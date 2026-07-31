@@ -494,6 +494,12 @@ fn seed_opencode_db(path: &PathBuf) -> Connection {
     connection
 }
 
+/// The shipped-default fast-path budget: what a production poll runs with
+/// when nothing in `[ingest.sqlite]` is overridden.
+fn default_opencode_budget() -> ScanBudget {
+    ScanBudget::fast_path(&moraine_config::SqliteIngestConfig::default())
+}
+
 fn opencode_sqlite_work(path: &Path) -> WorkItem {
     WorkItem {
         source_name: "opencode-sqlite-test".to_string(),
@@ -1101,9 +1107,17 @@ async fn opencode_sqlite_first_poll_emits_allowlisted_conversation_rows() {
             .is_some(),
         "OpenCode uses the append-only event sequence cursor"
     );
+    // §3.1 Change 4 restates the old "no context maps" absence check as a size
+    // budget: WI-06 *requires* persisting the reconstruction context (it is
+    // what lets the page loop start at the watermark), and what stays bounded
+    // is the serialized footprint, enforced by `evict_contexts_to_fit`.
     assert!(
-        cursor.get("session_contexts").is_none() && cursor.get("message_contexts").is_none(),
-        "OpenCode checkpoints stay bounded to aggregate sequence cursors"
+        cursor.pointer("/session_contexts/ses_demo").is_some(),
+        "the reconstruction context must persist in the cursor (§3.1 Change 2)"
+    );
+    assert!(
+        checkpoint.cursor_json.len() <= 4 * 1024 * 1024,
+        "the persisted cursor stays under the context byte ceiling"
     );
     let serialized = serde_json::to_string(&raw_rows).expect("serialize raw rows");
     assert!(
@@ -1315,6 +1329,7 @@ fn opencode_sqlite_scan_paginates_past_single_event_page() {
     let outcome = scan_opencode_database(
         path.to_str().expect("utf-8 path"),
         &OpenCodeState::fresh(),
+        &default_opencode_budget(),
         &mut ScanLedger::default(),
     );
     let (records, new_state, relevant_rows) = match outcome {
@@ -1385,6 +1400,7 @@ fn opencode_sqlite_project_dir_stays_on_first_absolute_session_directory() {
     let outcome = scan_opencode_database(
         path.to_str().expect("utf-8 path"),
         &OpenCodeState::fresh(),
+        &default_opencode_budget(),
         &mut ScanLedger::default(),
     );
     let records = match outcome {
@@ -1924,24 +1940,16 @@ fn opencode_fixture_uses_the_production_event_index() {
     cleanup(&path);
 }
 
-/// Issue #601 §2.0 / WI-01, OpenCode arm. Payload bytes are the exact lengths
-/// of what SQLite materialized *plus* what its aggregate preflight forced it to
-/// decode; the census axis carries schema validation and the narrow
-/// `event_sequence` read.
+/// Issue #601 §2.0 / WI-01, OpenCode arm, restated by WI-06 (§3.1 Change 5).
+/// Payload bytes are exactly the lengths of what SQLite materialized in the
+/// page loop — the per-aggregate `sum(length(data))` preflight that used to
+/// double a cold scan's byte cost is gone — and the census axis carries schema
+/// validation plus **one** `event_sequence` read, where WI-01's ledger showed
+/// two.
 ///
-/// Both totals record duplication the ledger exists to expose, so neither is an
-/// arbitrary constant:
-///
-/// - `opencode_aggregate_sequences` runs **twice** per scan (preflight + page
-///   loop), so the census is `2 ×` the `event_sequence` read;
-/// - `opencode_relevant_stats`'s `sum(length(data))` decodes every `data` byte
-///   in the range before the page loop reads the same rows again, so a cold
-///   scan's payload bytes are the row bytes **plus a second full pass over
-///   `data`** — the ~2× §1.1 finding 2 predicts, made visible instead of
-///   "real and invisible".
-///
-/// Issue #601 §3.1 Change 5 removes both duplications; these assertions are
-/// what force that to be restated rather than silently drifting.
+/// These equalities are what stop either duplication from silently returning:
+/// re-adding the preflight, or a second `opencode_aggregate_sequences` call,
+/// moves an exact number.
 #[test]
 fn opencode_ledger_charges_payload_bytes_at_the_read_site() {
     let path = unique_opencode_db_path("ledger-read-site");
@@ -1976,22 +1984,13 @@ fn opencode_ledger_charges_payload_bytes_at_the_read_site() {
     let aggregates: i64 = connection
         .query_row("SELECT count(*) FROM event_sequence", [], |row| row.get(0))
         .expect("count aggregates");
-    // What the preflight aggregate decodes: `data` only, over the same range.
-    let preflight_data_bytes: i64 = connection
-        .query_row(
-            "SELECT coalesce(sum(length(CAST(coalesce(e.data, '') AS BLOB))), 0) \
-             FROM event e JOIN event_sequence s ON s.aggregate_id = e.aggregate_id \
-             WHERE e.seq <= s.seq",
-            [],
-            |row| row.get(0),
-        )
-        .expect("sum preflight decoded bytes");
     drop(connection);
 
     let mut ledger = ScanLedger::default();
     let outcome = scan_opencode_database(
         path.to_str().expect("utf-8 path"),
         &OpenCodeState::fresh(),
+        &default_opencode_budget(),
         &mut ledger,
     );
     let records = match outcome {
@@ -2006,13 +2005,11 @@ fn opencode_ledger_charges_payload_bytes_at_the_read_site() {
         expected_rows > 0 && expected_bytes > 0,
         "fixture must have events"
     );
-    assert!(preflight_data_bytes > 0);
     assert_eq!(
-        ledger.payload_bytes,
-        (expected_bytes + preflight_data_bytes) as u64,
-        "payload bytes are the materialized column lengths plus the bytes the \
-         aggregate preflight forced SQLite to decode; charging only the former \
-         under-reports a cold scan by ~2×"
+        ledger.payload_bytes, expected_bytes as u64,
+        "payload bytes are exactly the materialized column lengths; more means \
+         a duplicate read path (the retired preflight) came back, fewer means \
+         a read bypassed the ledger"
     );
     assert_eq!(ledger.payload_rows, expected_rows as u64);
     assert_eq!(ledger.rows_emitted, records.len() as u64);
@@ -2021,10 +2018,6 @@ fn opencode_ledger_charges_payload_bytes_at_the_read_site() {
         "[DIVERGENT FIXTURE] events read and records emitted must differ, or the \
          two axes are interchangeable and neither is tested"
     );
-    // Census = schema validation + the `event_sequence` read, and the latter
-    // runs **twice** per scan today (preflight + page loop). Issue #601 §3.1
-    // Change 5 folds it to one; this assertion is what forces that number to
-    // be restated rather than silently drifting.
     let schema_census = {
         let connection = crate::sqlite_poll::open_read_only(path.to_str().expect("utf-8 path"))
             .expect("reopen for schema census");
@@ -2033,52 +2026,45 @@ fn opencode_ledger_charges_payload_bytes_at_the_read_site() {
     assert!(schema_census.census_rows > 0);
     assert_eq!(
         ledger.census_rows,
-        schema_census.census_rows + 2 * aggregates as u64,
+        schema_census.census_rows + aggregates as u64,
+        "one event_sequence read per scan (§3.1 Change 5), not two"
     );
     assert_eq!(
         ledger.census_bytes,
-        schema_census.census_bytes + 2 * aggregate_id_bytes as u64
+        schema_census.census_bytes + aggregate_id_bytes as u64
     );
 
     cleanup(&path);
 }
 
-/// Calibration baseline for gates G1b/G3 (issue #601 §3.1). Today
-/// `scan_opencode_rows` starts its page loop at `last_seq = -1`, so appending
-/// one event re-reads the aggregate's entire history — 639 events / 6.9 MB on
-/// the reference host to normalize one new event.
+/// The inversion of WI-01's calibration baseline (`opencode_incremental_scan_
+/// currently_re_reads_the_whole_aggregate`), exactly as that test demanded:
+/// with the page loop starting at the persisted watermark (§3.1 Change 1) and
+/// the reconstruction context persisted (Change 2), one appended event costs
+/// **exactly that event** — not the aggregate's history and not a context
+/// rebuild.
 ///
-/// This test *records* that, so that WI-06's fix has a measured "before" and
-/// so nobody can claim the fix without this assertion changing. When the
-/// watermark start lands, the incremental scan's payload bytes must collapse
-/// to the appended event and this assertion must be inverted.
+/// Fails for: restoring `let mut last_seq = -1;`, a context path that replays
+/// history on a warm scan, or any warm-scan read that bypasses the ledger.
 #[test]
-fn opencode_incremental_scan_currently_re_reads_the_whole_aggregate() {
-    let path = unique_opencode_db_path("incremental-baseline");
+fn opencode_fast_path_reads_only_the_appended_event() {
+    let path = unique_opencode_db_path("incremental-fast-path");
     let connection = seed_opencode_db(&path);
-
-    // The cold scan pays for `data` twice: once in the aggregate preflight and
-    // once in the page loop. Measure the preflight's share so the warm
-    // comparison below is denominated on the page loop alone.
-    let cold_preflight_data_bytes: i64 = connection
-        .query_row(
-            "SELECT coalesce(sum(length(CAST(coalesce(e.data, '') AS BLOB))), 0) \
-             FROM event e JOIN event_sequence s ON s.aggregate_id = e.aggregate_id \
-             WHERE e.seq <= s.seq",
-            [],
-            |row| row.get(0),
-        )
-        .expect("measure cold preflight bytes");
 
     let mut ledger = ScanLedger::default();
     let cold = scan_opencode_database(
         path.to_str().expect("utf-8 path"),
         &OpenCodeState::fresh(),
+        &default_opencode_budget(),
         &mut ledger,
     );
     let OpenCodeScanOutcome::Scanned { new_state, .. } = cold else {
         panic!("cold scan should succeed");
     };
+    assert!(
+        !new_state.session_contexts.is_empty(),
+        "the cold scan must persist the reconstruction context (§3.1 Change 2)"
+    );
 
     let next_seq: i64 = connection
         .query_row(
@@ -2120,42 +2106,24 @@ fn opencode_incremental_scan_currently_re_reads_the_whole_aggregate() {
             |row| row.get(0),
         )
         .expect("measure appended event");
-    // The preflight aggregate is denominated on `seq > prior_seq`, so on the
-    // warm scan it decodes only the appended event's `data` — while the page
-    // loop below still replays the whole aggregate. That asymmetry is §3.1
-    // Change 5's "the two axes must converge"; until they do, the warm total is
-    // the sum of both.
-    let appended_data_bytes: i64 = connection
-        .query_row(
-            "SELECT length(CAST(data AS BLOB)) FROM event WHERE id = 'evt_baseline_append'",
-            [],
-            |row| row.get(0),
-        )
-        .expect("measure appended data");
     drop(connection);
 
     let mut incremental = ScanLedger::default();
     let warm = scan_opencode_database(
         path.to_str().expect("utf-8 path"),
         &new_state,
+        &default_opencode_budget(),
         &mut incremental,
     );
     assert!(matches!(warm, OpenCodeScanOutcome::Scanned { .. }));
-
-    // Cold = preflight(all data) + page loop(all rows). Warm = preflight(the
-    // appended event's data only) + page loop(all rows + the appended row).
-    let cold_page_loop_bytes = ledger.payload_bytes - cold_preflight_data_bytes as u64;
     assert_eq!(
-        incremental.payload_bytes,
-        appended_data_bytes as u64 + cold_page_loop_bytes + appended_bytes as u64,
-        "BASELINE, NOT A TARGET: one appended event currently costs the whole \
-         aggregate's history because the page loop starts at seq = -1. Issue \
-         #601 WI-06 must make this collapse to the appended event alone (G1b/G3); \
-         when it does, invert this assertion rather than deleting it."
+        incremental.payload_rows, 1,
+        "one appended event is one payload row"
     );
-    assert!(
-        incremental.payload_bytes > 4 * appended_bytes as u64,
-        "the fixture must make the replay cost visibly dominate the append"
+    assert_eq!(
+        incremental.payload_bytes, appended_bytes as u64,
+        "one appended event costs exactly that event's bytes (WI-01's baseline \
+         measured the whole aggregate's history here)"
     );
 
     cleanup(&path);
@@ -2178,71 +2146,50 @@ fn poll_payload_rows(metrics: &Arc<Metrics>) -> u64 {
 /// `Scanned` and panicked otherwise, so the guarantee was unverified on every
 /// failure arm.
 ///
-/// The ceiling arm is reached through `opencode_relevant_stats`, whose
-/// `sum(length(data))` has already made SQLite decode the whole range — so
-/// "the bytes this scan had already paid for" is a real, non-zero number even
-/// though the page loop never ran.
+/// The failure driven is the headline scenario itself: a mixed-snapshot
+/// rejection *after* the page loop read everything — "a scan that reads and
+/// then loses the bracket is still charged". (WI-01's version reached a
+/// failure through the `MAX_OPENCODE_RELEVANT_ROWS` preflight ceiling; WI-06
+/// retired both the ceiling and the preflight.)
 ///
 /// Fails for: resetting or rebuilding the ledger on a `scan_opencode_database`
-/// failure arm, or dropping the aggregate byte charge from the preflight.
+/// failure arm.
 #[test]
 fn a_failed_opencode_scan_still_reports_the_bytes_it_had_already_read() {
     let path = unique_opencode_db_path("failure-arm-ledger");
     let connection = seed_opencode_db(&path);
-    let base_seq: i64 = connection
+    let expected_bytes: i64 = connection
         .query_row(
-            "SELECT seq FROM event_sequence WHERE aggregate_id = 'ses_demo'",
+            "SELECT coalesce(sum(length(CAST(e.id AS BLOB)) \
+             + length(CAST(e.aggregate_id AS BLOB)) \
+             + length(CAST(e.type AS BLOB)) \
+             + length(CAST(e.data AS BLOB))), 0) \
+             FROM event e JOIN event_sequence s ON s.aggregate_id = e.aggregate_id \
+             WHERE e.seq <= s.seq",
             [],
             |row| row.get(0),
         )
-        .expect("read base sequence");
-
-    // One event past `MAX_OPENCODE_RELEVANT_ROWS`, so the preflight ceiling
-    // fires before the page loop reads anything.
-    let overflow = 10_001i64;
-    connection
-        .execute_batch("BEGIN")
-        .expect("begin bulk insert");
-    {
-        let mut stmt = connection
-            .prepare(
-                "INSERT INTO event (id, aggregate_id, seq, type, data) VALUES (?1, ?2, ?3, ?4, ?5)",
-            )
-            .expect("prepare bulk insert");
-        for idx in 0..overflow {
-            stmt.execute(rusqlite::params![
-                format!("evt_ceiling_{idx:06}"),
-                "ses_demo",
-                base_seq + 1 + idx,
-                "message.part.updated.1",
-                r#"{"id":"prt_ceiling","messageID":"msg_demo","sessionID":"ses_demo"}"#,
-            ])
-            .expect("insert ceiling event");
-        }
-    }
-    connection
-        .execute(
-            "UPDATE event_sequence SET seq = ?1 WHERE aggregate_id = 'ses_demo'",
-            rusqlite::params![base_seq + overflow],
-        )
-        .expect("advance sequence");
-    connection.execute_batch("COMMIT").expect("commit");
+        .expect("sum event payload bytes");
     drop(connection);
+    let db_path = path.to_str().expect("utf-8 path");
 
+    crate::sqlite_poll::contention_injection::arm(db_path, 1);
     let mut ledger = ScanLedger::default();
     let outcome = scan_opencode_database(
-        path.to_str().expect("utf-8 path"),
+        db_path,
         &OpenCodeState::fresh(),
+        &default_opencode_budget(),
         &mut ledger,
     );
+    crate::sqlite_poll::contention_injection::disarm(db_path);
     let OpenCodeScanOutcome::Failed { error_kind, .. } = outcome else {
-        panic!("crossing the relevant-row ceiling must fail the scan");
+        panic!("the armed scan must lose the mixed-snapshot bracket");
     };
-    assert_eq!(error_kind, crate::sqlite_poll::ERROR_KIND_TOO_LARGE);
-    assert!(
-        ledger.payload_bytes > 0,
-        "the preflight had already decoded the whole range; a failure arm that \
-         reports zero bytes contradicts the ledger's headline guarantee"
+    assert_eq!(error_kind, crate::sqlite_poll::ERROR_KIND_MIXED_SNAPSHOT);
+    assert_eq!(
+        ledger.payload_bytes, expected_bytes as u64,
+        "the whole cold read had been paid before the bracket rejected it, and \
+         every byte of it must survive onto the failure arm"
     );
     assert!(
         ledger.census_rows > 0,
@@ -2768,6 +2715,1333 @@ async fn an_error_marker_without_a_block_reason_is_not_retried_as_a_blocked_open
         map.get(&cp_key).expect("checkpoint").status,
         "active",
         "the transient marker clears once a scan succeeds"
+    );
+
+    cleanup(&path);
+}
+
+/// Gate G1b (§8): the fast path must not replay part events. **[DIVERGENT
+/// FIXTURE]** 500 part events of ~16 KB each (~8 MB) against a dozen
+/// context-bearing events of ~1 KB — if part events were small, a full replay
+/// would pass the byte budget and the gate could not fail.
+///
+/// Two halves, one per §3.1 mechanism:
+///
+/// - **persisted context** (Change 2): with the cold cursor intact, one
+///   appended part event costs far under 128 KiB;
+/// - **bounded rebuild** (Change 3): with the contexts stripped (an evicted
+///   or pre-upgrade cursor), the type-scoped rebuild reads the context events
+///   only — still far under 128 KiB — and the emitted part is enriched from
+///   the rebuilt context, proving the rebuild is real and not just cheap.
+///
+/// Fails for: restoring `last_seq = -1`, or a context rebuild that drops the
+/// `type` filter (8 MB of part events crosses the 128 KiB line immediately).
+#[test]
+fn opencode_fast_path_does_not_replay_part_events() {
+    let path = unique_opencode_db_path("g1b-part-replay");
+    let connection = create_opencode_db(&path);
+    let part_padding = "p".repeat(16 * 1024);
+    let context_padding = "c".repeat(1024);
+    connection.execute_batch("BEGIN").expect("begin bulk seed");
+    connection
+        .execute(
+            "INSERT INTO event (id, aggregate_id, seq, type, data) \
+             VALUES ('evt_bulk_session', 'ses_bulk', 0, 'session.created.1', ?1)",
+            rusqlite::params![serde_json::to_string(&json!({
+                "sessionID": "ses_bulk",
+                "info": {
+                    "id": "ses_bulk",
+                    "directory": "/work/bulk",
+                    "title": "bulk session",
+                    "model": {"id": "glm-5.2", "providerID": "zai-coding-plan"},
+                    "time": {"created": 1780000000000_i64, "updated": 1780000000000_i64}
+                }
+            }))
+            .unwrap()],
+        )
+        .expect("insert bulk session event");
+    connection
+        .execute(
+            "INSERT INTO event (id, aggregate_id, seq, type, data) \
+             VALUES ('evt_bulk_message', 'ses_bulk', 1, 'message.updated.1', ?1)",
+            rusqlite::params![serde_json::to_string(&json!({
+                "sessionID": "ses_bulk",
+                "info": {
+                    "id": "msg_bulk",
+                    "sessionID": "ses_bulk",
+                    "role": "assistant",
+                    "modelID": "glm-5.2",
+                    "providerID": "zai-coding-plan",
+                    "note": context_padding,
+                    "time": {"created": 1780000000100_i64}
+                }
+            }))
+            .unwrap()],
+        )
+        .expect("insert bulk message event");
+    {
+        let mut stmt = connection
+            .prepare(
+                "INSERT INTO event (id, aggregate_id, seq, type, data) VALUES (?1, 'ses_bulk', ?2, ?3, ?4)",
+            )
+            .expect("prepare bulk insert");
+        for idx in 0..500i64 {
+            stmt.execute(rusqlite::params![
+                format!("evt_bulk_part_{idx:04}"),
+                2 + idx,
+                "message.part.updated.1",
+                serde_json::to_string(&json!({
+                    "sessionID": "ses_bulk",
+                    "part": {
+                        "id": format!("part_bulk_{idx:04}"),
+                        "messageID": "msg_bulk",
+                        "sessionID": "ses_bulk",
+                        "type": "text",
+                        "text": part_padding,
+                        "time": {"start": 1780000001000_i64 + idx}
+                    },
+                    "time": 1780000001000_i64 + idx
+                }))
+                .unwrap(),
+            ])
+            .expect("insert bulk part event");
+        }
+        // Ten more small context events, per the G1b fixture spec.
+        for idx in 0..10i64 {
+            stmt.execute(rusqlite::params![
+                format!("evt_bulk_ctx_{idx:02}"),
+                502 + idx,
+                "message.updated.1",
+                serde_json::to_string(&json!({
+                    "sessionID": "ses_bulk",
+                    "info": {
+                        "id": "msg_bulk",
+                        "sessionID": "ses_bulk",
+                        "role": "assistant",
+                        "modelID": "glm-5.2",
+                        "providerID": "zai-coding-plan",
+                        "note": context_padding,
+                        "time": {"created": 1780000002000_i64 + idx}
+                    }
+                }))
+                .unwrap(),
+            ])
+            .expect("insert bulk context event");
+        }
+    }
+    connection
+        .execute(
+            "INSERT INTO event_sequence (aggregate_id, seq, owner_id) VALUES ('ses_bulk', 511, NULL)",
+            [],
+        )
+        .expect("insert bulk sequence");
+    connection
+        .execute_batch("COMMIT")
+        .expect("commit bulk seed");
+
+    let mut cold_ledger = ScanLedger::default();
+    let cold = scan_opencode_database(
+        path.to_str().expect("utf-8 path"),
+        &OpenCodeState::fresh(),
+        &default_opencode_budget(),
+        &mut cold_ledger,
+    );
+    let OpenCodeScanOutcome::Scanned { new_state, .. } = cold else {
+        panic!("cold scan should succeed");
+    };
+
+    connection
+        .execute(
+            "INSERT INTO event (id, aggregate_id, seq, type, data) \
+             VALUES ('evt_bulk_append', 'ses_bulk', 512, 'message.part.updated.1', ?1)",
+            rusqlite::params![serde_json::to_string(&json!({
+                "sessionID": "ses_bulk",
+                "part": {
+                    "id": "part_bulk_append",
+                    "messageID": "msg_bulk",
+                    "sessionID": "ses_bulk",
+                    "type": "text",
+                    "text": part_padding,
+                    "time": {"start": 1780000003000_i64}
+                },
+                "time": 1780000003000_i64
+            }))
+            .unwrap()],
+        )
+        .expect("append part event");
+    connection
+        .execute(
+            "UPDATE event_sequence SET seq = 512 WHERE aggregate_id = 'ses_bulk'",
+            [],
+        )
+        .expect("advance bulk sequence");
+    drop(connection);
+
+    // Half one: persisted context intact.
+    let mut warm_ledger = ScanLedger::default();
+    let warm = scan_opencode_database(
+        path.to_str().expect("utf-8 path"),
+        &new_state,
+        &default_opencode_budget(),
+        &mut warm_ledger,
+    );
+    assert!(matches!(warm, OpenCodeScanOutcome::Scanned { .. }));
+    assert!(
+        warm_ledger.payload_bytes < 128 * 1024,
+        "one appended part event must not replay 8 MB of part history; read {} bytes",
+        warm_ledger.payload_bytes
+    );
+
+    // Half two: contexts stripped — the bounded rebuild path.
+    let mut stripped = (*new_state).clone();
+    stripped.session_contexts.clear();
+    stripped.message_contexts.clear();
+    let mut rebuild_ledger = ScanLedger::default();
+    let rebuilt = scan_opencode_database(
+        path.to_str().expect("utf-8 path"),
+        &stripped,
+        &default_opencode_budget(),
+        &mut rebuild_ledger,
+    );
+    let OpenCodeScanOutcome::Scanned { records, .. } = rebuilt else {
+        panic!("rebuild scan should succeed");
+    };
+    assert!(
+        rebuild_ledger.payload_bytes < 128 * 1024,
+        "the type-scoped rebuild must read context events only; read {} bytes",
+        rebuild_ledger.payload_bytes
+    );
+    let part = records
+        .iter()
+        .find(|record| record.record.get("type").and_then(Value::as_str) == Some("opencode_part"))
+        .expect("the appended part re-emits");
+    assert_eq!(
+        part.record.get("message_role").and_then(Value::as_str),
+        Some("assistant"),
+        "the emitted part must be enriched from the rebuilt context — a rebuild \
+         that reads nothing would pass the byte bound and emit an unenriched part"
+    );
+    assert_eq!(
+        part.project_dir, "/work/bulk",
+        "project_dir derivation must survive the rebuild (it drives exclusion \
+         and backend routing — §3.1 calls this a correctness bug, not cosmetic)"
+    );
+
+    cleanup(&path);
+}
+
+/// Gate G3 (§8): an OpenCode session growing to N events has bounded per-poll
+/// incremental work. Parameterized over N ∈ {100, 1,000, 10,000} events in
+/// one aggregate, appending one identical event at each size: the appended
+/// event's cost at N = 10,000 must be within 2× of N = 100.
+///
+/// The fixture carries the production indexes (WI-01) — without them this
+/// measurement would be of a full table scan and miscalibrated in both
+/// directions (the §8 calibration mutation).
+///
+/// Fails for: reintroducing linear replay, or a context rebuild proportional
+/// to history.
+#[test]
+fn opencode_incremental_work_is_flat_in_aggregate_length() {
+    let path = unique_opencode_db_path("g3-flat");
+    let connection = create_opencode_db(&path);
+    connection
+        .execute(
+            "INSERT INTO event (id, aggregate_id, seq, type, data) \
+             VALUES ('evt_flat_session', 'ses_flat', 0, 'session.created.1', ?1)",
+            rusqlite::params![serde_json::to_string(&json!({
+                "sessionID": "ses_flat",
+                "info": {
+                    "id": "ses_flat",
+                    "directory": "/work/flat",
+                    "title": "flat session",
+                    "time": {"created": 1780000000000_i64, "updated": 1780000000000_i64}
+                }
+            }))
+            .unwrap()],
+        )
+        .expect("insert flat session event");
+    connection
+        .execute(
+            "INSERT INTO event_sequence (aggregate_id, seq, owner_id) VALUES ('ses_flat', 0, NULL)",
+            [],
+        )
+        .expect("insert flat sequence");
+
+    let mut filled = 0i64;
+    let mut fill_to = |target: i64| {
+        connection.execute_batch("BEGIN").expect("begin fill");
+        {
+            let mut stmt = connection
+                .prepare(
+                    "INSERT INTO event (id, aggregate_id, seq, type, data) VALUES (?1, 'ses_flat', ?2, 'message.part.updated.1', ?3)",
+                )
+                .expect("prepare fill");
+            while filled < target {
+                let seq = filled + 1;
+                stmt.execute(rusqlite::params![
+                    format!("evt_flat_{seq:06}"),
+                    seq,
+                    serde_json::to_string(&json!({
+                        "sessionID": "ses_flat",
+                        "part": {
+                            "id": format!("part_flat_{seq:06}"),
+                            "messageID": "msg_flat",
+                            "sessionID": "ses_flat",
+                            "type": "text",
+                            "text": format!("flat body {seq}"),
+                            "time": {"start": 1780000000000_i64 + seq}
+                        },
+                        "time": 1780000000000_i64 + seq
+                    }))
+                    .unwrap(),
+                ])
+                .expect("insert fill event");
+                filled += 1;
+            }
+        }
+        connection
+            .execute(
+                "UPDATE event_sequence SET seq = ?1 WHERE aggregate_id = 'ses_flat'",
+                rusqlite::params![target],
+            )
+            .expect("advance fill sequence");
+        connection.execute_batch("COMMIT").expect("commit fill");
+    };
+
+    let db_path = path.to_str().expect("utf-8 path").to_string();
+    let mut state = OpenCodeState::fresh();
+    let mut measured = Vec::new();
+    for target in [100i64, 1_000, 10_000] {
+        fill_to(target);
+        // Catch up to the new history so the *next* append is incremental.
+        // Looped: one poll's work budget legitimately bounds a single scan
+        // (2,000 rows at the shipped default), and production covers a large
+        // backlog across successive polls exactly like this.
+        loop {
+            let mut catch_up = ScanLedger::default();
+            let caught =
+                scan_opencode_database(&db_path, &state, &default_opencode_budget(), &mut catch_up);
+            let OpenCodeScanOutcome::Scanned { new_state, .. } = caught else {
+                panic!("catch-up scan should succeed at N = {target}");
+            };
+            state = *new_state;
+            if !state.pending_coverage {
+                break;
+            }
+        }
+
+        // The measured append: byte-identical at every N.
+        fill_to(target + 1);
+        let mut ledger = ScanLedger::default();
+        let scanned =
+            scan_opencode_database(&db_path, &state, &default_opencode_budget(), &mut ledger);
+        let OpenCodeScanOutcome::Scanned { new_state, .. } = scanned else {
+            panic!("incremental scan should succeed at N = {target}");
+        };
+        state = *new_state;
+        measured.push(ledger.payload_bytes);
+    }
+
+    let at_100 = measured[0];
+    let at_10_000 = measured[2];
+    assert!(at_100 > 0, "the appended event must cost something");
+    assert!(
+        at_10_000 <= 2 * at_100,
+        "per-poll incremental work must be flat in aggregate length: \
+         {at_100} bytes at N=100 vs {at_10_000} bytes at N=10,000"
+    );
+
+    cleanup(&path);
+}
+
+/// Gate G8b (§8) and §3.1 Change 7: an aggregate *disappearing* from
+/// `event_sequence` (one deleted old session) is not a rewind. It must drop
+/// its watermark and context entries durably — which is also §7.2 F1's
+/// `new_state == prior_state_covered` conjunct for OpenCode: the deletion
+/// emits nothing and moves only the structural state, so only that comparison
+/// keeps the checkpoint from being suppressed — and it must not bump the
+/// generation or re-ingest anything.
+///
+/// The genuine-regression side (a `seq` that moves backwards still routes
+/// through `begin_database_replay`) is pinned by
+/// `opencode_sqlite_sequence_regression_resets_aggregate_cursor`, which stays
+/// green beside this test — together they bound the `is_some_and` fix from
+/// both directions.
+///
+/// Fails for: the old `is_none_or` conflation (a bump and a full re-ingest),
+/// or dropping the state conjunct from `scan_is_noop` (the drop never
+/// persists).
+#[tokio::test(flavor = "multi_thread")]
+async fn opencode_disappearing_aggregate_is_not_a_generation_bump() {
+    let path = unique_opencode_db_path("g8b-disappearance");
+    let db = seed_opencode_db(&path);
+    db.execute(
+        "INSERT INTO event (id, aggregate_id, seq, type, data) \
+         VALUES ('evt_second_session', 'ses_second', 0, 'session.created.1', ?1)",
+        rusqlite::params![serde_json::to_string(&json!({
+            "sessionID": "ses_second",
+            "info": {
+                "id": "ses_second",
+                "directory": "/work/second",
+                "title": "second session",
+                "time": {"created": 1780000200000_i64, "updated": 1780000200000_i64}
+            }
+        }))
+        .unwrap()],
+    )
+    .expect("insert second aggregate event");
+    db.execute(
+        "INSERT INTO event_sequence (aggregate_id, seq, owner_id) VALUES ('ses_second', 0, NULL)",
+        [],
+    )
+    .expect("insert second sequence");
+
+    let work = opencode_sqlite_work(&path);
+    let cp_key = checkpoint_key(&work.source_name, &work.path);
+    let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+    let poll_state = VolatilePollMap::new();
+    let metrics = Arc::new(Metrics::default());
+    let config = moraine_config::AppConfig::default();
+
+    drive_opencode_poll_with_metrics(&config, &work, &checkpoints, &poll_state, &metrics).await;
+    let generation_before = checkpoints
+        .read()
+        .await
+        .get(&cp_key)
+        .expect("cold checkpoint")
+        .source_generation;
+
+    // The old session is deleted wholesale: events and sequence row.
+    db.execute("DELETE FROM event WHERE aggregate_id = 'ses_second'", [])
+        .expect("delete second events");
+    db.execute(
+        "DELETE FROM event_sequence WHERE aggregate_id = 'ses_second'",
+        [],
+    )
+    .expect("delete second sequence");
+    drop(db);
+
+    let rows_before = poll_payload_rows(&metrics);
+    let batches =
+        drive_opencode_poll_with_metrics(&config, &work, &checkpoints, &poll_state, &metrics).await;
+    let raw_rows: usize = batches.iter().map(|batch| batch.raw_rows.len()).sum();
+    assert_eq!(raw_rows, 0, "a disappearance emits nothing");
+    assert_eq!(
+        poll_payload_rows(&metrics),
+        rows_before,
+        "and re-ingests nothing — no payload row is read"
+    );
+    let map = checkpoints.read().await;
+    let checkpoint = map.get(&cp_key).expect("post-disappearance checkpoint");
+    assert_eq!(
+        checkpoint.source_generation, generation_before,
+        "a disappearance must not bump the generation"
+    );
+    let cursor: Value = serde_json::from_str(&checkpoint.cursor_json).expect("cursor parses");
+    assert!(
+        cursor.pointer("/aggregate_sequences/ses_second").is_none(),
+        "the vanished aggregate's watermark drops durably"
+    );
+    assert!(
+        cursor.pointer("/session_contexts/ses_second").is_none(),
+        "and its context entry drops with it (§3.1 Change 7)"
+    );
+    assert!(
+        cursor.pointer("/aggregate_sequences/ses_demo").is_some(),
+        "the surviving aggregate's watermark is untouched"
+    );
+
+    cleanup(&path);
+}
+
+/// Plan §7.2 F1, OpenCode's `schema_fingerprint == checkpoint.schema_fingerprint`
+/// conjunct of `scan_is_noop`: a schema change with no row changes emits
+/// nothing, and only the fingerprint comparison keeps its checkpoint from
+/// being suppressed and the drift re-discovered on every later poll.
+///
+/// Fails for: dropping the schema conjunct from OpenCode's `scan_is_noop`.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_opencode_schema_change_with_no_row_changes_still_persists_its_checkpoint() {
+    let path = unique_opencode_db_path("schema-conjunct");
+    let db = seed_opencode_db(&path);
+    let work = opencode_sqlite_work(&path);
+    let cp_key = checkpoint_key(&work.source_name, &work.path);
+    let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+    let poll_state = VolatilePollMap::new();
+    let config = moraine_config::AppConfig::default();
+
+    drive_opencode_poll(&config, &work, &checkpoints, &poll_state).await;
+    let fingerprint_before = checkpoints
+        .read()
+        .await
+        .get(&cp_key)
+        .expect("cold checkpoint")
+        .schema_fingerprint;
+
+    db.execute("ALTER TABLE event ADD COLUMN extra text", [])
+        .expect("add drifting column");
+    drop(db);
+
+    let batches = drive_opencode_poll(&config, &work, &checkpoints, &poll_state).await;
+    let raw_rows: usize = batches.iter().map(|batch| batch.raw_rows.len()).sum();
+    assert_eq!(raw_rows, 0, "a schema change alone emits nothing");
+    let fingerprint_after = checkpoints
+        .read()
+        .await
+        .get(&cp_key)
+        .expect("post-drift checkpoint")
+        .schema_fingerprint;
+    assert_ne!(
+        fingerprint_before, fingerprint_after,
+        "the moved fingerprint must persist durably, not be suppressed as a \
+         noop and re-discovered on every later poll"
+    );
+
+    cleanup(&path);
+}
+
+/// Gate G4, row 4 (§8) — the OpenCode ceiling retirement WI-06 owns (§7.1
+/// D9): a store past any former ceiling keeps ingesting recent work with
+/// `coverage_degraded`, and no `sqlite_cursor_too_large` row is ever minted.
+///
+/// **[DIVERGENT FIXTURE]** the newest work must not be what the old any-order
+/// scan reached first: the cold never-read aggregate sorts *first* by
+/// `aggregate_id` (`aaa_cold`), the actively written known aggregate sorts
+/// *last* (`zzz_active`) — so a budget that binds after the delta class only
+/// emits the new events if delta-before-cold ordering (§2.3's table row for
+/// OpenCode: `event_sequence.seq > persisted seq` is the exact recency
+/// signal) actually works.
+///
+/// Fails for: a budget that fails the scan instead of degrading (the old
+/// `TooLarge` latch), bounded progress that walks `aggregate_id` order
+/// blindly, or a degraded poll that loses the cold aggregate's debt.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_opencode_store_over_budget_still_ingests_the_newest_events_first() {
+    let path = unique_opencode_db_path("g4-budget-order");
+    let db = Connection::open(&path).expect("create db");
+    drop(db);
+    let db = seed_opencode_db(&path);
+
+    let work = opencode_sqlite_work(&path);
+    let cp_key = checkpoint_key(&work.source_name, &work.path);
+    let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+    let poll_state = VolatilePollMap::new();
+    let mut config = moraine_config::AppConfig::default();
+
+    // Cold-cover the demo aggregate first, unbudgeted.
+    drive_opencode_poll(&config, &work, &checkpoints, &poll_state).await;
+
+    // A big cold aggregate that sorts before everything...
+    db.execute_batch("BEGIN").expect("begin cold seed");
+    {
+        let mut stmt = db
+            .prepare(
+                "INSERT INTO event (id, aggregate_id, seq, type, data) VALUES (?1, 'aaa_cold', ?2, 'message.part.updated.1', ?3)",
+            )
+            .expect("prepare cold insert");
+        for seq in 0..40i64 {
+            stmt.execute(rusqlite::params![
+                format!("evt_cold_{seq:04}"),
+                seq,
+                serde_json::to_string(&json!({
+                    "sessionID": "aaa_cold",
+                    "part": {
+                        "id": format!("part_cold_{seq:04}"),
+                        "messageID": "msg_cold",
+                        "sessionID": "aaa_cold",
+                        "type": "text",
+                        "text": format!("cold body {seq}"),
+                        "time": {"start": 1780000100000_i64 + seq}
+                    },
+                    "time": 1780000100000_i64 + seq
+                }))
+                .unwrap(),
+            ])
+            .expect("insert cold event");
+        }
+    }
+    db.execute(
+        "INSERT INTO event_sequence (aggregate_id, seq, owner_id) VALUES ('aaa_cold', 39, NULL)",
+        [],
+    )
+    .expect("insert cold sequence");
+    db.execute_batch("COMMIT").expect("commit cold seed");
+    // ...and fresh delta work on the covered aggregate that sorts after it.
+    let next_seq: i64 = db
+        .query_row(
+            "SELECT seq + 1 FROM event_sequence WHERE aggregate_id = 'ses_demo'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read next demo sequence");
+    db.execute(
+        "INSERT INTO event (id, aggregate_id, seq, type, data) \
+         VALUES ('evt_recent_work', 'ses_demo', ?1, 'message.part.updated.1', ?2)",
+        rusqlite::params![
+            next_seq,
+            serde_json::to_string(&json!({
+                "sessionID": "ses_demo",
+                "part": {
+                    "id": "part_recent_work",
+                    "messageID": "msg_assistant",
+                    "sessionID": "ses_demo",
+                    "type": "text",
+                    "text": "the newest work in the store",
+                    "time": {"start": 1780000200000_i64}
+                },
+                "time": 1780000200000_i64
+            }))
+            .unwrap()
+        ],
+    )
+    .expect("append recent work");
+    db.execute(
+        "UPDATE event_sequence SET seq = ?1 WHERE aggregate_id = 'ses_demo'",
+        rusqlite::params![next_seq],
+    )
+    .expect("advance demo sequence");
+    drop(db);
+
+    // A budget the cold aggregate alone would exhaust many times over.
+    config.ingest.sqlite.fast_path_max_payload_rows = 2;
+    let batches = drive_opencode_poll(&config, &work, &checkpoints, &poll_state).await;
+    let event_rows = all_event_rows(&batches);
+    assert!(
+        event_rows
+            .iter()
+            .any(|row| row.get("text_content").and_then(Value::as_str)
+                == Some("the newest work in the store")),
+        "the delta class must be read before the cold debt — recent work keeps \
+         flowing while history is over budget"
+    );
+    let error_rows: usize = batches.iter().map(|batch| batch.error_rows.len()).sum();
+    assert_eq!(
+        error_rows, 0,
+        "history size is a degradation, never an error (no TooLarge rows)"
+    );
+    let map = checkpoints.read().await;
+    let checkpoint = map.get(&cp_key).expect("degraded checkpoint");
+    let cursor: Value = serde_json::from_str(&checkpoint.cursor_json).expect("cursor parses");
+    assert_eq!(
+        cursor.get("pending_coverage").and_then(Value::as_bool),
+        Some(true),
+        "the cold debt is a durable resume marker"
+    );
+    assert_eq!(
+        cursor
+            .pointer("/aggregate_sequences/ses_demo")
+            .and_then(Value::as_i64),
+        Some(next_seq),
+        "the delta aggregate's watermark reaches the new event"
+    );
+
+    cleanup(&path);
+}
+
+/// §2.3's "continue next poll" for OpenCode, end to end, with **no further
+/// writes**: a 1-row budget against two cold aggregates converges to full
+/// coverage across resumed polls — the persisted resume marker keeps the
+/// quiet store scanning — then clears the marker durably and quiesces, with
+/// `cursor_json` omitting the flag entirely once false (§2.6 byte-identity).
+///
+/// Fails for: dropping the `!pending_coverage` conjunct from the cheap
+/// short-circuit (the unchanged stat ends every later poll and the remainder
+/// is unreachable forever), or a budget break that loses the remainder.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_degraded_opencode_cold_ingest_completes_without_new_writes() {
+    let path = unique_opencode_db_path("d6-cold-converges");
+    let db = Connection::open(&path).expect("create db");
+    drop(db);
+    let connection = create_opencode_db(&path);
+    for (aggregate, base) in [("ses_a", 1780000100000_i64), ("ses_b", 1780000200000_i64)] {
+        connection
+            .execute(
+                "INSERT INTO event (id, aggregate_id, seq, type, data) VALUES (?1, ?2, 0, 'session.created.1', ?3)",
+                rusqlite::params![
+                    format!("evt_{aggregate}_session"),
+                    aggregate,
+                    serde_json::to_string(&json!({
+                        "sessionID": aggregate,
+                        "info": {
+                            "id": aggregate,
+                            "directory": format!("/work/{aggregate}"),
+                            "title": format!("session {aggregate}"),
+                            "time": {"created": base, "updated": base}
+                        }
+                    }))
+                    .unwrap(),
+                ],
+            )
+            .expect("insert session event");
+        for seq in 1..3i64 {
+            connection
+                .execute(
+                    "INSERT INTO event (id, aggregate_id, seq, type, data) VALUES (?1, ?2, ?3, 'message.part.updated.1', ?4)",
+                    rusqlite::params![
+                        format!("evt_{aggregate}_{seq}"),
+                        aggregate,
+                        seq,
+                        serde_json::to_string(&json!({
+                            "sessionID": aggregate,
+                            "part": {
+                                "id": format!("part_{aggregate}_{seq}"),
+                                "messageID": format!("msg_{aggregate}"),
+                                "sessionID": aggregate,
+                                "type": "text",
+                                "text": format!("{aggregate} body {seq}"),
+                                "time": {"start": base + seq}
+                            },
+                            "time": base + seq
+                        }))
+                        .unwrap(),
+                    ],
+                )
+                .expect("insert part event");
+        }
+        connection
+            .execute(
+                "INSERT INTO event_sequence (aggregate_id, seq, owner_id) VALUES (?1, 2, NULL)",
+                rusqlite::params![aggregate],
+            )
+            .expect("insert sequence");
+    }
+    drop(connection);
+
+    let work = opencode_sqlite_work(&path);
+    let cp_key = checkpoint_key(&work.source_name, &work.path);
+    let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+    let poll_state = VolatilePollMap::new();
+    let metrics = Arc::new(Metrics::default());
+    let mut config = moraine_config::AppConfig::default();
+    config.ingest.sqlite.fast_path_max_payload_rows = 1;
+
+    drive_opencode_poll_with_metrics(&config, &work, &checkpoints, &poll_state, &metrics).await;
+    {
+        let map = checkpoints.read().await;
+        let checkpoint = map.get(&cp_key).expect("cold poll persists");
+        assert!(
+            checkpoint.cursor_json.contains("pending_coverage"),
+            "the resume marker must be durable"
+        );
+    }
+
+    // No touches: convergence must come from the marker alone.
+    let mut polls = 1;
+    loop {
+        drive_opencode_poll_with_metrics(&config, &work, &checkpoints, &poll_state, &metrics).await;
+        polls += 1;
+        let map = checkpoints.read().await;
+        let checkpoint = map.get(&cp_key).expect("checkpoint");
+        let cursor: Value = serde_json::from_str(&checkpoint.cursor_json).expect("cursor parses");
+        if cursor.get("pending_coverage").is_none() {
+            assert_eq!(
+                cursor
+                    .pointer("/aggregate_sequences/ses_a")
+                    .and_then(Value::as_i64),
+                Some(2),
+                "every ses_a event covered"
+            );
+            assert_eq!(
+                cursor
+                    .pointer("/aggregate_sequences/ses_b")
+                    .and_then(Value::as_i64),
+                Some(2),
+                "every ses_b event covered"
+            );
+            break;
+        }
+        assert!(
+            polls <= 12,
+            "a 1-row budget against 6 events must converge; still pending \
+             after {polls} polls"
+        );
+    }
+
+    // Quiesce: coverage complete, stat unchanged — the next poll must not scan.
+    let rows_before = poll_payload_rows(&metrics);
+    drive_opencode_poll_with_metrics(&config, &work, &checkpoints, &poll_state, &metrics).await;
+    assert_eq!(
+        poll_payload_rows(&metrics),
+        rows_before,
+        "a covered, unchanged store must short-circuit"
+    );
+
+    cleanup(&path);
+}
+
+/// The OpenCode twin of `a_replacement_replay_reads_past_the_fast_path_budget`
+/// (§7.1 D5): a replacement replay ignores the fast-path budget, because its
+/// finalize publishes the generation whole and a degraded replay would
+/// publish a hole through #602.
+///
+/// Fails for: passing the fast-path budget on OpenCode replays.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_opencode_replacement_replay_reads_past_the_fast_path_budget() {
+    let path = unique_opencode_db_path("d5-replay-unbudgeted");
+    let db = seed_opencode_db(&path);
+    let full_seq: i64 = db
+        .query_row(
+            "SELECT seq FROM event_sequence WHERE aggregate_id = 'ses_demo'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read full sequence");
+    drop(db);
+    let work = opencode_sqlite_work(&path);
+    let cp_key = checkpoint_key(&work.source_name, &work.path);
+    let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+    let poll_state = VolatilePollMap::new();
+    let metrics = Arc::new(Metrics::default());
+    let mut config = moraine_config::AppConfig::default();
+    config.ingest.sqlite.fast_path_max_payload_rows = 1;
+
+    drive_opencode_poll_with_metrics(&config, &work, &checkpoints, &poll_state, &metrics).await;
+
+    // A changed exclusion set starts a replacement replay under the same
+    // tight budget; the replay must ignore it.
+    let mut replaying = config.clone();
+    replaying.ingest.exclude_project_dirs = vec!["/no/such/dir/**".to_string()];
+    let rows_before = poll_payload_rows(&metrics);
+    drive_opencode_poll_with_metrics(&replaying, &work, &checkpoints, &poll_state, &metrics).await;
+    assert!(
+        poll_payload_rows(&metrics) - rows_before > 1,
+        "the replay must read past the 1-row budget"
+    );
+    let map = checkpoints.read().await;
+    let checkpoint = map.get(&cp_key).expect("finalized replay checkpoint");
+    assert_eq!(checkpoint.status, "active");
+    let cursor: Value = serde_json::from_str(&checkpoint.cursor_json).expect("cursor parses");
+    assert_eq!(
+        cursor
+            .pointer("/aggregate_sequences/ses_demo")
+            .and_then(Value::as_i64),
+        Some(full_seq),
+        "the replay must cover the whole aggregate, budget notwithstanding"
+    );
+    assert!(
+        cursor.get("pending_coverage").is_none(),
+        "a finalized replay owes nothing"
+    );
+
+    cleanup(&path);
+}
+
+/// §3.1 Change 4, the runaway side: contexts past either ceiling evict whole
+/// aggregates — session context and that aggregate's message contexts
+/// together, in the documented ascending-`aggregate_id` order — instead of
+/// failing anything. This pins the eviction *algorithm* at the method; the
+/// scan-path wiring (that a scan actually calls it before persisting) is
+/// `an_opencode_scan_evicts_contexts_over_the_ceiling_before_persisting`.
+///
+/// Fails for: an `evict_contexts_to_fit` that returns without evicting, one
+/// that evicts message contexts but strands the session context (or vice
+/// versa), or a descending order (the highest aggregate evicts first).
+#[test]
+fn an_opencode_context_over_its_ceiling_evicts_whole_aggregates_instead_of_failing() {
+    let mut state = OpenCodeState::fresh();
+    for aggregate in ["agg_a", "agg_b", "agg_c"] {
+        state.session_contexts.insert(
+            aggregate.to_string(),
+            OpenCodeSessionContext {
+                directory: format!("/work/{aggregate}"),
+                model: None,
+            },
+        );
+        let mut messages = BTreeMap::new();
+        for idx in 0..4 {
+            messages.insert(
+                format!("msg_{aggregate}_{idx}"),
+                OpenCodeMessageContext {
+                    role: "assistant".to_string(),
+                    ..OpenCodeMessageContext::default()
+                },
+            );
+        }
+        state
+            .message_contexts
+            .insert(aggregate.to_string(), messages);
+    }
+    // 15 entries (3 sessions + 12 messages); a 6-entry ceiling forces two
+    // whole aggregates out.
+    let evicted = state.evict_contexts_to_fit(6, usize::MAX);
+    assert_eq!(
+        evicted, 10,
+        "two whole aggregates — 2 sessions + 8 messages"
+    );
+    assert!(
+        !state.session_contexts.contains_key("agg_a")
+            && !state.message_contexts.contains_key("agg_a"),
+        "eviction is whole-aggregate and ascending: agg_a goes first"
+    );
+    assert!(
+        !state.session_contexts.contains_key("agg_b")
+            && !state.message_contexts.contains_key("agg_b"),
+        "agg_b goes second"
+    );
+    assert!(
+        state.session_contexts.contains_key("agg_c")
+            && state.message_contexts.contains_key("agg_c"),
+        "the highest aggregate survives whole"
+    );
+}
+
+/// §3.1 Change 4, the starvation side: contexts exactly at their ceiling
+/// evict nothing — the `<=` boundary — so the ceiling cannot chew through
+/// state it was meant to protect.
+///
+/// Fails for: `<` at either fit check.
+#[test]
+fn an_opencode_context_at_its_ceiling_evicts_nothing() {
+    let mut state = OpenCodeState::fresh();
+    state.session_contexts.insert(
+        "agg_a".to_string(),
+        OpenCodeSessionContext {
+            directory: "/work/agg_a".to_string(),
+            model: None,
+        },
+    );
+    let mut messages = BTreeMap::new();
+    messages.insert("msg_a_0".to_string(), OpenCodeMessageContext::default());
+    state.message_contexts.insert("agg_a".to_string(), messages);
+    let bytes = serde_json::to_string(&(&state.session_contexts, &state.message_contexts))
+        .expect("serialize contexts")
+        .len();
+
+    let before = state.clone();
+    let evicted = state.evict_contexts_to_fit(2, bytes);
+    assert_eq!(evicted, 0, "a payload exactly at its ceiling is kept");
+    assert_eq!(state, before, "and nothing was disturbed");
+}
+
+/// §2.3's un-processable single row, OpenCode arm (the rewrite of the old
+/// `TooLarge` row latch): one event larger than `SCAN_PAGE_MAX_BYTES` gets
+/// one error row, is skipped, and the watermark advances past it — so the
+/// report is one-shot and the aggregate keeps flowing.
+///
+/// Fails for: restoring the scan-failing `TooLarge` arm, a skip that stalls
+/// the watermark (the report repeats forever), or losing the neighbors.
+#[test]
+fn an_oversized_opencode_event_is_skipped_and_advanced_past() {
+    let path = unique_opencode_db_path("oversized-event");
+    let connection = create_opencode_db(&path);
+    let oversized = "x".repeat(SCAN_PAGE_MAX_BYTES + 1);
+    connection
+        .execute(
+            "INSERT INTO event (id, aggregate_id, seq, type, data) \
+             VALUES ('evt_before', 'ses_big', 0, 'session.created.1', ?1)",
+            rusqlite::params![serde_json::to_string(&json!({
+                "sessionID": "ses_big",
+                "info": {
+                    "id": "ses_big",
+                    "directory": "/work/big",
+                    "title": "session before the oversized row",
+                    "time": {"created": 1780000100000_i64, "updated": 1780000100000_i64}
+                }
+            }))
+            .unwrap()],
+        )
+        .expect("insert leading event");
+    connection
+        .execute(
+            "INSERT INTO event (id, aggregate_id, seq, type, data) \
+             VALUES ('evt_oversized', 'ses_big', 1, 'message.part.updated.1', ?1)",
+            rusqlite::params![format!("{{\"blob\":\"{oversized}\"}}")],
+        )
+        .expect("insert oversized event");
+    connection
+        .execute(
+            "INSERT INTO event (id, aggregate_id, seq, type, data) \
+             VALUES ('evt_after', 'ses_big', 2, 'message.part.updated.1', ?1)",
+            rusqlite::params![serde_json::to_string(&json!({
+                "sessionID": "ses_big",
+                "part": {
+                    "id": "part_after",
+                    "messageID": "msg_big",
+                    "sessionID": "ses_big",
+                    "type": "text",
+                    "text": "the neighbor after the oversized row",
+                    "time": {"start": 1780000100002_i64}
+                },
+                "time": 1780000100002_i64
+            }))
+            .unwrap()],
+        )
+        .expect("insert trailing event");
+    connection
+        .execute(
+            "INSERT INTO event_sequence (aggregate_id, seq, owner_id) VALUES ('ses_big', 2, NULL)",
+            [],
+        )
+        .expect("insert sequence");
+    drop(connection);
+
+    // Unbudgeted on purpose: the oversized row's bytes are honestly charged,
+    // so the default byte budget would bind right after it and defer the
+    // neighbor to the next poll — correct, but the budget tests' subject.
+    // This test isolates the §2.3 row-skip semantics.
+    let mut ledger = ScanLedger::default();
+    let outcome = scan_opencode_database(
+        path.to_str().expect("utf-8 path"),
+        &OpenCodeState::fresh(),
+        &ScanBudget::unbounded(),
+        &mut ledger,
+    );
+    let OpenCodeScanOutcome::Scanned {
+        records,
+        new_state,
+        row_errors,
+        ..
+    } = outcome
+    else {
+        panic!("an oversized event degrades per §2.3; it must not fail the scan");
+    };
+    assert_eq!(row_errors.len(), 1, "one error row for the skipped event");
+    assert_eq!(
+        row_errors[0].error_kind,
+        crate::sqlite_poll::ERROR_KIND_ROW_TOO_LARGE
+    );
+    assert_eq!(
+        new_state.aggregate_sequences.get("ses_big").copied(),
+        Some(2),
+        "the watermark advances past the skipped event to the last observed row"
+    );
+    let serialized = serde_json::to_string(&records.iter().map(|r| &r.record).collect::<Vec<_>>())
+        .expect("serialize records");
+    assert!(
+        serialized.contains("the neighbor after the oversized row"),
+        "the events around the skipped row still flow"
+    );
+
+    // One-shot: the watermark is past the oversized row, so the warm scan
+    // neither re-reads nor re-reports it.
+    let mut warm_ledger = ScanLedger::default();
+    let warm = scan_opencode_database(
+        path.to_str().expect("utf-8 path"),
+        &new_state,
+        &default_opencode_budget(),
+        &mut warm_ledger,
+    );
+    let OpenCodeScanOutcome::Scanned {
+        row_errors: warm_errors,
+        ..
+    } = warm
+    else {
+        panic!("warm scan should succeed");
+    };
+    assert!(warm_errors.is_empty(), "the report must be one-shot");
+    assert_eq!(
+        warm_ledger.payload_rows, 0,
+        "nothing is re-read behind the advanced watermark"
+    );
+
+    cleanup(&path);
+}
+
+/// The **byte** axis of the OpenCode work budget, at both of its call sites
+/// (WI-05's `a_nac_byte_budget_binds_at_both_call_sites` precedent): the
+/// rows-axis budget tests cannot see a call site that stops feeding the byte
+/// argument — `is_exhausted_by(ledger.payload_rows, 0)` at either site leaves
+/// them green — so each site gets its own divergent fixture: few large events
+/// under a byte-bounded, row-unbounded budget.
+///
+/// Scenario one pins the **between-aggregate** check: two cold aggregates of
+/// one event each. The second aggregate must never be materialized —
+/// `payload_rows` stays 1, because a site fed zero bytes falls through to the
+/// in-page check, which charges the second aggregate's first row before it
+/// can bind. Scenario two pins the **in-page** check: one aggregate of two
+/// events — the second event is charged one row and no bytes (the
+/// honest-ledger rule) and stays unread behind the committed watermark.
+///
+/// MUTATION (executed 2026-07-31): pass `0` for the byte argument at the
+/// between-aggregate call site — fails (scenario one charges 2 payload
+/// rows). Same at the in-page call site — fails (scenario one passes whole,
+/// then scenario two's watermark reaches seq 1). Each RED was confirmed in
+/// a filtered run, failing at its own scenario's named assertion — which is
+/// what makes the sites separately pinned.
+#[test]
+fn an_opencode_byte_budget_binds_at_both_call_sites() {
+    let byte_budget = ScanBudget {
+        max_payload_rows: u64::MAX,
+        max_payload_bytes: 1,
+    };
+
+    // Scenario one: the between-aggregate site.
+    let path = unique_opencode_db_path("byte-budget-between-aggregates");
+    let connection = create_opencode_db(&path);
+    for aggregate in ["agg_one", "agg_two"] {
+        connection
+            .execute(
+                "INSERT INTO event (id, aggregate_id, seq, type, data) \
+                 VALUES (?1, ?2, 0, 'session.created.1', ?3)",
+                rusqlite::params![
+                    format!("evt_{aggregate}"),
+                    aggregate,
+                    serde_json::to_string(&json!({
+                        "sessionID": aggregate,
+                        "info": {
+                            "id": aggregate,
+                            "directory": format!("/work/{aggregate}"),
+                            "title": format!("byte budget {aggregate}"),
+                            "time": {"created": 1780000100000_i64, "updated": 1780000100000_i64}
+                        }
+                    }))
+                    .unwrap(),
+                ],
+            )
+            .expect("insert session event");
+        connection
+            .execute(
+                "INSERT INTO event_sequence (aggregate_id, seq, owner_id) VALUES (?1, 0, NULL)",
+                rusqlite::params![aggregate],
+            )
+            .expect("insert sequence");
+    }
+    drop(connection);
+
+    let mut ledger = ScanLedger::default();
+    let outcome = scan_opencode_database(
+        path.to_str().expect("utf-8 path"),
+        &OpenCodeState::fresh(),
+        &byte_budget,
+        &mut ledger,
+    );
+    let OpenCodeScanOutcome::Scanned {
+        records, new_state, ..
+    } = outcome
+    else {
+        panic!("a byte-bound scan degrades; it must not fail");
+    };
+    assert_eq!(
+        ledger.payload_rows, 1,
+        "the byte budget must bind at the between-aggregate site: the second \
+         aggregate is never materialized (a site fed 0 bytes falls through \
+         to the in-page check, which charges the second aggregate's first row)"
+    );
+    let serialized = serde_json::to_string(&records.iter().map(|r| &r.record).collect::<Vec<_>>())
+        .expect("serialize records");
+    assert!(serialized.contains("byte budget agg_one"));
+    assert!(
+        !serialized.contains("byte budget agg_two"),
+        "the byte-skipped aggregate must not emit"
+    );
+    assert!(ledger.coverage_degraded);
+    assert!(
+        new_state.pending_coverage,
+        "the byte-skipped aggregate is a durable coverage debt"
+    );
+    assert!(
+        !new_state.aggregate_sequences.contains_key("agg_two"),
+        "a skipped never-read aggregate stays absent so a later poll re-detects it"
+    );
+    cleanup(&path);
+
+    // Scenario two: the in-page site.
+    let path = unique_opencode_db_path("byte-budget-in-page");
+    let connection = create_opencode_db(&path);
+    connection
+        .execute(
+            "INSERT INTO event (id, aggregate_id, seq, type, data) \
+             VALUES ('evt_paged_session', 'ses_paged', 0, 'session.created.1', ?1)",
+            rusqlite::params![serde_json::to_string(&json!({
+                "sessionID": "ses_paged",
+                "info": {
+                    "id": "ses_paged",
+                    "directory": "/work/paged",
+                    "title": "the first event pays the byte budget",
+                    "time": {"created": 1780000100000_i64, "updated": 1780000100000_i64}
+                }
+            }))
+            .unwrap()],
+        )
+        .expect("insert first event");
+    connection
+        .execute(
+            "INSERT INTO event (id, aggregate_id, seq, type, data) \
+             VALUES ('evt_paged_part', 'ses_paged', 1, 'message.part.updated.1', ?1)",
+            rusqlite::params![serde_json::to_string(&json!({
+                "sessionID": "ses_paged",
+                "part": {
+                    "id": "part_paged",
+                    "messageID": "msg_paged",
+                    "sessionID": "ses_paged",
+                    "type": "text",
+                    "text": "the second event stays unread",
+                    "time": {"start": 1780000100001_i64}
+                },
+                "time": 1780000100001_i64
+            }))
+            .unwrap()],
+        )
+        .expect("insert second event");
+    connection
+        .execute(
+            "INSERT INTO event_sequence (aggregate_id, seq, owner_id) \
+             VALUES ('ses_paged', 1, NULL)",
+            [],
+        )
+        .expect("insert sequence");
+    let first_event_bytes: i64 = connection
+        .query_row(
+            "SELECT length(CAST(id AS BLOB)) + length(CAST(aggregate_id AS BLOB)) \
+             + length(CAST(type AS BLOB)) + length(CAST(data AS BLOB)) \
+             FROM event WHERE id = 'evt_paged_session'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("measure first event");
+    drop(connection);
+
+    let mut ledger = ScanLedger::default();
+    let outcome = scan_opencode_database(
+        path.to_str().expect("utf-8 path"),
+        &OpenCodeState::fresh(),
+        &byte_budget,
+        &mut ledger,
+    );
+    let OpenCodeScanOutcome::Scanned {
+        records, new_state, ..
+    } = outcome
+    else {
+        panic!("a byte-bound scan degrades; it must not fail");
+    };
+    assert_eq!(
+        new_state.aggregate_sequences.get("ses_paged").copied(),
+        Some(0),
+        "the byte budget must bind at the in-page site: the watermark stops \
+         at the last processed event"
+    );
+    assert_eq!(
+        ledger.payload_rows, 2,
+        "the bound row was materialized before the budget could be consulted: \
+         one row on the rows axis"
+    );
+    assert_eq!(
+        ledger.payload_bytes, first_event_bytes as u64,
+        "and no bytes — the bound row's columns are never taken"
+    );
+    let serialized = serde_json::to_string(&records.iter().map(|r| &r.record).collect::<Vec<_>>())
+        .expect("serialize records");
+    assert!(
+        !serialized.contains("the second event stays unread"),
+        "the event behind the byte bound must not emit"
+    );
+    assert!(
+        new_state.pending_coverage,
+        "the unread tail is a durable coverage debt"
+    );
+    cleanup(&path);
+}
+
+/// §3.1 Change 4's **scan-path wiring**. The two method-level ceiling tests
+/// above pin the eviction *algorithm* (wholeness, order, boundary), not the
+/// production call inside `scan_opencode_rows` — delete that call and both
+/// stay green while nothing bounds the persisted contexts hashed into the
+/// #602 transition digest. This pin goes through `scan_opencode_database`
+/// with the production constants: a prior cursor carrying a context payload
+/// past `MAX_OPENCODE_CONTEXT_BYTES` must come out of the scan evicted and
+/// under the ceiling.
+///
+/// MUTATION (executed 2026-07-31): replace the `evict_contexts_to_fit` call
+/// in `scan_opencode_rows` with `let evicted = 0u64;` — this test fails
+/// (nothing evicts; the persisted payload stays over its ceiling) while both
+/// method-level ceiling tests stay green, which is the round-2 finding this
+/// pin closes.
+#[test]
+fn an_opencode_scan_evicts_contexts_over_the_ceiling_before_persisting() {
+    let path = unique_opencode_db_path("ceiling-scan-path");
+    let connection = create_opencode_db(&path);
+    for aggregate in ["agg_bloat", "ses_kept"] {
+        connection
+            .execute(
+                "INSERT INTO event (id, aggregate_id, seq, type, data) \
+                 VALUES (?1, ?2, 0, 'session.created.1', ?3)",
+                rusqlite::params![
+                    format!("evt_{aggregate}"),
+                    aggregate,
+                    serde_json::to_string(&json!({
+                        "sessionID": aggregate,
+                        "info": {
+                            "id": aggregate,
+                            "directory": format!("/work/{aggregate}"),
+                            "title": format!("ceiling {aggregate}"),
+                            "time": {"created": 1780000100000_i64, "updated": 1780000100000_i64}
+                        }
+                    }))
+                    .unwrap(),
+                ],
+            )
+            .expect("insert session event");
+        connection
+            .execute(
+                "INSERT INTO event_sequence (aggregate_id, seq, owner_id) VALUES (?1, 0, NULL)",
+                rusqlite::params![aggregate],
+            )
+            .expect("insert sequence");
+    }
+    drop(connection);
+
+    // A covered cursor (both watermarks current, so the scan reads nothing)
+    // whose carried context payload exceeds the production byte ceiling —
+    // only the scan's own eviction call can bring it back under.
+    let mut prior = OpenCodeState::fresh();
+    prior.event_scan_complete = true;
+    for aggregate in ["agg_bloat", "ses_kept"] {
+        prior.aggregate_sequences.insert(aggregate.to_string(), 0);
+    }
+    prior.session_contexts.insert(
+        "agg_bloat".to_string(),
+        OpenCodeSessionContext {
+            directory: "x".repeat(MAX_OPENCODE_CONTEXT_BYTES + 1024),
+            model: None,
+        },
+    );
+    prior.session_contexts.insert(
+        "ses_kept".to_string(),
+        OpenCodeSessionContext {
+            directory: "/work/ses_kept".to_string(),
+            model: None,
+        },
+    );
+
+    let mut ledger = ScanLedger::default();
+    let outcome = scan_opencode_database(
+        path.to_str().expect("utf-8 path"),
+        &prior,
+        &default_opencode_budget(),
+        &mut ledger,
+    );
+    let OpenCodeScanOutcome::Scanned { new_state, .. } = outcome else {
+        panic!("a ceiling crossing evicts per §2.3; it must not fail the scan");
+    };
+    assert_eq!(
+        ledger.evicted_entries, 1,
+        "the scan itself must evict the over-ceiling context before persisting"
+    );
+    assert!(
+        ledger.coverage_degraded,
+        "eviction reports itself as degraded coverage"
+    );
+    assert!(
+        !new_state.session_contexts.contains_key("agg_bloat"),
+        "whole-aggregate, ascending: the bloated aggregate goes"
+    );
+    assert!(
+        new_state.session_contexts.contains_key("ses_kept"),
+        "the aggregate above it survives whole"
+    );
+    let persisted =
+        serde_json::to_string(&(&new_state.session_contexts, &new_state.message_contexts))
+            .expect("serialize contexts")
+            .len();
+    assert!(
+        persisted <= MAX_OPENCODE_CONTEXT_BYTES,
+        "the persisted context payload must fit the production ceiling; got {persisted} bytes"
+    );
+    assert!(
+        !new_state.pending_coverage,
+        "context eviction is not coverage debt — events stay covered and \
+         enrichment rebuilds on demand"
     );
 
     cleanup(&path);

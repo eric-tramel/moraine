@@ -15,10 +15,10 @@ use tracing::{debug, warn};
 
 use super::{
     hash_str, open_read_only, record_scan_failure, record_scan_ledger, sqlite_data_version,
-    stat_fingerprint, take_payload_required_string, truncate_chars_local, ScanLedger,
+    stat_fingerprint, take_payload_required_string, truncate_chars_local, ScanBudget, ScanLedger,
     StatFingerprint, SyntheticRecord, VolatilePollMap, CURSOR_STATE_VERSION,
-    ERROR_KIND_MIXED_SNAPSHOT, ERROR_KIND_OPEN, ERROR_KIND_SCAN, ERROR_KIND_SCHEMA,
-    ERROR_KIND_TOO_LARGE, SCAN_PAGE_MAX_BYTES, SCAN_PAGE_SIZE,
+    ERROR_KIND_MIXED_SNAPSHOT, ERROR_KIND_OPEN, ERROR_KIND_ROW_TOO_LARGE, ERROR_KIND_SCAN,
+    ERROR_KIND_SCHEMA, SCAN_PAGE_MAX_BYTES, SCAN_PAGE_SIZE,
 };
 
 /// The paged event read, shared with the fixture-plan assertion in
@@ -29,12 +29,54 @@ const OPENCODE_EVENT_PAGE_SQL: &str = "SELECT id, aggregate_id, seq, type, data 
      WHERE aggregate_id = ?1 AND seq > ?2 AND seq <= ?3 \
      ORDER BY seq LIMIT ?4";
 
-const MAX_OPENCODE_RELEVANT_ROWS: u64 = 10_000;
-const MAX_OPENCODE_SCAN_BYTES: u64 = 128 * 1024 * 1024;
+/// Event types that feed the reconstruction context, split by which map they
+/// update. **Single source of truth** (issue #601 §3.1 Change 3):
+/// `update_opencode_context` dispatches on these slices and
+/// `opencode_context_rebuild_sql` derives its `IN` list from their
+/// concatenation, so a new context-bearing event type cannot be added to one
+/// and forgotten in the other.
+const OPENCODE_SESSION_CONTEXT_EVENT_TYPES: &[&str] = &["session.created.1", "session.updated.1"];
+const OPENCODE_MESSAGE_CONTEXT_EVENT_TYPES: &[&str] = &["message.updated.1"];
+
+/// Ceilings on the persisted reconstruction context (issue #601 §3.1
+/// Change 4). This is a **size budget, not an absence check**: WI-06 requires
+/// persisting the context (the old "cursor stays bounded" absence assertion
+/// directly contradicted it), and what stays bounded is the serialized
+/// footprint. Enforced by evicting whole aggregates — never by failing the
+/// scan — because eviction is cheap to recover from: the next delta poll of an
+/// evicted aggregate runs the type-scoped rebuild, measured at 95 rows / 47 KB
+/// / ~0.5 ms against the reference host's 639-event aggregate (§1.2).
+///
+/// Eviction order is ascending `aggregate_id`, and that is a *disclosed
+/// compromise*, not an oversight: OpenCode's `seq` is per-aggregate, so no
+/// cross-aggregate recency ordering exists in the store to be "least recently
+/// used" against. A deterministic order is mandatory (the maps ride
+/// `cursor_json`, hashed into the #602 transition digest — §2.6), and the
+/// rebuild cost above is what makes the ordering's quality nearly irrelevant.
+const MAX_OPENCODE_CONTEXT_ENTRIES: usize = 20_000;
+const MAX_OPENCODE_CONTEXT_BYTES: usize = 4 * 1024 * 1024;
+
 const OPENCODE_LONG_BINARY_STRING_CHARS: usize = 65_536;
 const OPENCODE_DUPLICATE_SESSION_MESSAGE_TYPES: &[&str] = &["user", "assistant"];
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+/// The §3.1 Change 3 bounded context rebuild: type-scoped (index-driven, never
+/// a full replay) and bounded at the resume watermark — events past it are
+/// walked by the page loop itself, so the rebuild reconstructs history only.
+fn opencode_context_rebuild_sql() -> String {
+    let types = OPENCODE_SESSION_CONTEXT_EVENT_TYPES
+        .iter()
+        .chain(OPENCODE_MESSAGE_CONTEXT_EVENT_TYPES)
+        .map(|event_type| format!("'{event_type}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "SELECT id, aggregate_id, seq, type, data FROM event \
+         WHERE aggregate_id = ?1 AND seq <= ?2 AND type IN ({types}) \
+         ORDER BY seq"
+    )
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 struct OpenCodeSessionContext {
     #[serde(default)]
     directory: String,
@@ -42,7 +84,7 @@ struct OpenCodeSessionContext {
     model: Option<Value>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 struct OpenCodeMessageContext {
     #[serde(default)]
     role: String,
@@ -56,7 +98,10 @@ struct OpenCodeMessageContext {
     directory: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+/// `Eq` is deliberately absent: the persisted contexts carry `serde_json`
+/// values (`model`), which are `PartialEq` only. `scan_is_noop`'s structural
+/// comparison needs `PartialEq` alone.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 struct OpenCodeState {
     version: u32,
     format: String,
@@ -66,10 +111,32 @@ struct OpenCodeState {
     event_scan_complete: bool,
     #[serde(default)]
     aggregate_sequences: BTreeMap<String, i64>,
+    /// Persisted reconstruction context (issue #601 §3.1 Change 2): the exact
+    /// inputs `enrich_message_record` / `enrich_part_record` /
+    /// `enrich_session_message_record` and `push_opencode_record`'s
+    /// `project_dir` derivation consume, seeded from the prior poll and
+    /// updated in place by delta events — which is what lets the page loop
+    /// start at the watermark instead of replaying history for context.
+    /// Keyed by session id (OpenCode's aggregate id for session aggregates).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    session_contexts: BTreeMap<String, OpenCodeSessionContext>,
+    /// Message contexts, nested by session (aggregate) id then message id, so
+    /// the §3.1 Change 4 ceiling can evict whole aggregates and the Change 7
+    /// disappearance rule can drop them.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    message_contexts: BTreeMap<String, BTreeMap<String, OpenCodeMessageContext>>,
     #[serde(default)]
     project_exclusions_hash: u64,
     #[serde(default)]
     last_error: String,
+    /// True while a work budget deliberately left known events unread this
+    /// generation (issue #601 §2.3's persisted resume marker). The cheap stat
+    /// short-circuit must not fire while set, or a quiet store's remainder is
+    /// unreachable forever. A function of committed scan decisions — never a
+    /// timestamp — so it rides the #602 digest safely (§2.6), and omitted
+    /// while false so `cursor_json` stays byte-identical for covered stores.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pending_coverage: bool,
 }
 
 impl OpenCodeState {
@@ -98,6 +165,51 @@ impl OpenCodeState {
 
     fn serialize(&self) -> String {
         serde_json::to_string(self).unwrap_or_default()
+    }
+
+    /// Enforce the §3.1 Change 4 context ceilings by evicting whole aggregates
+    /// (session context plus that aggregate's message contexts together, so an
+    /// aggregate is either enrichable or cleanly rebuildable — never half of
+    /// each). Returns the number of context *entries* dropped. Removal is in
+    /// batches of one-eighth of the aggregate set per round so a pathological
+    /// many-small-entries payload does not re-serialize per entry. See the
+    /// ceiling constants for why the order is ascending `aggregate_id`.
+    fn evict_contexts_to_fit(&mut self, max_entries: usize, max_bytes: usize) -> u64 {
+        let mut evicted = 0u64;
+        loop {
+            let entries = self
+                .message_contexts
+                .values()
+                .map(BTreeMap::len)
+                .sum::<usize>()
+                + self.session_contexts.len();
+            let bytes = serde_json::to_string(&(&self.session_contexts, &self.message_contexts))
+                .map(|raw| raw.len())
+                .unwrap_or(0);
+            if entries <= max_entries && bytes <= max_bytes {
+                return evicted;
+            }
+            let aggregates: Vec<String> = self
+                .session_contexts
+                .keys()
+                .chain(self.message_contexts.keys())
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            if aggregates.is_empty() {
+                return evicted;
+            }
+            let batch = (aggregates.len().div_ceil(8)).max(1);
+            for id in aggregates.into_iter().take(batch) {
+                if self.session_contexts.remove(&id).is_some() {
+                    evicted += 1;
+                }
+                if let Some(messages) = self.message_contexts.remove(&id) {
+                    evicted += messages.len() as u64;
+                }
+            }
+        }
     }
 }
 
@@ -131,7 +243,6 @@ struct OpenCodeAccumulated {
 #[derive(Debug)]
 enum OpenCodeScanError {
     Scan(anyhow::Error),
-    TooLarge(String),
 }
 
 impl From<anyhow::Error> for OpenCodeScanError {
@@ -146,12 +257,24 @@ impl From<rusqlite::Error> for OpenCodeScanError {
     }
 }
 
+/// One skipped row, destined for a single `ingest_errors` row (§2.3): an
+/// un-processable single event — larger than `SCAN_PAGE_MAX_BYTES` — is
+/// reported once and advanced past, never allowed to fail the scan. The
+/// watermark advancing past it is what makes the report one-shot.
+#[derive(Debug, Clone)]
+struct OpenCodeRowError {
+    source_line_no: u64,
+    error_kind: &'static str,
+    error_text: String,
+}
+
 enum OpenCodeScanOutcome {
     Scanned {
         records: Vec<SyntheticRecord>,
-        new_state: OpenCodeState,
+        new_state: Box<OpenCodeState>,
         schema_fingerprint: u64,
         relevant_rows: u64,
+        row_errors: Vec<OpenCodeRowError>,
     },
     Failed {
         error_kind: &'static str,
@@ -313,7 +436,18 @@ pub(crate) async fn process_opencode_sqlite_db(
     // throttle for the sweep slice must read the fault ladder alone.
     // `an_ordinary_poll_of_a_contended_opencode_store_is_not_throttled` fails
     // if it is added. See `plans/601-delta-sqlite.md` §7 WI-10.
-    if state.stat == current_stat && state.event_scan_complete && state.last_error.is_empty() {
+    //
+    // The `!pending_coverage` conjunct is §2.3's "continue next poll": while a
+    // budget remainder exists an unchanged stat must not end the poll (a quiet
+    // store's stat never moves again). Terminates because each resumed poll
+    // retires at least one budget of the remainder and the flag clears with
+    // the covering scan's checkpoint
+    // (`a_degraded_opencode_cold_ingest_completes_without_new_writes`).
+    if state.stat == current_stat
+        && state.event_scan_complete
+        && state.last_error.is_empty()
+        && !state.pending_coverage
+    {
         return Ok(());
     }
 
@@ -336,9 +470,19 @@ pub(crate) async fn process_opencode_sqlite_db(
 
     let scan_db_path = source_file.clone();
     let scan_state = state.clone();
+    // The fast-path work budget (issue #601 §2.1), from `[ingest.sqlite]`.
+    // Exceeding it commits what was read and degrades coverage; it never fails
+    // the scan. A replacement replay is unbudgeted: its finalize publishes the
+    // generation whole, so degrading it would publish a hole through #602
+    // (`an_opencode_replacement_replay_reads_past_the_fast_path_budget`).
+    let budget = if replacement_replay {
+        ScanBudget::unbounded()
+    } else {
+        ScanBudget::fast_path(&config.ingest.sqlite)
+    };
     let (outcome, ledger) = tokio::task::spawn_blocking(move || {
         let mut ledger = ScanLedger::default();
-        let outcome = scan_opencode_database(&scan_db_path, &scan_state, &mut ledger);
+        let outcome = scan_opencode_database(&scan_db_path, &scan_state, &budget, &mut ledger);
         (outcome, ledger)
     })
     .await
@@ -351,6 +495,7 @@ pub(crate) async fn process_opencode_sqlite_db(
             mut new_state,
             schema_fingerprint,
             relevant_rows,
+            row_errors,
         } => {
             new_state.stat = current_stat;
             new_state.last_error = String::new();
@@ -372,7 +517,7 @@ pub(crate) async fn process_opencode_sqlite_db(
                 && !retry_blocked_replay
                 && records.is_empty()
                 && checkpoint.status == "active"
-                && new_state == prior_state_covered
+                && *new_state == prior_state_covered
                 && schema_fingerprint == checkpoint.schema_fingerprint;
             if scan_is_noop {
                 poll_state.record_noop_scan(&cp_key, checkpoint.source_generation, new_state.stat);
@@ -390,6 +535,22 @@ pub(crate) async fn process_opencode_sqlite_db(
             }
 
             let mut batch = RowBatch::default();
+            // Per-row skips (§2.3): one `ingest_errors` row each, one-shot
+            // because the aggregate watermark advanced past the skipped event.
+            for row_error in &row_errors {
+                batch.push_error_row(json!({
+                    "source_name": work.source_name,
+                    "harness": work.harness,
+                    "source_file": source_file,
+                    "source_inode": inode,
+                    "source_generation": checkpoint.source_generation,
+                    "source_line_no": row_error.source_line_no,
+                    "source_offset": 0u64,
+                    "error_kind": row_error.error_kind,
+                    "error_text": row_error.error_text,
+                    "raw_fragment": "",
+                }));
+            }
             let mut replay_block_reason = None::<String>;
             for synthetic in &records {
                 if crate::dispatch::record_project_dir_is_excluded(
@@ -463,7 +624,7 @@ pub(crate) async fn process_opencode_sqlite_db(
                 } else {
                     "active".to_string()
                 },
-                cursor_json: new_state.serialize(),
+                cursor_json: (*new_state).serialize(),
                 source_fingerprint: inode,
                 schema_fingerprint,
                 policy_fingerprint: policy_fingerprint.clone(),
@@ -606,9 +767,21 @@ pub(crate) async fn process_opencode_sqlite_db(
 
 /// The caller owns `ledger` so that every early return — including each
 /// failure arm — still reports the bytes this scan had already paid for.
+///
+/// **Ceiling degradation (issue #601 §2.3, G4 row 4).** This scan has no
+/// history-size failure mode: `MAX_OPENCODE_RELEVANT_ROWS` /
+/// `MAX_OPENCODE_SCAN_BYTES` and their `sqlite_cursor_too_large` arms are
+/// retired, along with the per-aggregate `sum(length(data))` preflight that
+/// fed them — which also removes the preflight's second full pass over `data`
+/// (the ~2× §1.1 finding 2 predicted) and one of the duplicate
+/// `event_sequence` reads (§3.1 Change 5): the scan now reads
+/// `event_sequence` exactly once, here, and threads it down. What bounds a
+/// poll is the per-poll work budget; exceeding it commits what was read and
+/// records `coverage_degraded`.
 fn scan_opencode_database(
     db_path: &str,
     prior: &OpenCodeState,
+    budget: &ScanBudget,
     ledger: &mut ScanLedger,
 ) -> OpenCodeScanOutcome {
     let connection = match open_read_only(db_path) {
@@ -643,44 +816,18 @@ fn scan_opencode_database(
         }
     };
 
-    match opencode_relevant_stats(&connection, prior, ledger) {
-        Ok(stats) if stats.rows > MAX_OPENCODE_RELEVANT_ROWS => {
-            return OpenCodeScanOutcome::Failed {
-                error_kind: ERROR_KIND_TOO_LARGE,
-                error_text: format!(
-                    "{} OpenCode events exceed the {MAX_OPENCODE_RELEVANT_ROWS} event scan ceiling",
-                    stats.rows
-                ),
-            };
-        }
-        Ok(stats) if stats.max_row_bytes > SCAN_PAGE_MAX_BYTES as u64 => {
-            return OpenCodeScanOutcome::Failed {
-                error_kind: ERROR_KIND_TOO_LARGE,
-                error_text: format!(
-                    "largest OpenCode row is {} bytes, exceeding the {} byte row ceiling",
-                    stats.max_row_bytes, SCAN_PAGE_MAX_BYTES
-                ),
-            };
-        }
-        Ok(stats) if stats.total_bytes > MAX_OPENCODE_SCAN_BYTES => {
-            return OpenCodeScanOutcome::Failed {
-                error_kind: ERROR_KIND_TOO_LARGE,
-                error_text: format!(
-                    "{} OpenCode source bytes exceed the {} byte scan ceiling",
-                    stats.total_bytes, MAX_OPENCODE_SCAN_BYTES
-                ),
-            };
-        }
-        Ok(_) => {}
+    // §3.1 Change 5: the single `event_sequence` read this scan performs.
+    let aggregates = match opencode_aggregate_sequences(&connection, ledger) {
+        Ok(aggregates) => aggregates,
         Err(exc) => {
             return OpenCodeScanOutcome::Failed {
                 error_kind: ERROR_KIND_SCAN,
                 error_text: format!("{exc:#}"),
-            };
+            }
         }
-    }
+    };
 
-    let result = scan_opencode_rows(&connection, prior, ledger);
+    let result = scan_opencode_rows(&connection, prior, &aggregates, budget, ledger);
     let data_version_after = match sqlite_data_version(&connection) {
         Ok(value) => value,
         Err(exc) => {
@@ -705,19 +852,16 @@ fn scan_opencode_database(
     }
 
     match result {
-        Ok((records, new_state, relevant_rows)) => OpenCodeScanOutcome::Scanned {
-            records,
-            new_state,
+        Ok(scan) => OpenCodeScanOutcome::Scanned {
+            records: scan.records,
+            new_state: scan.new_state,
             schema_fingerprint,
-            relevant_rows,
+            relevant_rows: scan.relevant_rows,
+            row_errors: scan.row_errors,
         },
         Err(OpenCodeScanError::Scan(exc)) => OpenCodeScanOutcome::Failed {
             error_kind: ERROR_KIND_SCAN,
             error_text: format!("{exc:#}"),
-        },
-        Err(OpenCodeScanError::TooLarge(error_text)) => OpenCodeScanOutcome::Failed {
-            error_kind: ERROR_KIND_TOO_LARGE,
-            error_text,
         },
     }
 }
@@ -752,90 +896,126 @@ fn validate_opencode_schema(
     Ok(hash_str(&schema_material))
 }
 
-#[derive(Default)]
-struct OpenCodeRelevantStats {
-    rows: u64,
-    total_bytes: u64,
-    max_row_bytes: u64,
+/// What one `scan_opencode_rows` call produced.
+struct OpenCodeRowsScan {
+    records: Vec<SyntheticRecord>,
+    new_state: Box<OpenCodeState>,
+    relevant_rows: u64,
+    row_errors: Vec<OpenCodeRowError>,
 }
 
-/// Preflight sizing, and an honest account of what it costs.
+/// The delta scan (issue #601 §3.1). Each changed aggregate's page loop starts
+/// at its persisted watermark (Change 1) — never `-1` — and the persisted
+/// contexts supply the history the replay used to rebuild (Change 2), with the
+/// type-scoped rebuild as the bounded fallback when an aggregate's context was
+/// evicted or predates persistence (Change 3).
 ///
-/// The per-aggregate statement below is a scalar aggregate, so it materializes
-/// no row — but `sum(length(coalesce(data, '')))` makes SQLite decode every
-/// byte of `data` in the range (§1.1 finding 2). Those bytes are charged on the
-/// payload axis, which is why a cold OpenCode scan's `payload_bytes` is roughly
-/// **twice** its `data` size: once here and once in the page loop. That is the
-/// truth, and it is what makes the duplication visible to a byte budget instead
-/// of leaving it "real and invisible".
+/// **Ordering under the budget.** Changed *known* aggregates first — their
+/// watermark is exact, so this is the §2.3 "newest-first" for OpenCode
+/// (`event_sequence.seq > persisted seq` is the one exact recency signal the
+/// store has) and what §4's active-session freshness claim rides on — then
+/// never-read aggregates (cold debt), ascending `aggregate_id` within each
+/// class (no cross-aggregate recency ordering exists; `seq` is per-aggregate).
+/// Convergence does not need Cursor/NAC's never-read-first rule here: the
+/// per-aggregate watermark is a durable resume position, so the delta class
+/// shrinks to nothing and cold debt then takes the whole budget — D8a's
+/// argument, per aggregate.
 ///
-/// Issue #601 §3.1 Change 5 folds this O(#aggregates) preflight into the single
-/// `event_sequence` read, at which point the doubling disappears;
-/// `opencode_ledger_charges_payload_bytes_at_the_read_site` pins the current
-/// number so that change cannot land silently.
-fn opencode_relevant_stats(
-    connection: &Connection,
-    prior: &OpenCodeState,
-    ledger: &mut ScanLedger,
-) -> Result<OpenCodeRelevantStats> {
-    let mut stats = OpenCodeRelevantStats::default();
-    for aggregate in opencode_aggregate_sequences(connection, ledger)? {
-        let prior_seq = opencode_scan_from_seq(prior, &aggregate);
-        let (rows, total_bytes, max_row_bytes): (i64, i64, i64) = connection
-            .query_row(
-                // `CAST(… AS BLOB)` on purpose: bare `length()` over a TEXT
-                // value counts *characters*, and both results are compared
-                // against byte ceilings and charged to a byte axis. The
-                // in-scan check (`build_event_row`) measures real bytes, so
-                // the character form also made the preflight and the loop
-                // disagree on any non-ASCII payload.
-                "SELECT count(*), coalesce(sum(length(CAST(coalesce(data, '') AS BLOB))), 0), \
-                 coalesce(max(length(CAST(coalesce(data, '') AS BLOB))), 0) \
-                 FROM event WHERE aggregate_id = ?1 AND seq > ?2 AND seq <= ?3",
-                rusqlite::params![&aggregate.aggregate_id, prior_seq, aggregate.seq],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .with_context(|| {
-                format!(
-                    "failed measuring OpenCode events for {}",
-                    aggregate.aggregate_id
-                )
-            })?;
-        stats.rows = stats.rows.saturating_add(rows.max(0) as u64);
-        stats.total_bytes = stats.total_bytes.saturating_add(total_bytes.max(0) as u64);
-        stats.max_row_bytes = stats.max_row_bytes.max(max_row_bytes.max(0) as u64);
-        // `sum(length(data))` is exactly the count of bytes SQLite decoded to
-        // answer this statement, so it is also exactly what the payload axis
-        // owes for it.
-        ledger.charge_aggregate_payload_bytes(total_bytes.max(0) as u64);
-    }
-    Ok(stats)
-}
-
+/// **Budget binding.** Between events, never before the first this poll (a
+/// poll always makes forward progress); the bound event was materialized by
+/// SQLite before the check could run, so it is charged one payload row with no
+/// bytes — the same honest-ledger rule as NAC's episode loop.
 fn scan_opencode_rows(
     connection: &Connection,
     prior: &OpenCodeState,
+    aggregates: &[OpenCodeAggregateSequence],
+    budget: &ScanBudget,
     ledger: &mut ScanLedger,
-) -> std::result::Result<(Vec<SyntheticRecord>, OpenCodeState, u64), OpenCodeScanError> {
+) -> std::result::Result<OpenCodeRowsScan, OpenCodeScanError> {
     let mut records = Vec::new();
     let mut accumulated = OpenCodeAccumulated::default();
     let mut aggregate_sequences = BTreeMap::new();
-    let mut session_contexts = BTreeMap::new();
-    let mut message_contexts = BTreeMap::new();
+    let mut row_errors = Vec::new();
     let mut relevant_events = 0u64;
-    let mut context_events = 0u64;
-    let mut context_bytes = 0u64;
+    let mut events_processed = 0u64;
+    let mut degraded = false;
 
-    for aggregate in opencode_aggregate_sequences(connection, ledger)? {
-        let scan_from_seq = opencode_scan_from_seq(prior, &aggregate);
+    // Change 7: a vanished aggregate drops its watermark (absent from the
+    // rebuild below) *and* its context entries (filtered here) — it is not a
+    // rewind and must never bump the generation (G8b).
+    let current_ids: std::collections::BTreeSet<&str> = aggregates
+        .iter()
+        .map(|aggregate| aggregate.aggregate_id.as_str())
+        .collect();
+    let mut session_contexts: BTreeMap<String, OpenCodeSessionContext> = prior
+        .session_contexts
+        .iter()
+        .filter(|(id, _)| current_ids.contains(id.as_str()))
+        .map(|(id, context)| (id.clone(), context.clone()))
+        .collect();
+    let mut message_contexts: BTreeMap<String, BTreeMap<String, OpenCodeMessageContext>> = prior
+        .message_contexts
+        .iter()
+        .filter(|(id, _)| current_ids.contains(id.as_str()))
+        .map(|(id, contexts)| (id.clone(), contexts.clone()))
+        .collect();
+
+    let mut changed: Vec<(&OpenCodeAggregateSequence, i64, bool)> = Vec::new();
+    for aggregate in aggregates {
+        let scan_from_seq = opencode_scan_from_seq(prior, aggregate);
         if aggregate.seq <= scan_from_seq {
             aggregate_sequences.insert(aggregate.aggregate_id.clone(), scan_from_seq);
             continue;
         }
+        let known = prior
+            .aggregate_sequences
+            .contains_key(&aggregate.aggregate_id);
+        changed.push((aggregate, scan_from_seq, known));
+    }
+    // Delta (known) class before cold (never-read) class; `aggregates` arrives
+    // in `aggregate_id` order, and the stable sort keeps it within each class.
+    changed.sort_by_key(|(_, _, known)| std::cmp::Reverse(*known));
 
-        let mut last_seq = -1;
+    for (idx, (aggregate, scan_from_seq, _)) in changed.iter().enumerate() {
+        if events_processed > 0 && budget.is_exhausted_by(ledger.payload_rows, ledger.payload_bytes)
+        {
+            // Commit what was read (§2.1/§2.3): skipped known aggregates keep
+            // their watermark ("unread this poll", never "rewound"), skipped
+            // never-read aggregates stay absent so a later poll re-detects
+            // them. The skip is exact on the rows axis — `seq` bounds it.
+            let mut skipped_events = 0u64;
+            for (aggregate, scan_from_seq, _) in &changed[idx..] {
+                if *scan_from_seq >= 0 {
+                    aggregate_sequences.insert(aggregate.aggregate_id.clone(), *scan_from_seq);
+                }
+                skipped_events = skipped_events
+                    .saturating_add(aggregate.seq.saturating_sub((*scan_from_seq).max(-1)) as u64);
+            }
+            ledger.mark_degraded(skipped_events, 0);
+            degraded = true;
+            break;
+        }
+
+        // Change 3: resuming an aggregate whose session context is missing
+        // (evicted, or the cursor predates context persistence) rebuilds it
+        // with the type-scoped read — 95 rows / 47 KB / ~0.5 ms on the
+        // reference aggregate versus 639 rows / 6.9 MB for the full replay.
+        if *scan_from_seq >= 0 && !session_contexts.contains_key(&aggregate.aggregate_id) {
+            rebuild_opencode_context(
+                connection,
+                &aggregate.aggregate_id,
+                *scan_from_seq,
+                &mut session_contexts,
+                &mut message_contexts,
+                ledger,
+            )?;
+        }
+
+        // Change 1: the page loop's lower bound is the persisted watermark.
+        let mut last_seq = *scan_from_seq;
         let mut observed_any = false;
-        loop {
+        let mut aggregate_bound = false;
+        'pages: loop {
             let mut page_rows = 0usize;
             let mut page_bytes = 0usize;
             let mut page_capped = false;
@@ -848,39 +1028,49 @@ fn scan_opencode_rows(
                     SCAN_PAGE_SIZE as i64
                 ])?;
                 while let Some(row) = rows.next()? {
+                    if events_processed > 0
+                        && budget.is_exhausted_by(ledger.payload_rows, ledger.payload_bytes)
+                    {
+                        // The row SQLite just handed over was materialized
+                        // before the budget could be consulted: one row on the
+                        // rows axis, no bytes (its columns are never taken).
+                        // It stays inside the skipped remainder — the
+                        // watermark did not advance past it.
+                        ledger.charge_payload_row();
+                        aggregate_bound = true;
+                        break 'pages;
+                    }
                     let event = build_event_row(row, ledger)?;
                     if event.data_bytes > SCAN_PAGE_MAX_BYTES {
-                        return Err(OpenCodeScanError::TooLarge(format!(
-                            "largest OpenCode event is {} bytes, exceeding the {} byte row ceiling",
-                            event.data_bytes, SCAN_PAGE_MAX_BYTES
-                        )));
+                        // Un-processable single row (§2.3): one error row,
+                        // skip it, advance the watermark past it — one-shot,
+                        // never a scan failure and never a stall.
+                        row_errors.push(OpenCodeRowError {
+                            source_line_no: event.seq.max(0) as u64,
+                            error_kind: ERROR_KIND_ROW_TOO_LARGE,
+                            error_text: format!(
+                                "OpenCode event {} (aggregate {}, seq {}) is {} bytes, \
+                                 exceeding the {} byte row ceiling; event skipped",
+                                event.id,
+                                event.aggregate_id,
+                                event.seq,
+                                event.data_bytes,
+                                SCAN_PAGE_MAX_BYTES
+                            ),
+                        });
+                        last_seq = event.seq;
+                        observed_any = true;
+                        events_processed += 1;
+                        relevant_events += 1;
+                        continue;
                     }
                     page_rows += 1;
                     page_bytes = page_bytes.saturating_add(event.data_bytes);
-                    context_events = context_events.saturating_add(1);
-                    context_bytes = context_bytes.saturating_add(event.data_bytes as u64);
-                    if context_events > MAX_OPENCODE_RELEVANT_ROWS {
-                        return Err(OpenCodeScanError::TooLarge(format!(
-                            "{context_events} OpenCode context events exceed the {MAX_OPENCODE_RELEVANT_ROWS} event scan ceiling"
-                        )));
-                    }
-                    if context_bytes > MAX_OPENCODE_SCAN_BYTES {
-                        return Err(OpenCodeScanError::TooLarge(format!(
-                            "{context_bytes} OpenCode context bytes exceed the {MAX_OPENCODE_SCAN_BYTES} byte scan ceiling"
-                        )));
-                    }
-
                     update_opencode_context(&event, &mut session_contexts, &mut message_contexts);
+                    apply_opencode_event(&event, &mut accumulated);
+                    relevant_events += 1;
+                    events_processed += 1;
                     observed_any = true;
-                    if event.seq > scan_from_seq {
-                        relevant_events += 1;
-                        if relevant_events > MAX_OPENCODE_RELEVANT_ROWS {
-                            return Err(OpenCodeScanError::TooLarge(format!(
-                                "{relevant_events} OpenCode events exceed the {MAX_OPENCODE_RELEVANT_ROWS} event scan ceiling"
-                            )));
-                        }
-                        apply_opencode_event(&event, &mut accumulated);
-                    }
                     last_seq = event.seq;
                     if page_bytes >= SCAN_PAGE_MAX_BYTES || page_rows >= SCAN_PAGE_SIZE {
                         page_capped = true;
@@ -893,10 +1083,25 @@ fn scan_opencode_rows(
                 break;
             }
         }
+        if aggregate_bound {
+            // Mid-aggregate bound: the watermark is the durable resume
+            // position (D8a's rule — oldest-first of the new tail, because an
+            // exact resume position exists), so the next poll continues from
+            // exactly here. Remaining aggregates are handled by the
+            // between-aggregate check above on the next iteration.
+            if observed_any {
+                aggregate_sequences.insert(aggregate.aggregate_id.clone(), last_seq);
+            } else if *scan_from_seq >= 0 {
+                aggregate_sequences.insert(aggregate.aggregate_id.clone(), *scan_from_seq);
+            }
+            ledger.mark_degraded(aggregate.seq.saturating_sub(last_seq.max(-1)) as u64, 0);
+            degraded = true;
+            continue;
+        }
         if observed_any {
             aggregate_sequences.insert(aggregate.aggregate_id.clone(), last_seq);
-        } else if scan_from_seq >= 0 {
-            aggregate_sequences.insert(aggregate.aggregate_id.clone(), scan_from_seq);
+        } else if *scan_from_seq >= 0 {
+            aggregate_sequences.insert(aggregate.aggregate_id.clone(), *scan_from_seq);
         }
     }
 
@@ -922,8 +1127,49 @@ fn scan_opencode_rows(
     new_state.project_exclusions_hash = prior.project_exclusions_hash;
     new_state.event_scan_complete = true;
     new_state.aggregate_sequences = aggregate_sequences;
+    new_state.session_contexts = session_contexts;
+    new_state.message_contexts = message_contexts;
+    // §2.3's persisted resume marker: set exactly when this scan deliberately
+    // left known events unread. Context eviction below is *not* coverage debt
+    // — events are immutable, watermarks are kept, and enrichment rebuilds on
+    // demand — so it marks the ledger but not this flag.
+    new_state.pending_coverage = degraded;
+    // Change 4: the context ceiling, enforced by eviction, never by failing.
+    let evicted =
+        new_state.evict_contexts_to_fit(MAX_OPENCODE_CONTEXT_ENTRIES, MAX_OPENCODE_CONTEXT_BYTES);
+    ledger.mark_evicted(evicted);
     ledger.rows_emitted = records.len() as u64;
-    Ok((records, new_state, relevant_events))
+    Ok(OpenCodeRowsScan {
+        records,
+        new_state: Box::new(new_state),
+        relevant_rows: relevant_events,
+        row_errors,
+    })
+}
+
+/// §3.1 Change 3: rebuild one aggregate's reconstruction context from its
+/// context-bearing events at or below the resume watermark. Type-scoped and
+/// index-driven — the whole point is that this is *not* a replay — and charged
+/// on the payload axis at the read site like every other `data` read.
+fn rebuild_opencode_context(
+    connection: &Connection,
+    aggregate_id: &str,
+    through_seq: i64,
+    session_contexts: &mut BTreeMap<String, OpenCodeSessionContext>,
+    message_contexts: &mut BTreeMap<String, BTreeMap<String, OpenCodeMessageContext>>,
+    ledger: &mut ScanLedger,
+) -> std::result::Result<(), OpenCodeScanError> {
+    let sql = opencode_context_rebuild_sql();
+    let mut stmt = connection.prepare_cached(&sql)?;
+    let mut rows = stmt.query(rusqlite::params![aggregate_id, through_seq])?;
+    while let Some(row) = rows.next()? {
+        let event = build_event_row(row, ledger)?;
+        if event.data_bytes > SCAN_PAGE_MAX_BYTES {
+            continue;
+        }
+        update_opencode_context(&event, session_contexts, message_contexts);
+    }
+    Ok(())
 }
 
 fn opencode_sequences_rewound(
@@ -941,13 +1187,20 @@ fn opencode_sequences_rewound(
         .into_iter()
         .map(|aggregate| (aggregate.aggregate_id, aggregate.seq))
         .collect::<BTreeMap<_, _>>();
+    // §3.1 Change 7: disappearance is not a rewind. An aggregate absent from
+    // `event_sequence` (one deleted old session) drops its watermark and
+    // context entries in the scan and must not force a whole-database
+    // generation bump and full re-ingest (G8b,
+    // `opencode_disappearing_aggregate_is_not_a_generation_bump`). Only a
+    // genuine `current < prior` regression routes through
+    // `begin_database_replay`.
     Ok(prior
         .aggregate_sequences
         .iter()
         .any(|(aggregate_id, prior_seq)| {
             current
                 .get(aggregate_id)
-                .is_none_or(|current_seq| current_seq < prior_seq)
+                .is_some_and(|current_seq| current_seq < prior_seq)
         }))
 }
 
@@ -1013,44 +1266,46 @@ fn build_event_row(row: &rusqlite::Row<'_>, ledger: &mut ScanLedger) -> Result<O
 fn update_opencode_context(
     event: &OpenCodeEventRow,
     session_contexts: &mut BTreeMap<String, OpenCodeSessionContext>,
-    message_contexts: &mut BTreeMap<String, OpenCodeMessageContext>,
+    message_contexts: &mut BTreeMap<String, BTreeMap<String, OpenCodeMessageContext>>,
 ) {
-    match event.event_type.as_str() {
-        "session.created.1" | "session.updated.1" => {
-            let info = event.data.get("info").unwrap_or(&event.data);
-            if let Some((id, record)) = build_session_event_record(info) {
-                let next = session_context_from_record(&record);
-                session_contexts
-                    .entry(id)
-                    .and_modify(|current| {
-                        if !std::path::Path::new(&current.directory).is_absolute()
-                            && std::path::Path::new(&next.directory).is_absolute()
-                        {
-                            current.directory.clone_from(&next.directory);
-                        }
-                        if next.model.is_some() {
-                            current.model.clone_from(&next.model);
-                        }
-                    })
-                    .or_insert(next);
-            }
+    // Dispatch on the same constants the rebuild SQL is derived from (§3.1
+    // Change 3's single source of truth).
+    let event_type = event.event_type.as_str();
+    if OPENCODE_SESSION_CONTEXT_EVENT_TYPES.contains(&event_type) {
+        let info = event.data.get("info").unwrap_or(&event.data);
+        if let Some((id, record)) = build_session_event_record(info) {
+            let next = session_context_from_record(&record);
+            session_contexts
+                .entry(id)
+                .and_modify(|current| {
+                    if !std::path::Path::new(&current.directory).is_absolute()
+                        && std::path::Path::new(&next.directory).is_absolute()
+                    {
+                        current.directory.clone_from(&next.directory);
+                    }
+                    if next.model.is_some() {
+                        current.model.clone_from(&next.model);
+                    }
+                })
+                .or_insert(next);
         }
-        "message.updated.1" => {
-            let info = event.data.get("info").unwrap_or(&event.data);
-            if let Some((id, record)) = build_message_event_record(info) {
-                let context = message_context_from_record(&record);
-                if let Some(session_id) = record.get("session_id").and_then(Value::as_str) {
-                    if std::path::Path::new(&context.directory).is_absolute() {
-                        let session = session_contexts.entry(session_id.to_string()).or_default();
-                        if !std::path::Path::new(&session.directory).is_absolute() {
-                            session.directory.clone_from(&context.directory);
-                        }
+    } else if OPENCODE_MESSAGE_CONTEXT_EVENT_TYPES.contains(&event_type) {
+        let info = event.data.get("info").unwrap_or(&event.data);
+        if let Some((id, record)) = build_message_event_record(info) {
+            let context = message_context_from_record(&record);
+            if let Some(session_id) = record.get("session_id").and_then(Value::as_str) {
+                if std::path::Path::new(&context.directory).is_absolute() {
+                    let session = session_contexts.entry(session_id.to_string()).or_default();
+                    if !std::path::Path::new(&session.directory).is_absolute() {
+                        session.directory.clone_from(&context.directory);
                     }
                 }
-                message_contexts.insert(id, context);
+                message_contexts
+                    .entry(session_id.to_string())
+                    .or_default()
+                    .insert(id, context);
             }
         }
-        _ => {}
     }
 }
 
@@ -1452,13 +1707,14 @@ fn enrich_message_record(
 fn enrich_part_record(
     record: &mut Map<String, Value>,
     session_contexts: &BTreeMap<String, OpenCodeSessionContext>,
-    message_contexts: &BTreeMap<String, OpenCodeMessageContext>,
+    message_contexts: &BTreeMap<String, BTreeMap<String, OpenCodeMessageContext>>,
 ) {
     let session_id = record
         .get("session_id")
         .and_then(Value::as_str)
-        .unwrap_or_default();
-    if let Some(context) = session_contexts.get(session_id) {
+        .unwrap_or_default()
+        .to_string();
+    if let Some(context) = session_contexts.get(&session_id) {
         if !record.contains_key("directory") && !context.directory.is_empty() {
             record.insert("directory".to_string(), json!(context.directory));
         }
@@ -1473,7 +1729,10 @@ fn enrich_part_record(
         .get("message_id")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    if let Some(context) = message_contexts.get(message_id) {
+    if let Some(context) = message_contexts
+        .get(&session_id)
+        .and_then(|by_message| by_message.get(message_id))
+    {
         if !context.role.is_empty() {
             record.insert("message_role".to_string(), json!(context.role));
         }
