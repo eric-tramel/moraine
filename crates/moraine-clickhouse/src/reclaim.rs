@@ -8,6 +8,8 @@
 //! costs an operator their history. WI-05 supplies the driver and the first
 //! two executors, in one change, which is the only order
 //! `no_executor_may_be_registered_before_the_ledger_driver_is_wired` permits.
+//! WI-07 registers the third executor — the canonical read-index scope
+//! (`reclaim_read_index`) — onto the already-wired driver.
 //!
 //! ## The §3.2 protocol, as implemented
 //!
@@ -449,6 +451,19 @@ impl ReclaimScope {
         }
     }
 
+    /// The key one unit of this scope is identified by. See
+    /// [`ReclaimUnitGrain`]; exhaustive, so a new scope must decide.
+    pub fn unit_grain(self) -> ReclaimUnitGrain {
+        match self {
+            Self::McpOpenOrphan | Self::McpOpenRetiredLineage => {
+                ReclaimUnitGrain::SessionCandidateGeneration
+            }
+            Self::ReadIndexGeneration | Self::CanonicalGeneration => {
+                ReclaimUnitGrain::SourceGeneration
+            }
+        }
+    }
+
     /// Human-readable description used by the CLI refusal.
     pub fn describe(self) -> &'static str {
         match self {
@@ -873,6 +888,129 @@ pub struct ReclaimUnit {
     pub unsettled_seconds: u64,
 }
 
+/// The key a scope's unit is identified by, in the ledger and in its delete
+/// predicates.
+///
+/// An exhaustive property of the scope rather than an inference from which
+/// candidate columns happen to be non-empty: adding a scope without deciding
+/// its grain is a compile error, and the grain drives both the unit's
+/// `reclaim_id` (its ledger identity) and the claim-time validation in
+/// [`ReclaimCandidateRow::into_unit`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReclaimUnitGrain {
+    /// One `(session_id, candidate_generation)` pair — the two `mcp_open`
+    /// scopes.
+    SessionCandidateGeneration,
+    /// One `(source_host, source_name, source_file, source_generation)` tuple
+    /// — the read-index scope, and WI-09's canonical scope.
+    SourceGeneration,
+}
+
+/// Row shape every registered candidate probe returns.
+///
+/// One struct across both grains, with the other grain's key fields defaulted
+/// — the transport deserializes one shape, and [`Self::into_unit`] restores
+/// fail-loud behaviour by refusing a row that does not carry its scope's own
+/// key. Without that check, a probe emitting the wrong column names would
+/// deserialize into all-default rows and claim ledger units keyed `('', 0)`
+/// whose deletes bind nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub(crate) struct ReclaimCandidateRow {
+    #[serde(default)]
+    pub(crate) session_id: String,
+    #[serde(default)]
+    pub(crate) candidate_generation: u64,
+    #[serde(default)]
+    pub(crate) source_host: String,
+    #[serde(default)]
+    pub(crate) source_name: String,
+    #[serde(default)]
+    pub(crate) source_file: String,
+    #[serde(default)]
+    pub(crate) source_generation: u32,
+    #[serde(default)]
+    pub(crate) event_rows: u64,
+    #[serde(default)]
+    pub(crate) turn_rows: u64,
+    #[serde(default)]
+    pub(crate) header_rows: u64,
+    #[serde(default)]
+    pub(crate) navigation_rows: u64,
+    #[serde(default)]
+    pub(crate) locator_rows: u64,
+    #[serde(default)]
+    pub(crate) directory_rows: u64,
+}
+
+impl ReclaimCandidateRow {
+    pub(crate) fn estimated_rows(&self) -> u64 {
+        self.event_rows
+            .saturating_add(self.turn_rows)
+            .saturating_add(self.header_rows)
+            .saturating_add(self.navigation_rows)
+            .saturating_add(self.locator_rows)
+            .saturating_add(self.directory_rows)
+    }
+
+    /// The claimable unit this candidate describes, or an error naming the
+    /// missing key when the row does not carry its scope's grain.
+    ///
+    /// The `reclaim_id` format for the session grain is unchanged from WI-05
+    /// (`{scope}:{session}:{generation}`), deliberately: it is the ledger's
+    /// `(scope, reclaim_id)` key, and reformatting it would stop a re-claim of
+    /// an in-flight unit from collapsing onto its existing row.
+    pub(crate) fn into_unit(self, scope: ReclaimScope) -> Result<ReclaimUnit> {
+        let reclaim_id = match scope.unit_grain() {
+            ReclaimUnitGrain::SessionCandidateGeneration => {
+                if self.session_id.is_empty() || self.candidate_generation == 0 {
+                    anyhow::bail!(
+                        "scope `{scope}` is session-grained but its probe returned a candidate \
+                         without a `(session_id, candidate_generation)` key: {self:?}"
+                    );
+                }
+                format!(
+                    "{}:{}:{}",
+                    scope.as_str(),
+                    self.session_id,
+                    self.candidate_generation
+                )
+            }
+            ReclaimUnitGrain::SourceGeneration => {
+                if self.source_file.is_empty() || self.source_generation == 0 {
+                    anyhow::bail!(
+                        "scope `{scope}` is generation-grained but its probe returned a candidate \
+                         without a `(source_host, source_name, source_file, source_generation)` \
+                         key: {self:?}"
+                    );
+                }
+                format!(
+                    "{}:{}:{}:{}:{}",
+                    scope.as_str(),
+                    self.source_host,
+                    self.source_name,
+                    self.source_file,
+                    self.source_generation
+                )
+            }
+        };
+        let estimated_rows = self.estimated_rows();
+        Ok(ReclaimUnit {
+            reclaim_id,
+            scope,
+            source_host: self.source_host,
+            source_name: self.source_name,
+            source_file: self.source_file,
+            source_generation: self.source_generation,
+            session_id: self.session_id,
+            candidate_generation: self.candidate_generation,
+            phase: ReclaimPhase::Claimed,
+            estimated_rows,
+            estimated_bytes: 0,
+            unsettled_seconds: 0,
+        })
+    }
+}
+
 /// Ledger totals by phase.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReclaimLedgerSummary {
@@ -931,7 +1069,7 @@ pub struct ReclaimStatusReport {
     pub storage: Option<StorageReport>,
     pub ledger: ReclaimLedgerSummary,
     pub reclaimable: Vec<ReclaimableEstimate>,
-    /// Scopes an executor exists for. Empty in this build.
+    /// Scopes an executor exists for.
     pub registered_executors: Vec<ReclaimScope>,
     pub denomination: String,
     pub error: Option<String>,
@@ -1216,15 +1354,22 @@ pub fn executor_for(scope: ReclaimScope) -> Option<RegisteredExecutor> {
             },
             predicates: crate::reclaim_mcp_open::mcp_open_unit_predicates,
         }),
-        // WI-07 registers this.
-        ReclaimScope::ReadIndexGeneration => None,
+        // WI-07.
+        ReclaimScope::ReadIndexGeneration => Some(RegisteredExecutor {
+            scope,
+            probe: |database, horizon, limit| {
+                crate::reclaim_read_index::read_index_candidate_sql(database, horizon, limit)
+            },
+            predicates: crate::reclaim_read_index::read_index_unit_predicates,
+        }),
         // WI-09 registers this.
         ReclaimScope::CanonicalGeneration => None,
     }
 }
 
-/// Every scope with a registered executor. Two in this build, both over the
-/// legacy open-projection tables; see [`executor_for`].
+/// Every scope with a registered executor. Three in this build — the two
+/// legacy open-projection scopes and the canonical read-index scope; see
+/// [`executor_for`].
 pub fn registered_executors() -> Vec<ReclaimScope> {
     ReclaimScope::ALL
         .into_iter()
@@ -1547,7 +1692,7 @@ impl ClickHouseClient {
         scope: ReclaimScope,
         retention: &RetentionConfig,
         limit: usize,
-    ) -> Result<Option<Vec<crate::reclaim_mcp_open::McpOpenCandidateRow>>> {
+    ) -> Result<Option<Vec<ReclaimCandidateRow>>> {
         let Some(executor) = executor_for(scope) else {
             return Ok(None);
         };
@@ -1945,26 +2090,12 @@ impl ClickHouseClient {
         let mut units = redrive.redriven;
         let mut estimated_rows_total = 0_u64;
         for candidate in candidates {
-            let estimated_rows = candidate.estimated_rows();
-            let unit = ReclaimUnit {
-                reclaim_id: format!(
-                    "{}:{}:{}",
-                    scope.as_str(),
-                    candidate.session_id,
-                    candidate.candidate_generation
-                ),
-                scope,
-                source_host: String::new(),
-                source_name: String::new(),
-                source_file: String::new(),
-                source_generation: 0,
-                session_id: candidate.session_id.clone(),
-                candidate_generation: candidate.candidate_generation,
-                phase: ReclaimPhase::Claimed,
-                estimated_rows,
-                estimated_bytes: (estimated_rows as f64 * bytes_per_row) as u64,
-                unsettled_seconds: 0,
-            };
+            // A row that does not carry its scope's unit key is refused here,
+            // before anything durable happens — see
+            // `ReclaimCandidateRow::into_unit`.
+            let mut unit = candidate.into_unit(scope)?;
+            let estimated_rows = unit.estimated_rows;
+            unit.estimated_bytes = (estimated_rows as f64 * bytes_per_row) as u64;
             // Claim first, then execute, both inside the unit's own
             // envelope. Everything after the claim is re-derivable from the
             // ledger row that statement makes durable.
@@ -3022,28 +3153,146 @@ mod tests {
 
     // ---- executors ------------------------------------------------------
 
-    /// Exactly the two `mcp_open` scopes execute in this build. Names only what
-    /// it checks: it deliberately does **not** call `reclaim_run`, so it is not
-    /// the guard for anything inside that function — see the `reclaim_run_*`
-    /// tests below, which do.
+    /// Exactly the two `mcp_open` scopes and the read-index scope execute in
+    /// this build. Names only what it checks: it deliberately does **not**
+    /// call `reclaim_run`, so it is not the guard for anything inside that
+    /// function — see the `reclaim_run_*` tests below, which do.
     ///
-    /// MUTATION (executed 2026-07-28): register `ReadIndexGeneration` => FAILS
-    /// here on the exact-set assertion. WI-07 has no probe in this build, so a
+    /// MUTATION (executed 2026-07-31): register `CanonicalGeneration` => FAILS
+    /// here on the exact-set assertion. WI-09 has no probe in this build, so a
     /// registration would claim units nothing can describe. **Upper bound.**
+    ///
+    /// MUTATION (executed 2026-07-31): unregister `ReadIndexGeneration`
+    /// (restore its `None` arm) => FAILS here on the exact-set assertion.
+    /// **Lower bound: WI-07's executor is a deliberate entry, and losing it in
+    /// a merge must not be silent.**
     #[test]
-    fn this_build_registers_exactly_the_two_mcp_open_scopes() {
+    fn this_build_registers_exactly_the_three_bucket_three_scopes() {
         assert_eq!(
             registered_executors(),
             vec![
                 ReclaimScope::McpOpenOrphan,
-                ReclaimScope::McpOpenRetiredLineage
+                ReclaimScope::McpOpenRetiredLineage,
+                ReclaimScope::ReadIndexGeneration
             ]
         );
-        for scope in [
-            ReclaimScope::ReadIndexGeneration,
-            ReclaimScope::CanonicalGeneration,
+        assert!(
+            executor_for(ReclaimScope::CanonicalGeneration).is_none(),
+            "`canonical_generation` must not execute before WI-09"
+        );
+    }
+
+    /// The grain of every scope's unit, pinned per scope — not derived from
+    /// the subject. The grain drives the ledger identity and the claim-time
+    /// key validation, so a one-token change here re-keys a scope's ledger.
+    ///
+    /// MUTATION (executed 2026-07-31): map `ReadIndexGeneration` to
+    /// `SessionCandidateGeneration` => FAILS here and at
+    /// `a_candidate_row_must_carry_its_scopes_unit_key`. **Lower bound.**
+    #[test]
+    fn each_scopes_unit_grain_is_pinned() {
+        for (scope, grain) in [
+            (
+                ReclaimScope::McpOpenOrphan,
+                ReclaimUnitGrain::SessionCandidateGeneration,
+            ),
+            (
+                ReclaimScope::McpOpenRetiredLineage,
+                ReclaimUnitGrain::SessionCandidateGeneration,
+            ),
+            (
+                ReclaimScope::ReadIndexGeneration,
+                ReclaimUnitGrain::SourceGeneration,
+            ),
+            (
+                ReclaimScope::CanonicalGeneration,
+                ReclaimUnitGrain::SourceGeneration,
+            ),
         ] {
-            assert!(executor_for(scope).is_none(), "`{scope}` must not execute");
+            assert_eq!(scope.unit_grain(), grain, "`{scope}`");
+        }
+    }
+
+    /// **G-CANDKEY.** Fails for: a candidate row claiming a unit without its
+    /// scope's own key — the all-default row a mis-shaped probe response
+    /// deserializes into, whose deletes would bind `('', 0)`.
+    /// Denomination: the returned error, and the exact `reclaim_id` of the
+    /// accepted rows (the session-grain format is WI-05's, unchanged — it is
+    /// the ledger key, and reformatting it would stop a re-claim from
+    /// collapsing onto its existing row).
+    ///
+    /// MUTATION (executed 2026-07-31): delete the empty-key `bail!` from the
+    /// `SourceGeneration` arm of `into_unit` => FAILS here on the refusal
+    /// assertion. **Lower bound.**
+    ///
+    /// MUTATION (executed 2026-07-31): build the session-grain `reclaim_id`
+    /// with the source-grain format => FAILS here on the id pin. **Width: the
+    /// grain decides the identity.**
+    #[test]
+    fn a_candidate_row_must_carry_its_scopes_unit_key() {
+        let session_row = ReclaimCandidateRow {
+            session_id: "s-1".to_string(),
+            candidate_generation: 99,
+            event_rows: 2,
+            turn_rows: 1,
+            header_rows: 1,
+            ..empty_candidate_row()
+        };
+        let unit = session_row
+            .clone()
+            .into_unit(ReclaimScope::McpOpenOrphan)
+            .expect("a session-keyed row claims under a session-grained scope");
+        assert_eq!(unit.reclaim_id, "mcp_open_orphan:s-1:99");
+        assert_eq!(unit.estimated_rows, 4);
+
+        let generation_row = ReclaimCandidateRow {
+            source_host: "h".to_string(),
+            source_name: "codex".to_string(),
+            source_file: "/a.jsonl".to_string(),
+            source_generation: 5,
+            navigation_rows: 3,
+            locator_rows: 3,
+            directory_rows: 1,
+            ..empty_candidate_row()
+        };
+        let unit = generation_row
+            .clone()
+            .into_unit(ReclaimScope::ReadIndexGeneration)
+            .expect("a generation-keyed row claims under a generation-grained scope");
+        assert_eq!(unit.reclaim_id, "read_index_generation:h:codex:/a.jsonl:5");
+        assert_eq!(unit.estimated_rows, 7);
+
+        // Cross-grain rows are refused, in both directions, naming the key.
+        let refused = session_row
+            .into_unit(ReclaimScope::ReadIndexGeneration)
+            .expect_err("a session-keyed row must not claim a generation-grained unit");
+        assert!(
+            refused.to_string().contains("source_generation"),
+            "{refused}"
+        );
+        let refused = generation_row
+            .into_unit(ReclaimScope::McpOpenOrphan)
+            .expect_err("a generation-keyed row must not claim a session-grained unit");
+        assert!(
+            refused.to_string().contains("candidate_generation"),
+            "{refused}"
+        );
+    }
+
+    fn empty_candidate_row() -> ReclaimCandidateRow {
+        ReclaimCandidateRow {
+            session_id: String::new(),
+            candidate_generation: 0,
+            source_host: String::new(),
+            source_name: String::new(),
+            source_file: String::new(),
+            source_generation: 0,
+            event_rows: 0,
+            turn_rows: 0,
+            header_rows: 0,
+            navigation_rows: 0,
+            locator_rows: 0,
+            directory_rows: 0,
         }
     }
 
@@ -3117,7 +3366,7 @@ mod tests {
     ///
     /// `ReclaimAuthority::for_scope` inside `reclaim_run` is the S2
     /// enforcement point at the command boundary. Deleting it left the suite
-    /// at 177/0, because `this_build_registers_exactly_the_two_mcp_open_scopes`
+    /// at 177/0, because `this_build_registers_exactly_the_three_bucket_three_scopes`
     /// — named `this_build_registers_no_executor` when that was written —
     /// never called `reclaim_run` at all; it asserted over the registry.
     ///
@@ -4704,20 +4953,47 @@ mod tests {
     fn the_per_run_unit_bound_is_derived_from_the_measured_unit_cost() {
         // `mcp_open_events` is unprunable for this unit key — `Condition:
         // true`, every part, every granule, on any day — so one unit costs one
-        // full scan of it. Two scopes share the 60 s tick, so the per-minute
-        // ceiling is `2 * bound` full scans of the largest `mcp_open` table.
+        // full scan of it. Every registered scope that **names that table**
+        // shares the 60 s tick, so the per-minute ceiling is
+        // `mcp_open_scopes * bound` full scans of the largest `mcp_open`
+        // table. The multiplier is the scopes whose `tables()` include it —
+        // not `registered_executors().len()`, which as of WI-07 counts the
+        // read-index scope too, and that scope's deletes never touch a
+        // `mcp_open` table: multiplying by it would let shrinking the bound
+        // "pay for" a scope that costs a ~0.4 GiB sweep, not a ~10 GiB one.
+        // The read-index sweep gets its own ceiling below, in its own
+        // denomination.
         //
         // This reads the **constant**. What a run actually sends is a separate
         // fact, and this test cannot see it: `reclaim_candidates` could pass a
         // literal and nothing here would notice. That half is
         // `the_per_run_unit_bound_reaches_every_paged_statement`, which parses
         // the `LIMIT` off the statements a real run issued.
-        let full_scans_per_tick = registered_executors().len() * RECLAIM_MAX_UNITS_PER_RUN;
+        let mcp_open_scopes = registered_executors()
+            .into_iter()
+            .filter(|scope| scope.tables().contains(&ReclaimTable::McpOpenEvents))
+            .count();
+        assert_eq!(
+            mcp_open_scopes, 2,
+            "the two mcp_open scopes are the ones whose units scan the ~10 GiB table"
+        );
+        let full_scans_per_tick = mcp_open_scopes * RECLAIM_MAX_UNITS_PER_RUN;
         assert!(
             (1..=16).contains(&full_scans_per_tick),
             "an unattended tick may issue {full_scans_per_tick} unprunable full scans of the \
              largest mcp_open table per minute; that is not a bound"
         );
+        // The read-index scope's unit deletes are unprunable too — none of the
+        // three tables leads its primary key or partition key with any column
+        // of the generation tuple — but the tables total ~0.4 GiB, not
+        // ~10 GiB, so the same page bound holds it to a per-tick sweep two
+        // orders of magnitude smaller.
+        let read_index_scopes = registered_executors()
+            .into_iter()
+            .filter(|scope| scope.tables().contains(&ReclaimTable::McpEventNavigation))
+            .count();
+        assert_eq!(read_index_scopes, 1);
+        assert!((1..=16).contains(&(read_index_scopes * RECLAIM_MAX_UNITS_PER_RUN)));
     }
 
     /// The `LIMIT` a statement was sent with, if it carries one.
@@ -4809,10 +5085,17 @@ mod tests {
                 .any(|(statement, _)| statement.contains("ORDER BY claimed_at ASC")),
             "the run issued no re-drive page: {issued:?}"
         );
+        // Both candidate-probe orderings: the session-grained scopes' and the
+        // read-index scope's. A probe that matched neither would silently fall
+        // out of this count, which is why the expectation is exact.
         let probes = paged
             .iter()
             .filter(|(statement, _)| {
                 statement.contains("ORDER BY session_id ASC, candidate_generation ASC")
+                    || statement.contains(
+                        "ORDER BY source_host ASC, source_name ASC, source_file ASC, \
+                         source_generation ASC",
+                    )
             })
             .count();
         assert_eq!(
@@ -4822,11 +5105,18 @@ mod tests {
              or a call site this test cannot see stayed unbounded: {issued:?}"
         );
 
+        // The V4 mitigation, re-derived from the wire: one unit is one
+        // unprunable full scan of `mcp_open_events` for every scope that names
+        // that table, and each such scope gets its own page on the same 60 s
+        // tick. See `the_per_run_unit_bound_is_derived_from_the_measured_unit_cost`
+        // for why the multiplier is the mcp_open-naming scopes rather than the
+        // whole registry.
+        let mcp_open_scopes = registered_executors()
+            .into_iter()
+            .filter(|scope| scope.tables().contains(&ReclaimTable::McpOpenEvents))
+            .count();
         for (statement, limit) in paged {
-            // The V4 mitigation, re-derived from the wire: one unit is one
-            // unprunable full scan of `mcp_open_events`, every registered scope
-            // gets its own page on the same 60 s tick.
-            let full_scans_per_tick = registered_executors().len() * limit;
+            let full_scans_per_tick = mcp_open_scopes * limit;
             assert!(
                 (1..=16).contains(&full_scans_per_tick),
                 "a paged statement reached the server bounded at {limit}, which is \

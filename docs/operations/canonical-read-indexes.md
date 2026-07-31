@@ -303,6 +303,61 @@ Verify every reader process of a shared backend is on a v2-capable build before
 promoting. Promotion is idempotent — re-running on an already-promoted backend
 reports "no change" and succeeds.
 
+## Reclaiming superseded generations
+
+The three index tables store rows for **every** source generation ever
+ingested — the maintaining MVs are publication-blind by design, and gating
+happens at read time via the pinned published-head join. A replacement replay
+of a source therefore leaves the old generation's rows in place forever,
+growing the indexes without bound in the number of replays.
+
+Issue #603's `read_index_generation` reclaim scope bounds that. It collects
+rows whose `(source_host, source_name, source_file, source_generation)`:
+
+1. appears in publication **history** (it was once published — a durable
+   liveness decision exists), and
+2. is no longer the file's **current head** (a later publication displaced
+   it), and
+3. was displaced longer ago than `retention.derived_horizon_hours` (24 h by
+   default).
+
+It runs from `moraine db reclaim run --scope read_index_generation --confirm`,
+and from the unattended maintenance tick when
+`retention.storage_reclaim_maintenance = true` (see
+[configuration](../configuration.md#retention)).
+
+**Why this is invisible to readers.** Every reader of these tables filters
+every row through the head set reconstructed at its request's pinned
+publication revision, and that pin is captured from current state at request
+start and lives for one request. A generation displaced from the head more
+than a horizon ago is selectable by no in-flight or future request — which is
+also why a reader can never observe a *partially* reclaimed generation: the
+three per-table deletes of one unit are not atomic, but every row they remove
+is already invisible at every reachable pin.
+
+**Rows for generations that were never published are not collected.** The MVs
+write index rows when the `events` insert lands, *before* the publication
+head is written, so "in the indexes but not in publication history" is
+exactly what a publication in flight looks like — and also what a crashed
+pre-#602 ingest left behind. The scope refuses to touch either; a
+`core-index rebuild` removes the crashed residue along with everything else.
+
+**The rollback caveat — the one operational hazard to know.** Re-publishing a
+generation that was already reclaimed (an operator rollback past the horizon)
+makes readers select a generation whose index rows are gone: sessions served
+from it will read as absent or truncated *with no error*. The canonical
+`events` rows are untouched by this scope, so recovery is always available
+and always the same:
+
+```
+moraine db core-index rebuild
+```
+
+A rollback executed **within** the horizon needs nothing — the horizon exists
+precisely so that a freshly displaced generation is never claimed. If you
+roll a source's publication back to an earlier generation more than a horizon
+after it was displaced, run the rebuild afterwards.
+
 ## Rollback
 
 - **Kill-switch (fastest):** set `open_reader = "v1"` and restart the reader

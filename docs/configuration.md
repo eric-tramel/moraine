@@ -987,20 +987,19 @@ would touch, and refuses a bucket-1/2 scope unless the matching key above is
 present — naming the missing key. Export before pruning with
 `moraine export events --format jsonl`.
 
-Two scopes delete in this release, both bucket 3 and both over the legacy
-open-projection tables:
+Three scopes delete in this release, all bucket 3:
 
 | Scope | What it collects |
 |---|---|
 | `mcp_open_orphan` | Child rows whose `(session, candidate generation)` has **no publication header**. No reader can authorize them on either engine, so this is safe independently of the canonical-read cutover. |
 | `mcp_open_retired_lineage` | Complete snapshots in a source lineage the session has left, once a newer lineage is published *and* live for that session and the old one is unselectable by any request. |
+| `read_index_generation` | Canonical read-index rows (`mcp_session_directory`, `mcp_event_locator`, `mcp_event_navigation`) belonging to **retired** source generations: generations publication history records as published and that a later publication has displaced from the current head, once that supersession is older than `derived_horizon_hours`. The three tables are content-free and rebuildable with `moraine db core-index rebuild`; see [canonical read indexes](operations/canonical-read-indexes.md#reclaiming-superseded-generations) for the rollback caveat this horizon is the window for. |
 
-`read_index_generation` and `canonical_generation` still have no executor:
-`run` refuses them a third time — naming the work item that will add one — and
-exits non-zero. `canonical_generation` is additionally excluded from the
-automatic tick by design, so configuring a retention horizon grants the
-explicit CLI permission to prune history and never grants it to a background
-task.
+`canonical_generation` still has no executor: `run` refuses it — naming the
+work item that will add one — and exits non-zero. It is additionally excluded
+from the automatic tick by design, so configuring a retention horizon grants
+the explicit CLI permission to prune history and never grants it to a
+background task.
 
 Each unit is written to the reclaim ledger *before* its first delete and
 settled after its last, and every run finishes the ledger's unsettled units
@@ -1019,7 +1018,7 @@ storage_reclaim_maintenance = true   # default: false
 ```
 
 `moraine db reclaim run --confirm` is always available. This key decides only
-whether the ingest maintenance tick *also* reclaims the two `mcp_open` scopes
+whether the ingest maintenance tick *also* reclaims the three bucket-3 scopes
 on its own, roughly once a minute.
 
 **It defaults to `false`, deliberately.** Reclamation makes a disk fuller

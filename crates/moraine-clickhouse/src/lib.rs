@@ -35,6 +35,9 @@ pub mod reclaim;
 /// Issue #603 WI-05. The two `mcp_open_*` candidate probes and the delete
 /// predicates they authorize.
 mod reclaim_mcp_open;
+/// Issue #603 WI-07. The canonical read-index candidate probe and the delete
+/// predicates it authorizes.
+mod reclaim_read_index;
 /// Issue #603 WI-01. The ownership model as code: what may ever be deleted.
 pub mod storage_class;
 /// Issue #603 WI-02. Bytes, parts, disk headroom, and the effective policy.

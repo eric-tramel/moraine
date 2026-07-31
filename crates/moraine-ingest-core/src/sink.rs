@@ -302,9 +302,10 @@ const MAINTENANCE_STATEMENTS_PER_SESSION: u32 = 4;
 /// `retention.storage_reclaim_maintenance` is `true`, which it is not by
 /// default.**
 ///
-/// Only the bucket-3 `mcp_open` scopes: both are `default-on`, both are
-/// authorized by the stock `DerivedOnly` token, and neither can reach a
-/// bucket-1/2 table — `ReclaimScope::tables` decides that, and
+/// Only the bucket-3 scopes: the two `mcp_open` scopes and the canonical
+/// read-index scope (WI-07) are `default-on`, all three are authorized by the
+/// stock `DerivedOnly` token, and none can reach a bucket-1/2 table —
+/// `ReclaimScope::tables` decides that, and
 /// `the_default_reachable_table_set_excludes_all_user_history` pins it.
 /// `canonical_generation` is deliberately absent and must stay absent: plan
 /// §3.7 runs bucket-1/2 reclamation **only** from the explicit CLI, so an
@@ -316,9 +317,10 @@ const MAINTENANCE_STATEMENTS_PER_SESSION: u32 = 4;
 /// stayed a hard-coded constant with no config key while defaulting to on,
 /// which meant a stock install had no way to stop an unattended delete loop
 /// short of editing the binary.
-const STORAGE_RECLAIM_MAINTENANCE_SCOPES: [ReclaimScope; 2] = [
+const STORAGE_RECLAIM_MAINTENANCE_SCOPES: [ReclaimScope; 3] = [
     ReclaimScope::McpOpenOrphan,
     ReclaimScope::McpOpenRetiredLineage,
+    ReclaimScope::ReadIndexGeneration,
 ];
 
 /// The batch size one flush cycle's statement cap is derived from
@@ -3460,37 +3462,46 @@ mod tests {
     /// `mcp_open_backfill_plans FINAL`: the pre-existing
     /// `reclaim_superseded_mcp_open_snapshots` path and the projector's own
     /// plan reads both use those, so a count of them measures the wrong
-    /// janitor. These two aliases exist only inside the #603 probes.
-    const RECLAIM_PROBE_SIGNATURES: [(ReclaimScope, &str); 2] = [
+    /// janitor. These three aliases exist only inside the #603 probes.
+    const RECLAIM_PROBE_SIGNATURES: [(ReclaimScope, &str); 3] = [
         (ReclaimScope::McpOpenOrphan, "child.candidate_generation"),
         (ReclaimScope::McpOpenRetiredLineage, "l.live_fingerprint"),
+        (ReclaimScope::ReadIndexGeneration, "ri_rollup"),
     ];
 
     /// Three tests below drive their per-scope loops off
     /// [`RECLAIM_PROBE_SIGNATURES`], so it is the subject of none of them and
     /// the expectation of all of them — the same shape that made the janitor's
     /// scope-list assertion vacuous twice, one level removed. Its arity is
-    /// fixed by its type, but replacing the second entry with a duplicate of
-    /// the first compiles and leaves every one of those loops checking
-    /// `mcp_open_orphan` twice while claiming per-scope coverage. So the
-    /// scopes it names are pinned here, once, against literals.
+    /// fixed by its type, but replacing an entry with a duplicate of another
+    /// compiles and leaves every one of those loops checking one scope twice
+    /// while claiming per-scope coverage. So the scopes it names are pinned
+    /// here, once, against literals.
     ///
     /// MUTATION (executed 2026-07-28): replace the retired-lineage entry with
     /// a second `McpOpenOrphan` row => FAILS here. **Lower bound.**
+    ///
+    /// MUTATION (executed 2026-07-31): replace the read-index entry with a
+    /// second `McpOpenOrphan` row => FAILS here on the exact-set assertion.
     #[test]
-    fn the_probe_signature_table_names_both_janitor_scopes() {
+    fn the_probe_signature_table_names_every_janitor_scope() {
         assert_eq!(
             RECLAIM_PROBE_SIGNATURES.map(|(scope, _)| scope),
             [
                 ReclaimScope::McpOpenOrphan,
-                ReclaimScope::McpOpenRetiredLineage
+                ReclaimScope::McpOpenRetiredLineage,
+                ReclaimScope::ReadIndexGeneration
             ],
         );
-        let [(_, first), (_, second)] = RECLAIM_PROBE_SIGNATURES;
-        assert_ne!(
-            first, second,
-            "two scopes identified by the same fragment identify one scope"
-        );
+        let fragments = RECLAIM_PROBE_SIGNATURES.map(|(_, fragment)| fragment);
+        for (index, fragment) in fragments.iter().enumerate() {
+            for other in fragments.iter().skip(index + 1) {
+                assert_ne!(
+                    fragment, other,
+                    "two scopes identified by the same fragment identify one scope"
+                );
+            }
+        }
     }
 
     /// Drive one maintenance cycle to completion and hand back what it issued.
@@ -3603,8 +3614,8 @@ mod tests {
     /// `STORAGE_RECLAIM_MAINTENANCE_SCOPES` with a second `McpOpenOrphan` =>
     /// FAILS on the retired-lineage probe count. **Width: per scope, which is
     /// what the name claims.** *Dropping* the entry rather than replacing it
-    /// is not the mutation: the constant is `[ReclaimScope; 2]`, so a
-    /// one-element initialiser does not compile and the assertion is never
+    /// is not the mutation: the constant is `[ReclaimScope; 3]`, so a
+    /// two-element initialiser does not compile and the assertion is never
     /// reached. The replacement preserves the arity and is the same defect —
     /// a janitor that never drives the second scope.
     ///
@@ -3613,8 +3624,8 @@ mod tests {
     /// `ReclaimScope::CanonicalGeneration` => FAILS on the bucket assertion:
     /// the background janitor must never reach user history, and plan §3.7
     /// runs bucket-1/2 reclamation only from the explicit CLI. **Upper
-    /// bound.** Again arity-preserving for the same reason — *adding* a third
-    /// scope to a `[ReclaimScope; 2]` does not compile, so the recipe that
+    /// bound.** Again arity-preserving for the same reason — *adding* a fourth
+    /// scope to a `[ReclaimScope; 3]` does not compile, so the recipe that
     /// says "add" tests nothing.
     #[tokio::test(flavor = "multi_thread")]
     async fn projection_maintenance_drives_the_storage_reclaim_ledger() {
@@ -3635,7 +3646,8 @@ mod tests {
             STORAGE_RECLAIM_MAINTENANCE_SCOPES,
             [
                 ReclaimScope::McpOpenOrphan,
-                ReclaimScope::McpOpenRetiredLineage
+                ReclaimScope::McpOpenRetiredLineage,
+                ReclaimScope::ReadIndexGeneration
             ],
             "the janitor's scope list changed; that is a deliberate decision, not a refactor"
         );
