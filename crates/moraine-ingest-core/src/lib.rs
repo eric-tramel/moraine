@@ -249,6 +249,17 @@ pub(crate) struct Metrics {
     /// observed-scan denominator the failure-backoff gate asserts on;
     /// `ingest_errors` rows are rate-limited and cannot count scans.
     pub(crate) sqlite_scan_failures_total: AtomicU64,
+    /// Payload rows read by reconciliation sweep slices (issue #601 §2.2) — a
+    /// subset of `sqlite_poll_payload_rows_total`, folded from the ledger's
+    /// sweep axes so G6a-class gates can assert "no sweep ran" on it.
+    pub(crate) sqlite_sweep_rows_total: AtomicU64,
+    /// Payload bytes read by sweep slices.
+    pub(crate) sqlite_sweep_bytes_total: AtomicU64,
+    /// Committed sweep slices, counted where the slice's checkpoint persists.
+    pub(crate) sqlite_sweep_slices_total: AtomicU64,
+    /// Scans that committed with degraded coverage (issue #601 §2.3): a work
+    /// budget bound, a census truncated, or checkpoint state was evicted.
+    pub(crate) sqlite_coverage_degraded_scans_total: AtomicU64,
     pub(crate) last_error: Mutex<String>,
 }
 

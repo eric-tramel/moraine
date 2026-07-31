@@ -2721,3 +2721,54 @@ async fn a_crash_interrupted_opencode_replay_resumes_from_its_replaying_status()
 
     cleanup(&path);
 }
+
+/// Plan §7.2 F2, the widening direction, at the OpenCode call site: an
+/// `error`-status checkpoint with **no block reason** is an ordinary
+/// transient failure marker, and the poll it precedes is an ordinary poll.
+/// Widening `retry_blocked_replay` to a bare `status == "error"` turns it
+/// into a blocked-replacement retry: the watermark resets and every event
+/// replays behind a fresh `BeginReplay`. The unchanged fixture emits nothing
+/// on the correct path, so any re-emission fails this test.
+///
+/// MUTATION (executed 2026-07-31): drop
+/// `&& !checkpoint.block_reason.is_empty()` from OpenCode's
+/// `retry_blocked_replay` — this test fails (events replay); RED was confirmed
+/// in a filtered run, so suite-wide isolation is not claimed.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_error_marker_without_a_block_reason_is_not_retried_as_a_blocked_opencode_replay() {
+    let path = unique_opencode_db_path("error-marker-width");
+    let _db = seed_opencode_db(&path);
+    let work = opencode_sqlite_work(&path);
+    let cp_key = checkpoint_key(&work.source_name, &work.path);
+    let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+
+    let first = run_opencode_poll(&work, &checkpoints).await;
+    assert!(!all_event_rows(&first).is_empty());
+
+    // Rewrite the committed checkpoint into a transient-error marker: the
+    // shape the non-replay failure arm persists.
+    {
+        let mut map = checkpoints.write().await;
+        let checkpoint = map.get_mut(&cp_key).expect("committed checkpoint");
+        checkpoint.status = "error".to_string();
+        checkpoint.block_reason.clear();
+        let mut state = OpenCodeState::parse(&checkpoint.cursor_json);
+        state.last_error = crate::sqlite_poll::ERROR_KIND_SCAN.to_string();
+        checkpoint.cursor_json = state.serialize();
+    }
+
+    let batches = run_opencode_poll(&work, &checkpoints).await;
+    assert!(
+        all_event_rows(&batches).is_empty(),
+        "an ordinary error marker must clear through an ordinary scan; \
+         re-emission means the poll was retried as a blocked replay"
+    );
+    let map = checkpoints.read().await;
+    assert_eq!(
+        map.get(&cp_key).expect("checkpoint").status,
+        "active",
+        "the transient marker clears once a scan succeeds"
+    );
+
+    cleanup(&path);
+}

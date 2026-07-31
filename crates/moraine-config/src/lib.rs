@@ -253,6 +253,93 @@ pub struct IngestConfig {
     /// sequence, SHA-256 event-identity digests, and a monotonic timestamp.
     #[serde(default)]
     pub ack_observation: bool,
+    #[serde(default)]
+    pub sqlite: SqliteIngestConfig,
+}
+
+/// Per-poll work budgets for SQLite-backed sources (issue #601 §2.1/§2.2).
+///
+/// These are **per-poll work** budgets, not history-size ceilings: exceeding
+/// one is never an error. The scan commits what it read in newest-first order,
+/// reports `coverage_degraded`, and the remainder is covered by later polls
+/// and by the reconciliation sweep. The sweep keys are what §2.2's published
+/// maximum complete-sweep interval is denominated on:
+///
+/// ```text
+/// projected_full_sweep_seconds
+///   = ceil(relevant_payload_bytes / sweep_slice_max_payload_bytes)
+///     * sweep_slice_min_interval_seconds
+/// ```
+///
+/// At the defaults (8 MiB slices every 300 s) the 48.2 MB reference Cursor
+/// host sweeps completely in 6 slices = 1,800 s (30 min).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SqliteIngestConfig {
+    /// Payload bytes one poll's fast path may materialize before it degrades.
+    #[serde(default = "default_sqlite_fast_path_max_payload_bytes")]
+    pub fast_path_max_payload_bytes: u64,
+    /// Rows whose payload one poll's fast path may materialize.
+    #[serde(default = "default_sqlite_fast_path_max_payload_rows")]
+    pub fast_path_max_payload_rows: u64,
+    /// Census rows (narrow, index-backed reads) one poll may walk; guards
+    /// pathological keyspaces, not payload cost.
+    #[serde(default = "default_sqlite_fast_path_max_census_rows")]
+    pub fast_path_max_census_rows: u64,
+    /// Payload bytes one reconciliation sweep slice may read.
+    #[serde(default = "default_sqlite_sweep_slice_max_payload_bytes")]
+    pub sweep_slice_max_payload_bytes: u64,
+    /// Rows whose payload one sweep slice may read.
+    #[serde(default = "default_sqlite_sweep_slice_max_payload_rows")]
+    pub sweep_slice_max_payload_rows: u64,
+    /// Wall-clock budget for one sweep slice, inside the blocking scan task.
+    #[serde(default = "default_sqlite_sweep_slice_max_millis")]
+    pub sweep_slice_max_millis: u64,
+    /// Minimum interval between sweep slices of one database.
+    #[serde(default = "default_sqlite_sweep_slice_min_interval_seconds")]
+    pub sweep_slice_min_interval_seconds: u64,
+}
+
+fn default_sqlite_fast_path_max_payload_bytes() -> u64 {
+    16 * 1024 * 1024
+}
+
+fn default_sqlite_fast_path_max_payload_rows() -> u64 {
+    2_000
+}
+
+fn default_sqlite_fast_path_max_census_rows() -> u64 {
+    250_000
+}
+
+fn default_sqlite_sweep_slice_max_payload_bytes() -> u64 {
+    8 * 1024 * 1024
+}
+
+fn default_sqlite_sweep_slice_max_payload_rows() -> u64 {
+    1_000
+}
+
+fn default_sqlite_sweep_slice_max_millis() -> u64 {
+    250
+}
+
+fn default_sqlite_sweep_slice_min_interval_seconds() -> u64 {
+    300
+}
+
+impl Default for SqliteIngestConfig {
+    fn default() -> Self {
+        Self {
+            fast_path_max_payload_bytes: default_sqlite_fast_path_max_payload_bytes(),
+            fast_path_max_payload_rows: default_sqlite_fast_path_max_payload_rows(),
+            fast_path_max_census_rows: default_sqlite_fast_path_max_census_rows(),
+            sweep_slice_max_payload_bytes: default_sqlite_sweep_slice_max_payload_bytes(),
+            sweep_slice_max_payload_rows: default_sqlite_sweep_slice_max_payload_rows(),
+            sweep_slice_max_millis: default_sqlite_sweep_slice_max_millis(),
+            sweep_slice_min_interval_seconds: default_sqlite_sweep_slice_min_interval_seconds(),
+        }
+    }
 }
 
 /// The configured `[mcp] open_reader` selector for the `open` tool family
@@ -1445,6 +1532,7 @@ impl Default for IngestConfig {
             reconcile_interval_seconds: default_reconcile_interval_seconds(),
             heartbeat_interval_seconds: default_heartbeat_interval_seconds(),
             ack_observation: false,
+            sqlite: SqliteIngestConfig::default(),
         }
     }
 }
@@ -2379,6 +2467,45 @@ fn normalize_config(mut cfg: AppConfig) -> Result<AppConfig> {
     // Fail closed on `[retention]` too (issue #603 §4 S2): a horizon below the
     // non-configurable floor never produces a usable AppConfig.
     validate_retention(&cfg.retention).map_err(|error| anyhow::anyhow!("{error}"))?;
+
+    // Fail closed on `[ingest.sqlite]` (issue #601 §2.1/§2.2): a zero work
+    // budget is not "no work", it is a poll that degrades on its first row
+    // forever, and a zero sweep interval turns every reconcile tick into a
+    // sweep slice. `sweep_slice_max_millis` is deliberately exempt — zero is
+    // the meaningful "one item per slice" floor and the slice driver's
+    // forward-progress rule makes it safe.
+    for (key, value) in [
+        (
+            "fast_path_max_payload_bytes",
+            cfg.ingest.sqlite.fast_path_max_payload_bytes,
+        ),
+        (
+            "fast_path_max_payload_rows",
+            cfg.ingest.sqlite.fast_path_max_payload_rows,
+        ),
+        (
+            "fast_path_max_census_rows",
+            cfg.ingest.sqlite.fast_path_max_census_rows,
+        ),
+        (
+            "sweep_slice_max_payload_bytes",
+            cfg.ingest.sqlite.sweep_slice_max_payload_bytes,
+        ),
+        (
+            "sweep_slice_max_payload_rows",
+            cfg.ingest.sqlite.sweep_slice_max_payload_rows,
+        ),
+        (
+            "sweep_slice_min_interval_seconds",
+            cfg.ingest.sqlite.sweep_slice_min_interval_seconds,
+        ),
+    ] {
+        if value == 0 {
+            return Err(anyhow::anyhow!(
+                "ingest.sqlite.{key} must be greater than zero"
+            ));
+        }
+    }
 
     for (exclude_idx, pattern) in cfg.ingest.exclude_project_dirs.iter_mut().enumerate() {
         *pattern = expand_path(pattern.trim());
@@ -4286,6 +4413,118 @@ watch_root = "~/.cursor/projects"
         assert_eq!(cfg.backend.bind, "127.0.0.1");
         assert_eq!(cfg.backend.auth_token, None);
         assert!(cfg.mcp.use_central_server);
+    }
+
+    /// Issue #601 WI-04. The shipped `[ingest.sqlite]` block and the code
+    /// defaults are two statements of the same budgets; this is the guard that
+    /// keeps them from drifting. It fails when either side moves alone —
+    /// including any one-token scaling of a default budget constant, in either
+    /// direction, because the template pins the exact number.
+    #[test]
+    fn shipped_template_sqlite_budgets_match_the_code_defaults() {
+        let path = write_temp_config(
+            include_str!("../../../config/moraine.toml"),
+            "shipped-template-sqlite-budgets",
+        );
+        let cfg = load_config(&path).expect("shipped template must parse");
+        std::fs::remove_file(&path).ok();
+
+        let raw: toml::Value = toml::from_str(include_str!("../../../config/moraine.toml"))
+            .expect("shipped template must be TOML");
+        let block = raw
+            .get("ingest")
+            .and_then(|ingest| ingest.get("sqlite"))
+            .expect("template must ship the [ingest.sqlite] block");
+        let shipped = |key: &str| {
+            block
+                .get(key)
+                .and_then(toml::Value::as_integer)
+                .unwrap_or_else(|| panic!("template must ship ingest.sqlite.{key}"))
+                as u64
+        };
+
+        let defaults = SqliteIngestConfig::default();
+        for (key, loaded, default) in [
+            (
+                "fast_path_max_payload_bytes",
+                cfg.ingest.sqlite.fast_path_max_payload_bytes,
+                defaults.fast_path_max_payload_bytes,
+            ),
+            (
+                "fast_path_max_payload_rows",
+                cfg.ingest.sqlite.fast_path_max_payload_rows,
+                defaults.fast_path_max_payload_rows,
+            ),
+            (
+                "fast_path_max_census_rows",
+                cfg.ingest.sqlite.fast_path_max_census_rows,
+                defaults.fast_path_max_census_rows,
+            ),
+            (
+                "sweep_slice_max_payload_bytes",
+                cfg.ingest.sqlite.sweep_slice_max_payload_bytes,
+                defaults.sweep_slice_max_payload_bytes,
+            ),
+            (
+                "sweep_slice_max_payload_rows",
+                cfg.ingest.sqlite.sweep_slice_max_payload_rows,
+                defaults.sweep_slice_max_payload_rows,
+            ),
+            (
+                "sweep_slice_max_millis",
+                cfg.ingest.sqlite.sweep_slice_max_millis,
+                defaults.sweep_slice_max_millis,
+            ),
+            (
+                "sweep_slice_min_interval_seconds",
+                cfg.ingest.sqlite.sweep_slice_min_interval_seconds,
+                defaults.sweep_slice_min_interval_seconds,
+            ),
+        ] {
+            assert_eq!(
+                shipped(key),
+                default,
+                "template ingest.sqlite.{key} must state the code default"
+            );
+            assert_eq!(
+                loaded, default,
+                "loaded ingest.sqlite.{key} must round-trip the default"
+            );
+        }
+    }
+
+    /// A zero work budget is a poll that degrades on its first row forever,
+    /// and a zero sweep interval is a sweep on every reconcile tick; both fail
+    /// closed at load. `sweep_slice_max_millis = 0` stays loadable on purpose:
+    /// it is the one-item-per-slice floor the driver's forward-progress rule
+    /// makes meaningful.
+    #[test]
+    fn zero_sqlite_budgets_are_rejected_at_load() {
+        for key in [
+            "fast_path_max_payload_bytes",
+            "fast_path_max_payload_rows",
+            "fast_path_max_census_rows",
+            "sweep_slice_max_payload_bytes",
+            "sweep_slice_max_payload_rows",
+            "sweep_slice_min_interval_seconds",
+        ] {
+            let contents = format!("[ingest.sqlite]\n{key} = 0\n");
+            let path = write_temp_config(&contents, &format!("sqlite-zero-{key}"));
+            let err = load_config(&path).expect_err("zero budget must fail closed");
+            std::fs::remove_file(&path).ok();
+            assert!(
+                format!("{err:#}").contains(&format!("ingest.sqlite.{key}")),
+                "error must name the offending key, got: {err:#}"
+            );
+        }
+
+        let path = write_temp_config(
+            "[ingest.sqlite]\nsweep_slice_max_millis = 0\n",
+            "sqlite-zero-millis",
+        );
+        let cfg = load_config(&path).expect("zero millis is the one-item floor, not an error");
+        std::fs::remove_file(&path).ok();
+        assert_eq!(cfg.ingest.sqlite.sweep_slice_max_millis, 0);
     }
 
     #[test]

@@ -57,6 +57,24 @@ debounce_ms = 50
 reconcile_interval_seconds = 30.0
 heartbeat_interval_seconds = 5.0
 
+# Per-poll work budgets for SQLite-backed sources (Cursor, NAC, OpenCode).
+# These are per-poll budgets, not history ceilings: exceeding one is never an
+# error — the scan commits what it read newest-first, reports degraded
+# coverage, and the remainder is covered by later polls and the sweep.
+# The published maximum complete-sweep interval is
+#   ceil(relevant_payload_bytes / sweep_slice_max_payload_bytes)
+#     * sweep_slice_min_interval_seconds
+# = 6 slices * 300 s = 1800 s (30 min) for a 48 MB relevant keyspace at these
+# defaults.
+[ingest.sqlite]
+fast_path_max_payload_bytes = 16777216
+fast_path_max_payload_rows = 2000
+fast_path_max_census_rows = 250000
+sweep_slice_max_payload_bytes = 8388608
+sweep_slice_max_payload_rows = 1000
+sweep_slice_max_millis = 250
+sweep_slice_min_interval_seconds = 300
+
 [[ingest.sources]]
 name = "codex"
 harness = "codex"
