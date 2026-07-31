@@ -1626,6 +1626,20 @@ mod tests {
     /// "the probe was issued" means the same thing on both surfaces.
     const ORPHAN_PROBE_SIGNATURE: &str = "child.candidate_generation";
     const RETIRED_PROBE_SIGNATURE: &str = "l.live_fingerprint";
+    const CANONICAL_PROBE_SIGNATURE: &str = "cg_rollup";
+
+    /// Registered scopes `retention` authorizes to probe. Every scope is
+    /// registered as of WI-09, so the count varies with the config alone:
+    /// three without the protected keys, four with both set.
+    fn authorized_probing_scopes(retention: &moraine_config::RetentionConfig) -> usize {
+        moraine_clickhouse::ReclaimScope::ALL
+            .into_iter()
+            .filter(|scope| {
+                moraine_clickhouse::reclaim::executor_for(*scope).is_some()
+                    && moraine_clickhouse::ReclaimAuthority::for_scope(*scope, retention).is_ok()
+            })
+            .count()
+    }
 
     /// **G-CONFIRM.** Fails for: an unconfirmed `moraine db reclaim run`
     /// proceeding.
@@ -1696,8 +1710,11 @@ mod tests {
     /// `the_unconfirmed_run_ceremony_is_enforced_end_to_end`.
     ///
     /// MUTATION (executed 2026-07-27): make `reclaim_run_exit_code` return `0`
-    /// for `NoExecutor` => FAILS here, on the end-to-end call and on the pure
-    /// mapping. **Lower bound.**
+    /// for `NoExecutor` => FAILS here on the pure mapping. (When first
+    /// executed this also failed an end-to-end no-executor call; that call
+    /// was retired with WI-09, which registered the last executor — the
+    /// variant is now reachable only in a downgrade build, and the guard on
+    /// it is the mapping row below.) **Lower bound.**
     ///
     /// MUTATION (executed 2026-07-27): make it return `1` for every variant =>
     /// FAILS on the `Idle`/`Settled` rows, so "always fail" is not a passing
@@ -1712,33 +1729,23 @@ mod tests {
     /// `RECLAIM_REFUSAL_EXIT_CODE` exists to prevent.**
     #[tokio::test(flavor = "multi_thread")]
     async fn a_refusal_exits_non_zero() {
-        // End to end: a confirmed run of an authorized scope with no
-        // registered executor refuses, and that refusal is not a success.
-        // Every default-on scope has an executor as of WI-07, so the one
-        // scope still awaiting its executor is bucket-1 `canonical_generation`
-        // — authorize it explicitly so the refusal under test is the registry,
-        // not the missing `[retention]` key (that refusal has its own gate
-        // above). Naming a registered scope here would assert that a run
-        // reaches the network, which is the opposite of the ceremony this
-        // gate is about.
-        let cfg = offline_config(moraine_config::RetentionConfig {
-            canonical_history_horizon_days: Some(365.0),
-            raw_audit_horizon_days: Some(90.0),
-            ..moraine_config::RetentionConfig::default()
-        });
-        let unregistered = moraine_clickhouse::ReclaimScope::ALL
-            .into_iter()
-            .find(|scope| moraine_clickhouse::reclaim::executor_for(*scope).is_none())
-            .expect("at least one scope still awaits its executor");
-        let code = cmd_db_reclaim_run(
-            &cfg,
-            &plain_output(),
-            reclaim_run_args(unregistered.as_str(), true),
-        )
-        .await
-        .expect("no executor is a refusal, not an error");
-        assert_eq!(code, ExitCode::from(1));
-        assert_ne!(code, ExitCode::SUCCESS);
+        // The `NoExecutor` refusal is no longer reachable end-to-end: every
+        // scope has an executor as of WI-09, so an authorized confirmed run
+        // reaches the network by design. What remains checkable end-to-end is
+        // that a fully-registered build still refuses locally where it must —
+        // `the_unconfirmed_run_ceremony_is_enforced_end_to_end` holds the
+        // unconfirmed exit code and the missing-key error — while this test
+        // pins the outcome→exit-code mapping variant by variant, `NoExecutor`
+        // included, because a downgrade build reaches it again and the
+        // silent-success mapping is what `RECLAIM_REFUSAL_EXIT_CODE` exists
+        // to prevent.
+        assert!(
+            moraine_clickhouse::ReclaimScope::ALL
+                .into_iter()
+                .all(|scope| moraine_clickhouse::reclaim::executor_for(scope).is_some()),
+            "if a scope lost its executor, restore the end-to-end no-executor probe this \
+             test carried before WI-09"
+        );
 
         // And the mapping itself, variant by variant.
         use moraine_clickhouse::ReclaimOutcome;
@@ -1957,16 +1964,29 @@ mod tests {
         .expect("a full-scope plan reaches the server");
         assert_eq!(code, ExitCode::SUCCESS);
 
-        // Every scope with a registered executor probes; the rest issue no
-        // statement at all, so this is the number of probes a plan can carry a
-        // horizon on today.
-        let registered = moraine_clickhouse::reclaim::registered_executors().len();
+        // Every scope the config authorizes probes; the rest issue no
+        // statement at all. `widened_retention` carries no protected key, so
+        // the three bucket-3 scopes probe at the derived horizon and the
+        // canonical scope — registered as of WI-09 — is refused into a note
+        // instead of a probe, which is itself asserted: a plan that probed
+        // user history under an unauthorized config would be the S2 refusal
+        // failing at this call site.
+        let probing = authorized_probing_scopes(&cfg.retention);
+        assert_eq!(
+            probing, 3,
+            "no protected key is set, so canonical must not probe"
+        );
         assert!(mock.count(ORPHAN_PROBE_SIGNATURE) > 0);
         assert!(mock.count(RETIRED_PROBE_SIGNATURE) > 0);
         assert_eq!(
+            mock.count(CANONICAL_PROBE_SIGNATURE),
+            0,
+            "an unauthorized canonical scope issued its probe"
+        );
+        assert_eq!(
             mock.count(&format!("toIntervalSecond({configured})")),
-            registered,
-            "every registered scope's probe must carry the configured horizon"
+            probing,
+            "every authorized scope's probe must carry the configured horizon"
         );
         assert_eq!(
             mock.count(&format!("toIntervalSecond({stock})")),
@@ -2004,11 +2024,20 @@ mod tests {
             report.error
         );
 
-        let registered = moraine_clickhouse::reclaim::registered_executors().len();
+        let probing = authorized_probing_scopes(&cfg.retention);
+        assert_eq!(
+            probing, 3,
+            "no protected key is set, so canonical must not probe"
+        );
+        assert_eq!(
+            mock.count(CANONICAL_PROBE_SIGNATURE),
+            0,
+            "an unauthorized canonical scope issued its probe"
+        );
         assert_eq!(
             mock.count(&format!("toIntervalSecond({configured})")),
-            registered,
-            "every registered scope's probe must carry the configured horizon"
+            probing,
+            "every authorized scope's probe must carry the configured horizon"
         );
         assert_eq!(
             mock.count(&format!("toIntervalSecond({stock})")),

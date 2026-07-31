@@ -685,7 +685,7 @@ mod tests {
             read_index_candidate_sql("moraine", 86_400, 8)
         );
         assert_eq!(
-            (executor.predicates)(&unit()),
+            (executor.predicates)("moraine", &unit()),
             read_index_unit_predicates(&unit())
         );
         assert_eq!(

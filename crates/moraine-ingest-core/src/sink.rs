@@ -3674,6 +3674,65 @@ mod tests {
         assert_enveloped(&state, "ingest-maintenance", Some(1));
     }
 
+    /// **G-MAINT-CANONICAL.** The unattended janitor never reaches user
+    /// history, even on a host whose operator has configured **everything** —
+    /// maintenance reclaim on, both protected `[retention]` keys set. As of
+    /// WI-09 the `canonical_generation` scope has a registered executor and
+    /// an authorizable config like this one, so the roster constant (and the
+    /// bucket assertion above) is all that keeps the 60-second tick out of
+    /// `events`: plan §3.7 — WS-3c runs only from the explicit CLI.
+    /// Denomination: the statements the cycle issued, matched on the
+    /// canonical probe's unique `cg_rollup` fragment and on the delete texts.
+    ///
+    /// MUTATION (executed 2026-07-31): append-replace `ReadIndexGeneration`
+    /// in `STORAGE_RECLAIM_MAINTENANCE_SCOPES` with
+    /// `ReclaimScope::CanonicalGeneration` => FAILS here on the probe count
+    /// (under this fully-authorized config the run proceeds to the probe) —
+    /// and `projection_maintenance_drives_the_storage_reclaim_ledger` fails
+    /// with it on the roster pin. **Lower bound, at the config this scope's
+    /// other guards cannot reach: the stock-config test above cannot see
+    /// this, because there the authority check refuses before the roster
+    /// matters.**
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_janitor_never_probes_user_history_even_when_fully_authorized() {
+        let retention = moraine_config::RetentionConfig {
+            storage_reclaim_maintenance: true,
+            canonical_history_horizon_days: Some(30.0),
+            raw_audit_horizon_days: Some(30.0),
+            ..moraine_config::RetentionConfig::default()
+        };
+        let (state, _) = run_maintenance_cycle(retention).await;
+        // The canonical scope stayed untouched: no probe, no scoped ledger
+        // read, no delete naming a protected table. Asserted FIRST, so the
+        // roster mutation this gate exists for fails on the canonical
+        // detection rather than on whichever bucket-3 scope it displaced.
+        assert_eq!(
+            state.query_count("cg_rollup"),
+            0,
+            "the unattended janitor issued the canonical candidate probe"
+        );
+        assert_eq!(
+            state.query_count("scope = 'canonical_generation'"),
+            0,
+            "the unattended janitor read the ledger for canonical units"
+        );
+        for table in ["events", "raw_events", "ingest_errors"] {
+            assert_eq!(
+                state.query_count(&format!("DELETE FROM `moraine`.{table}\n")),
+                0,
+                "the unattended janitor issued a delete naming `{table}`"
+            );
+        }
+        // And the bucket-3 janitor genuinely ran, so the zeros above are a
+        // refusal rather than a cycle that did nothing.
+        for (scope, signature) in RECLAIM_PROBE_SIGNATURES {
+            assert!(
+                state.query_count(signature) > 0,
+                "`{scope}` never issued its own candidate probe"
+            );
+        }
+    }
+
     /// **G-MAINT-TRIGGER.** The janitor's run is an *unattended* one, observed
     /// by what the run did on a nearly-full disk rather than by reading the
     /// token at the call site.

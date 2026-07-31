@@ -1,0 +1,27 @@
+-- Issue #603 WI-09, resolving open question OQ-1 (hazard H5):
+-- decommission the `search_conversation_terms` accumulator's feed.
+--
+-- `search_conversation_terms` is a SummingMergeTree with NO tombstone path
+-- (sql/010): a delete never decrements it, so once WI-09's opt-in
+-- `canonical_generation` reclaim can remove postings, any statistic the
+-- accumulator claimed to hold would be permanently overstated. It already
+-- double-counts on every re-ingest, and it is dead: zero readers across the
+-- repository, the monitor UI, and the Python bindings (checked 2026-07-31 —
+-- only schema registration and migration text name it). sql/037 already
+-- recorded its feed as dead write amplification: `mv_search_conversation_terms`
+-- (sql/032) aggregates unauthorized raw postings rows into it on every insert.
+--
+-- This migration drops exactly that materialized view. Dropping the MV ends
+-- the write amplification and freezes the table as a historical artifact that
+-- claims nothing about the live corpus; the frozen table itself remains
+-- classified `never_delete` (crates/moraine-clickhouse/src/storage_class.rs)
+-- — unreachable by every reclaim authority token — and is dropped by WI-10's
+-- batched schema cleanup alongside `search_interaction_log` (OQ-2), which is
+-- where the `REQUIRED_SCHEMA_OBJECTS` and health-vector edits batch.
+--
+-- Purely a `DROP VIEW`: no data-bearing relation is touched, re-runs are
+-- no-ops, and the S4 migration gate admits the statement by head (a view
+-- holds no rows; the destructive spelling this gate watches for is the drop
+-- of the *table*, which this migration deliberately does not perform).
+
+DROP VIEW IF EXISTS moraine.mv_search_conversation_terms;
