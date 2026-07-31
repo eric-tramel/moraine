@@ -1831,7 +1831,7 @@ PY
   # The normalized truncation row can become visible before every raw insert
   # from the same queued scan. Establish the no-op baseline only after the raw
   # count has remained unchanged across consecutive poll intervals.
-  nac_raw_rows_before_noop="$(wait_for_clickhouse_scalar_stable "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.raw_events WHERE source_name = 'ci-nac'" 30 3)"
+  nac_raw_rows_before_noop="$(wait_for_clickhouse_scalar_stable "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.raw_events WHERE source_name = 'ci-nac'" 120 3)"
   nac_checkpoint_updated_at_before_noop="$(clickhouse_scalar "$clickhouse_url" "SELECT toString(max(updated_at)) FROM ${clickhouse_database}.ingest_checkpoints WHERE source_name = 'ci-nac'")"
   nac_heartbeat_before_touch="$(clickhouse_scalar "$clickhouse_url" "SELECT toString(max(ts)) FROM ${clickhouse_database}.ingest_heartbeats")"
   "$python_bin" - "$nac_fixture_file" <<'PY'
@@ -2293,6 +2293,7 @@ print(f"nac:{namespace}:{raw_session_id}")
 PY
 )"
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-nac' AND source_generation = 2 AND session_id = '${nac_replacement_session_id}' AND position(text_content, '${nac_replacement_keyword}') > 0" 120
+  wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.ingest_checkpoints FINAL WHERE source_name = 'ci-nac' AND source_generation = 2" 120
   assert_clickhouse_count "$clickhouse_url" "nac replacement advances source generation" "SELECT count() FROM ${clickhouse_database}.ingest_checkpoints FINAL WHERE source_name = 'ci-nac' AND source_generation = 2" "1"
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM (SELECT session_id, generation, dirty_revision, total_events FROM ${clickhouse_database}.mcp_open_sessions FINAL WHERE session_id = '${nac_replacement_session_id}') AS projected INNER JOIN (SELECT session_id, dirty_revision FROM ${clickhouse_database}.mcp_open_dirty_sessions FINAL WHERE session_id = '${nac_replacement_session_id}') AS dirty USING (session_id) WHERE projected.total_events = 8 AND projected.dirty_revision = dirty.dirty_revision" 120
   wait_for_clickhouse_scalar_stable "$clickhouse_url" "SELECT concat(toString(slot), ':', toString(generation), ':', toString(source_revision), ':', toString(dirty_revision), ':', toString(total_events)) FROM ${clickhouse_database}.mcp_open_sessions FINAL WHERE session_id = '${nac_replacement_session_id}' LIMIT 1" 60 5 >/dev/null

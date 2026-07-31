@@ -149,6 +149,20 @@ async fn file_attention_merges_normalized_exact_lookup_with_suffix_fallback() {
             "legacy root guard must reject {fragment}: {fallback_query}"
         );
     }
+    let query_ids = state
+        .query_ids
+        .lock()
+        .expect("query ids lock")
+        .iter()
+        .filter_map(Clone::clone)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        query_ids,
+        [
+            "test-file-attention-normalized-exact",
+            "test-file-attention-normalized-suffix",
+        ]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
