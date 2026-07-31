@@ -443,11 +443,16 @@ while time.monotonic() < deadline:
                     f"{line}"
                 )
             observed.append(hit_match.group(1) == "true")
-    if len(observed) >= 2:
-        if observed[:2] == [False, True]:
+    # The cold smoke retries retryable read-model transitions, so it may emit
+    # several misses before succeeding. The next fresh process must then hit
+    # the shared cache: accept exactly one-or-more misses followed by hits.
+    if True in observed:
+        first_hit = observed.index(True)
+        if first_hit > 0 and all(observed[first_hit:]):
             raise SystemExit(0)
         raise SystemExit(
-            "post-baseline mcp_search_cache markers were not ordered miss then hit: "
+            "post-baseline mcp_search_cache markers were not ordered as "
+            "one or more misses followed by one or more hits: "
             f"{observed}; lines={relevant[-10:]}"
         )
     time.sleep(0.2)
