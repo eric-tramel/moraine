@@ -82,7 +82,7 @@ fn healthy_probe_script() -> Vec<ScriptedResponse> {
                         "oldest_retained_text": "2026-02-20T14:16:45Z"
                     },
                     {
-                        "name": "mcp_open_turns",
+                        "name": "mcp_event_navigation",
                         "rows": 234_694_u64,
                         "compressed_bytes": 14_356_000_000_u64,
                         "uncompressed_bytes": 40_000_000_000_u64,
@@ -173,14 +173,14 @@ async fn store_health_maps_all_successful_probe_facts() {
             events.oldest_retained.as_deref(),
             Some("2026-02-20T14:16:45Z")
         );
-        let turns = storage
+        let navigation = storage
             .tables
             .iter()
-            .find(|table| table.name == "mcp_open_turns")
-            .expect("turns row");
-        assert_eq!(turns.class, Some(TableClass::Derived));
+            .find(|table| table.name == "mcp_event_navigation")
+            .expect("navigation row");
+        assert_eq!(navigation.class, Some(TableClass::Derived));
         assert_eq!(
-            turns.oldest_retained, None,
+            navigation.oldest_retained, None,
             "a hash-partitioned table reports NO oldest row, never the epoch"
         );
         assert_eq!(storage.unclassified_tables(), vec!["mystery_table"]);
@@ -232,8 +232,7 @@ async fn store_health_maps_all_successful_probe_facts() {
 /// MUTATION (executed 2026-07-28): pass `&RetentionConfig::default()` to
 /// `storage_report` from `ClickHouseConversationRepository::read_storage_probe`
 /// => FAILS here, and only here: with this one test skipped the same mutation
-/// leaves the remaining 1601 workspace tests green. **Lower bound, and the
-/// finding.**
+/// leaves the rest of the workspace green — measured 2026-07-28 as "the remaining 1601", a denominator this PR moved (WI-10 deletes tests with the code they covered) and did NOT re-measure; the isolation was observed, the current count was not. **Lower bound, and the finding.**
 #[tokio::test(flavor = "multi_thread")]
 async fn the_storage_probe_reports_the_operators_retention_policy() {
     scoped(async {
@@ -421,14 +420,6 @@ async fn diagnostics_maps_doctor_partial_report_and_ping_short_circuit() {
             diagnostics.missing_tables,
             vec![
                 "ingest_errors",
-                "mcp_open_sessions",
-                "mcp_open_turns",
-                "mcp_open_events",
-                "mcp_open_dirty_sessions",
-                "mcp_open_projection_state",
-                "mcp_open_publication_headers",
-                "mcp_open_generation_readiness",
-                "mcp_open_backfill_plans",
                 "published_source_generations",
                 "ingest_checkpoint_transitions",
                 "source_generation_publication_readiness",
@@ -451,8 +442,6 @@ async fn diagnostics_maps_doctor_partial_report_and_ping_short_circuit() {
                 "v_live_tool_io",
                 "v_live_search_documents",
                 "v_live_search_postings",
-                "v_mcp_open_publication_headers",
-                "v_current_mcp_open_generation_readiness",
                 // issue #603 WI-04: migration 038's ledger is part of the
                 // schema handshake, so a database without it reports it
                 // missing rather than silently tolerating a reclaimer with no

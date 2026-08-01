@@ -188,8 +188,7 @@ pub(crate) struct ReclaimStatusArgs {
 
 #[derive(Debug, Args)]
 pub(crate) struct ReclaimPlanArgs {
-    /// Limit the dry run to one scope (`mcp_open_orphan`,
-    /// `mcp_open_retired_lineage`, `read_index_generation`,
+    /// Limit the dry run to one scope (`read_index_generation`,
     /// `canonical_generation`). Omit for all.
     #[arg(long)]
     pub(crate) scope: Option<String>,
@@ -199,9 +198,9 @@ pub(crate) struct ReclaimPlanArgs {
 
 #[derive(Debug, Args)]
 pub(crate) struct ReclaimRunArgs {
-    /// The scope to reclaim (`mcp_open_orphan`, `mcp_open_retired_lineage`,
-    /// `read_index_generation`, `canonical_generation`). Required: there is
-    /// deliberately no "everything".
+    /// The scope to reclaim (`read_index_generation`,
+    /// `canonical_generation`). Required: there is deliberately no
+    /// "everything".
     #[arg(long)]
     pub(crate) scope: String,
     /// Acknowledge the deletion. Without it the command prints exactly what
@@ -418,10 +417,10 @@ mod tests {
     ///
     /// `ReclaimScope::parse` accepts all of `ReclaimScope::ALL`, so a scope
     /// missing from this list is runnable and undiscoverable: an operator
-    /// reading `--help` cannot find it. That is how
-    /// `mcp_open_retired_lineage` came to be a registered, default-on executor
-    /// with a header table entry in `docs/configuration.md` and no mention in
-    /// the one place an operator looks first.
+    /// reading `--help` cannot find it. That is how the since-retired
+    /// `mcp_open_retired_lineage` came to be a registered, default-on
+    /// executor with a header table entry in `docs/configuration.md` and no
+    /// mention in the one place an operator looks first.
     ///
     /// Asserted against the enum rather than a literal list, so registering a
     /// scope and forgetting the help text fails here rather than shipping.
@@ -433,7 +432,7 @@ mod tests {
     /// drives. `run --help` named **zero** scopes and stayed green, so the
     /// destructive subcommand was the undiscoverable one.
     ///
-    /// MUTATION (executed 2026-07-28): drop `mcp_open_retired_lineage` from
+    /// MUTATION (executed 2026-07-31): drop `read_index_generation` from
     /// `ReclaimPlanArgs::scope`'s doc comment => FAILS here on `plan`.
     /// **Lower bound.**
     ///
@@ -489,7 +488,7 @@ mod tests {
             "reclaim",
             "plan",
             "--scope",
-            "mcp_open_orphan",
+            "read_index_generation",
             "--json",
         ]);
         match plan.command {
@@ -499,7 +498,7 @@ mod tests {
                         command: ReclaimCommand::Plan(args),
                     }),
             }) => {
-                assert_eq!(args.scope.as_deref(), Some("mcp_open_orphan"));
+                assert_eq!(args.scope.as_deref(), Some("read_index_generation"));
                 assert!(args.json);
             }
             _ => panic!("expected reclaim plan command"),

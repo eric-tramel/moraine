@@ -88,9 +88,8 @@ use crate::domain::{
     McpTurnRef, OpenContext, OpenEvent, OpenEventRequest, Page, PageRequest, RepoConfig,
     SearchEventHit, SearchEventKind, SearchEventsQuery, SearchEventsResult, SearchEventsStats,
     SearchMcpEventHit, SearchMcpEventsQuery, SearchMcpEventsResult, SearchMcpEventsStats,
-    SearchStrategyHint, SessionAnalytics, SessionAnalyticsQuery, SessionEventsDirection,
-    SessionEventsQuery, SessionMetadata, SessionOriginScope, SessionSearchQuery,
-    SessionSearchResults, SessionStep, SessionTurn, ToolResult, TraceEvent, Turn, TurnListFilter,
+    SearchStrategyHint, SessionEventsDirection, SessionEventsQuery, SessionMetadata,
+    SessionOriginScope, SessionSearchQuery, SessionSearchResults, TraceEvent, Turn, TurnListFilter,
     TurnSummary, WebSearchEvent,
 };
 use crate::error::{RepoError, RepoResult};
@@ -104,7 +103,6 @@ mod consistency;
 mod file_attention;
 mod helpers;
 mod list;
-mod mcp_open_read;
 mod open;
 mod operations;
 mod repo_impl;
@@ -200,33 +198,27 @@ impl ClickHouseConversationRepository {
     /// probe runs once at startup and cannot retry, while this one is already
     /// on a request path that can. Both latch a genuine `false`, so neither
     /// gate can flap open and shut mid-process.
-    pub(super) async fn canonical_list_path_ready(&self) -> bool {
+    pub(super) async fn canonical_list_path_ready(&self) -> RepoResult<bool> {
         if let Some(ready) = self.canonical_list_ready.get() {
-            return *ready;
+            return Ok(*ready);
         }
-        match self.ch.open_v2_reader_ready().await {
-            Ok(ready) => {
-                // Latch ONLY the positive. Readiness is monotonic once
-                // published, so caching `true` is safe and keeps the flip
-                // one-way for the process. Caching `false` is not the same
-                // thing: readiness becomes true when the backfill publishes,
-                // and a latched negative would pin every reader to the
-                // fallback — and the monitor's page route to a hard 503 —
-                // until the daemon is restarted. While not ready this costs
-                // one point-read of `mcp_read_index_state` per call.
-                if ready {
-                    let _ = self.canonical_list_ready.set(true);
-                }
-                ready
-            }
-            Err(error) => {
-                warn!(
-                    error = %error,
-                    "open_v2 reader readiness probe failed; session listing stays on the projected-header path"
-                );
-                false
-            }
+        // A failed probe PROPAGATES typed since issue #603 WI-10: with the
+        // projected-header fallback retired, mapping a budget refusal or a
+        // transport failure to `false` would misreport it as "indexes not
+        // ready" — a message that sends the operator at the wrong recovery
+        // recipe.
+        let ready = self.map_backend(self.ch.open_v2_reader_ready().await)?;
+        // Latch ONLY the positive. Readiness is monotonic once published, so
+        // caching `true` is safe and keeps the flip one-way for the process.
+        // Caching `false` is not the same thing: readiness becomes true when
+        // the backfill publishes, and a latched negative would pin every
+        // reader — and the monitor's page route — to a hard refusal until
+        // the daemon is restarted. While not ready this costs one point-read
+        // of `mcp_read_index_state` per call.
+        if ready {
+            let _ = self.canonical_list_ready.set(true);
         }
+        Ok(ready)
     }
 
     pub(super) fn table_ref(&self, table: &str) -> String {

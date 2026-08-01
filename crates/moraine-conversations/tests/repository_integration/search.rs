@@ -2,108 +2,39 @@ use super::*;
 use moraine_conversations::ClickHouseConversationRepository;
 
 #[tokio::test(flavor = "multi_thread")]
-async fn search_mcp_events_distinguishes_unready_and_dirty_projection_snapshots() {
-    scoped(async {
-        for (projection_ready, projection_clean) in [(0_u8, 1_u8), (1_u8, 0_u8)] {
-            let metadata = json!({
-                "row_kind": 1_u8,
-                "event_uid": "",
-                "session_id": "",
-                "slot": 0_u8,
-                "generation": 0_u64,
-                "raw_score": 0.0,
-                "matched_terms": 0_u64,
-                "event_unix_ms": 0_i64,
-                "docs": 100_u64,
-                "total_doc_len": 5000_u64,
-                "scope_exists": 1_u8,
-                "projection_ready": projection_ready,
-                "projection_clean": projection_clean
-            });
-            let attempts = if projection_clean == 0 { 4 } else { 1 };
-            let responses = (0..attempts)
-                .map(|_| {
-                    ScriptedResponse::rows(&["toUInt8(0) AS row_kind"], json!([metadata.clone()]))
-                })
-                .collect();
-            let (repo, state) = build_scripted_repo_with_readiness(responses, false).await;
-
-            let error = repo
-                .search_mcp_events(SearchMcpEventsQuery {
-                    query: "projection health".to_string(),
-                    n_hits: Some(5),
-                    min_score: Some(0.0),
-                    min_should_match: Some(1),
-                    ..SearchMcpEventsQuery::default()
-                })
-                .await
-                .expect_err("unhealthy projection must fail closed");
-            if projection_ready == 0 {
-                assert!(error.to_string().contains("not ready"), "{error}");
-            } else {
-                assert!(matches!(error, RepoError::ReadModelChanged));
-            }
-            assert_script_consumed(&state, attempts);
-        }
-    })
-    .await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn search_mcp_events_immediate_retry_finishes_within_request_deadline() {
-    let (repo, state) = build_repo_with_options(
-        100,
-        MockOptions {
-            dirty_projection_on_first_candidate: true,
-            ..MockOptions::default()
-        },
-    )
-    .await;
-    let query = || SearchMcpEventsQuery {
-        query: "active ingest".to_string(),
-        n_hits: Some(10),
-        min_score: Some(0.0),
-        min_should_match: Some(1),
-        ..SearchMcpEventsQuery::default()
-    };
-
-    let budget = interactive_test_budget(4.0);
-    let retry = tokio::time::timeout(
-        Duration::from_secs(4),
-        QueryEnvelope::new("request", QueryClass::Interactive, &budget)
-            .scope(repo.search_mcp_events(query())),
-    )
-    .await
-    .expect("bounded internal retry must finish inside the request deadline")
-    .expect("dirty-then-published operation must succeed");
-    assert_eq!(retry.hits.len(), 2);
-
-    let queries = state.queries.lock().expect("queries lock");
-    let candidate_queries = queries
-        .iter()
-        .filter(|query| {
-            query.contains("toUInt8(0) AS row_kind") && query.contains("term_postings AS (")
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(candidate_queries.len(), 2);
-    assert!(candidate_queries[0].contains("search_corpus_stats"));
-    assert!(!candidate_queries[1].contains("search_corpus_stats"));
-    assert!(candidate_queries[1].contains("tuple(toUInt64(100), toUInt64(5000)) AS corpus_stats"));
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn search_mcp_events_applies_session_origin_scope() {
     scoped(async {
         let (repo, state) = build_scoped_repo(&["/work/s.origin_cwd/project"]).await;
 
+        // The canonical engine splits the scope decision: the session's
+        // origin roots gate the Phase 0 scope-existence point read (which
+        // answers `scope_exists = false` here, because the fixture session's
+        // origin is outside the configured root), while the exact
+        // harness/source filters ride the bounded ranking pass of a global
+        // search on the same scoped repository.
+        let scoped_result = repo
+            .search_mcp_events(SearchMcpEventsQuery {
+                query: "hello world".to_string(),
+                n_hits: Some(10),
+                session_id: Some("sess_a".to_string()),
+                event_types: Some(vec![
+                    McpEventType::UserInput,
+                    McpEventType::AssistantResponse,
+                ]),
+                min_score: Some(0.0),
+                min_should_match: Some(1),
+                ..SearchMcpEventsQuery::default()
+            })
+            .await
+            .expect("scoped search_mcp_events");
+        assert!(
+            !scoped_result.scope_exists,
+            "an out-of-root session must read as absent under the scoped repo"
+        );
+
         repo.search_mcp_events(SearchMcpEventsQuery {
             query: "hello world".to_string(),
             n_hits: Some(10),
-            session_id: Some("sess_a".to_string()),
-            event_types: Some(vec![
-                McpEventType::UserInput,
-                McpEventType::AssistantResponse,
-            ]),
             harness: Some("claude-code".to_string()),
             source_name: Some("claude".to_string()),
             min_score: Some(0.0),
@@ -111,20 +42,23 @@ async fn search_mcp_events_applies_session_origin_scope() {
             ..SearchMcpEventsQuery::default()
         })
         .await
-        .expect("scoped search_mcp_events");
+        .expect("filtered global search_mcp_events");
 
         let queries = state.queries.lock().expect("queries lock").clone();
-        let search_query = queries
+        let scope_query = queries
             .iter()
-            .find(|q| q.contains("toUInt8(0) AS row_kind") && q.contains("AS raw_score"))
-            .expect("search query should be captured");
-
-        assert!(search_query.contains("s.origin_cwd = '/work/s.origin_cwd/project'"));
-        assert!(search_query.contains("startsWith(s.origin_cwd, '/work/s.origin_cwd/project/')"));
-        assert!(search_query.contains("scope_s.origin_cwd = '/work/s.origin_cwd/project'"));
-        assert!(!search_query.contains("'/work/scope_s.origin_cwd/project'"));
-        assert!(search_query.contains("p.harness = 'claude-code'"));
-        assert!(search_query.contains("p.source_name = 'claude'"));
+            .find(|q| q.contains("AS scope_exists"))
+            .expect("scope-existence query should be captured");
+        assert!(scope_query.contains("scoped.origin_cwd = '/work/s.origin_cwd/project'"));
+        assert!(
+            scope_query.contains("startsWith(scoped.origin_cwd, '/work/s.origin_cwd/project/')")
+        );
+        let ranking_query = queries
+            .iter()
+            .find(|q| q.contains("term_postings AS (") && q.contains("AS raw_score"))
+            .expect("ranking query should be captured");
+        assert!(ranking_query.contains("p.harness = 'claude-code'"));
+        assert!(ranking_query.contains("p.source_name = 'claude'"));
     })
     .await;
 }
@@ -455,24 +389,29 @@ async fn search_events_includes_session_time_bounds() {
 /// WI-09, the defect the issue names: "activity in session A must never disable
 /// search in session B".
 ///
-/// The v1 engine gates every request on TWO corpus-global scalars —
-/// `projection_ready` and `projection_clean` — and `projection_clean` is
+/// The retired v1 engine gated every request on two corpus-global scalars —
+/// `projection_ready` and `projection_clean`, the latter
 /// `countIf(dirty.dirty_revision > published.dirty_revision) = 0` over EVERY
-/// live session. One actively-ingesting session therefore returned
+/// live session — so one actively-ingesting session returned
 /// `ReadModelChanged` for every other session's search, and
 /// `run_publication_consistent_scoped` retried the whole operation four times
-/// before surfacing `internal_error`.
+/// before surfacing `internal_error`. The canonical engine has no global gate:
+/// validity is proven per row, twice, by the locator version join during
+/// ranking and by the candidate's presence at the same `event_version` in live
+/// navigation during derivation.
 ///
-/// The v2 engine has no global gate. Validity is proven per row instead, and
-/// twice: by the locator version join during ranking, and by the candidate's
-/// presence at the same `event_version` in live navigation during derivation.
-/// The mock's `dirty_projection_on_first_candidate` makes the projection report
-/// itself dirty; under v1 that is fatal, under v2 it is not even read.
-///
-/// MUTATION: re-introduce either gate into `search_mcp_event_page_v2` and this
-/// fails.
+/// **What this test still proves is narrower than its old name claimed.** The
+/// mock option that fed a dirty projection scalar (`dirty_projection_on_first_
+/// candidate`) went with the v1 mock handler it was read by — that handler was
+/// proved unreachable, so the option was inert and "a regression that
+/// re-introduced a global gate would fail here" was not true. What remains is
+/// a full-shape assertion on one canonical search: the ranked page, its
+/// winner-only hydration decoration, and the two-level `session_completed`
+/// rule. The absence of a global gate is now covered where it is decidable —
+/// `every_v2_search_builder_is_free_of_the_projection`
+/// (`search_canonical.rs`), which reads the statements the builders emit.
 #[tokio::test(flavor = "multi_thread")]
-async fn v2_search_is_unaffected_by_a_dirty_projection() {
+async fn a_canonical_search_page_carries_its_winner_hydration_and_session_flags() {
     scoped(async {
         let query = || SearchMcpEventsQuery {
             query: "hello world".to_string(),
@@ -482,51 +421,12 @@ async fn v2_search_is_unaffected_by_a_dirty_projection() {
             ..SearchMcpEventsQuery::default()
         };
 
-        // v1, dirty backend: fails closed for everyone, and burns all four
-        // `run_publication_consistent_scoped` attempts doing it.
-        let dirty_metadata = json!({
-            "row_kind": 1_u8,
-            "event_uid": "",
-            "session_id": "",
-            "slot": 0_u8,
-            "generation": 0_u64,
-            "raw_score": 0.0,
-            "matched_terms": 0_u64,
-            "event_unix_ms": 0_i64,
-            "docs": 100_u64,
-            "total_doc_len": 5000_u64,
-            "scope_exists": 1_u8,
-            "projection_ready": 1_u8,
-            "projection_clean": 0_u8
-        });
-        let (v1_repo, v1_state) = build_scripted_repo_with_readiness(
-            (0..4)
-                .map(|_| {
-                    ScriptedResponse::rows(
-                        &["toUInt8(0) AS row_kind"],
-                        json!([dirty_metadata.clone()]),
-                    )
-                })
-                .collect(),
-            false,
-        )
-        .await;
-        let v1_error = v1_repo
-            .search_mcp_events(query())
-            .await
-            .expect_err("the projected-header engine fails closed on a dirty projection");
-        assert_script_consumed(&v1_state, 4);
-        assert!(
-            matches!(v1_error, RepoError::ReadModelChanged),
-            "the v1 behaviour this issue removes must still be reproducible, or \
-             the v2 assertion below proves nothing: {v1_error}"
-        );
-
-        // v2, same dirty backend: serves.
+        // A dirty projection was fatal under the retired v1 engine (it failed
+        // every request closed); the canonical engine never read the dirtiness
+        // relation, and since WI-10 the relation itself is dropped.
         let (repo, state) = build_repo_with_options(
             100,
             MockOptions {
-                dirty_projection_on_first_candidate: true,
                 open_v2_reader_ready: Some(true),
                 ..MockOptions::default()
             },
@@ -535,7 +435,7 @@ async fn v2_search_is_unaffected_by_a_dirty_projection() {
         let result = repo
             .search_mcp_events(query())
             .await
-            .expect("a dirty projection cannot disable the canonical engine");
+            .expect("the canonical engine serves a ranked page");
 
         assert_eq!(result.hits.len(), 2);
         assert_eq!(result.hits[0].event_uid, "evt-c-42");
@@ -937,9 +837,12 @@ async fn search_mcp_events_supports_global_search_with_enriched_hits() {
         assert_eq!(result.hits[0].event_uid, "evt-c-42");
         assert_eq!(result.hits[0].event_type, McpEventType::AssistantResponse);
         assert_eq!(result.hits[0].session_id, "sess_c");
+        // The canonical metadata fold answers per-field-latest from the
+        // session's metadata-bearing events, so the TITLE field is the title
+        // event's value — the retired v1 header folded the summary in here.
         assert_eq!(
             result.hits[0].session_title.as_deref(),
-            Some("Session C summary")
+            Some("Session C title")
         );
         assert_eq!(result.hits[0].source_name.as_deref(), Some("codex"));
         assert_eq!(result.hits[0].event_time, "2026-01-03 10:02:00");
@@ -1077,7 +980,11 @@ async fn envelope_scope_passes_remaining_deadline_to_every_read() {
         .filter(|(query, _)| !query.trim_start().starts_with("INSERT INTO"))
         .map(|(_, params)| params)
         .collect::<Vec<_>>();
-    assert_eq!(read_params.len(), 2);
+    // The bounded canonical pipeline: corpus stats, ranking, dedup
+    // derivation, digest keys, batched totals, metadata, turn scalars, and
+    // the wide winner read — every one carries the envelope's remaining
+    // deadline.
+    assert_eq!(read_params.len(), 8);
     for params in read_params {
         let remaining = params["max_execution_time"]
             .parse::<f64>()
@@ -1088,7 +995,7 @@ async fn envelope_scope_passes_remaining_deadline_to_every_read() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn search_mcp_events_uses_one_candidate_and_one_bounded_detail_query() {
+async fn search_mcp_events_cold_read_set_is_exactly_the_bounded_pipeline() {
     scoped(async {
         let (repo, state) = build_repo().await;
 
@@ -1106,60 +1013,45 @@ async fn search_mcp_events_uses_one_candidate_and_one_bounded_detail_query() {
                 ..SearchMcpEventsQuery::default()
             })
             .await
-            .expect("two-stage search succeeds");
+            .expect("bounded search succeeds");
         assert_eq!(result.hits.len(), 2);
 
+        // The whole cold pipeline, exactly: one corpus-stats read, one
+        // bounded ranking pass, one dedup derivation, one digest-key read,
+        // one batched-totals read, one metadata read, one turn-scalar read,
+        // and one wide winner read. No refill loop, no OFFSET paging, and —
+        // since issue #603 WI-10 dropped the projection — no `mcp_open_*`
+        // relation anywhere in the set.
         let queries = state.queries.lock().expect("queries lock");
-        assert_eq!(queries.len(), 2, "cold search must issue exactly two reads");
-        assert!(queries[0].contains("toUInt8(0) AS row_kind"));
-        assert!(queries[0].contains("ORDER BY raw_score DESC, event_unix_ms DESC, event_uid ASC"));
+        let reads: Vec<&String> = queries
+            .iter()
+            .filter(|query| !query.trim_start().starts_with("INSERT INTO"))
+            .collect();
+        assert_eq!(reads.len(), 8, "cold search must issue exactly eight reads");
         assert_eq!(
-            queries[0].matches("search_corpus_stats").count(),
-            1,
-            "scalar corpus metadata must expand exactly once"
-        );
-        assert!(queries[0].contains("mcp_open_dirty_sessions"));
-        assert!(queries[0].contains("WHERE notEmpty(session_id)"));
-        assert!(queries[0].contains("live_session_ids AS ("));
-        assert!(queries[0].contains("session_id IN (SELECT session_id FROM live_session_ids)"));
-        assert!(queries[0].contains("AS projection_clean"));
-        assert!(!queries[0].contains("matching_doc_ids AS ("));
-        assert!(!queries[0].contains("projected_candidates AS ("));
-        assert_eq!(
-            queries[0]
-                .matches("FROM `moraine`.`v_live_search_postings` AS p FINAL")
+            reads
+                .iter()
+                .filter(|query| query.contains("term_postings AS ("))
                 .count(),
             1,
-            "candidate ranking must expand the live postings view once"
+            "one bounded ranking pass"
         );
-        assert!(queries[0].contains("ALL INNER JOIN `moraine`.`mcp_open_events` AS e FINAL"));
-        assert!(queries[0].contains("ON e.source_host = p.source_host"));
-        assert!(queries[0].contains("AND e.event_uid = p.doc_id"));
-        assert!(queries[0].contains("AND e.session_id = s.session_id"));
-        assert!(queries[0].contains("AND e.slot = s.slot"));
-        assert!(queries[0].contains("AND e.generation = s.generation"));
-        assert!(queries[0].contains("GROUP BY p.doc_id, p.source_host"));
-        assert!(queries[0].contains("greatest(toFloat64(corpus_docs), toFloat64(p.df))"));
-        assert!(!queries[0].contains("uniqExact"));
-        assert!(queries[1].contains("SELECT arrayJoin(['sess_a','sess_c']) AS session_id"));
-        assert!(!queries[1].contains("FROM `moraine`.`search_postings`"));
-        for alias in ["h", "e", "dirty"] {
-            assert!(queries[1].contains(&format!(
-                "{alias}.session_id IN (SELECT session_id FROM candidate_session_ids)"
-            )));
+        assert_eq!(
+            reads
+                .iter()
+                .filter(|query| query.contains("FROM `moraine`.`search_corpus_stats`"))
+                .count(),
+            1,
+            "one corpus-stats read"
+        );
+        for query in queries.iter() {
+            assert!(!query.contains(" OFFSET "), "no refill paging: {query}");
+            assert!(!query.contains("mcp_open_"), "no projection read: {query}");
+            assert!(
+                !query.contains("v_conversation_trace") && !query.contains("v_session_summary"),
+                "no legacy view chain: {query}"
+            );
         }
-        assert!(queries[1].contains("documents AS ("));
-        assert!(queries[1].contains("candidate_heads AS ("));
-        assert!(queries[1].contains("tupleElement(candidate, 1) AS source_host"));
-        assert!(queries[1].contains("sessions.generation = candidate.generation"));
-        assert!(queries[1].contains("WHERE (document.source_host, document.event_uid) IN ("));
-        assert!(queries[1].contains("ON projected_events.source_host = candidate.source_host"));
-        assert!(queries[1].contains("argMax(leftUTF8(document.text_content"));
-        assert!(queries[1].contains("argMax(leftUTF8(document.payload_json"));
-        assert!(!queries[1].contains("argMax(leftUTF8(text_content"));
-        assert!(!queries[1].contains("argMax(leftUTF8(payload_json"));
-        assert!(!queries[1].contains("leftUTF8(argMax(text_content"));
-        assert!(!queries[1].contains("leftUTF8(argMax(payload_json"));
         assert!(
             queries.iter().all(|query| query
                 .lines()
@@ -1167,11 +1059,6 @@ async fn search_mcp_events_uses_one_candidate_and_one_bounded_detail_query() {
                 .all(|line| line.trim_start().starts_with("ALL INNER JOIN"))),
             "search stages must explicitly preserve inner-join multiplicity"
         );
-        assert!(queries.iter().all(|query| {
-            !query.contains("v_conversation_trace")
-                && !query.contains("v_session_summary")
-                && !query.contains("event_kind = 'session_meta'")
-        }));
     })
     .await;
 }
@@ -1200,7 +1087,7 @@ async fn search_mcp_events_supports_session_scoped_search() {
         let queries = state.queries.lock().expect("queries lock").clone();
         let search_query = queries
             .iter()
-            .find(|q| q.contains("toUInt8(0) AS row_kind") && q.contains("p.session_id = 'sess_a'"))
+            .find(|q| q.contains("term_postings AS (") && q.contains("p.session_id = 'sess_a'"))
             .expect("session-scoped search query should be captured");
         assert!(search_query.contains("p.session_id = 'sess_a'"));
     })
@@ -1236,16 +1123,21 @@ async fn search_mcp_events_supports_turn_scoped_search() {
         assert_eq!(result.hits[0].tool_name.as_deref(), Some("bash"));
         assert_eq!(result.hits[0].call_id.as_deref(), Some("call-bash-1"));
 
+        // The canonical turn scope is two-sided: Phase 0 derives the turn's
+        // live uid set from the navigation index, and the ranking pass binds
+        // its candidates to that uid set — never to a projection turn row.
         let queries = state.queries.lock().expect("queries lock").clone();
-        let search_query = queries
+        assert!(
+            queries
+                .iter()
+                .any(|q| q.contains("AS turn_seq") && q.contains("n.session_id = 'sess_c'")),
+            "the turn-uid derivation should be captured: {queries:#?}"
+        );
+        let ranking_query = queries
             .iter()
-            .find(|q| {
-                q.contains("toUInt8(0) AS row_kind")
-                    && q.contains("e.session_id = 'sess_c' AND e.turn_seq = 2")
-            })
-            .expect("turn-scoped search query should be captured");
-        assert!(search_query.contains("e.session_id = 'sess_c' AND e.turn_seq = 2"));
-        assert!(search_query.contains("ALL INNER JOIN `moraine`.`mcp_open_turns` AS scope_t FINAL"));
+            .find(|q| q.contains("term_postings AS (") && q.contains("p.session_id = 'sess_c'"))
+            .expect("turn-scoped ranking query should be captured");
+        assert!(ranking_query.contains("p.event_uid IN ["));
     })
     .await;
 }
@@ -1373,11 +1265,10 @@ async fn search_mcp_events_event_type_filter_distinguishes_user_and_assistant_me
 
         let queries = state.queries.lock().expect("queries lock").clone();
         assert!(queries.iter().any(|q| {
-            q.contains("toUInt8(0) AS row_kind") && q.contains("lowerUTF8(p.actor_role) = 'user'")
+            q.contains("term_postings AS (") && q.contains("lowerUTF8(p.actor_role) = 'user'")
         }));
         assert!(queries.iter().any(|q| {
-            q.contains("toUInt8(0) AS row_kind")
-                && q.contains("lowerUTF8(p.actor_role) = 'assistant'")
+            q.contains("term_postings AS (") && q.contains("lowerUTF8(p.actor_role) = 'assistant'")
         }));
     })
     .await;
@@ -1426,7 +1317,7 @@ async fn search_mcp_events_deduplicates_before_limit_and_reports_truncation() {
         // `LIMIT 3 OFFSET 3`, up to sixteen times.
         let candidate_queries = queries
             .iter()
-            .filter(|query| query.contains("toUInt8(0) AS row_kind"))
+            .filter(|query| query.contains("term_postings AS ("))
             .collect::<Vec<_>>();
         assert_eq!(candidate_queries.len(), 1, "{queries:?}");
         let first_candidate_query = candidate_queries[0];
@@ -1434,16 +1325,13 @@ async fn search_mcp_events_deduplicates_before_limit_and_reports_truncation() {
         assert!(!first_candidate_query.contains("OFFSET"));
         assert!(!first_candidate_query.contains("text_content"));
         assert!(!first_candidate_query.contains("SHA256"));
+        // Dedup keys ride the stored per-document digest, and the collapsing
+        // window includes every ranked candidate — 'evt-b-9' among them.
         assert!(queries.iter().any(|query| {
-            query.contains("hex(SHA256(projected_events.text_content)) AS text_content_digest")
-        }));
-        assert!(queries.iter().any(|query| {
-            query.contains("JSONExtractString(document.payload_json, 'phase')")
+            query.contains("AS text_content_digest")
                 && query.contains("AS payload_phase")
+                && query.contains("'evt-b-9'")
         }));
-        assert!(queries
-            .iter()
-            .any(|query| { query.contains("documents AS (") && query.contains("'evt-b-9'") }));
     })
     .await;
 }
@@ -1459,8 +1347,10 @@ async fn search_mcp_events_deduplicates_before_limit_and_reports_truncation() {
 #[tokio::test(flavor = "multi_thread")]
 async fn search_mcp_events_issues_exactly_one_ranking_statement() {
     scoped(async {
-        // Over BOTH engines: this guard used to run only against the retired
-        // v1 path, where a v2 refill-loop regression could not reach it.
+        // Through the engine matrix. This guard used to run only against the
+        // retired v1 path, where a v2 refill-loop regression could not reach
+        // it; the matrix is one entry wide today, and running through it is
+        // what keeps that true by construction rather than by memory.
         for path in SearchPath::ALL {
             let (repo, state) = path.repo().await;
 
@@ -1495,18 +1385,25 @@ async fn search_mcp_events_issues_exactly_one_ranking_statement() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn search_mcp_events_classifies_hydration_projection_movement() {
+async fn search_mcp_events_serves_a_winner_whose_wide_row_moved_without_fabricating() {
+    // The retired v1 engine turned a missing pinned detail row into
+    // `ReadModelChanged`; the canonical engine's wide read is a best-effort
+    // fill within the pinned publication revision, so a winner whose wide row
+    // moved between ranking and hydration is still served — from its
+    // content-free ranking identity, with NO fabricated content — and every
+    // other winner hydrates normally.
     scoped(async {
         let (repo, _state) = build_repo_with_options(
             100,
             MockOptions {
                 omit_first_mcp_detail_row: true,
+                open_v2_reader_ready: Some(true),
                 ..MockOptions::default()
             },
         )
         .await;
 
-        let error = repo
+        let result = repo
             .search_mcp_events(SearchMcpEventsQuery {
                 query: "hello world".to_string(),
                 n_hits: Some(2),
@@ -1515,9 +1412,21 @@ async fn search_mcp_events_classifies_hydration_projection_movement() {
                 ..SearchMcpEventsQuery::default()
             })
             .await
-            .expect_err("missing pinned detail must report projection movement");
+            .expect("a moved wide row must not fail the whole page");
 
-        assert!(matches!(error, RepoError::ReadModelChanged));
+        assert_eq!(result.hits.len(), 2);
+        let starved = &result.hits[0];
+        assert_eq!(starved.event_uid, "evt-c-42");
+        assert!(
+            starved.text_content.is_none() && starved.snippet.is_empty(),
+            "the starved winner must not carry fabricated content: {starved:?}"
+        );
+        let hydrated = &result.hits[1];
+        assert_eq!(hydrated.event_uid, "evt-a-11");
+        assert!(
+            hydrated.text_content.is_some(),
+            "the un-starved winner still hydrates: {hydrated:?}"
+        );
     })
     .await;
 }
@@ -1615,26 +1524,30 @@ async fn search_mcp_events_reports_event_ordinal_within_turn() {
 // ---------------------------------------------------------------------------
 // Issue #597 B4: the engine matrix.
 //
-// `build_repo()` pins `open_v2_reader_ready = false`, so every MCP search
-// fixture written before this issue exercises the RETIRED v1 engine and cannot
-// fail on a v2 regression. The matrix below runs ONE assertion set over BOTH
-// engines against ONE mock corpus (`mcp_search_detail_row`), the way #599's
-// `ListPath` matrix does for session listing.
+// It was introduced because every MCP search fixture written before #597 ran
+// against the v1 engine and could not fail on a v2 regression; ONE assertion
+// set over ONE mock corpus (`mcp_search_detail_row`) run through the matrix
+// fixed that, the way #599's `ListPath` matrix does for session listing.
 //
-// MUTATION: break either engine's hit assembly and the matrix names the engine
-// that broke.
+// Issue #603 WI-10 retired v1, so the matrix is one entry wide. It is kept
+// rather than inlined for two reasons: an assertion failure still names the
+// path it ran under, and a future second read path inherits every test in the
+// matrix instead of being bolted on beside them. `ListPath` is one entry wide
+// for the same reason.
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SearchPath {
-    /// `open_v2.ready = 0`: the projected-header engine, still the fallback.
-    Projection,
-    /// `open_v2.ready = 1`: the bounded canonical engine this issue ships.
+    /// `open_v2.ready = 1`: the bounded canonical engine — the only engine
+    /// since issue #603 WI-10 retired the projected-header fallback. The
+    /// matrix shape survives so a future second engine inherits every test
+    /// unchanged; the unpublished state is a typed refusal, pinned by
+    /// [`search_mcp_events_refuses_typed_while_indexes_unpublished`].
     Canonical,
 }
 
 impl SearchPath {
-    const ALL: [SearchPath; 2] = [SearchPath::Projection, SearchPath::Canonical];
+    const ALL: [SearchPath; 1] = [SearchPath::Canonical];
 
     async fn repo(self) -> (ClickHouseConversationRepository, Arc<MockState>) {
         self.repo_with(MockOptions::default()).await
@@ -1647,26 +1560,59 @@ impl SearchPath {
         build_repo_with_options(
             100,
             MockOptions {
-                open_v2_reader_ready: Some(self == SearchPath::Canonical),
+                open_v2_reader_ready: Some(true),
                 ..options
             },
         )
         .await
     }
 
-    /// The ranking pass's statement signature on this engine. v1 carries the
-    /// synthetic `row_kind` metadata row; v2 projects the locator's
-    /// `post_version`.
+    /// The ranking pass's statement signature on this engine: v2 projects the
+    /// locator's `post_version`.
     fn is_ranking_statement(self, query: &str) -> bool {
         match self {
-            SearchPath::Projection => {
-                query.contains("toUInt8(0) AS row_kind") && query.contains("term_postings AS (")
-            }
             SearchPath::Canonical => {
                 query.contains("term_postings AS (") && query.contains("AS post_version")
             }
         }
     }
+}
+
+/// Issue #603 WI-10: with the projected-header engine retired, an unpublished
+/// store refuses typed — naming the sweep — instead of silently serving the
+/// fallback (which no longer exists) or a confident empty answer.
+#[tokio::test(flavor = "multi_thread")]
+async fn search_mcp_events_refuses_typed_while_indexes_unpublished() {
+    scoped(async {
+        let (repo, _state) = build_repo_with_options(
+            100,
+            MockOptions {
+                open_v2_reader_ready: Some(false),
+                ..MockOptions::default()
+            },
+        )
+        .await;
+        let error = repo
+            .search_mcp_events(SearchMcpEventsQuery {
+                query: "hello world".to_string(),
+                n_hits: Some(2),
+                min_score: Some(0.0),
+                min_should_match: Some(1),
+                ..SearchMcpEventsQuery::default()
+            })
+            .await
+            .expect_err("an unpublished store must refuse search");
+        match error {
+            RepoError::Backend(message) => {
+                assert!(
+                    message.contains("not ready") && message.contains("moraine db migrate"),
+                    "the refusal must name the sweep: {message}"
+                );
+            }
+            other => panic!("expected the typed unready refusal, got {other:?}"),
+        }
+    })
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2264,7 +2210,8 @@ async fn a_candidate_navigation_carries_at_another_version_is_dropped() {
 /// statement, ONE cache slot — on every backend.
 ///
 /// `docs`/`avgdl` come from `search_corpus_stats` for `search_events`,
-/// `search_conversations`, v2 MCP search and v1 MCP search alike. The design
+/// `search_conversations` and canonical MCP search alike — and did for the
+/// retired v1 MCP search too. The design
 /// (§2.6, OQ-2) decided against additionally semi-joining `mcp_event_locator`
 /// there: it is an O(D)x O(E) scan for two scalars, on the interactive path,
 /// and it was briefly shipped — that is correction C2. `df` therefore counts a
@@ -2364,28 +2311,19 @@ async fn bounded_search_reads_one_corpus_statement_on_every_backend() {
 
 /// C4, the other half. The corpus-stats cache is a SINGLE slot, and that is
 /// correct precisely because there is one population: the entry conversation
-/// search writes is the entry v1 MCP search reads, so the slot is shared
-/// rather than fought over.
+/// search writes is the entry canonical MCP search reads, so the slot is
+/// shared rather than fought over.
 ///
-/// The v1 engine inlines `search_corpus_stats` into its own ranking statement
-/// only when the cache is COLD, which is what makes the reuse observable in
-/// the statement text.
-///
-/// MUTATION: give the cache entry a per-caller identity again (or make
-/// `cached_corpus_stats` always miss); v1 re-reads the corpus and this fails.
+/// The ranking statement inlines `search_corpus_stats` only when the cache is
+/// COLD, which is what makes the reuse observable in the statement text — the
+/// assertion below is that the MCP ranking statement does NOT carry it, and
+/// that exactly one corpus read reached the backend for both searches.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_corpus_stats_cache_slot_is_shared_by_every_search_path() {
     scoped(async {
-        let (repo, state) = build_repo_with_options(
-            100,
-            MockOptions {
-                open_v2_reader_ready: Some(false),
-                ..MockOptions::default()
-            },
-        )
-        .await;
+        let (repo, state) = build_repo().await;
 
-        // Prime the slot from the v2 side.
+        // Prime the slot from the conversation-search side.
         let conversations = repo
             .search_conversations(ConversationSearchQuery {
                 query: "hello world".to_string(),
@@ -2402,7 +2340,7 @@ async fn the_corpus_stats_cache_slot_is_shared_by_every_search_path() {
             .expect("conversation search");
         assert_eq!(conversations.stats.docs, DOCUMENT_AUTHORIZED_DOCS);
 
-        // v1 MCP search reads the SAME slot.
+        // The canonical MCP event search reads the SAME slot.
         let mcp = repo
             .search_mcp_events(SearchMcpEventsQuery {
                 query: "hello world".to_string(),
@@ -2412,22 +2350,22 @@ async fn the_corpus_stats_cache_slot_is_shared_by_every_search_path() {
                 ..SearchMcpEventsQuery::default()
             })
             .await
-            .expect("v1 mcp search");
+            .expect("canonical mcp search");
         assert_eq!(mcp.stats.docs, DOCUMENT_AUTHORIZED_DOCS);
 
         let queries = state.queries.lock().expect("queries lock").clone();
-        let v1_ranking: Vec<&String> = queries
+        let mcp_ranking: Vec<&String> = queries
             .iter()
             .filter(|query| {
-                query.contains("toUInt8(0) AS row_kind") && query.contains("term_postings AS (")
+                query.contains("term_postings AS (") && query.contains("AS post_version")
             })
             .collect();
-        assert_eq!(v1_ranking.len(), 1, "{queries:?}");
+        assert_eq!(mcp_ranking.len(), 1, "{queries:?}");
         assert!(
-            !v1_ranking[0].contains("search_corpus_stats"),
-            "v1 must reuse the primed slot instead of inlining a second \
-             corpus read: {}",
-            v1_ranking[0]
+            !mcp_ranking[0].contains("search_corpus_stats"),
+            "the mcp search must reuse the primed slot instead of inlining a \
+             second corpus read: {}",
+            mcp_ranking[0]
         );
         assert_eq!(
             queries
@@ -2435,7 +2373,7 @@ async fn the_corpus_stats_cache_slot_is_shared_by_every_search_path() {
                 .filter(|query| query.contains("FROM `moraine`.`search_corpus_stats`"))
                 .count(),
             1,
-            "one corpus read for both engines: {queries:?}"
+            "one corpus read for both paths: {queries:?}"
         );
     })
     .await;

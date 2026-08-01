@@ -4,9 +4,9 @@ use moraine_clickhouse::{STATE_KEY_CORE_INDEXES, STATE_KEY_OPEN_V2};
 
 use super::*;
 use crate::domain::{
-    AnalyticsRange, AnalyticsSnapshot, CoreIndexHealth, IngestHeartbeatRead, SessionAnalytics,
-    SessionAnalyticsQuery, StorageReport, StoreDiagnostics, StoreHealth, StoreProbe, TablePreview,
-    TablePreviewQuery, TableSummaries, WebSearchEvent,
+    AnalyticsRange, AnalyticsSnapshot, CoreIndexHealth, IngestHeartbeatRead, StorageReport,
+    StoreDiagnostics, StoreHealth, StoreProbe, TablePreview, TablePreviewQuery, TableSummaries,
+    WebSearchEvent,
 };
 
 #[async_trait]
@@ -21,16 +21,6 @@ impl ConversationRepository for ClickHouseConversationRepository {
         })
         .await
     }
-    async fn list_session_analytics(
-        &self,
-        query: SessionAnalyticsQuery,
-    ) -> RepoResult<Vec<SessionAnalytics>> {
-        self.run_publication_consistent(PublicationReadClass::MovingFeed, || {
-            self.list_session_analytics_impl(query.clone())
-        })
-        .await
-    }
-
     async fn analytics_series(&self, range: AnalyticsRange) -> RepoResult<AnalyticsSnapshot> {
         self.run_publication_consistent(PublicationReadClass::MovingFeed, || {
             self.analytics_series_impl(range)
@@ -108,15 +98,6 @@ impl ConversationRepository for ClickHouseConversationRepository {
         .await
     }
 
-    async fn get_mcp_session(&self, session_id: &str) -> RepoResult<Option<McpSessionOpen>> {
-        self.run_publication_consistent_scoped(
-            PublicationReadClass::Strict,
-            PublicationReadScope::session(session_id),
-            || self.get_mcp_session_impl(session_id),
-        )
-        .await
-    }
-
     async fn list_mcp_sessions(
         &self,
         filter: McpSessionListFilter,
@@ -176,32 +157,6 @@ impl ConversationRepository for ClickHouseConversationRepository {
         .await
     }
 
-    async fn get_mcp_turn(
-        &self,
-        session_id: &str,
-        turn_seq: u32,
-    ) -> RepoResult<Option<McpTurnOpen>> {
-        self.run_publication_consistent_scoped(
-            PublicationReadClass::Strict,
-            PublicationReadScope::session(session_id),
-            || self.get_mcp_turn_impl(session_id, turn_seq, true),
-        )
-        .await
-    }
-
-    async fn get_mcp_turn_summary(
-        &self,
-        session_id: &str,
-        turn_seq: u32,
-    ) -> RepoResult<Option<McpTurnOpen>> {
-        self.run_publication_consistent_scoped(
-            PublicationReadClass::Strict,
-            PublicationReadScope::session(session_id),
-            || self.get_mcp_turn_impl(session_id, turn_seq, false),
-        )
-        .await
-    }
-
     async fn open_event(&self, req: OpenEventRequest) -> RepoResult<OpenContext> {
         let scope = PublicationReadScope::event(&req.event_uid);
         self.run_publication_consistent_scoped_with_result_scope(
@@ -222,8 +177,10 @@ impl ConversationRepository for ClickHouseConversationRepository {
     async fn canonical_reader_ready(&self) -> bool {
         // Same latch the directory listing path gates on, so `open` and `list`
         // cannot disagree about whether this backend's canonical indexes are
-        // published.
-        self.canonical_list_path_ready().await
+        // published. This boolean probe keeps the trait's fail-closed shape:
+        // a probe error reads as not-ready here, while the repository's own
+        // read paths propagate the typed error instead.
+        self.canonical_list_path_ready().await.unwrap_or(false)
     }
 
     async fn canonical_open_session_page(
@@ -269,7 +226,7 @@ impl ConversationRepository for ClickHouseConversationRepository {
 
     async fn canonical_open_event(&self, event_uid: &str) -> RepoResult<Option<McpEventOpen>> {
         // Event opens widen their scope from the event to its resolved session
-        // once the locator has identified it (mirrors `get_mcp_event`).
+        // once the locator has identified it.
         self.run_publication_consistent_scoped_with_result_scope(
             PublicationReadClass::AnchoredSession,
             PublicationReadScope::event(event_uid),
@@ -279,20 +236,6 @@ impl ConversationRepository for ClickHouseConversationRepository {
                     .map(|event| PublicationReadScope::session(&event.event.session_id))
             },
             || self.canonical_open_event_impl(event_uid),
-        )
-        .await
-    }
-
-    async fn get_mcp_event(&self, event_uid: &str) -> RepoResult<Option<McpEventOpen>> {
-        self.run_publication_consistent_scoped_with_result_scope(
-            PublicationReadClass::Strict,
-            PublicationReadScope::event(event_uid),
-            |result: &Option<McpEventOpen>| {
-                result
-                    .as_ref()
-                    .map(|event| PublicationReadScope::session(&event.event.session_id))
-            },
-            || self.get_mcp_event_impl(event_uid),
         )
         .await
     }

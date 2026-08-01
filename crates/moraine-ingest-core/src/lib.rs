@@ -447,8 +447,6 @@ pub async fn run_ingestor(config: AppConfig) -> Result<()> {
         ),
         ("ingest_append_control", "control_revision"),
         ("publication_diagnostic_events", "diagnostic_revision"),
-        ("mcp_open_publication_headers", "candidate_publication_id"),
-        ("mcp_open_generation_readiness", "candidate_publication_id"),
         ("raw_events", "source_host"),
         ("events", "source_host"),
         ("event_links", "source_host"),

@@ -142,12 +142,19 @@ pub(crate) struct CoreIndexReport {
     pub(crate) audit: Option<CoreIndexAuditOutcome>,
     /// The configured `[mcp] open_reader` value: `auto` | `v1` | `v2`.
     pub(crate) configured_open_reader: String,
-    /// The effective reader after resolution: `v1` | `v2` | `error`.
+    /// The effective reader after resolution: `v2` | `error`. Never `v1` —
+    /// issue #603 WI-10 retired that reader.
     pub(crate) effective_open_reader: String,
-    /// True when a config override (`v1`/`v2`) is forcing the effective reader.
+    /// True when the config names a reader the resolution declined to honor.
+    /// With one reader left that is exactly the retired `v1` selector: `auto`
+    /// and `v2` are synonyms that force nothing, and an unready store is a
+    /// readiness fact rather than a config one, so it does NOT set this flag
+    /// (`core_index_report_lines` would otherwise tell a stock `auto` install
+    /// it carries an override its `moraine.toml` does not contain).
     pub(crate) open_reader_override: bool,
-    /// Human-readable note about the resolution (override in effect, forced-v2
-    /// while indexes are not ready, etc.).
+    /// Human-readable note about the resolution — the retirement note for a
+    /// configured `v1`, the not-ready-run-migrate note for an unready store,
+    /// or both.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) open_reader_note: Option<String>,
 }
@@ -631,8 +638,11 @@ pub(crate) fn render_status(output: &CliOutput, snapshot: &StatusSnapshot) -> Re
     }
     if let Some(core_index) = &snapshot.core_index {
         doctor_lines.push(status_core_index_line(core_index));
-        // Surface a non-silent config override prominently even in the concise
-        // view, and a forced-v2-not-ready misconfiguration.
+        // Two things must be impossible to miss even in the concise view: a
+        // config override (post-WI-10 that is exactly a still-configured `v1`)
+        // and an unready store. The second is a readiness fact rather than a
+        // config one, so it sets no override flag and is ORed in on its own —
+        // which is why `open_reader_override` does not need to lie about it.
         if let Some(note) = &core_index.open_reader_note {
             if core_index.open_reader_override || core_index.effective_open_reader == "error" {
                 doctor_lines.push(format!("  open reader: {note}"));
@@ -1381,19 +1391,60 @@ mod tests {
         assert!(!joined.contains("config override"), "{joined}");
     }
 
+    /// The two reader states this renderer can actually be handed after issue
+    /// #603 WI-10, rendered rather than asserted as struct fields.
+    ///
+    /// The retargeting matters: this test used to pin
+    /// `configured=v1, effective=v1 (config override)` and a note reading
+    /// "v1 forced by [mcp] open_reader". `OpenReaderMode::resolve` can no
+    /// longer produce `effective=v1` in any input, and that note text exists
+    /// nowhere in the tree — so the guard covered an unreachable state while
+    /// the reachable one (`configured=v1, effective=v2`, carrying
+    /// `RETIRED_V1_NOTE`) had no render coverage at all; only
+    /// `CoreIndexReport` field values were asserted, in `commands.rs`.
+    ///
+    /// Both directions of the `(config override)` suffix are bounded here: a
+    /// configured `v1` must carry it, and an unready stock `auto` install —
+    /// the normal state of a fresh install between `migrate` and the first
+    /// sweep — must not.
     #[test]
-    fn core_index_lines_flag_v1_override() {
-        let mut report = ready_report();
-        report.configured_open_reader = "v1".to_string();
-        report.effective_open_reader = "v1".to_string();
-        report.open_reader_override = true;
-        report.open_reader_note = Some("v1 forced by [mcp] open_reader".to_string());
-        let joined = core_index_report_lines(&report).join("\n");
+    fn core_index_lines_flag_the_retired_v1_config_and_not_a_mere_unready_store() {
+        let mut retired = ready_report();
+        retired.configured_open_reader = "v1".to_string();
+        retired.effective_open_reader = "v2".to_string();
+        retired.open_reader_override = true;
+        retired.open_reader_note =
+            Some(moraine_config::OpenReaderMode::RETIRED_V1_NOTE.to_string());
+        let joined = core_index_report_lines(&retired).join("\n");
         assert!(
-            joined.contains("open reader: configured=v1, effective=v1 (config override)"),
+            joined.contains("open reader: configured=v1, effective=v2 (config override)"),
             "{joined}"
         );
-        assert!(joined.contains("open reader note: v1 forced"), "{joined}");
+        assert!(
+            joined.contains(&format!(
+                "open reader note: {}",
+                moraine_config::OpenReaderMode::RETIRED_V1_NOTE
+            )),
+            "{joined}"
+        );
+
+        // Unready under a stock `auto`: an error, and NOT an override.
+        let mut unready = ready_report();
+        unready.open_v2_ready = false;
+        unready.open_v2_provenance = None;
+        unready.effective_open_reader = "error".to_string();
+        unready.open_reader_override = false;
+        unready.open_reader_note =
+            Some("the canonical read indexes are not ready; open will fail".to_string());
+        let joined = core_index_report_lines(&unready).join("\n");
+        assert!(
+            joined.contains("open reader: configured=auto, effective=error"),
+            "{joined}"
+        );
+        assert!(
+            !joined.contains("config override"),
+            "a default `auto` config contains no override to report: {joined}"
+        );
     }
 
     #[test]
@@ -1437,8 +1488,15 @@ mod tests {
                 active_parts: 24,
                 oldest_retained: Some("2026-02-20T14:16:45Z".to_string()),
             },
+            // A LIVE derived table. `mcp_open_turns` stood here until issue
+            // #603 WI-10; after migration 041 `classify` answers `None` for
+            // every retired name, so a fixture pairing that name with
+            // `Some(Derived)` describes a report the collector can no longer
+            // build. (The twin fixture in
+            // `moraine-clickhouse/src/storage_report.rs` was migrated to the
+            // same live names.)
             moraine_clickhouse::StorageTableReport {
-                name: "mcp_open_turns".to_string(),
+                name: "mcp_event_navigation".to_string(),
                 class: Some(moraine_clickhouse::TableClass::Derived),
                 rows: 234_694,
                 compressed_bytes: 14_356_000_000,
@@ -1475,11 +1533,11 @@ mod tests {
         let mut rendered = storage_report_lines(&report);
         rendered.push(status_storage_line(&report));
         rendered.extend(reclaimable_lines(&[reclaim::ReclaimableEstimate {
-            scope: ReclaimScope::McpOpenOrphan,
+            scope: ReclaimScope::ReadIndexGeneration,
             units: 3,
             estimated_rows: 10,
             estimated_bytes: 5_368_709_120,
-            tables: vec!["mcp_open_events".to_string()],
+            tables: vec!["mcp_event_navigation".to_string()],
             note: Some("probe not registered".to_string()),
         }]));
         rendered.push(reclaim::estimated_bytes_note());
@@ -1498,7 +1556,7 @@ mod tests {
         // Any estimate line must carry the qualifier next to the number.
         let estimate_line = rendered
             .iter()
-            .find(|line| line.contains("scope mcp_open_orphan"))
+            .find(|line| line.contains("scope read_index_generation"))
             .expect("estimate line");
         assert!(
             estimate_line.contains(reclaim::ESTIMATE_QUALIFIER),
@@ -1648,14 +1706,14 @@ mod tests {
         // A blocked run is a distinct, counted outcome — not an indistinguishable
         // "nothing to do".
         let blocked = ReclaimOutcome::Blocked {
-            scope: ReclaimScope::McpOpenOrphan,
+            scope: ReclaimScope::ReadIndexGeneration,
             pending_mutations: 3,
         };
         assert!(!blocked.deleted_anything());
         assert_ne!(
             blocked,
             ReclaimOutcome::Idle {
-                scope: ReclaimScope::McpOpenOrphan
+                scope: ReclaimScope::ReadIndexGeneration
             }
         );
         render_reclaim_outcome(&output, &blocked, false).expect("blocked renders");
@@ -1725,7 +1783,7 @@ mod tests {
         /// read from the `Idle` arm.
         const IDLE_PHRASE: &str = "nothing to reclaim";
 
-        let scope = ReclaimScope::McpOpenOrphan;
+        let scope = ReclaimScope::ReadIndexGeneration;
         let settled = reclaim_outcome_lines(&ReclaimOutcome::Settled {
             scope,
             units: 7,

@@ -250,47 +250,8 @@ pub(crate) fn query_budgets(cfg: &AppConfig) -> ValidatedQueryBudgets {
 #[derive(Debug, Clone)]
 pub(super) enum DatabaseProgress {
     Migration(MigrationProgress),
-    ReconciliationInspecting,
-    ReconciliationStarted {
-        historical: bool,
-    },
-    ReconciliationAdvanced {
-        processed: usize,
-    },
-    ReconciliationFinished {
-        processed: usize,
-    },
-    /// The v1 `mcp_open` read-model backfill failed and startup continued
-    /// degraded. The affected sessions stay durably dirty
-    /// (`mcp_open_dirty_sessions`), so the v1 reader treats them exactly as
-    /// it treats any dirty session; the canonical sweep still runs.
-    /// `dirty_sessions` is a best-effort bounded count (`None` when the
-    /// probe itself failed; capped at [`DIRTY_SESSION_REPORT_LIMIT`]).
-    ReconciliationFailed {
-        dirty_sessions: Option<usize>,
-        error: String,
-    },
-    /// Canonical read-index (issue #598) backfill progress. Runs after and
-    /// outside the v1 read-model backfill.
+    /// Canonical read-index (issue #598) backfill progress.
     CoreIndex(CoreIndexBackfillProgress),
-}
-
-/// Page bound for the post-failure dirty-session probe behind
-/// [`DatabaseProgress::ReconciliationFailed`]. A bounded read keeps the
-/// diagnostic from repeating the very failure it is reporting on a huge
-/// corpus; [`format_dirty_session_count`] renders a count at this bound as
-/// "N+".
-const DIRTY_SESSION_REPORT_LIMIT: usize = 1_000;
-
-/// Operator-facing rendering of the best-effort dirty-session count carried
-/// by [`DatabaseProgress::ReconciliationFailed`].
-pub(super) fn format_dirty_session_count(count: Option<usize>) -> String {
-    match count {
-        None => "an unknown number of sessions".to_string(),
-        Some(1) => "1 session".to_string(),
-        Some(n) if n >= DIRTY_SESSION_REPORT_LIMIT => format!("{n}+ sessions"),
-        Some(n) => format!("{n} sessions"),
-    }
 }
 
 async fn migrate_database_with_progress<F>(
@@ -302,75 +263,20 @@ where
 {
     let ch = ClickHouseClient::new(cfg.clickhouse.clone())?;
     let budgets = query_budgets(cfg);
-    let applied = ch
+    let mut deferred = false;
+    let mut applied = ch
         .run_migrations_with_progress_and_budget(&budgets.migration, |event| {
+            if matches!(event, MigrationProgress::Deferred { .. }) {
+                deferred = true;
+            }
             on_progress(DatabaseProgress::Migration(event));
         })
         .await?;
-    on_progress(DatabaseProgress::ReconciliationInspecting);
-
-    // The ready probe and read-model backfill previously ran unenveloped
-    // here; migrate/up wraps them in one Migration-class envelope whose
-    // absolute deadline honors the operator client timeout (amendments
-    // A5/A6). The migration runner above scopes its own per-statement
-    // envelopes and is unaffected. A backfill that exceeds this budget fails
-    // with a typed error and stays retryable: its cursor is persisted after
-    // every page.
-    let reconciliation = ch
-        .migration_envelope(&budgets.migration)
-        .scope(async {
-            let historical = !ch.mcp_open_read_model_ready().await?;
-            on_progress(DatabaseProgress::ReconciliationStarted { historical });
-
-            let mut processed = 0;
-            ch.backfill_mcp_open_read_model_with_progress(|refreshed_sessions| {
-                processed = refreshed_sessions;
-                on_progress(DatabaseProgress::ReconciliationAdvanced {
-                    processed: refreshed_sessions,
-                });
-            })
-            .await
-            .context("failed to backfill MCP open read model")?;
-            on_progress(DatabaseProgress::ReconciliationFinished { processed });
-            Ok::<_, anyhow::Error>(())
-        })
-        .await;
-
-    // A v1 backfill failure is degradation, not a startup abort. The v1
-    // `mcp_open` read model is the legacy projection: any session whose
-    // re-projection failed stays durably dirty (`mcp_open_dirty_sessions`
-    // survives restarts) and the v1 reader degrades for exactly those
-    // sessions, the same way it does for any dirty session. Aborting here
-    // used to stop `up` BEFORE the issue #598 canonical sweep below — on the
-    // reference host, one giant session's per-session projection INSERT
-    // exceeded the Migration-class memory budget, and the resulting abort
-    // left the stack down with `open_v2` unpublished, blocking the very
-    // cutover that makes this projection obsolete. The budget itself is not
-    // the fix: the class budget is validated against the compile-time
-    // backstop matching the bundled server profile, and raising it past the
-    // server's own limit would only move the failure. So: warn loudly (the
-    // renderers surface the error, the bounded dirty count, and the fact
-    // that the sweep proceeds) and continue. The canonical sweep's own
-    // failures below stay fatal — it is the read path everything is
-    // cutting over to.
-    if let Err(error) = reconciliation {
-        let dirty_sessions = ch
-            .migration_envelope(&budgets.migration)
-            .scope(ch.pending_dirty_mcp_open_sessions(DIRTY_SESSION_REPORT_LIMIT))
-            .await
-            .ok()
-            .map(|sessions| sessions.len());
-        on_progress(DatabaseProgress::ReconciliationFailed {
-            dirty_sessions,
-            error: format!("{error:#}"),
-        });
-    }
 
     // Issue #598 WI-03: sweep the pre-existing corpus into the migration-036
-    // canonical read indexes, then audit + publish readiness. This is sequenced
-    // AFTER and OUTSIDE the v1 backfill envelope above (BINDING D5): the sweep
-    // scopes its OWN Migration-class batch envelope per page rather than sharing
-    // one envelope whose deadline would cap the sum of every page's time.
+    // canonical read indexes, then audit + publish readiness. The sweep scopes
+    // its OWN Migration-class batch envelope per page rather than sharing one
+    // envelope whose deadline would cap the sum of every page's time.
     //
     // The migrate/up path only ever targets the default single-owner local
     // backend (config: the default backend is "the only backend moraine
@@ -387,6 +293,23 @@ where
     .await
     .context("failed to backfill canonical read indexes")?;
 
+    // Issue #603 WI-10: the retirement migration (041) defers until `open_v2`
+    // publishes, and the canonical sweep above is exactly what publishes it —
+    // so a deferred pass is retried once in the same startup and a healthy
+    // host retires its legacy projection without a second invocation. A pass
+    // that defers AGAIN (the audit did not pass, so readiness was withheld) is
+    // surfaced through the same Deferred progress event, whose reason names
+    // the recovery recipe; the run still succeeds and the projection bytes
+    // stay untouched until the audit is fixed.
+    if deferred {
+        let retried = ch
+            .run_migrations_with_progress_and_budget(&budgets.migration, |event| {
+                on_progress(DatabaseProgress::Migration(event));
+            })
+            .await?;
+        applied.extend(retried);
+    }
+
     Ok(MigrationOutcome { applied })
 }
 
@@ -401,44 +324,21 @@ where
 }
 
 async fn cmd_db_migrate(cfg: &AppConfig) -> Result<MigrationOutcome> {
-    let mut historical = false;
     migrate_database_with_progress(cfg, |event| match event {
+        // Preflight and deferral are the two operator-facing migration
+        // events (issue #603 WI-10): the retirement's reclaimed-bytes note,
+        // and the named actionable reason when its precondition is unmet.
+        DatabaseProgress::Migration(MigrationProgress::Preflight { note, .. }) => {
+            eprintln!("{note}");
+        }
+        DatabaseProgress::Migration(MigrationProgress::Deferred {
+            version,
+            name,
+            reason,
+        }) => {
+            eprintln!("warning: migration {version} ({name}) deferred: {reason}");
+        }
         DatabaseProgress::Migration(_) => {}
-        DatabaseProgress::ReconciliationInspecting => {}
-        DatabaseProgress::ReconciliationStarted {
-            historical: required,
-        } => {
-            historical = required;
-            if historical {
-                eprintln!(
-                    "Building the MCP open read model from existing sessions; this one-time step may take several minutes."
-                );
-            }
-        }
-        DatabaseProgress::ReconciliationAdvanced { processed } => {
-            if historical {
-                eprintln!("  projected {processed} sessions");
-            }
-        }
-        DatabaseProgress::ReconciliationFinished { .. } => {
-            if historical {
-                eprintln!("MCP open read model ready.");
-            }
-        }
-        DatabaseProgress::ReconciliationFailed {
-            dirty_sessions,
-            error,
-        } => {
-            eprintln!("warning: failed to backfill the MCP open (v1) read model; continuing startup.");
-            eprintln!("warning:   {error}");
-            eprintln!(
-                "warning:   still dirty: {}; v1 `open` reads for those sessions degrade until reconciled.",
-                format_dirty_session_count(dirty_sessions)
-            );
-            eprintln!(
-                "warning:   the canonical read-index sweep (issue #598) runs next and does not depend on this projection."
-            );
-        }
         DatabaseProgress::CoreIndex(event) => match event {
             CoreIndexBackfillProgress::Starting { resuming } => {
                 eprintln!(
@@ -492,9 +392,11 @@ async fn cmd_db_doctor(cfg: &AppConfig) -> Result<DoctorReport> {
     .await
 }
 
-/// The CLI operates on the default single-owner Local backend, so open-reader
-/// resolution and any `open_v2` publication here is Local-mode (matching the
-/// migrate path's `publication_mode_is_local = true`, BINDING D3).
+/// The CLI operates on the default single-owner Local backend, so any
+/// `open_v2` publication here is Local-mode (matching the migrate path's
+/// `publication_mode_is_local = true`, BINDING D3). Since issue #603 WI-10
+/// this gates only readiness *publication*; reader resolution no longer
+/// consults it.
 const CLI_PUBLICATION_MODE_IS_LOCAL: bool = true;
 
 /// Raw `mcp_read_index_state` reads gathered for operator surfacing.
@@ -740,28 +642,44 @@ fn build_core_index_report(
         .as_ref()
         .and_then(|row| snowflake_age_seconds(row.generation));
 
-    let resolution = configured.resolve(open_v2_ready, CLI_PUBLICATION_MODE_IS_LOCAL);
+    // Post-WI-10 resolution: one reader, gated on readiness alone. A config
+    // still saying `v1` is accepted; the note surfaces the retirement (the
+    // same string the MCP backend logs), and `open_reader_override` flags it
+    // so the status panel renders the note prominently.
+    //
+    // `open_reader_override` is exactly `retired_v1_requested` on BOTH arms.
+    // With one reader left, `auto` and `v2` are synonyms that force nothing,
+    // so `v1` is the only configured value the resolution declines to honor.
+    // Hardcoding `true` on the unready arm would tell a default `auto` install
+    // it carries a config override it does not have — and post-041 that is the
+    // NORMAL state between `migrate` and the first sweep, and of every host
+    // whose audit fails. Prominence does not need the lie: the concise status
+    // branch already ORs in `effective_open_reader == "error"`.
+    let resolution = configured.resolve(open_v2_ready);
     let (effective, override_active, note) = match resolution {
-        OpenReaderResolution::V1 { config_override } => (
-            "v1",
-            config_override,
-            config_override.then(|| {
-                "v1 forced by [mcp] open_reader (kill-switch); v2 readiness ignored".to_string()
-            }),
-        ),
-        OpenReaderResolution::V2 { config_override } => (
+        OpenReaderResolution::V2 {
+            retired_v1_requested,
+        } => (
             "v2",
-            config_override,
-            config_override.then(|| "v2 forced by [mcp] open_reader".to_string()),
+            retired_v1_requested,
+            retired_v1_requested.then(|| OpenReaderMode::RETIRED_V1_NOTE.to_string()),
         ),
-        OpenReaderResolution::ForcedV2Unready => (
+        OpenReaderResolution::Unready {
+            retired_v1_requested,
+        } => (
             "error",
-            true,
-            Some(
-                "[mcp] open_reader = \"v2\" but the core read indexes are not ready; \
-                 open will fail (run `moraine db core-index rebuild`)"
-                    .to_string(),
-            ),
+            retired_v1_requested,
+            Some(if retired_v1_requested {
+                format!(
+                    "the canonical read indexes are not ready; open will fail (run `moraine db \
+                     migrate`, or `moraine db core-index rebuild`). Also: {}",
+                    OpenReaderMode::RETIRED_V1_NOTE
+                )
+            } else {
+                "the canonical read indexes are not ready; open will fail (run `moraine db \
+                 migrate`, or `moraine db core-index rebuild`)"
+                    .to_string()
+            }),
         ),
     };
 
@@ -807,19 +725,40 @@ fn rebuild_publication_mode_is_local(prior_open_v2: Option<&ReadIndexState>) -> 
             .is_some_and(|row| row.ready == 1 && row.cursor == OPEN_V2_PROVENANCE_OPERATOR_PROMOTE)
 }
 
+/// What `moraine db core-index rebuild` prints before it touches anything.
+///
+/// Readiness revocation only reaches processes started AFTER it: a running
+/// backend/MCP process samples `open_v2` readiness once at construction and
+/// keeps that answer for its lifetime (WI-08), so it would go on resolving v2
+/// against the truncated indexes for the whole re-sweep.
+///
+/// The ACTION is a restart. The REASON is **not** that a restarted process
+/// falls back to something — issue #603 WI-10 deleted the v1 reader, so a
+/// restarted process re-reads the readiness this rebuild just revoked and
+/// answers `open` with the typed unready error. Failing loudly beats serving
+/// silently truncated sessions; that is the whole argument, and the message
+/// must make it rather than promise a reader that no longer exists.
+///
+/// A `&[&str]` rather than four `eprintln!`s so the claim is testable: this is
+/// the recovery path named by the retirement gate's deferral reason, by
+/// `build_core_index_report`'s unready note, and by
+/// `docs/operations/canonical-read-indexes.md`.
+const REBUILD_RESTART_WARNING: &[&str] = &[
+    "WARNING: already-running backend/MCP processes cache the open v2 reader for their",
+    "         process lifetime and will keep serving it against the truncated indexes.",
+    "         Restart them now (`moraine down && moraine up`): a restarted process reads",
+    "         the readiness this rebuild revokes and refuses `open` with a typed error",
+    "         until the rebuild republishes it. The v1 reader is retired (issue #603",
+    "         WI-10), so there is nothing to fall back to — refusing loudly is the point.",
+];
+
 async fn cmd_db_core_index_rebuild(cfg: &AppConfig, output: &CliOutput) -> Result<ExitCode> {
     let ch = ClickHouseClient::new(cfg.clickhouse.clone())?;
     let budgets = query_budgets(cfg);
 
-    // Readiness revocation only reaches processes started AFTER it: running
-    // backend/MCP processes cache open_v2 readiness for their process lifetime
-    // (WI-08) and would keep serving v2 against the truncated indexes.
-    eprintln!("WARNING: already-running backend/MCP processes cache the open v2 reader for their");
-    eprintln!("         process lifetime and will keep serving it against the truncated indexes.");
-    eprintln!(
-        "         Restart them now (`moraine down && moraine up`) so they serve v1 until this"
-    );
-    eprintln!("         rebuild republishes readiness.");
+    for line in REBUILD_RESTART_WARNING {
+        eprintln!("{line}");
+    }
 
     let prior_open_v2 = ch
         .migration_envelope(&budgets.migration)
@@ -1362,76 +1301,151 @@ mod tests {
         (200, String::new())
     }
 
-    /// The per-session v1 projection INSERT — the statement class whose
-    /// memory rejection took the reference host's startup down.
-    fn is_v1_projection_insert(statement: &str) -> bool {
-        statement.starts_with("INSERT INTO") && statement.contains(".mcp_open_events\n")
+    /// One of migration 041's eight family drops, as it reaches the wire.
+    fn is_retirement_drop(statement: &str) -> bool {
+        statement.starts_with("DROP TABLE IF EXISTS") && statement.contains(".mcp_open_")
     }
 
-    /// The v1 legacy-head publish that advances a session's dirty pointer in
-    /// `mcp_open_sessions`; its absence after a failure is what "the session
-    /// stays dirty" means on the wire.
-    fn is_v1_legacy_head_publish(statement: &str) -> bool {
-        statement.starts_with("INSERT INTO") && statement.contains(".mcp_open_sessions\n")
+    /// Migration 041's settle-by-drop ledger append.
+    fn is_ledger_settle(statement: &str) -> bool {
+        statement.starts_with("INSERT INTO") && statement.contains(".storage_reclaim_ledger")
     }
 
-    /// Steering for the reference-host failure: the historical page discovers
-    /// one giant session, its batch facts make it coverable, and its
-    /// per-session projection INSERT is rejected by the server's memory
-    /// backstop. The durable dirty probe afterwards still reports it dirty.
-    /// Everything else answers success with an empty result set.
-    fn giant_session_projection_failure(statement: &str) -> (u16, String) {
-        if is_v1_projection_insert(statement) {
-            return (
-                500,
-                "Code: 241. DB::Exception: Memory limit (for query) exceeded: \
-                 would use 4.02 GiB (attempt to allocate chunk of 134217728 bytes), \
-                 maximum: 4.00 GiB: While executing JoiningTransform. \
-                 (MEMORY_LIMIT_EXCEEDED)"
-                    .to_string(),
-            );
-        }
-        if statement.contains(".v_live_events") && statement.contains("session_id > ''") {
-            return (200, "{\"session_id\":\"sess-giant\"}\n".to_string());
-        }
-        if statement.contains("AS required_source_heads") && statement.contains("groupUniqArray") {
-            return (
-                200,
-                concat!(
-                    "{\"session_id\":\"sess-giant\",\"slot\":0,\"source_revision\":7,",
-                    "\"dirty_revision\":3,\"required_source_heads\":[{\"source_host\":\"host-a\",",
-                    "\"source_name\":\"claude\",\"source_file\":\"sessions/sess-giant.jsonl\",",
-                    "\"source_generation\":1,\"publication_revision\":5}]}\n"
-                )
-                .to_string(),
-            );
-        }
-        if statement.contains("generateSnowflakeID()) AS source_revision") {
-            return (200, "{\"source_revision\":11}\n".to_string());
-        }
-        if statement.contains("d.dirty_revision > ifNull(s.dirty_revision, 0)") {
-            return (200, "{\"session_id\":\"sess-giant\"}\n".to_string());
-        }
-        empty_result(statement)
+    /// The canonical sweep's durable `open_v2` readiness publication.
+    fn is_open_v2_publish(statement: &str) -> bool {
+        statement.contains("('open_v2', 1, generateSnowflakeID(), 'auto-local')")
     }
 
-    /// The reference host's epic deploy failure, re-driven through the
-    /// command path: the v1 `mcp_open` re-projection of one giant session
-    /// exceeds the server memory budget mid-INSERT. Startup must degrade,
-    /// not abort — the session stays dirty on the wire (no legacy-head
-    /// publish, no v1 ready flag), the operator warning event fires exactly
-    /// once with the bounded dirty count and the server error, and the
-    /// issue #598 canonical sweep still runs and still auto-publishes
-    /// `open_v2`, the cutover this failure used to block.
+    /// The runner's `system.parts` footprint probe for the retired family, as
+    /// it reaches the wire.
+    fn is_family_footprint_probe(statement: &str) -> bool {
+        statement.contains("system.parts") && statement.contains("'mcp_open_projection_state'")
+    }
+
+    /// What the family holds on the host a shape describes: the four figures
+    /// `retired_family_footprint_sql` reports, in one place so a shape cannot
+    /// declare a total and a content split that could not coexist.
+    #[derive(Clone, Copy)]
+    struct FamilyFootprint {
+        family_rows: u64,
+        family_bytes: u64,
+        content_rows: u64,
+        content_bytes: u64,
+    }
+
+    /// The marker five of the family's migrations seed without reading a corpus,
+    /// measured on a real ClickHouse 25.12.5.44 server with bundled migrations
+    /// 001–040 applied to an empty database (2026-08-01):
+    /// `mcp_open_projection_state` held 2 rows / 392 B across 2 active parts,
+    /// and the other seven retired tables held nothing. The count is merge
+    /// state (ReplacingMergeTree collapsing seven seeds), never zero.
     ///
-    /// MUTATION (executed 2026-07-31): restore the fatal `?` on the v1
-    /// reconciliation envelope in `migrate_database_with_progress` (drop
-    /// the catch) — this test fails: the function returns the backfill
-    /// error, no failure event fires, and no canonical readiness statement
-    /// reaches the server.
+    /// Every shape below carries it, because every store that ran 027–035 has
+    /// it. A shape whose `family_*` omitted it would be describing a store
+    /// that cannot exist — and that is precisely the fiction that made the
+    /// fresh-install arm look reachable when it was not.
+    const BOOKKEEPING_SEED_ROWS: u64 = 2;
+    const BOOKKEEPING_SEED_BYTES: u64 = 392;
+
+    impl FamilyFootprint {
+        /// A store that projected `content_rows` / `content_bytes`, plus the
+        /// data-independent marker seed every store carries.
+        fn projected(content_rows: u64, content_bytes: u64) -> Self {
+            Self {
+                family_rows: content_rows + BOOKKEEPING_SEED_ROWS,
+                family_bytes: content_bytes + BOOKKEEPING_SEED_BYTES,
+                content_rows,
+                content_bytes,
+            }
+        }
+
+        /// A fresh install: 027–035 ran, nothing was ever projected.
+        fn fresh_install() -> Self {
+            Self::projected(0, 0)
+        }
+    }
+
+    /// Steering for a host in a given retirement shape: answers the
+    /// mcp_read_index_state existence probe and the `open_v2` state read from
+    /// a flag the sweep's own publish statement flips, and the `system.parts`
+    /// footprint probe from the shape's [`FamilyFootprint`]. Everything else
+    /// answers `empty_result`.
+    ///
+    /// The footprint arm matches on `system.parts` alone rather than on a
+    /// particular table literal, so a change to the family list cannot quietly
+    /// unsteer it and drop the walk back onto `empty_result`. It cannot fall
+    /// through silently either way: `retired_family_footprint` treats an
+    /// absent row as an error, so an unanswered probe aborts the migrate call
+    /// instead of reading as an empty family.
+    fn retirement_shape_steering(
+        published: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        footprint: FamilyFootprint,
+        publish_flips_readiness: bool,
+    ) -> impl Fn(&str) -> (u16, String) + Send + Sync + 'static {
+        move |statement: &str| {
+            if is_open_v2_publish(statement) && publish_flips_readiness {
+                published.store(true, std::sync::atomic::Ordering::SeqCst);
+                return (200, String::new());
+            }
+            if statement.contains("name = 'mcp_read_index_state'") {
+                return (200, "{\"value\":\"1\"}\n".to_string());
+            }
+            if statement.contains("state_key = 'open_v2'") {
+                let ready = u8::from(published.load(std::sync::atomic::Ordering::SeqCst));
+                return (
+                    200,
+                    format!(
+                        "{{\"state_key\":\"open_v2\",\"ready\":{ready},\"generation\":\"4400000000000000\",\"cursor\":\"\"}}\n"
+                    ),
+                );
+            }
+            if statement.contains("system.parts") && statement.contains("mcp_open_") {
+                let FamilyFootprint {
+                    family_rows,
+                    family_bytes,
+                    content_rows,
+                    content_bytes,
+                } = footprint;
+                return (
+                    200,
+                    format!(
+                        "{{\"family_rows\":{family_rows},\"family_bytes\":{family_bytes},\
+                          \"content_rows\":{content_rows},\"content_bytes\":{content_bytes}}}\n"
+                    ),
+                );
+            }
+            empty_result(statement)
+        }
+    }
+
+    /// The three retirement host shapes (issue #603 WI-10), walked as the
+    /// migrate/`up` sequence walks them against the stand-in server.
+    ///
+    /// **Shape (a) — already cut over** (the reference host: `open_v2.ready =
+    /// 1`, family populated, drain mid-flight): migration 041 applies in the
+    /// FIRST pass, its preflight note reports the compressed column bytes the
+    /// drop returns, the eight drops and the settle-by-drop ledger append reach
+    /// the wire, and nothing defers.
+    ///
+    /// MUTATION (executed 2026-07-31): invert the `ready` arm of
+    /// `retirement_gate` (treat a published host as unpublished) => FAILS
+    /// here on `deferred == 0` (the cut-over host defers instead of
+    /// retiring), and `a_never_cut_over_host_defers_retirement_until_the_
+    /// sweep_publishes` fails with it on the drop ordering.
+    ///
+    /// MUTATION (executed 2026-08-01): reword the note's column clause back to
+    /// the pre-E3 "of on-disk bytes" => FAILS here on the whole-note equality.
+    /// Under review round 6's `contains("20.70 GiB") && contains("23920
+    /// rows")` it PASSED, which is how a quoted note in the PR body came to
+    /// name a column the runner does not sum. **The wording half.**
     #[tokio::test]
-    async fn a_failed_v1_projection_degrades_and_the_canonical_sweep_still_publishes() {
-        let mock = MigrateServerMock::new(giant_session_projection_failure);
+    async fn a_cut_over_host_retires_the_projection_in_the_first_pass() {
+        let published = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mock = MigrateServerMock::new(retirement_shape_steering(
+            published,
+            FamilyFootprint::projected(23_918, 22_221_999_608),
+            false,
+        ));
         let cfg = mock_config(
             spawn_migrate_server_mock(mock.clone()).await,
             moraine_config::RetentionConfig::default(),
@@ -1440,33 +1454,352 @@ mod tests {
         let mut events: Vec<DatabaseProgress> = Vec::new();
         let outcome = migrate_database_with_progress(&cfg, |event| events.push(event))
             .await
-            .expect("startup continues past the failed v1 backfill");
-        assert!(!outcome.applied.is_empty(), "schema migrations ran first");
+            .expect("a cut-over host migrates cleanly");
+        assert!(
+            outcome.applied.iter().any(|version| version == "041"),
+            "the retirement migration applied: {:?}",
+            outcome.applied
+        );
 
-        let failures: Vec<_> = events
+        let deferred = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    DatabaseProgress::Migration(MigrationProgress::Deferred { .. })
+                )
+            })
+            .count();
+        assert_eq!(deferred, 0, "a cut-over host never defers: {events:?}");
+        let preflights: Vec<&String> = events
             .iter()
             .filter_map(|event| match event {
-                DatabaseProgress::ReconciliationFailed {
-                    dirty_sessions,
-                    error,
-                } => Some((*dirty_sessions, error.clone())),
+                DatabaseProgress::Migration(MigrationProgress::Preflight {
+                    version: "041",
+                    note,
+                }) => Some(note),
                 _ => None,
             })
             .collect();
-        assert_eq!(failures.len(), 1, "exactly one failure event");
-        assert_eq!(failures[0].0, Some(1), "bounded dirty count observed");
-        assert!(
-            failures[0].1.contains("MEMORY_LIMIT_EXCEEDED"),
-            "event carries the server rejection: {}",
-            failures[0].1
+        assert_eq!(preflights.len(), 1, "{events:?}");
+        // The note WHOLE. `contains("20.70 GiB")` plus `contains("23920 rows")`
+        // left every other word of the sentence free to drift, and it did: the
+        // PR body quoted a pre-E3 "returns 20.70 GiB on disk" that the runner
+        // had already stopped printing, and both substrings still matched.
+        // What the note names is the COLUMN it summed, which is the whole
+        // point of E3 — `sum(data_compressed_bytes)` and `sum(bytes_on_disk)`
+        // differ by ~8 MiB across this family — so the clause naming it is
+        // load-bearing, not decoration.
+        //
+        // This is also the other half of the sql/041 header pin. `sql/041`'s
+        // header quotes RETIREMENT_PROCEED_NOTE_PREFIX (`storage_class::tests::
+        // the_migration_header_quotes_the_note_the_runner_emits`); this is what
+        // proves the constant is also what an operator sees. A migration is
+        // immutable once released, so a quoted operator string moraine does not
+        // print can never be corrected in place — only prevented.
+        assert_eq!(
+            preflights[0].as_str(),
+            format!(
+                "{}20.70 GiB of compressed column data (23920 rows across 8 tables; \
+                 sum(data_compressed_bytes) over active system.parts, measured immediately \
+                 before the drop — DROP TABLE ... SYNC deletes the parts before returning, \
+                 so unlike a reclaim DELETE none of it is merge-deferred)",
+                moraine_clickhouse::RETIREMENT_PROCEED_NOTE_PREFIX,
+            ),
         );
-        assert!(
-            !events
+        assert_eq!(mock.count(is_retirement_drop), 8, "all eight family drops");
+        assert_eq!(mock.count(is_ledger_settle), 1, "the settle-by-drop append");
+        let settle = {
+            let statements = mock
+                .statements
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            statements
                 .iter()
-                .any(|event| matches!(event, DatabaseProgress::ReconciliationFinished { .. })),
-            "the degraded run must not also claim completion"
+                .find(|statement| is_ledger_settle(statement))
+                .expect("settle statement recorded")
+                .clone()
+        };
+        // Settle-by-drop semantics (mid-drain safe): the append advances the
+        // two retired scopes' unsettled units to `abandoned`, never `done`.
+        assert!(settle.contains("'abandoned'"), "{settle}");
+        assert!(settle.contains("'mcp_open_orphan'"), "{settle}");
+        assert!(settle.contains("'mcp_open_retired_lineage'"), "{settle}");
+        assert!(settle.contains("'claimed', 'deleting'"), "{settle}");
+        assert!(!settle.contains("'done'"), "{settle}");
+    }
+
+    /// **Shape (b) — never cut over, projection populated**: the first pass
+    /// defers 041 with the named actionable reason, the canonical sweep runs
+    /// and publishes `open_v2`, and the same startup's retry pass applies the
+    /// retirement — every family drop reaches the wire strictly AFTER the
+    /// readiness publication. This is the plan's deferred-cutover recovery
+    /// recipe as one startup.
+    ///
+    /// MUTATION (executed 2026-07-31): drop the `if deferred` retry from
+    /// `migrate_database_with_progress` => FAILS here ("041" never applied;
+    /// zero drops on the wire) while the run still returns Ok — exactly the
+    /// silent-deferral this walk exists to forbid.
+    #[tokio::test]
+    async fn a_never_cut_over_host_defers_retirement_until_the_sweep_publishes() {
+        let published = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mock = MigrateServerMock::new(retirement_shape_steering(
+            published,
+            FamilyFootprint::projected(23_918, 22_221_999_608),
+            true,
+        ));
+        let cfg = mock_config(
+            spawn_migrate_server_mock(mock.clone()).await,
+            moraine_config::RetentionConfig::default(),
         );
 
+        let mut events: Vec<DatabaseProgress> = Vec::new();
+        let outcome = migrate_database_with_progress(&cfg, |event| events.push(event))
+            .await
+            .expect("the deferred retirement retries in the same startup");
+        assert!(
+            outcome.applied.iter().any(|version| version == "041"),
+            "the retry pass applied the retirement: {:?}",
+            outcome.applied
+        );
+
+        let deferrals: Vec<&String> = events
+            .iter()
+            .filter_map(|event| match event {
+                DatabaseProgress::Migration(MigrationProgress::Deferred {
+                    version: "041",
+                    reason,
+                    ..
+                }) => Some(reason),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deferrals.len(), 1, "{events:?}");
+        assert!(
+            deferrals[0].contains("has not cut over")
+                && deferrals[0].contains("open_v2 is unpublished")
+                && deferrals[0].contains("moraine db core-index rebuild"),
+            "the deferral names the recovery recipe: {}",
+            deferrals[0]
+        );
+        // The figure the deferral quotes is what would be LOST, so it counts
+        // the seven content tables (23 918 rows) — not the family total
+        // (23 920), which includes the marker seed no store is without. The
+        // fresh-install walk is the arm that fails when the gate reads the
+        // total; this is the arm that fails when the REASON does.
+        assert!(
+            deferrals[0].contains("23918 projected rows"),
+            "the deferral reports the projected content it would lose, not the family total: {}",
+            deferrals[0]
+        );
+        assert!(
+            !deferrals[0].contains("23920"),
+            "the family total is not what a deferral is about: {}",
+            deferrals[0]
+        );
+
+        // Ordering on the wire: readiness published strictly before any drop.
+        let statements = mock
+            .statements
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let publish_at = statements
+            .iter()
+            .position(|statement| is_open_v2_publish(statement))
+            .expect("the sweep published open_v2");
+        let drop_positions: Vec<usize> = statements
+            .iter()
+            .enumerate()
+            .filter_map(|(index, statement)| is_retirement_drop(statement).then_some(index))
+            .collect();
+        assert_eq!(drop_positions.len(), 8, "all eight family drops ran");
+        assert!(
+            drop_positions.iter().all(|index| *index > publish_at),
+            "every drop must follow the readiness publication: publish at {publish_at}, \
+             drops at {drop_positions:?}"
+        );
+    }
+
+    /// **Shape (b), audit never passes**: the sweep runs but readiness stays
+    /// withheld, so the retry pass defers AGAIN, the run still succeeds, and
+    /// not one family drop reaches the wire — the projection bytes stay
+    /// untouched until the operator fixes the audit (the reason keeps naming
+    /// the recipe).
+    #[tokio::test]
+    async fn a_host_whose_audit_never_passes_keeps_its_projection_bytes() {
+        let published = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // publish_flips_readiness = false: even if a publish statement
+        // arrives, readiness stays 0 — the withheld-audit shape.
+        let mock = MigrateServerMock::new(retirement_shape_steering(
+            published,
+            FamilyFootprint::projected(23_918, 22_221_999_608),
+            false,
+        ));
+        let cfg = mock_config(
+            spawn_migrate_server_mock(mock.clone()).await,
+            moraine_config::RetentionConfig::default(),
+        );
+
+        let mut events: Vec<DatabaseProgress> = Vec::new();
+        let outcome = migrate_database_with_progress(&cfg, |event| events.push(event))
+            .await
+            .expect("a still-deferred retirement is not a startup failure");
+        assert!(
+            !outcome.applied.iter().any(|version| version == "041"),
+            "041 must not apply while open_v2 is unpublished: {:?}",
+            outcome.applied
+        );
+        let deferrals = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    DatabaseProgress::Migration(MigrationProgress::Deferred { version: "041", .. })
+                )
+            })
+            .count();
+        assert_eq!(deferrals, 2, "both passes defer: {events:?}");
+        assert_eq!(
+            mock.count(is_retirement_drop),
+            0,
+            "no family drop may run before the cutover is durable"
+        );
+    }
+
+    /// **Shape (c) — fresh install**: migrations 027–035 created the family
+    /// moments earlier in the same pass and projected nothing into it, so the
+    /// gate's no-projected-content arm applies 041 immediately — no deferral,
+    /// and the note says the drop loses nothing. The canonical sweep then
+    /// publishes over the empty corpus.
+    ///
+    /// The steering is a MEASUREMENT, not a convenience. Through review round
+    /// 4 this walk ran on the unsteered `empty_result`, whose footprint answer
+    /// is no rows at all; the zero it asserted was an artifact of the stand-in
+    /// rather than a property of the schema, and against a real server the arm
+    /// it claims to cover was unreachable. Executed 2026-08-01 against a
+    /// ClickHouse 25.12.5.44 server with bundled migrations 001–040 applied to
+    /// an empty database, the family holds 2 rows / 392 B — every byte of it
+    /// `mcp_open_projection_state`, which migrations 027, 029, 033, 034 and
+    /// 035 seed without reading a corpus across seven `INSERT`s (027's is the
+    /// `WHERE NOT EXISTS` guard, 029's is a bare `VALUES`).
+    /// [`FamilyFootprint::fresh_install`] is that measurement, and with it the
+    /// round-4 build DEFERS here:
+    ///
+    /// ```text
+    /// DEFERRED 041: … this store has not cut over to the canonical read
+    /// indexes (open_v2 is unpublished) and the projection still holds 2 rows
+    /// (392 B) … run `moraine db core-index rebuild` …
+    /// ```
+    ///
+    /// The note is asserted WHOLE, not by three `contains`. Review round 6
+    /// asserted three substrings of it and shipped "migrations 027 and 029" —
+    /// two of the five — in the words between them, where nothing could see
+    /// it. The seed clause is INTERPOLATED from
+    /// [`moraine_clickhouse::BOOKKEEPING_SEED_CLAUSE`] rather than transcribed,
+    /// which splits the job cleanly in two: this walk pins that an operator is
+    /// shown that clause, and
+    /// `storage_class::tests::the_bookkeeping_table_is_the_one_the_migrations_seed_without_reading_data`
+    /// pins that the clause is what the migrations actually do. Rewording the
+    /// constant therefore does NOT fail here — it fails there, which is the
+    /// half that can tell right from wrong.
+    ///
+    /// MUTATION (executed 2026-08-01): gate `retirement_gate`'s third arm on
+    /// `rows == 0` (the family total) instead of `content_rows == 0` => FAILS
+    /// here on `a fresh install never defers`, and on that assertion ONLY:
+    /// `cargo test -p moraine --locked --no-fail-fast` gives 247 passed / 1
+    /// failed and one panic. The `041 applied on the first pass` assertion is
+    /// checked FIRST and PASSES, because the mutation defers 041 in pass one
+    /// and the retried pass applies it, so `outcome.applied` still carries
+    /// `041` — the event dump the panic prints ends in
+    /// `Applied { … version: "041" … }`. A mutation record that names two
+    /// failures where the run produces one is claiming coverage the guard
+    /// does not have. **The behaviour half.**
+    ///
+    /// MUTATION (executed 2026-08-01): delete `{BOOKKEEPING_SEED_CLAUSE}` from
+    /// `retirement_gate`'s note, leaving "…the 2-row (392 B)
+    /// mcp_open_projection_state marker, so the drop loses nothing" => FAILS
+    /// here on the whole-note equality. Under round 6's three `contains` it
+    /// passed. **The wording half.**
+    ///
+    /// What this walk does NOT cover, and must not be read as covering: WHICH
+    /// tables the footprint statement sums. The steering answers the probe
+    /// with four figures directly, so the stand-in never reports a table list.
+    /// Through review round 6 this docstring claimed the opposite — that
+    /// flipping `mcp_open_projection_state`'s `holds_projected_content` "FAILS
+    /// here identically". Executed 2026-08-01 across `cargo test -p moraine -p
+    /// moraine-clickhouse --locked --no-fail-fast`, that flip gives 511 passed
+    /// / 1 failed: all 248 `moraine` tests pass, this walk among them, and the
+    /// single failure is the derivation guard named above. This walk covers the
+    /// gate's BEHAVIOUR under a measured footprint; the split itself is that
+    /// guard's, and saying otherwise made a guard name a promise it did not
+    /// keep.
+    #[tokio::test]
+    async fn a_fresh_install_retires_the_empty_projection_without_deferring() {
+        let published = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mock = MigrateServerMock::new(retirement_shape_steering(
+            published,
+            FamilyFootprint::fresh_install(),
+            true,
+        ));
+        let cfg = mock_config(
+            spawn_migrate_server_mock(mock.clone()).await,
+            moraine_config::RetentionConfig::default(),
+        );
+
+        let mut events: Vec<DatabaseProgress> = Vec::new();
+        let outcome = migrate_database_with_progress(&cfg, |event| events.push(event))
+            .await
+            .expect("a fresh install migrates cleanly");
+        assert!(
+            outcome.applied.iter().any(|version| version == "041"),
+            "041 applied on the first pass: {:?}",
+            outcome.applied
+        );
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                DatabaseProgress::Migration(MigrationProgress::Deferred { .. })
+            )),
+            "a fresh install never defers: {events:?}"
+        );
+        let note = events
+            .iter()
+            .find_map(|event| match event {
+                DatabaseProgress::Migration(MigrationProgress::Preflight {
+                    version: "041",
+                    note,
+                }) => Some(note.clone()),
+                _ => None,
+            })
+            .expect("the retirement preflight note fires");
+        // The note WHOLE, not three substrings of it. Everything the
+        // fresh-install note has to say has to be in it: nothing projected,
+        // the marker rows named rather than hidden (an operator who greps
+        // `system.parts` after this note must not find two rows the note
+        // claimed were not there), the seeding migrations named correctly, and
+        // the reason the drop is safe. The seed clause is INTERPOLATED from
+        // the constant the derivation guard checks rather than transcribed, so
+        // this walk pins that the operator sees that clause while the
+        // derivation pins that the clause is true.
+        assert_eq!(
+            note,
+            format!(
+                "retiring the legacy mcp_open_* projection: the family holds no projected \
+                 rows — only the 2-row (392 B) mcp_open_projection_state marker {}, so the \
+                 drop loses nothing (canonical read-index readiness publishes when the sweep \
+                 next runs)",
+                moraine_clickhouse::BOOKKEEPING_SEED_CLAUSE,
+            ),
+        );
+        // The walk is steered, not defaulted: the footprint probe reached the
+        // wire and this shape answered it.
+        assert_eq!(
+            mock.count(is_family_footprint_probe),
+            1,
+            "the gate must have measured the family exactly once"
+        );
+        assert_eq!(mock.count(is_retirement_drop), 8);
         let published: Vec<_> = events
             .iter()
             .filter_map(|event| match event {
@@ -1482,80 +1815,11 @@ mod tests {
             vec![(true, true)],
             "the canonical sweep published, open_v2 auto-flipped"
         );
-
-        assert_eq!(mock.count(is_v1_projection_insert), 1);
-        assert_eq!(mock.count(is_v1_legacy_head_publish), 0);
-        assert_eq!(
-            mock.count(|statement| statement.contains("mcp_open_projection_state")
-                && statement.contains("('global', 1,")),
-            0,
-            "the v1 ready flag must not be written on failure"
-        );
-        assert_eq!(
-            mock.count(|statement| statement.contains("('core_indexes', 1, generateSnowflakeID()")),
-            1
-        );
-        assert_eq!(
-            mock.count(|statement| statement
-                .contains("('open_v2', 1, generateSnowflakeID(), 'auto-local')")),
-            1
-        );
-    }
-
-    /// The degraded-path catch must not change a clean run: with every
-    /// statement succeeding, the v1 backfill completes (ready flag written
-    /// once, completion event once, no failure event) and the canonical
-    /// sweep publishes as before.
-    #[tokio::test]
-    async fn a_clean_database_sequence_finishes_v1_and_publishes_the_sweep() {
-        let mock = MigrateServerMock::new(empty_result);
-        let cfg = mock_config(
-            spawn_migrate_server_mock(mock.clone()).await,
-            moraine_config::RetentionConfig::default(),
-        );
-
-        let mut events: Vec<DatabaseProgress> = Vec::new();
-        let outcome = migrate_database_with_progress(&cfg, |event| events.push(event))
-            .await
-            .expect("clean sequence succeeds");
-        assert!(!outcome.applied.is_empty(), "schema migrations ran");
-
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| matches!(event, DatabaseProgress::ReconciliationFinished { .. }))
-                .count(),
-            1
-        );
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| matches!(event, DatabaseProgress::ReconciliationFailed { .. }))
-                .count(),
-            0
-        );
-        let published: Vec<_> = events
-            .iter()
-            .filter_map(|event| match event {
-                DatabaseProgress::CoreIndex(CoreIndexBackfillProgress::Published {
-                    core_indexes,
-                    open_v2,
-                }) => Some((*core_indexes, *open_v2)),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(published, vec![(true, true)]);
-        assert_eq!(
-            mock.count(|statement| statement.contains("mcp_open_projection_state")
-                && statement.contains("('global', 1,")),
-            1,
-            "the v1 ready flag is written exactly once on success"
-        );
     }
 
     /// Steers the canonical readiness publish to a server error while every
-    /// other statement succeeds, so the sweep — not the v1 projection — is
-    /// the thing that fails.
+    /// other statement succeeds, so the sweep — not the v1 projection, and
+    /// not the retirement gate — is the thing that fails.
     fn canonical_publish_failure(statement: &str) -> (u16, String) {
         if statement.contains("('core_indexes', 1, generateSnowflakeID()") {
             return (
@@ -1563,7 +1827,12 @@ mod tests {
                 "Code: 241. DB::Exception: injected canonical publish failure".to_string(),
             );
         }
-        empty_result(statement)
+        // The migration pass has to get PAST the retirement gate for the sweep
+        // to be reached at all, so the footprint probe is answered with the
+        // fresh-install measurement. An unanswered probe is an error now, and
+        // this test would then be asserting the wrong abort.
+        let published = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        retirement_shape_steering(published, FamilyFootprint::fresh_install(), false)(statement)
     }
 
     /// The non-fatal catch covers the v1 projection ONLY. A canonical-sweep
@@ -1623,14 +1892,15 @@ mod tests {
 
     /// Statement fragment unique to each registered scope's candidate probe —
     /// the same signatures `sink::tests::RECLAIM_PROBE_SIGNATURES` uses, so
-    /// "the probe was issued" means the same thing on both surfaces.
-    const ORPHAN_PROBE_SIGNATURE: &str = "child.candidate_generation";
-    const RETIRED_PROBE_SIGNATURE: &str = "l.live_fingerprint";
+    /// "the probe was issued" means the same thing on both surfaces. (The two
+    /// retired `mcp_open` scopes' signatures left with their executors,
+    /// issue #603 WI-10.)
+    const READ_INDEX_PROBE_SIGNATURE: &str = "ri_rollup";
     const CANONICAL_PROBE_SIGNATURE: &str = "cg_rollup";
 
-    /// Registered scopes `retention` authorizes to probe. Every scope is
-    /// registered as of WI-09, so the count varies with the config alone:
-    /// three without the protected keys, four with both set.
+    /// Registered scopes `retention` authorizes to probe. Both remaining
+    /// scopes are registered, so the count varies with the config alone:
+    /// one without the protected keys, two with both set.
     fn authorized_probing_scopes(retention: &moraine_config::RetentionConfig) -> usize {
         moraine_clickhouse::ReclaimScope::ALL
             .into_iter()
@@ -1749,7 +2019,7 @@ mod tests {
 
         // And the mapping itself, variant by variant.
         use moraine_clickhouse::ReclaimOutcome;
-        let scope = moraine_clickhouse::ReclaimScope::McpOpenOrphan;
+        let scope = moraine_clickhouse::ReclaimScope::ReadIndexGeneration;
         assert_eq!(
             reclaim_run_exit_code(&ReclaimOutcome::NoExecutor {
                 scope,
@@ -1814,17 +2084,17 @@ mod tests {
     /// deletes on demand. `sink::tests::the_unattended_janitor_uses_the_
     /// operators_retention_horizon` closes exactly this for the janitor and
     /// states the consequence, which is identical here: the horizon is the only
-    /// thing separating the orphan collector from a prepare in flight, because
-    /// `prepare` writes children first and the header last. An operator who
-    /// widens `retention.derived_horizon_hours` because their host publishes
-    /// slowly would have got the stock 24h on `reclaim run --confirm`, and the
-    /// collector would have deleted the children of every prepare between 24h
+    /// thing separating the reclaimer from a source generation whose
+    /// supersession is still settling. An operator who widens
+    /// `retention.derived_horizon_hours` because their host publishes slowly
+    /// would have got the stock 24h on `reclaim run --confirm`, and the
+    /// reclaimer would have collected every generation superseded between 24h
     /// and their configured horizon.
     ///
     /// MUTATION (executed 2026-07-28): pass `&RetentionConfig::default()` to
     /// `reclaim_run` from `cmd_db_reclaim_run` => FAILS here, and **only**
-    /// here: re-run with this one test skipped, the same mutation leaves the
-    /// remaining 1601 workspace tests green. **Lower bound, and the finding.**
+    /// here: re-run with this one test skipped, the same mutation
+    /// leaves the rest of the workspace green — measured 2026-07-28 as "the remaining 1601", a denominator this PR moved (WI-10 deletes tests with the code they covered) and did NOT re-measure; the isolation was observed, the current count was not. **Lower bound, and the finding.**
     #[tokio::test(flavor = "multi_thread")]
     async fn the_operator_run_uses_the_operators_retention_horizon() {
         let retention = widened_retention();
@@ -1835,7 +2105,7 @@ mod tests {
         let code = cmd_db_reclaim_run(
             &cfg,
             &plain_output(),
-            reclaim_run_args("mcp_open_orphan", true),
+            reclaim_run_args("read_index_generation", true),
         )
         .await
         .expect("a confirmed run of a registered bucket-3 scope reaches the server");
@@ -1846,7 +2116,7 @@ mod tests {
         );
 
         assert!(
-            mock.count(ORPHAN_PROBE_SIGNATURE) > 0,
+            mock.count(READ_INDEX_PROBE_SIGNATURE) > 0,
             "the run never issued its candidate probe"
         );
         assert_eq!(
@@ -1883,8 +2153,8 @@ mod tests {
     /// MUTATION (executed 2026-07-28): change `cmd_db_reclaim_run`'s
     /// `ReclaimTrigger::Operator` to `Maintenance` => FAILS here twice: the
     /// probe is never issued and the command exits `RECLAIM_REFUSAL_EXIT_CODE`.
-    /// With this one test skipped the same mutation leaves the remaining 1601
-    /// workspace tests green. **Lower bound, and the finding.**
+    /// With this one test skipped the same mutation
+    /// leaves the rest of the workspace green — measured 2026-07-28 as "the remaining 1601", a denominator this PR moved (WI-10 deletes tests with the code they covered) and did NOT re-measure; the isolation was observed, the current count was not. **Lower bound, and the finding.**
     ///
     /// MUTATION (executed 2026-07-28): raise the stand-in's free space above
     /// `RECLAIM_MIN_FREE_BYTES` => FAILS here, which is the point: this test
@@ -1907,7 +2177,7 @@ mod tests {
         let code = cmd_db_reclaim_run(
             &cfg,
             &plain_output(),
-            reclaim_run_args("mcp_open_orphan", true),
+            reclaim_run_args("read_index_generation", true),
         )
         .await
         .expect("a confirmed operator run must not error on a full disk");
@@ -1919,7 +2189,7 @@ mod tests {
             "the reclaim preamble never read free space"
         );
         assert!(
-            mock.count(ORPHAN_PROBE_SIGNATURE) > 0,
+            mock.count(READ_INDEX_PROBE_SIGNATURE) > 0,
             "the operator's run declined for free disk"
         );
         assert_eq!(
@@ -1943,8 +2213,8 @@ mod tests {
     ///
     /// MUTATION (executed 2026-07-28): pass `&RetentionConfig::default()` to
     /// `reclaim_plan` from `cmd_db_reclaim_plan` => FAILS here, and only here:
-    /// with this one test skipped the same mutation leaves the remaining 1601
-    /// workspace tests green. **Lower bound, and the finding.**
+    /// with this one test skipped the same mutation
+    /// leaves the rest of the workspace green — measured 2026-07-28 as "the remaining 1601", a denominator this PR moved (WI-10 deletes tests with the code they covered) and did NOT re-measure; the isolation was observed, the current count was not. **Lower bound, and the finding.**
     #[tokio::test(flavor = "multi_thread")]
     async fn the_planner_uses_the_operators_retention_horizon() {
         let retention = widened_retention();
@@ -1973,11 +2243,10 @@ mod tests {
         // failing at this call site.
         let probing = authorized_probing_scopes(&cfg.retention);
         assert_eq!(
-            probing, 3,
+            probing, 1,
             "no protected key is set, so canonical must not probe"
         );
-        assert!(mock.count(ORPHAN_PROBE_SIGNATURE) > 0);
-        assert!(mock.count(RETIRED_PROBE_SIGNATURE) > 0);
+        assert!(mock.count(READ_INDEX_PROBE_SIGNATURE) > 0);
         assert_eq!(
             mock.count(CANONICAL_PROBE_SIGNATURE),
             0,
@@ -2008,8 +2277,8 @@ mod tests {
     ///
     /// MUTATION (executed 2026-07-28): pass `&RetentionConfig::default()` to
     /// `reclaim_status` from `gather_reclaim_status` => FAILS here, and only
-    /// here: with this one test skipped the same mutation leaves the remaining
-    /// 1601 workspace tests green. **Lower bound, and the finding.**
+    /// here: with this one test skipped the same mutation
+    /// leaves the rest of the workspace green — measured 2026-07-28 as "the remaining 1601", a denominator this PR moved (WI-10 deletes tests with the code they covered) and did NOT re-measure; the isolation was observed, the current count was not. **Lower bound, and the finding.**
     #[tokio::test(flavor = "multi_thread")]
     async fn the_status_report_uses_the_operators_retention_horizon() {
         let retention = widened_retention();
@@ -2026,7 +2295,7 @@ mod tests {
 
         let probing = authorized_probing_scopes(&cfg.retention);
         assert_eq!(
-            probing, 3,
+            probing, 1,
             "no protected key is set, so canonical must not probe"
         );
         assert_eq!(
@@ -2232,8 +2501,11 @@ mod tests {
         assert!((4..=8).contains(&age), "age was {age}");
     }
 
+    /// Issue #603 WI-10 config compatibility at the status surface: a config
+    /// still saying `v1` reports the v2 reader as effective and renders the
+    /// retirement note (the same string the MCP backend logs).
     #[test]
-    fn build_core_index_report_v1_override_beats_ready_indexes() {
+    fn build_core_index_report_retired_v1_selector_serves_v2_with_the_note() {
         let state = RawCoreIndexState {
             core_indexes: Some(state_row(STATE_KEY_CORE_INDEXES, 1, snowflake_for(1), "{}")),
             open_v2: Some(state_row(
@@ -2248,16 +2520,16 @@ mod tests {
             }),
         };
         let report = build_core_index_report(OpenReaderMode::V1, state);
-        assert_eq!(report.effective_open_reader, "v1");
+        assert_eq!(report.effective_open_reader, "v2");
         assert!(report.open_reader_override);
-        assert!(report
-            .open_reader_note
-            .as_deref()
-            .is_some_and(|note| note.contains("kill-switch")));
+        assert_eq!(
+            report.open_reader_note.as_deref(),
+            Some(OpenReaderMode::RETIRED_V1_NOTE)
+        );
     }
 
     #[test]
-    fn build_core_index_report_forced_v2_unready_is_an_error() {
+    fn build_core_index_report_unready_is_an_error_carrying_the_recovery_note() {
         let state = RawCoreIndexState {
             core_indexes: Some(state_row(STATE_KEY_CORE_INDEXES, 0, 0, "")),
             open_v2: Some(state_row(STATE_KEY_OPEN_V2, 0, 0, "")),
@@ -2265,7 +2537,11 @@ mod tests {
         };
         let report = build_core_index_report(OpenReaderMode::V2, state);
         assert_eq!(report.effective_open_reader, "error");
-        assert!(report.open_reader_override);
+        // `v2` is a synonym for `auto` after issue #603 WI-10: it forces
+        // nothing, so it is not an override. Prominence comes from the
+        // effective reader being `error`, which the concise status branch ORs
+        // in on its own.
+        assert!(!report.open_reader_override);
         assert!(report
             .open_reader_note
             .as_deref()
@@ -2288,9 +2564,100 @@ mod tests {
         let report = build_core_index_report(OpenReaderMode::Auto, state);
         assert!(!report.open_v2_ready);
         assert!(report.open_v2_provenance.is_none());
-        // Ready core indexes but open_v2 not published: auto stays on v1.
-        assert_eq!(report.effective_open_reader, "v1");
+        // Ready core indexes but open_v2 not published: with the v1 reader
+        // retired (issue #603 WI-10) there is nothing to stay on — the
+        // surface reports the typed-unready state. It is NOT an override: the
+        // config says `auto` and contains no reader selection to override.
+        // Post-041 this is the normal state of a fresh install between
+        // `migrate` and the first sweep.
+        assert_eq!(report.effective_open_reader, "error");
         assert!(!report.open_reader_override);
+    }
+
+    /// **The `open_reader_override` denominator.** The flag renders as
+    /// "(config override)" on the operator's reader line, so it is a claim
+    /// about the contents of their `moraine.toml`. After issue #603 WI-10 it
+    /// is true for exactly one configured value — the retired `v1` — because
+    /// `auto` and `v2` are synonyms that force nothing and an unready store is
+    /// a readiness fact rather than a config one.
+    ///
+    /// Exhaustive over `OpenReaderMode` × readiness rather than sampled, so
+    /// neither direction can drift: a hardcoded `true` on the unready arm
+    /// (which is what shipped into round 1, and made
+    /// `build_core_index_report_hides_provenance_when_not_promoted` certify
+    /// the wrong claim) fails on the `auto`/`v2` unready rows, and a hardcoded
+    /// `false` fails on both `v1` rows.
+    ///
+    /// MUTATION (executed 2026-08-01): restore `true` on the `Unready` arm of
+    /// `build_core_index_report` => FAILS here on `(auto, unready)`.
+    #[test]
+    fn the_open_reader_override_flag_marks_exactly_the_retired_v1_config() {
+        for (configured, ready, expected_override) in [
+            (OpenReaderMode::Auto, true, false),
+            (OpenReaderMode::Auto, false, false),
+            (OpenReaderMode::V2, true, false),
+            (OpenReaderMode::V2, false, false),
+            (OpenReaderMode::V1, true, true),
+            (OpenReaderMode::V1, false, true),
+        ] {
+            let state = RawCoreIndexState {
+                core_indexes: Some(state_row(
+                    STATE_KEY_CORE_INDEXES,
+                    u8::from(ready),
+                    snowflake_for(1),
+                    "{}",
+                )),
+                open_v2: Some(state_row(
+                    STATE_KEY_OPEN_V2,
+                    u8::from(ready),
+                    snowflake_for(1),
+                    "auto-local",
+                )),
+                audit: None,
+            };
+            let report = build_core_index_report(configured, state);
+            assert_eq!(
+                report.open_reader_override,
+                expected_override,
+                "configured={}, open_v2 ready={ready}",
+                configured.as_str()
+            );
+            assert_eq!(
+                report.effective_open_reader,
+                if ready { "v2" } else { "error" },
+                "configured={}, open_v2 ready={ready}",
+                configured.as_str()
+            );
+        }
+    }
+
+    /// The rebuild's operator warning states a REASON, and after issue #603
+    /// WI-10 that reason cannot be "they serve v1" — this PR deletes the v1
+    /// reader, so a restarted process reads the readiness the rebuild just
+    /// revoked and refuses `open` with the typed unready error.
+    ///
+    /// The message shipped byte-identical to its pre-WI-10 text through round
+    /// 1 and nothing was red, because four `eprintln!` calls have no seam.
+    ///
+    /// MUTATION (executed 2026-08-01): restore the original fourth line
+    /// ("… so they serve v1 until this rebuild republishes readiness") =>
+    /// FAILS here on the no-fallback assertion.
+    #[test]
+    fn the_rebuild_warning_promises_a_typed_refusal_not_a_v1_fallback() {
+        let warning = REBUILD_RESTART_WARNING.join(" ");
+        // The action survives: restart, with the command an operator can run.
+        assert!(warning.contains("moraine down && moraine up"), "{warning}");
+        // The reason is the typed refusal, and the retirement is named.
+        assert!(warning.contains("typed error"), "{warning}");
+        assert!(warning.contains("#603"), "{warning}");
+        // No surface may promise a reader this build does not contain.
+        for forbidden in ["serve v1", "serves v1", "serving v1", "fall back to v1"] {
+            assert!(
+                !warning.contains(forbidden),
+                "the v1 reader is retired; `{forbidden}` promises a fallback that does not \
+                 exist: {warning}"
+            );
+        }
     }
 
     #[test]

@@ -9,9 +9,8 @@ use moraine_conversations::{
     AnalyticsRange, ConversationListFilter, ConversationListSort, ConversationMode,
     ConversationRepository, ConversationSearchQuery, FileAttentionQuery, McpEventType,
     McpSessionListFilter, PageRequest, QueryClass, QueryEnvelope, RepoError, SearchEventKind,
-    SearchEventsQuery, SearchMcpEventsQuery, SearchStrategyHint, SessionAnalyticsQuery,
-    SessionEventsDirection, SessionEventsQuery, SessionLookback, SessionSearchQuery, SessionStep,
-    StoreProbe, TableClass, TablePreviewQuery, TurnListFilter,
+    SearchEventsQuery, SearchMcpEventsQuery, SearchStrategyHint, SessionEventsDirection,
+    SessionEventsQuery, SessionSearchQuery, StoreProbe, TableClass, TablePreviewQuery,
 };
 use serde_json::json;
 use tokio::sync::Notify;

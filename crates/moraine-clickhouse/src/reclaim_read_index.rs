@@ -8,9 +8,11 @@
 //! (`sql/036`) and fully rebuildable with `moraine db core-index rebuild`,
 //! which is the documented recovery path if a reclaim here ever proves wrong.
 //!
-//! The probe and the deletes live in one module on the `reclaim_mcp_open`
-//! precedent: a scope's candidate set, its bounding, and the exact predicate
-//! each of its tables receives are one reviewable unit.
+//! The probe and the deletes live in one module — the same shape
+//! [`crate::reclaim_canonical`] uses, and the one the `mcp_open` scopes used
+//! before issue #603 WI-10 retired them with their tables: a scope's
+//! candidate set, its bounding, and the exact predicate each of its tables
+//! receives are one reviewable unit.
 //!
 //! ## What "retired" means here, and why it is publication-aware
 //!
@@ -293,8 +295,8 @@ mod tests {
     }
 
     /// The horizon and page the fixture's generated files are built at. One
-    /// pair, mirroring `reclaim_mcp_open`'s, so the probe golden and the
-    /// agreement check inside the delete golden measure one probe.
+    /// pair, so the probe golden and the agreement check inside the delete
+    /// golden measure one probe.
     const FIXTURE_HORIZON_SECONDS: u64 = 86_400;
     const FIXTURE_PROBE_LIMIT: usize = 512;
 
@@ -304,10 +306,10 @@ mod tests {
     /// `testdata/reclaim_probe/fixture_read_index.sql`.
     ///
     /// Hand-maintained, and therefore checked against the probe at fixture run
-    /// time by the `throwIf` block [`fixture_delete_script`] opens with — the
-    /// same defence `reclaim_mcp_open::FIXTURE_UNITS` carries, for the same
-    /// reason: a delete script generated from a stale list reports "intact"
-    /// for exactly the rows a real run would destroy.
+    /// time by the `throwIf` block [`fixture_delete_script`] opens with, for
+    /// the reason every hand-maintained unit list needs that defence: a delete
+    /// script generated from a stale list reports "intact" for exactly the
+    /// rows a real run would destroy.
     const FIXTURE_UNITS: &[(&str, &str, &str, u32)] = &[("h", "codex", "/live.jsonl", 5)];
 
     /// The statements that make `read_index_delete.sql` abort unless the
@@ -574,8 +576,8 @@ mod tests {
         );
     }
 
-    /// The config→statement half of the horizon path for this scope, the
-    /// mirror of `reclaim_mcp_open`'s. The wiring from
+    /// The config→statement half of the horizon path for this scope. The
+    /// wiring from
     /// `RetentionConfig::derived_horizon_seconds` into `(executor.probe)` is
     /// gated by `reclaim::tests::the_configured_horizon_reaches_the_probe_statement`,
     /// which reads the statement a run actually issued.
@@ -595,10 +597,10 @@ mod tests {
     /// predicate's text, in either direction.
     /// Denomination: the exact predicate string, per table.
     ///
-    /// The equality pin is the `reclaim_mcp_open` G-EXTENT shape, carried over
-    /// with its rationale: every other guard is a `contains`, and `contains`
-    /// cannot see a predicate that *widens* — the widened text still contains
-    /// the narrow text, and the widening is what empties a table.
+    /// The equality pin is deliberate, and its rationale is why every scope
+    /// carries one: every other guard is a `contains`, and `contains` cannot
+    /// see a predicate that *widens* — the widened text still contains the
+    /// narrow text, and the widening is what empties a table.
     ///
     /// MUTATION (executed 2026-07-31): append ` OR source_file = {file}` to
     /// the predicate => FAILS here on all three tables. **Upper bound — the
@@ -665,9 +667,11 @@ mod tests {
     /// The registered executor runs **this** probe and **these** predicates,
     /// and its unit grain is the source generation.
     ///
-    /// MUTATION (executed 2026-07-31): point `ReadIndexGeneration`'s `probe`
-    /// at `reclaim_mcp_open::orphan_candidate_sql` => FAILS on the probe
-    /// equality. **Lower bound.**
+    /// MUTATION (executed 2026-08-01): point `ReadIndexGeneration`'s `probe`
+    /// at `reclaim_canonical::canonical_candidate_sql` — the other registered
+    /// scope's probe, and the nearest live stand-in now that issue #603 WI-10
+    /// retired the `mcp_open` executors this row used to borrow — => FAILS on
+    /// the probe equality. **Lower bound.**
     ///
     /// MUTATION (executed 2026-07-31): map `ReadIndexGeneration` to
     /// `ReclaimUnitGrain::SessionCandidateGeneration` in
@@ -697,11 +701,13 @@ mod tests {
     }
 
     /// The `clickhouse local` fixture's files hold **this build's**
-    /// statements, verbatim — a text comparison, not an execution, exactly as
-    /// `reclaim_mcp_open::tests::the_fixture_files_are_this_builds_statements_verbatim`
-    /// and for the same reason: the fixture is executed by hand
-    /// (`testdata/reclaim_probe/fixture_read_index.sql` carries the recipe),
-    /// and a hand-run fixture that silently measures the previous build is
+    /// statements, verbatim — a text comparison, not an execution, for the
+    /// reason every hand-run fixture needs one: the fixture is executed by
+    /// hand (`testdata/reclaim_probe/fixture_read_index_ddl.sql` carries the
+    /// recipe for both arms — the fresh-stack run against empty tables and the
+    /// populated run — the same way `fixture_canonical_ddl.sql` does for the
+    /// canonical scope), and a hand-run fixture that silently measures the
+    /// previous build is
     /// worse than no fixture. The `reclaim-generation` live gate remains
     /// **unwritten** in this branch.
     ///

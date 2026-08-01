@@ -162,7 +162,6 @@ impl IngestAckObserver {
 #[derive(Default)]
 struct PendingAckBatch {
     event_identity_digests: Vec<String>,
-    projection_session_ids: BTreeSet<String>,
 }
 
 impl PendingAckBatch {
@@ -171,109 +170,16 @@ impl PendingAckBatch {
             .extend(event_rows.iter().filter_map(event_identity_digest));
     }
 
-    /// Projection session ids survive the acknowledgement clear: a session
-    /// deferred by the refresh governor stays pending until its refresh
-    /// actually succeeds, at which point it is removed individually.
     fn clear(&mut self) {
         self.event_identity_digests.clear();
     }
-
-    fn extend_projection(&mut self, session_ids: &BTreeSet<String>) {
-        self.projection_session_ids
-            .extend(session_ids.iter().cloned());
-    }
 }
 
-/// Debounce and failure-backoff state for the live MCP open projection.
-///
-/// Refresh cost is dominated by session history size, so each session's next
-/// refresh is spaced proportionally to its last observed refresh cost: cheap
-/// sessions stay near-realtime while one enormous streaming session cannot
-/// re-snapshot itself at every flush tick. Failures back off per session, so
-/// one persistently unstable session never delays anyone else's refresh.
-#[derive(Default)]
-struct ProjectionGovernor {
-    history: HashMap<String, ProjectionSessionState>,
-    in_flight: BTreeSet<String>,
-}
-
-#[derive(Default, Clone, Copy)]
-struct ProjectionSessionState {
-    last_success: Option<Instant>,
-    last_cost: Duration,
-    consecutive_failures: u32,
-    retry_not_before: Option<Instant>,
-}
-
-struct ProjectionOutcome {
-    session_id: String,
-    cost: Duration,
-    error: Option<String>,
-}
-
-/// Single-flight off-loop refresh worker. The sink loop must never block
-/// behind a multi-minute snapshot of one enormous session, so refreshes run
-/// in their own task and report back through a shared outcome list that the
-/// loop applies on later ticks.
-struct ProjectionWorker {
-    requests: tokio::sync::mpsc::Sender<Vec<String>>,
-    outcomes: Arc<Mutex<Vec<ProjectionOutcome>>>,
-    /// Durable projection debt found by the maintenance task, merged into the
-    /// pending set on the next drain.
-    discovered: Arc<Mutex<BTreeSet<String>>>,
-}
-
-fn spawn_projection_worker(
-    clickhouse: ClickHouseClient,
-    budgets: ValidatedQueryBudgets,
-) -> ProjectionWorker {
-    let (requests, mut rx) = tokio::sync::mpsc::channel::<Vec<String>>(1);
-    let outcomes = Arc::new(Mutex::new(Vec::new()));
-    let completed = Arc::clone(&outcomes);
-    tokio::spawn(async move {
-        while let Some(sessions) = rx.recv().await {
-            for session_id in sessions {
-                let started = Instant::now();
-                // Task-locals do not cross `tokio::spawn`: the worker builds
-                // its own Background envelope, one per session refresh, so a
-                // single enormous session spends its own budget and a
-                // deadline failure is retried by the per-session backoff.
-                let envelope = background_envelope(&budgets, "ingest-projection");
-                let error = envelope
-                    .scope(
-                        clickhouse
-                            .refresh_mcp_open_read_model(std::iter::once(session_id.as_str())),
-                    )
-                    .await
-                    .err()
-                    .map(|error| format!("{error:#}"));
-                completed
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .push(ProjectionOutcome {
-                        session_id,
-                        cost: started.elapsed(),
-                        error,
-                    });
-            }
-        }
-    });
-    ProjectionWorker {
-        requests,
-        outcomes,
-        discovered: Arc::new(Mutex::new(BTreeSet::new())),
-    }
-}
-
-const PROJECTION_REFRESH_MIN_GAP: Duration = Duration::from_secs(2);
-const PROJECTION_REFRESH_MAX_GAP: Duration = Duration::from_secs(600);
-const PROJECTION_REFRESH_COST_FACTOR: u32 = 20;
-const PROJECTION_FAILURE_BACKOFF_FLOOR: Duration = Duration::from_secs(1);
-const PROJECTION_FAILURE_BACKOFF_CEILING: Duration = Duration::from_secs(60);
-const PROJECTION_HISTORY_LIMIT: usize = 4096;
 const THROTTLED_RETRY_DELAY_CEILING: Duration = Duration::from_secs(60);
-const SNAPSHOT_RECLAIM_INTERVAL: Duration = Duration::from_secs(60);
-const PROJECTION_DEBT_PAGE: usize = 256;
+/// Cadence of the background storage-reclaim maintenance tick (issue #603).
+const STORAGE_RECLAIM_INTERVAL: Duration = Duration::from_secs(60);
+/// Page bound the maintenance envelope's statement cap is derived from.
+const MAINTENANCE_PAGE: usize = 256;
 
 /// Fixed statement overhead of one flush cycle: append-fence begin/commit/
 /// block, recovering-append probe, insert-only preflight, checkpoint commit
@@ -289,39 +195,30 @@ const FLUSH_STATEMENT_OVERHEAD: u32 = 64;
 /// stays as the floor for small flushes.
 const FLUSH_STATEMENTS_PER_ITEM: u32 = 4;
 
-/// Fixed statement overhead of one projection-maintenance cycle: the durable
-/// dirty-session page read plus the reclaim bookkeeping statements.
+/// Fixed statement overhead of one storage-reclaim maintenance cycle.
 const MAINTENANCE_STATEMENT_OVERHEAD: u32 = 16;
 
-/// Per-session statement allowance for one maintenance cycle: superseded
-/// snapshot reclaim issues a handful of statements per reclaimed generation,
-/// bounded by the debt page size known at envelope creation.
+/// Per-unit statement allowance for one maintenance cycle, bounded by the
+/// page size known at envelope creation.
 const MAINTENANCE_STATEMENTS_PER_SESSION: u32 = 4;
 
 /// Issue #603 scopes the maintenance tick drives, in order — **and only when
 /// `retention.storage_reclaim_maintenance` is `true`, which it is not by
 /// default.**
 ///
-/// Only the bucket-3 scopes: the two `mcp_open` scopes and the canonical
-/// read-index scope (WI-07) are `default-on`, all three are authorized by the
-/// stock `DerivedOnly` token, and none can reach a bucket-1/2 table —
-/// `ReclaimScope::tables` decides that, and
-/// `the_default_reachable_table_set_excludes_all_user_history` pins it.
-/// `canonical_generation` is deliberately absent and must stay absent: plan
-/// §3.7 runs bucket-1/2 reclamation **only** from the explicit CLI, so an
-/// operator who configures a retention horizon does not thereby hand the
-/// background janitor permission to prune their history.
+/// Only the bucket-3 canonical read-index scope (WI-07): it is `default-on`,
+/// authorized by the stock `DerivedOnly` token, and cannot reach a bucket-1/2
+/// table — `ReclaimScope::tables` decides that, and
+/// `the_default_reachable_table_set_excludes_all_user_history` pins it. (The
+/// two `mcp_open` scopes this list carried were retired with their tables by
+/// WI-10 / migration 041.) `canonical_generation` is deliberately absent and
+/// must stay absent: plan §3.7 runs bucket-1/2 reclamation **only** from the
+/// explicit CLI, so an operator who configures a retention horizon does not
+/// thereby hand the background janitor permission to prune their history.
 ///
 /// Which scopes the janitor *may* drive and whether it drives them at all are
-/// two separate decisions, and only the first belongs in a `const`. This list
-/// stayed a hard-coded constant with no config key while defaulting to on,
-/// which meant a stock install had no way to stop an unattended delete loop
-/// short of editing the binary.
-const STORAGE_RECLAIM_MAINTENANCE_SCOPES: [ReclaimScope; 3] = [
-    ReclaimScope::McpOpenOrphan,
-    ReclaimScope::McpOpenRetiredLineage,
-    ReclaimScope::ReadIndexGeneration,
-];
+/// two separate decisions, and only the first belongs in a `const`.
+const STORAGE_RECLAIM_MAINTENANCE_SCOPES: [ReclaimScope; 1] = [ReclaimScope::ReadIndexGeneration];
 
 /// The batch size one flush cycle's statement cap is derived from
 /// (amendment A7): `FLUSH_STATEMENT_OVERHEAD + FLUSH_STATEMENTS_PER_ITEM *
@@ -350,71 +247,40 @@ impl Drop for MaintenanceSlot {
     }
 }
 
-/// Background projection maintenance, at most one run at a time per sink:
-/// reseed durable projection debt (dirty sessions that outlived a restart or
-/// were dropped from the in-memory pending set) into `discovered`, reclaim
-/// superseded snapshots, then drive the issue #603 ledger for the two
-/// registered `mcp_open` scopes. Mutations are server-side durable, so a lost
-/// response only delays accounting until the next tick.
+/// Background storage-reclaim maintenance (issue #603), at most one run at a
+/// time per sink. Mutations are server-side durable, so a lost response only
+/// delays accounting until the next tick.
 ///
-/// The #603 driver runs **last**, after the projector has had its turn, and
-/// runs under the same single-flight `MaintenanceSlot`. Its first act on every
-/// tick is to re-drive any unit the ledger left unsettled, so the first tick
-/// after a process restart is also the startup recovery pass — there is no
-/// separate startup path to forget to call, which is the shape the existing
-/// reclaimer's stranded children came from.
-fn spawn_projection_maintenance(
+/// The driver's first act on every tick is to re-drive any unit the ledger
+/// left unsettled, so the first tick after a process restart is also the
+/// startup recovery pass — there is no separate startup path to forget to
+/// call, which is the shape the retired v1 reclaimer's stranded children
+/// came from.
+fn spawn_storage_reclaim_maintenance(
     clickhouse: &ClickHouseClient,
     budgets: ValidatedQueryBudgets,
     retention: moraine_config::RetentionConfig,
     in_flight: &Arc<AtomicBool>,
-    discovered: &Arc<Mutex<BTreeSet<String>>>,
 ) {
     if in_flight.swap(true, Ordering::SeqCst) {
         return;
     }
     let clickhouse = clickhouse.clone();
     let slot = MaintenanceSlot(Arc::clone(in_flight));
-    let discovered = Arc::clone(discovered);
     tokio::spawn(async move {
         let _slot = slot;
         // Task-locals do not cross `tokio::spawn`: the janitor builds its own
-        // Background envelope per cycle, cap derived from the debt page size
-        // it can touch (amendment A7).
+        // Background envelope per cycle, cap derived from the page size it
+        // can touch (amendment A7).
         let envelope = background_batch_envelope(
             &budgets,
             "ingest-maintenance",
             MAINTENANCE_STATEMENT_OVERHEAD,
             MAINTENANCE_STATEMENTS_PER_SESSION,
-            PROJECTION_DEBT_PAGE,
+            MAINTENANCE_PAGE,
         );
         envelope
             .scope(async {
-                match clickhouse
-                    .pending_dirty_mcp_open_sessions(PROJECTION_DEBT_PAGE)
-                    .await
-                {
-                    Ok(sessions) if !sessions.is_empty() => {
-                        discovered
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .extend(sessions);
-                    }
-                    Ok(_) => {}
-                    Err(error) => {
-                        warn!("failed to reconcile durable mcp open projection debt: {error:#}");
-                    }
-                }
-                match clickhouse.reclaim_superseded_mcp_open_snapshots().await {
-                    Ok(stats) if stats.total() > 0 => info!(
-                        superseded_generations = stats.superseded_generations,
-                        "reclaimed superseded mcp open snapshot generations"
-                    ),
-                    Ok(_) => {}
-                    Err(error) => {
-                        warn!("superseded mcp open snapshot reclaim failed: {error:#}");
-                    }
-                }
                 // Opt-in. On a stock config the janitor issues no reclaim
                 // statement at all — not the probe, not the ledger read.
                 if retention.storage_reclaim_maintenance {
@@ -443,7 +309,7 @@ fn spawn_projection_maintenance(
                                 redriven,
                                 failed,
                                 abandoned,
-                                "reclaimed legacy open-projection storage (row count is a \
+                                "reclaimed superseded derived storage (row count is a \
                                  claim-time estimate; on-disk delta is merge-deferred)"
                             ),
                             // Hazard H9: "blocked" and "nothing to do" must not be
@@ -485,141 +351,6 @@ fn spawn_projection_maintenance(
     });
 }
 
-fn projection_refresh_gap(cost: Duration) -> Duration {
-    (cost * PROJECTION_REFRESH_COST_FACTOR)
-        .clamp(PROJECTION_REFRESH_MIN_GAP, PROJECTION_REFRESH_MAX_GAP)
-}
-
-fn projection_failure_backoff(consecutive_failures: u32) -> Duration {
-    let shift = consecutive_failures.saturating_sub(1).min(6);
-    (PROJECTION_FAILURE_BACKOFF_FLOOR * (1_u32 << shift)).min(PROJECTION_FAILURE_BACKOFF_CEILING)
-}
-
-impl ProjectionGovernor {
-    fn due_sessions(&self, pending: &BTreeSet<String>, now: Instant) -> BTreeSet<String> {
-        pending
-            .iter()
-            .filter(|session_id| !self.in_flight.contains(session_id.as_str()))
-            .filter(|session_id| {
-                self.history.get(session_id.as_str()).is_none_or(|state| {
-                    state.retry_not_before.is_none_or(|instant| now >= instant)
-                        && state.last_success.is_none_or(|finished_at| {
-                            now.saturating_duration_since(finished_at)
-                                >= projection_refresh_gap(state.last_cost)
-                        })
-                })
-            })
-            .cloned()
-            .collect()
-    }
-
-    fn mark_in_flight(&mut self, sessions: &[String]) {
-        self.in_flight.extend(sessions.iter().cloned());
-    }
-
-    fn apply_outcome(
-        &mut self,
-        outcome: ProjectionOutcome,
-        pending: &mut BTreeSet<String>,
-        now: Instant,
-    ) {
-        self.in_flight.remove(&outcome.session_id);
-        match outcome.error {
-            None => {
-                pending.remove(&outcome.session_id);
-                self.history.insert(
-                    outcome.session_id,
-                    ProjectionSessionState {
-                        last_success: Some(now),
-                        last_cost: outcome.cost,
-                        consecutive_failures: 0,
-                        retry_not_before: None,
-                    },
-                );
-            }
-            Some(error) => {
-                let state = self.history.entry(outcome.session_id.clone()).or_default();
-                state.consecutive_failures = state.consecutive_failures.saturating_add(1);
-                let delay = projection_failure_backoff(state.consecutive_failures);
-                state.retry_not_before = Some(now + delay);
-                warn!(
-                    session_id = outcome.session_id.as_str(),
-                    consecutive_failures = state.consecutive_failures,
-                    retry_in_ms = delay.as_millis() as u64,
-                    "mcp open projection refresh failed; session stays pending: {error}"
-                );
-            }
-        }
-        if self.history.len() > PROJECTION_HISTORY_LIMIT {
-            let mut ages = self
-                .history
-                .values()
-                .filter_map(|state| state.last_success)
-                .collect::<Vec<_>>();
-            ages.sort_unstable();
-            if let Some(cutoff) = ages.get(ages.len() / 2).copied() {
-                self.history.retain(|_, state| {
-                    state
-                        .last_success
-                        .is_none_or(|finished_at| finished_at > cutoff)
-                });
-            }
-        }
-    }
-}
-
-/// Apply finished refreshes and hand the currently due sessions to the
-/// worker. Never blocks and never fails the surrounding loop: canonical rows
-/// are already durable and `mcp_open_dirty_sessions` persists the projection
-/// debt, so a failed or deferred refresh is simply retried on a later tick.
-fn drain_pending_projection(
-    worker: &ProjectionWorker,
-    governor: &mut ProjectionGovernor,
-    pending_ack: &mut PendingAckBatch,
-) {
-    let discovered = std::mem::take(
-        &mut *worker
-            .discovered
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner),
-    );
-    pending_ack.projection_session_ids.extend(discovered);
-    let outcomes = std::mem::take(
-        &mut *worker
-            .outcomes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner),
-    );
-    let now = Instant::now();
-    for outcome in outcomes {
-        governor.apply_outcome(outcome, &mut pending_ack.projection_session_ids, now);
-    }
-    if pending_ack.projection_session_ids.is_empty() {
-        return;
-    }
-    let due = governor.due_sessions(&pending_ack.projection_session_ids, now);
-    if due.is_empty() {
-        return;
-    }
-    // Cheapest sessions first: while one enormous session occupies the
-    // worker for minutes, everyone queued behind it waits, so inexpensive
-    // near-realtime sessions must never queue behind it within one batch.
-    let mut ordered: Vec<String> = due.into_iter().collect();
-    ordered.sort_by_key(|session_id| {
-        governor
-            .history
-            .get(session_id)
-            .map_or(Duration::ZERO, |state| state.last_cost)
-    });
-    match worker.requests.try_send(ordered.clone()) {
-        Ok(()) => governor.mark_in_flight(&ordered),
-        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {}
-        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-            warn!("mcp open projection worker stopped; sessions stay pending");
-        }
-    }
-}
-
 #[derive(Default)]
 struct PendingFlush {
     raw_rows: Vec<Value>,
@@ -629,7 +360,6 @@ struct PendingFlush {
     error_rows: Vec<Value>,
     checkpoint_updates: HashMap<String, Checkpoint>,
     acknowledgements: PendingAckBatch,
-    projection: ProjectionGovernor,
     quarantined_generations: QuarantinedGenerations,
     append_manifest: Option<AppendManifest>,
     append_fence: Option<(String, u64)>,
@@ -1046,10 +776,9 @@ pub(crate) fn spawn_sink_task(
         flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut heartbeat_tick = tokio::time::interval(heartbeat_interval);
         heartbeat_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let mut reclaim_tick = tokio::time::interval(SNAPSHOT_RECLAIM_INTERVAL);
+        let mut reclaim_tick = tokio::time::interval(STORAGE_RECLAIM_INTERVAL);
         reclaim_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let reclaim_in_flight = Arc::new(AtomicBool::new(false));
-        let projection_worker = spawn_projection_worker(clickhouse.clone(), budgets);
         let mut throttling_flush_retries = false;
         let mut throttled_flush_failures: u32 = 0;
 
@@ -1400,26 +1129,16 @@ pub(crate) fn spawn_sink_task(
                             pending_batch_bytes = 0;
                         }
                     }
-                    // Sessions whose canonical rows flushed owe a projection
-                    // pass; the off-loop worker runs it so a huge session can
-                    // never stall intake, and deferred sessions are retried
-                    // here even when no new rows arrive.
-                    drain_pending_projection(
-                        &projection_worker,
-                        &mut pending.projection,
-                        &mut pending.acknowledgements,
-                    );
                 }
                 _ = heartbeat_tick.tick() => {
                     emit_heartbeat(&clickhouse, &budgets, &metrics, &role).await;
                 }
                 _ = reclaim_tick.tick() => {
-                    spawn_projection_maintenance(
+                    spawn_storage_reclaim_maintenance(
                         &clickhouse,
                         budgets,
                         config.retention,
                         &reclaim_in_flight,
-                        &projection_worker.discovered,
                     );
                 }
             }
@@ -2308,7 +2027,6 @@ async fn flush_pending_statements(
         error_rows,
         checkpoint_updates,
         acknowledgements: pending_ack,
-        projection: _,
         quarantined_generations,
         append_manifest: pending_append_manifest,
         append_fence: pending_append_fence,
@@ -2364,8 +2082,7 @@ async fn flush_pending_statements(
     let append_manifest = pending_append_manifest
         .as_mut()
         .expect("pending append manifest was initialized");
-    let projection_all_sources = publication.is_none();
-    let mut live_projection_sources = BTreeSet::<(String, String, String, u32)>::new();
+    let mut live_published_sources = BTreeSet::<(String, String, String, u32)>::new();
     if let Some(publication) = publication {
         let mut has_live_append = false;
         for checkpoint in checkpoint_updates.values() {
@@ -2415,7 +2132,7 @@ async fn flush_pending_statements(
                 }
             };
             if active && published {
-                live_projection_sources.insert((
+                live_published_sources.insert((
                     checkpoint_host.to_string(),
                     transition.source.source_name.clone(),
                     transition.source.source_file.clone(),
@@ -2442,7 +2159,7 @@ async fn flush_pending_statements(
                 source_file.clone(),
                 source_generation,
             );
-            if live_projection_sources.contains(&source_tuple) {
+            if live_published_sources.contains(&source_tuple) {
                 continue;
             }
             let source = SourceKey {
@@ -2455,7 +2172,7 @@ async fn flush_pending_statements(
                 .await
             {
                 Ok(true) => {
-                    live_projection_sources.insert(source_tuple);
+                    live_published_sources.insert(source_tuple);
                     has_live_append = true;
                 }
                 Ok(false) => {}
@@ -2576,37 +2293,6 @@ async fn flush_pending_statements(
         })
         .collect();
 
-    let projected_session_ids = event_rows
-        .iter()
-        .filter(|row| {
-            projection_all_sources
-                || live_projection_sources.contains(&(
-                    row.get("source_host")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
-                    row.get("source_name")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
-                    row.get("source_file")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
-                    row.get("source_generation")
-                        .and_then(Value::as_u64)
-                        .and_then(|value| u32::try_from(value).ok())
-                        .unwrap_or_default(),
-                ))
-        })
-        .filter_map(|row| {
-            row.get("session_id")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        })
-        .filter(|session_id| !session_id.is_empty())
-        .collect::<BTreeSet<_>>();
-
     let flush_result = async {
         if !raw_rows.is_empty() {
             let insert = if publication.is_some() {
@@ -2641,7 +2327,9 @@ async fn flush_pending_statements(
         // `events` is ReplacingMergeTree(event_version) with a PK that is a
         // deterministic function of the record bytes, the whole-block retry
         // collapses to the same logical rows and cannot duplicate canonical
-        // content. Projection debt is enqueued only AFTER this insert commits.
+        // content. Nothing is enqueued for later work here: since issue #603
+        // WI-10 there is no dirty-session queue, and the read indexes this
+        // insert must maintain are maintained by the MVs above, inside it.
         if !event_rows.is_empty() {
             clickhouse
                 .insert_json_rows_sync("events", event_rows)
@@ -2653,7 +2341,6 @@ async fn flush_pending_statements(
             if ack_observer.enabled {
                 pending_ack.extend(event_rows);
             }
-            pending_ack.extend_projection(&projected_session_ids);
             event_rows.clear();
         }
 
@@ -2695,12 +2382,6 @@ async fn flush_pending_statements(
                 .fetch_add(error_rows.len() as u64, Ordering::Relaxed);
             error_rows.clear();
         }
-
-        // MCP open compatibility snapshots are refreshed off-loop by the
-        // projection worker: session ids enter the pending set only after
-        // their canonical rows are durable (Events stage above), and the
-        // dirty-session relation persists the debt across restarts, so
-        // checkpoints never wait on projection.
 
         if !checkpoint_rows.is_empty() {
             commit_checkpoint_updates(
@@ -2900,11 +2581,6 @@ mod tests {
         append_control_response: Arc<Mutex<Option<String>>>,
         current_source_head_response: Arc<Mutex<Option<String>>>,
         live_event_exists: Arc<Mutex<bool>>,
-        /// WI-04: any query whose text contains one of these needles fails with
-        /// a 500, regardless of statement kind. Used to simulate a genuinely
-        /// failing/slow MCP-open projection refresh (whose statements read/write
-        /// only `mcp_open_*` and never `INSERT INTO events`).
-        fail_query_needles: Arc<Mutex<Vec<String>>>,
         /// What `system.disks` reports, when a test wants the free-disk gate
         /// to be reachable. `None` answers the read with an empty body, which
         /// is what every pre-#603 test expects and what leaves
@@ -2943,14 +2619,6 @@ mod tests {
                 .lock()
                 .expect("mock fail_always mutex poisoned")
                 .remove(table);
-        }
-
-        /// Fail every statement whose text contains `needle` (WI-04).
-        fn fail_query_containing(&self, needle: &str) {
-            self.fail_query_needles
-                .lock()
-                .expect("mock fail_query_needles mutex poisoned")
-                .push(needle.to_string());
         }
 
         fn call_count(&self, table: &str) -> usize {
@@ -3082,21 +2750,6 @@ mod tests {
             .lock()
             .expect("mock envelope ids mutex poisoned")
             .push(params.get("query_id").cloned());
-        {
-            let needles = state
-                .fail_query_needles
-                .lock()
-                .expect("mock fail_query_needles mutex poisoned");
-            if let Some(needle) = needles
-                .iter()
-                .find(|needle| query.contains(needle.as_str()))
-            {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("intentional query failure matching {needle}"),
-                );
-            }
-        }
         if query.contains("v_current_ingest_append_control") {
             return (
                 StatusCode::OK,
@@ -3395,50 +3048,20 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn projection_worker_creates_its_own_envelope_inside_the_spawn() {
-        let (clickhouse, state) =
-            spawn_mock_clickhouse_with_state(MockClickHouseState::default()).await;
-        let worker = spawn_projection_worker(clickhouse, test_budgets());
-        worker
-            .requests
-            .send(vec!["session-1".to_string()])
-            .await
-            .expect("projection worker accepts requests");
-
-        timeout(Duration::from_secs(5), async {
-            loop {
-                if !worker
-                    .outcomes
-                    .lock()
-                    .expect("projection outcome mutex poisoned")
-                    .is_empty()
-                {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("projection refresh completes");
-
-        // The refresh ran inside tokio::spawn, where no caller envelope can
-        // reach: every statement must still be enveloped by the worker's own
-        // per-session Background envelope.
-        assert_enveloped(&state, "ingest-projection", None);
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn projection_maintenance_creates_its_own_envelope_inside_the_spawn() {
+    async fn reclaim_maintenance_creates_its_own_envelope_inside_the_spawn() {
         let (clickhouse, state) =
             spawn_mock_clickhouse_with_state(MockClickHouseState::default()).await;
         let in_flight = Arc::new(AtomicBool::new(false));
-        let discovered = Arc::new(Mutex::new(BTreeSet::new()));
-        spawn_projection_maintenance(
+        // Opted in, so the cycle issues statements at all; the stock-config
+        // no-statement half is `the_maintenance_tick_is_opt_in_on_a_stock_config`.
+        spawn_storage_reclaim_maintenance(
             &clickhouse,
             test_budgets(),
-            moraine_config::RetentionConfig::default(),
+            moraine_config::RetentionConfig {
+                storage_reclaim_maintenance: true,
+                ..moraine_config::RetentionConfig::default()
+            },
             &in_flight,
-            &discovered,
         );
 
         timeout(Duration::from_secs(5), async {
@@ -3456,52 +3079,21 @@ mod tests {
     }
 
     /// A statement fragment that appears in **exactly one** scope's #603
-    /// candidate probe and nowhere else in the tree.
-    ///
-    /// Deliberately not `required_heads_fingerprint` or
-    /// `mcp_open_backfill_plans FINAL`: the pre-existing
-    /// `reclaim_superseded_mcp_open_snapshots` path and the projector's own
-    /// plan reads both use those, so a count of them measures the wrong
-    /// janitor. These three aliases exist only inside the #603 probes.
-    const RECLAIM_PROBE_SIGNATURES: [(ReclaimScope, &str); 3] = [
-        (ReclaimScope::McpOpenOrphan, "child.candidate_generation"),
-        (ReclaimScope::McpOpenRetiredLineage, "l.live_fingerprint"),
-        (ReclaimScope::ReadIndexGeneration, "ri_rollup"),
-    ];
+    /// candidate probe and nowhere else in the tree. The `ri_rollup` alias
+    /// exists only inside the read-index probe.
+    const RECLAIM_PROBE_SIGNATURES: [(ReclaimScope, &str); 1] =
+        [(ReclaimScope::ReadIndexGeneration, "ri_rollup")];
 
-    /// Three tests below drive their per-scope loops off
+    /// The tests below drive their per-scope loops off
     /// [`RECLAIM_PROBE_SIGNATURES`], so it is the subject of none of them and
-    /// the expectation of all of them — the same shape that made the janitor's
-    /// scope-list assertion vacuous twice, one level removed. Its arity is
-    /// fixed by its type, but replacing an entry with a duplicate of another
-    /// compiles and leaves every one of those loops checking one scope twice
-    /// while claiming per-scope coverage. So the scopes it names are pinned
-    /// here, once, against literals.
-    ///
-    /// MUTATION (executed 2026-07-28): replace the retired-lineage entry with
-    /// a second `McpOpenOrphan` row => FAILS here. **Lower bound.**
-    ///
-    /// MUTATION (executed 2026-07-31): replace the read-index entry with a
-    /// second `McpOpenOrphan` row => FAILS here on the exact-set assertion.
+    /// the expectation of all of them. The scopes it names are pinned here,
+    /// once, against literals.
     #[test]
     fn the_probe_signature_table_names_every_janitor_scope() {
         assert_eq!(
             RECLAIM_PROBE_SIGNATURES.map(|(scope, _)| scope),
-            [
-                ReclaimScope::McpOpenOrphan,
-                ReclaimScope::McpOpenRetiredLineage,
-                ReclaimScope::ReadIndexGeneration
-            ],
+            [ReclaimScope::ReadIndexGeneration],
         );
-        let fragments = RECLAIM_PROBE_SIGNATURES.map(|(_, fragment)| fragment);
-        for (index, fragment) in fragments.iter().enumerate() {
-            for other in fragments.iter().skip(index + 1) {
-                assert_ne!(
-                    fragment, other,
-                    "two scopes identified by the same fragment identify one scope"
-                );
-            }
-        }
     }
 
     /// Drive one maintenance cycle to completion and hand back what it issued.
@@ -3518,14 +3110,7 @@ mod tests {
     ) -> (MockClickHouseState, Arc<AtomicBool>) {
         let (clickhouse, state) = spawn_mock_clickhouse_with_state(state).await;
         let in_flight = Arc::new(AtomicBool::new(false));
-        let discovered = Arc::new(Mutex::new(BTreeSet::new()));
-        spawn_projection_maintenance(
-            &clickhouse,
-            test_budgets(),
-            retention,
-            &in_flight,
-            &discovered,
-        );
+        spawn_storage_reclaim_maintenance(&clickhouse, test_budgets(), retention, &in_flight);
         timeout(Duration::from_secs(5), async {
             loop {
                 if !in_flight.load(Ordering::SeqCst) {
@@ -3543,15 +3128,9 @@ mod tests {
     ///
     /// This is the V4 default, and it is the whole reason
     /// `retention.storage_reclaim_maintenance` exists. A reclaim delete is a
-    /// server-side mutation that writes `_row_exists` masks *before* any merge
-    /// frees space, and the delete against `mcp_open_events` cannot be
-    /// index-pruned at all — `EXPLAIN indexes = 1` reports `Condition: true`
-    /// and reads every active part and every granule, because `session_id`
-    /// appears in neither that table's partition key nor its primary key
-    /// (sampled 2026-07-28: 452/452 parts, 9 692/9 692 granules over 9.66 GiB;
-    /// the counts move with merges, the shape does not). Defaulting that into
-    /// a 60-second unattended tick on a host with no headroom is how disk
-    /// pressure becomes an outage.
+    /// server-side mutation that writes `_row_exists` masks *before* any
+    /// merge frees space; defaulting that into a 60-second unattended tick on
+    /// a host with no headroom is how disk pressure becomes an outage.
     ///
     /// MUTATION (executed 2026-07-28): change the `Default` impl's
     /// `storage_reclaim_maintenance` to `true` => FAILS here. **Upper bound,
@@ -3559,8 +3138,8 @@ mod tests {
     /// opt-in and shipping a default-on delete loop.**
     ///
     /// MUTATION (executed 2026-07-28): delete the
-    /// `if retention.storage_reclaim_maintenance` guard from
-    /// `spawn_projection_maintenance` => FAILS here. **Lower bound.**
+    /// `if retention.storage_reclaim_maintenance` guard from the maintenance
+    /// task => FAILS here. **Lower bound.**
     #[tokio::test(flavor = "multi_thread")]
     async fn the_maintenance_tick_is_opt_in_on_a_stock_config() {
         let stock = moraine_config::RetentionConfig::default();
@@ -3569,10 +3148,6 @@ mod tests {
             "the unattended reclaim janitor must be off on a stock install"
         );
         let (state, _) = run_maintenance_cycle(stock).await;
-        // Statements only the #603 driver issues. The pre-existing
-        // `reclaim_superseded_mcp_open_snapshots` path has its own
-        // `system.mutations` probe and still runs, so a bare
-        // "FROM system.mutations" count would be measuring the wrong janitor.
         assert_eq!(
             state.query_count("storage_reclaim_ledger"),
             0,
@@ -3596,39 +3171,22 @@ mod tests {
     /// called from the janitor, which is the difference between an executor
     /// that exists and one that runs.
     /// Denomination: the statements the maintenance cycle actually issued,
-    /// **counted per scope**.
-    ///
-    /// The previous revision asserted two *global* counters inside a
-    /// `for scope in …` loop, so both assertions were satisfied by the first
-    /// scope's statements and dropping `McpOpenRetiredLineage` from the list
-    /// left it green — the per-scope claim in its name was vacuous. Here each
-    /// scope is identified by the one statement only it issues: its own
-    /// candidate probe, matched on a fragment unique to that probe.
+    /// **counted per scope**, each scope identified by the one statement only
+    /// it issues: its own candidate probe, matched on a fragment unique to
+    /// that probe.
     ///
     /// MUTATION (executed 2026-07-28): delete the
-    /// `for scope in STORAGE_RECLAIM_MAINTENANCE_SCOPES` loop from
-    /// `spawn_projection_maintenance` => FAILS on both scopes. **Lower
-    /// bound.**
+    /// `for scope in STORAGE_RECLAIM_MAINTENANCE_SCOPES` loop from the
+    /// maintenance task => FAILS on the probe count. **Lower bound.**
     ///
-    /// MUTATION (executed 2026-07-28): replace `McpOpenRetiredLineage` in
-    /// `STORAGE_RECLAIM_MAINTENANCE_SCOPES` with a second `McpOpenOrphan` =>
-    /// FAILS on the retired-lineage probe count. **Width: per scope, which is
-    /// what the name claims.** *Dropping* the entry rather than replacing it
-    /// is not the mutation: the constant is `[ReclaimScope; 3]`, so a
-    /// two-element initialiser does not compile and the assertion is never
-    /// reached. The replacement preserves the arity and is the same defect —
-    /// a janitor that never drives the second scope.
-    ///
-    /// MUTATION (executed 2026-07-28): replace `McpOpenOrphan` in
+    /// MUTATION (executed 2026-07-28; arity-preserving): replace the entry in
     /// `STORAGE_RECLAIM_MAINTENANCE_SCOPES` with
     /// `ReclaimScope::CanonicalGeneration` => FAILS on the bucket assertion:
     /// the background janitor must never reach user history, and plan §3.7
     /// runs bucket-1/2 reclamation only from the explicit CLI. **Upper
-    /// bound.** Again arity-preserving for the same reason — *adding* a fourth
-    /// scope to a `[ReclaimScope; 3]` does not compile, so the recipe that
-    /// says "add" tests nothing.
+    /// bound.**
     #[tokio::test(flavor = "multi_thread")]
-    async fn projection_maintenance_drives_the_storage_reclaim_ledger() {
+    async fn the_maintenance_tick_drives_the_storage_reclaim_ledger() {
         let retention = moraine_config::RetentionConfig {
             storage_reclaim_maintenance: true,
             ..moraine_config::RetentionConfig::default()
@@ -3644,11 +3202,7 @@ mod tests {
         // for the subject changing.
         assert_eq!(
             STORAGE_RECLAIM_MAINTENANCE_SCOPES,
-            [
-                ReclaimScope::McpOpenOrphan,
-                ReclaimScope::McpOpenRetiredLineage,
-                ReclaimScope::ReadIndexGeneration
-            ],
+            [ReclaimScope::ReadIndexGeneration],
             "the janitor's scope list changed; that is a deliberate decision, not a refactor"
         );
         for (scope, signature) in RECLAIM_PROBE_SIGNATURES {
@@ -3688,7 +3242,7 @@ mod tests {
     /// in `STORAGE_RECLAIM_MAINTENANCE_SCOPES` with
     /// `ReclaimScope::CanonicalGeneration` => FAILS here on the probe count
     /// (under this fully-authorized config the run proceeds to the probe) —
-    /// and `projection_maintenance_drives_the_storage_reclaim_ledger` fails
+    /// and `the_maintenance_tick_drives_the_storage_reclaim_ledger` fails
     /// with it on the roster pin. **Lower bound, at the config this scope's
     /// other guards cannot reach: the stock-config test above cannot see
     /// this, because there the authority check refuses before the roster
@@ -3739,7 +3293,7 @@ mod tests {
     /// Denomination: the statements the cycle issued after the disk read.
     ///
     /// `ReclaimTrigger::Maintenance` is a single token in
-    /// `spawn_projection_maintenance`, and it is the entire "Default
+    /// `spawn_storage_reclaim_maintenance`, and it is the entire "Default
     /// configuration on a host with <10 GiB free" safety story: `Operator`
     /// skips the free-disk check, because a person at the console may need to
     /// reclaim *because* the disk is full.
@@ -3758,7 +3312,7 @@ mod tests {
     /// MUTATION (executed 2026-07-28): raise the mock's free space above
     /// `RECLAIM_MIN_FREE_BYTES` => FAILS here, which is the point: this test
     /// distinguishes "declined for the disk" from "did nothing", and
-    /// `projection_maintenance_drives_the_storage_reclaim_ledger` above holds
+    /// `the_maintenance_tick_drives_the_storage_reclaim_ledger` above holds
     /// the other side. **Width.**
     #[tokio::test(flavor = "multi_thread")]
     async fn the_unattended_janitor_declines_to_reclaim_on_a_nearly_full_disk() {
@@ -3804,12 +3358,12 @@ mod tests {
     /// reached the probe statement.
     /// Denomination: the `toIntervalSecond(…)` literal on the issued probes.
     ///
-    /// `spawn_projection_maintenance` passing `RetentionConfig::default()`
-    /// instead of `&retention` was green everywhere: the two bucket-3 scopes
-    /// are authorized by the stock `DerivedOnly` token either way, so the only
+    /// `spawn_storage_reclaim_maintenance` passing `RetentionConfig::default()`
+    /// instead of `&retention` was green everywhere: the bucket-3 scope is
+    /// authorized by the stock `DerivedOnly` token either way, so the only
     /// observable difference is the safety horizon — and the horizon is the
-    /// only thing separating the orphan collector from a prepare in flight,
-    /// since `prepare` writes children first and the header last. An operator
+    /// only thing separating the reclaimer from a source generation whose
+    /// supersession is still settling. An operator
     /// who widens the horizon because their host publishes slowly would have
     /// been silently ignored by the unattended tick and only the unattended
     /// tick.
@@ -4122,75 +3676,6 @@ mod tests {
         "Code: 117. DB::Exception: Size of JSON object at position 104890103 is extremely large. \
          Expected not greater than 10485760 bytes, but current is 104890103 bytes per row. \
          While executing ParallelParsingBlockInputFormat.";
-
-    #[test]
-    fn projection_governor_debounces_by_cost_and_isolates_failures() {
-        let mut governor = ProjectionGovernor::default();
-        let mut pending: BTreeSet<String> = ["cheap", "huge", "failing"]
-            .into_iter()
-            .map(str::to_string)
-            .collect();
-        let now = Instant::now();
-
-        // Unknown sessions are immediately due; in-flight sessions are not.
-        assert_eq!(governor.due_sessions(&pending, now).len(), 3);
-        governor.mark_in_flight(&["huge".to_string()]);
-        assert!(!governor.due_sessions(&pending, now).contains("huge"));
-
-        // Success removes the session from pending and schedules the next
-        // refresh proportionally to its cost, clamped to the ceiling.
-        governor.apply_outcome(
-            ProjectionOutcome {
-                session_id: "huge".to_string(),
-                cost: Duration::from_secs(60),
-                error: None,
-            },
-            &mut pending,
-            now,
-        );
-        assert!(!pending.contains("huge"));
-        pending.insert("huge".to_string());
-        assert!(!governor.due_sessions(&pending, now).contains("huge"));
-        assert!(governor
-            .due_sessions(&pending, now + Duration::from_secs(601))
-            .contains("huge"));
-
-        // Cheap sessions come due again at the floor.
-        governor.apply_outcome(
-            ProjectionOutcome {
-                session_id: "cheap".to_string(),
-                cost: Duration::from_millis(10),
-                error: None,
-            },
-            &mut pending,
-            now,
-        );
-        pending.insert("cheap".to_string());
-        assert!(!governor.due_sessions(&pending, now).contains("cheap"));
-        assert!(governor
-            .due_sessions(&pending, now + Duration::from_secs(2))
-            .contains("cheap"));
-
-        // A failure backs off only the failing session and keeps it pending.
-        governor.mark_in_flight(&["failing".to_string()]);
-        governor.apply_outcome(
-            ProjectionOutcome {
-                session_id: "failing".to_string(),
-                cost: Duration::ZERO,
-                error: Some("refresh failed".to_string()),
-            },
-            &mut pending,
-            now,
-        );
-        assert!(pending.contains("failing"));
-        assert!(!governor.due_sessions(&pending, now).contains("failing"));
-        assert!(governor
-            .due_sessions(&pending, now + Duration::from_secs(2))
-            .contains("failing"));
-        assert!(governor
-            .due_sessions(&pending, now + Duration::from_secs(2))
-            .contains("cheap"));
-    }
 
     #[tokio::test]
     async fn failed_flush_throttles_sink_consumption() {
@@ -5499,7 +4984,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn unpublished_replay_batch_does_not_schedule_mcp_projection_refresh() {
+    async fn unpublished_replay_batch_flushes_without_touching_retired_projection() {
         let state = MockClickHouseState::default();
         state.set_current_source_head_response(json!({
             "source_generation": 1,
@@ -5571,13 +5056,9 @@ mod tests {
 
         assert_eq!(mock_state.rows("events").len(), 1);
         assert_eq!(
-            mock_state.query_count("mcp_open_backfill_plans"),
+            mock_state.query_count("mcp_open"),
             0,
-            "an unpublished replacement chunk must not invoke the MCP projector"
-        );
-        assert!(
-            pending.acknowledgements.projection_session_ids.is_empty(),
-            "unpublished sources must not enqueue projection debt"
+            "no statement may reference the retired v1 projection"
         );
     }
 
@@ -6315,22 +5796,19 @@ mod tests {
 
     // ---- WI-04 (issue #598): retry-boundary + MV failure-mode verification ----
     //
-    // Spec §2 guarantee (issue-598.md:38-45, 155): a slow or failed projection —
-    // and, after migration 036, a firing read-index materialized view — must
+    // Spec §2 guarantee (issue #598 §2): a failed downstream stage —
+    // including a firing migration-036 read-index materialized view — must
     // never cause an already-committed canonical `events` batch to be inserted a
     // second time. The retry boundary that enforces this lives in
     // `flush_pending_statements`: each stage clears its own buffer immediately
     // after ClickHouse confirms its insert (e.g. `event_rows.clear()` right after
     // the Events stage), so a failure in any *later* stage retries only the
-    // unfinished tables. The MCP-open projection is strictly downstream and
-    // off-loop (`spawn_projection_worker` -> `refresh_mcp_open_read_model`, which
-    // only ever writes `mcp_open_*` relations), so it can never re-enter the flush
-    // path nor re-insert `events`. These four tests pin that boundary end-to-end.
-    // The ClickHouse-level idempotency of the whole-block retry (ReplacingMergeTree
-    // collapse of `events` and the RMT/AggregatingMergeTree 036 index targets under
-    // the deterministic `sort_time` key) is a live property exercised by the
-    // `canonical-index-backfill` sandbox mode (WI-03/WI-10); these unit tests pin
-    // the sink-observable contract that feeds it.
+    // unfinished tables. These tests pin that boundary end-to-end. The
+    // ClickHouse-level idempotency of the whole-block retry (ReplacingMergeTree
+    // collapse of `events` and the RMT/AggregatingMergeTree 036 index targets
+    // under the deterministic `sort_time` key) is a live property exercised by
+    // the `canonical-index-backfill` sandbox mode; these unit tests pin the
+    // sink-observable contract that feeds it.
 
     #[tokio::test(flavor = "multi_thread")]
     async fn downstream_stage_failure_never_reinserts_canonical_events() {
@@ -6385,73 +5863,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn failing_projection_refresh_does_not_reinsert_canonical_events() {
-        // Commit a canonical events batch, then drive the off-loop projection
-        // worker against a backend that fails the projection's very first read. A
-        // genuinely failing/slow projection refresh must not re-insert `events`.
-        let state = MockClickHouseState::default();
-        // The projection's first statement is the backfill-facts CTE; fail it so
-        // the refresh returns an error. That statement is a SELECT over
-        // `mcp_open_*` / `events FINAL` and never issues `INSERT INTO events`.
-        state.fail_query_containing("requested_events");
-        let (clickhouse, mock_state) = spawn_mock_clickhouse_with_state(state).await;
-        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
-        let metrics = Arc::new(Metrics::default());
-
-        let mut pending = PendingFlush {
-            event_rows: vec![json!({
-                "event_uid": "evt-1",
-                "event_version": 1,
-                "session_id": "session-a",
-            })],
-            ..PendingFlush::default()
-        };
-        assert!(flush_pending(&clickhouse, &checkpoints, &metrics, &mut pending).await);
-        assert_eq!(mock_state.call_count("events"), 1);
-        assert!(
-            pending
-                .acknowledgements
-                .projection_session_ids
-                .contains("session-a"),
-            "the durable events batch enqueues its session for off-loop projection",
-        );
-
-        let worker = spawn_projection_worker(clickhouse, test_budgets());
-        worker
-            .requests
-            .send(vec!["session-a".to_string()])
-            .await
-            .expect("projection worker accepts requests");
-
-        let outcome_error = timeout(Duration::from_secs(5), async {
-            loop {
-                if let Some(error) = worker
-                    .outcomes
-                    .lock()
-                    .expect("projection outcome mutex poisoned")
-                    .first()
-                    .map(|outcome| outcome.error.clone())
-                {
-                    return error;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("projection refresh reports an outcome");
-
-        assert!(
-            outcome_error.is_some(),
-            "the projection refresh must genuinely fail in this scenario",
-        );
-        assert_eq!(
-            mock_state.call_count("events"),
-            1,
-            "a failing projection refresh must NOT re-insert canonical events",
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
     async fn mv_failure_surfaces_as_events_insert_failure_and_whole_block_retries() {
         // Migration 036 adds three read-index materialized views that fire inside
         // the `INSERT INTO events` statement. With `materialized_views_ignore_errors`
@@ -6489,10 +5900,6 @@ mod tests {
         assert!(!first, "an MV failure fails the events insert loudly");
         assert_eq!(mock_state.call_count("events"), 1);
         assert_eq!(pending.event_rows.len(), 1, "the whole block stays pending");
-        assert!(
-            pending.acknowledgements.projection_session_ids.is_empty(),
-            "projection debt is enqueued only after the events insert is durable",
-        );
 
         let second = flush_pending(&clickhouse, &checkpoints, &metrics, &mut pending).await;
         assert!(second, "the retry re-inserts the whole block");
@@ -6502,13 +5909,6 @@ mod tests {
         assert_eq!(
             durable[0], event_row,
             "the retry re-sends byte-identical rows: deterministic PK => RMT collapse",
-        );
-        assert!(
-            pending
-                .acknowledgements
-                .projection_session_ids
-                .contains("session-a"),
-            "projection debt is enqueued once the events insert commits",
         );
     }
 

@@ -2144,7 +2144,7 @@ mod tests {
                 oldest_retained: Some("2026-02-20T14:16:45Z".to_string()),
             },
             moraine_conversations::StorageTableReport {
-                name: "mcp_open_turns".to_string(),
+                name: "mcp_event_navigation".to_string(),
                 class: Some(moraine_conversations::TableClass::Derived),
                 rows: 234_694,
                 compressed_bytes: 14_356_000_000,
@@ -2510,8 +2510,6 @@ mod tests {
         assert_eq!(calls.list_table_summaries, 2);
         assert_eq!(calls.list_web_searches, vec![1_000]);
         assert_eq!(calls.analytics_series, vec![AnalyticsRange::SevenDays]);
-        // The feed reads the shared discovery operation, never the projector.
-        assert!(calls.list_session_analytics.is_empty());
         let (filter, page) = calls
             .list_mcp_sessions
             .first()
@@ -3331,7 +3329,6 @@ mod tests {
                 turns,
                 completed: false,
                 terminal_event_uid: None,
-                snapshot: None,
             },
             continuation,
         }
@@ -3415,12 +3412,10 @@ mod tests {
             Some(&sample_continuation(2))
         );
         // The canonical reader, and nothing else.
-        assert!(calls.get_mcp_session.is_empty());
         assert!(calls.get_conversation.is_empty());
         assert!(calls.list_turns.is_empty());
         assert!(calls.list_session_events.is_empty());
         assert!(calls.list_mcp_sessions.is_empty());
-        assert!(calls.list_session_analytics.is_empty());
     }
 
     #[tokio::test]

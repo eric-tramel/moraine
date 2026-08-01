@@ -257,9 +257,9 @@ read_rows = 500000000
 read_bytes = 10737418240    # 10 GiB
 statement_cap = 256
 
-# background: ingest publication inspections, projection refreshes, janitor
-# work. The 600s deadline matches the projection debounce ceiling so the
-# worst-case legitimate projection refresh fits in one budget.
+# background: ingest publication inspections and janitor work. The 600s
+# deadline is sized for the janitor's largest legitimate single unit, so a
+# healthy background pass fits in one budget instead of retrying forever.
 [query_budgets.background]
 deadline_seconds = 600.0
 memory_bytes = 2147483648   # 2 GiB

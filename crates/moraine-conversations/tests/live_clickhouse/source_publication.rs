@@ -1,11 +1,11 @@
 use super::OwnedDatabaseName;
 use anyhow::{bail, Context, Result};
-use moraine_clickhouse::{ClickHouseClient, McpOpenHostRevision, McpOpenPublicationRequest};
+use moraine_clickhouse::ClickHouseClient;
 use moraine_conversations::{
     AnalyticsRange, ClickHouseConversationRepository, ConversationListFilter, ConversationListSort,
     ConversationRepository, FileAttentionQuery, McpEventType, McpSessionListFilter, PageRequest,
     RepoConfig, RepoError, SearchEventsQuery, SearchMcpEventsQuery, SearchStrategyHint,
-    SessionAnalyticsQuery, SessionEventsDirection, SessionEventsQuery, SessionLookback,
+    SessionEventsDirection, SessionEventsQuery,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -208,8 +208,6 @@ impl ExpectedPublicationModel {
 #[derive(Clone, Copy, Debug)]
 struct DurableBoundaryState {
     model: ExpectedPublicationModel,
-    legacy_model: ExpectedPublicationModel,
-    prepared_header_count: Option<u64>,
     final_checkpoint_durable: bool,
     final_readiness_durable: bool,
 }
@@ -1250,9 +1248,6 @@ fn publication_attention_query() -> FileAttentionQuery {
     }
 }
 
-// `list_session_analytics` is deprecated pending projector retirement;
-// these suites are the callers that keep it covered until it is deleted.
-#[allow(deprecated)]
 async fn assert_live_repository_surfaces(
     repository: &ClickHouseConversationRepository,
     boundary: &str,
@@ -1313,41 +1308,24 @@ async fn assert_live_repository_surfaces(
         &expected_sessions,
     )?;
 
-    let monitor_sessions = repository
-        .list_session_analytics(SessionAnalyticsQuery {
-            lookback: SessionLookback::All,
-            limit: 100,
-        })
+    // The projector-backed analytics listing retired with the projection
+    // (issue #603 WI-10); the same publication-boundary claim — the changed
+    // session serves exactly its live generation's content — reads through
+    // the canonical event feed.
+    let changed_texts = session_event_texts(repository, "changed-session")
         .await
-        .with_context(|| format!("{boundary}: monitor session analytics failed"))?;
-    assert_session_id_set(
-        &format!("{boundary}: monitor session analytics"),
-        monitor_sessions
-            .iter()
-            .map(|session| session.summary.session_id.clone()),
-        &expected_sessions,
-    )?;
-    let changed = monitor_sessions
-        .iter()
-        .find(|session| session.summary.session_id == "changed-session")
-        .with_context(|| format!("{boundary}: changed-session analytics row is missing"))?;
-    let analytics_event_uids = changed
-        .turns
-        .iter()
-        .flat_map(|turn| {
-            turn.steps.iter().filter_map(|step| match step {
-                moraine_conversations::SessionStep::Assistant { text, .. } => Some(text.as_str()),
-                _ => None,
-            })
-        })
-        .collect::<Vec<_>>();
+        .with_context(|| format!("{boundary}: changed-session event feed failed"))?;
     let expected_changed_text = match model {
         ExpectedPublicationModel::GenerationOne => "beforeterm commonterm",
         ExpectedPublicationModel::GenerationTwo => "replacementterm commonterm",
     };
-    if !analytics_event_uids.contains(&expected_changed_text) || changed.summary.total_events != 2 {
+    if !changed_texts
+        .iter()
+        .any(|(_, text)| text.contains(expected_changed_text))
+        || changed_texts.len() != 2
+    {
         bail!(
-            "{boundary}: changed-session analytics was not a complete {:?} model: {changed:?}",
+            "{boundary}: changed-session event feed was not a complete {:?} model: {changed_texts:?}",
             model
         );
     }
@@ -1702,54 +1680,6 @@ async fn assert_durable_boundary_state(
     boundary: &str,
     state: DurableBoundaryState,
 ) -> Result<()> {
-    let candidate_readiness_count = scalar_u64(
-        clickhouse,
-        database,
-        &format!(
-            "SELECT toUInt64(count()) AS value \
-             FROM `{}`.`v_current_mcp_open_generation_readiness` \
-             WHERE candidate_publication_id = 'source-publication-g2' \
-               AND source_host = '{}' AND source_name = '{}' AND source_file = '{}' \
-               AND source_generation = 2 AND ready = 1 AND block_reason = '' \
-               AND affected_session_count = 6 AND prepared_session_count = 6 \
-               AND tombstone_count = 1 \
-             FORMAT JSONEachRow",
-            database.as_str(),
-            HOST_A,
-            SOURCE,
-            SOURCE_FILE,
-        ),
-    )
-    .await?;
-    let candidate_header_count = scalar_u64(
-        clickhouse,
-        database,
-        &format!(
-            "SELECT toUInt64(count()) AS value \
-             FROM `{}`.`v_mcp_open_publication_headers` \
-             WHERE candidate_publication_id = 'source-publication-g2' \
-             FORMAT JSONEachRow",
-            database.as_str(),
-        ),
-    )
-    .await?;
-    match state.prepared_header_count {
-        Some(expected) => {
-            if candidate_readiness_count != 1 || candidate_header_count != expected {
-                bail!(
-                    "{boundary}: reconstructed compatibility preparation was incomplete: readiness={candidate_readiness_count}, headers={candidate_header_count}, expected_headers={expected}"
-                );
-            }
-        }
-        None => {
-            if candidate_readiness_count != 0 || candidate_header_count != 0 {
-                bail!(
-                    "{boundary}: reconstructed runtime observed compatibility rows before preparation: readiness={candidate_readiness_count}, headers={candidate_header_count}"
-                );
-            }
-        }
-    }
-
     let physical_event_count = scalar_u64(
         clickhouse,
         database,
@@ -1887,38 +1817,6 @@ async fn assert_durable_boundary_state(
     Ok(())
 }
 
-async fn assert_legacy_compatibility_pointer(
-    clickhouse: &ClickHouseClient,
-    database: &OwnedDatabaseName,
-    boundary: &str,
-    expected: ExpectedPublicationModel,
-) -> Result<()> {
-    let (expected_uid, hidden_uid) = match expected {
-        ExpectedPublicationModel::GenerationOne => (CHANGED_UIDS.at(1), CHANGED_UIDS.at(2)),
-        ExpectedPublicationModel::GenerationTwo => (CHANGED_UIDS.at(2), CHANGED_UIDS.at(1)),
-    };
-    let query_count = |event_uid: &str| {
-        format!(
-            "SELECT toUInt64(count()) AS value \
-             FROM `{database}`.`mcp_open_sessions` AS sessions FINAL \
-             INNER JOIN `{database}`.`mcp_open_events` AS events FINAL \
-               ON events.session_id = sessions.session_id \
-              AND events.slot = sessions.slot AND events.generation = sessions.generation \
-             WHERE sessions.session_id = 'changed-session' AND events.event_uid = '{event_uid}' \
-             FORMAT JSONEachRow",
-            database = database.as_str(),
-        )
-    };
-    let expected_count = scalar_u64(clickhouse, database, &query_count(expected_uid)).await?;
-    let hidden_count = scalar_u64(clickhouse, database, &query_count(hidden_uid)).await?;
-    if expected_count != 1 || hidden_count != 0 {
-        bail!(
-            "{boundary}: legacy compatibility pointer was mixed: expected={expected_count}, hidden={hidden_count}"
-        );
-    }
-    Ok(())
-}
-
 async fn assert_complete_after_reconstruction(
     durable_client: &ClickHouseClient,
     database: &OwnedDatabaseName,
@@ -1930,8 +1828,6 @@ async fn assert_complete_after_reconstruction(
     // all boundary observations are made through this reconstructed runtime.
     let (restarted_client, restarted_repository) = reconstruct_reader_runtime(durable_client)?;
     assert_durable_boundary_state(&restarted_client, database, boundary, state).await?;
-    assert_legacy_compatibility_pointer(&restarted_client, database, boundary, state.legacy_model)
-        .await?;
 
     let head = current_head(&restarted_client, database).await?;
     if head.source_generation != state.model.source_generation()
@@ -1990,47 +1886,49 @@ async fn assert_complete_after_reconstruction(
         ),
     };
     if restarted_repository
-        .get_mcp_event(expected_changed)
+        .canonical_open_event(expected_changed)
         .await?
         .is_none()
     {
         bail!("{boundary}: reconstructed runtime omitted the expected changed event");
     }
     if restarted_repository
-        .get_mcp_event(hidden_changed)
+        .canonical_open_event(hidden_changed)
         .await?
         .is_some()
     {
         bail!("{boundary}: reconstructed runtime mixed old and new changed events");
     }
     if restarted_repository
-        .get_mcp_event(expected_stable)
+        .canonical_open_event(expected_stable)
         .await?
         .is_none()
         || restarted_repository
-            .get_mcp_event(hidden_stable)
+            .canonical_open_event(hidden_stable)
             .await?
             .is_some()
     {
         bail!("{boundary}: reconstructed runtime observed a mixed stable-event state");
     }
     if restarted_repository
-        .get_mcp_event(expected_empty)
+        .canonical_open_event(expected_empty)
         .await?
         .is_none()
         || restarted_repository
-            .get_mcp_event(hidden_empty)
+            .canonical_open_event(hidden_empty)
             .await?
             .is_some()
     {
         bail!("{boundary}: reconstructed runtime observed a mixed empty-event state");
     }
-    let new_event = restarted_repository.get_mcp_event(NEW_UIDS.at(2)).await?;
+    let new_event = restarted_repository
+        .canonical_open_event(NEW_UIDS.at(2))
+        .await?;
     if new_event.is_some() != expect_new {
         bail!("{boundary}: reconstructed runtime observed a mixed new-event state");
     }
     let deleted_event = restarted_repository
-        .get_mcp_event(DELETED_UIDS.at(1))
+        .canonical_open_event(DELETED_UIDS.at(1))
         .await?;
     if deleted_event.is_some() != expect_deleted {
         bail!("{boundary}: reconstructed runtime observed a mixed deletion state");
@@ -2088,8 +1986,6 @@ async fn assert_complete_after_reconstruction(
             "boundary": boundary,
             "observed_generation": head.source_generation,
             "observed_publication_revision": head.publication_revision,
-            "legacy_generation": state.legacy_model.source_generation(),
-            "candidate_prepared": state.prepared_header_count.is_some(),
             "final_checkpoint_durable": state.final_checkpoint_durable,
             "final_readiness_durable": state.final_readiness_durable,
         })
@@ -2711,11 +2607,16 @@ pub(super) async fn run(
     let repository =
         ClickHouseConversationRepository::new(clickhouse.clone(), RepoConfig::default());
     clickhouse
-        .backfill_mcp_open_read_model()
+        .backfill_canonical_read_indexes(
+            true,
+            &super::live_fixture_budget(),
+            &super::default_interactive_budget(),
+            |_| {},
+        )
         .await
-        .context("failed to build initial MCP compatibility projection")?;
+        .context("failed to build the canonical read indexes")?;
     if repository
-        .get_mcp_event(DELETED_UIDS.at(1))
+        .canonical_open_event(DELETED_UIDS.at(1))
         .await?
         .is_none()
     {
@@ -2766,19 +2667,6 @@ pub(super) async fn run(
         )
         .await
         .context("failed to merge cross-host UID fixture")?;
-    clickhouse
-        .request_text(
-            &format!(
-                "OPTIMIZE TABLE `{}`.`mcp_open_events` FINAL",
-                database.as_str()
-            ),
-            None,
-            Some(database.as_str()),
-            false,
-            None,
-        )
-        .await
-        .context("failed to merge cross-host MCP event fixture")?;
     let cross_host_count = scalar_u64(
         clickhouse,
         database,
@@ -2793,43 +2681,11 @@ pub(super) async fn run(
     if cross_host_count != 2 {
         bail!("cross-host identical UIDs collapsed after FINAL: {cross_host_count}");
     }
-    let cross_host_mcp_count = scalar_u64(
-        clickhouse,
-        database,
-        &format!(
-            "SELECT toUInt64(count()) AS value FROM `{}`.`mcp_open_events` FINAL \
-             WHERE event_uid = '{}' AND session_id = 'cross-host-session' \
-             FORMAT JSONEachRow",
-            database.as_str(),
-            CROSS_HOST_UID_G1,
-        ),
-    )
-    .await?;
-    if cross_host_mcp_count != 2 {
-        bail!("cross-host MCP events collapsed after OPTIMIZE FINAL: {cross_host_mcp_count}");
-    }
-    let cross_host_mcp_content = scalar_u64(
-        clickhouse,
-        database,
-        &format!(
-            "SELECT toUInt64(countIf(\
-               (source_host = '{}' AND text_content = 'hostalphaterm') OR \
-               (source_host = '{}' AND text_content = 'hostbetaterm')\
-             )) AS value FROM `{}`.`mcp_open_events` FINAL \
-             WHERE event_uid = '{}' AND session_id = 'cross-host-session' \
-             FORMAT JSONEachRow",
-            HOST_A,
-            HOST_B,
-            database.as_str(),
-            CROSS_HOST_UID_G1,
-        ),
-    )
-    .await?;
-    if cross_host_mcp_content != 2 {
-        bail!("cross-host MCP projection mixed host-qualified content");
-    }
+    // The v1 projection's per-host rows retired with the projection; the
+    // canonical locator keeps one row per (event_uid, source_host), and the
+    // reader's host-order determinism is asserted through the open below.
     let deterministic_open = repository
-        .get_mcp_event(CROSS_HOST_UID_G1)
+        .canonical_open_event(CROSS_HOST_UID_G1)
         .await?
         .context("cross-host MCP event UID did not resolve")?;
     if deterministic_open.event.text_content != "hostalphaterm" {
@@ -2938,8 +2794,6 @@ pub(super) async fn run(
         "physical_rows_durable",
         DurableBoundaryState {
             model: ExpectedPublicationModel::GenerationOne,
-            legacy_model: ExpectedPublicationModel::GenerationOne,
-            prepared_header_count: None,
             final_checkpoint_durable: false,
             final_readiness_durable: false,
         },
@@ -2969,53 +2823,9 @@ pub(super) async fn run(
     )
     .await?;
 
-    let compatibility_writer = reconstruct_clickhouse_client(clickhouse)?;
-    let readiness = compatibility_writer
-        .prepare_mcp_open_publication(&McpOpenPublicationRequest {
-            candidate_publication_id: "source-publication-g2".to_string(),
-            operation_id: "prepare-primary-g2".to_string(),
-            publisher_id: "source-publication-live-test".to_string(),
-            source_host: HOST_A.to_string(),
-            source_name: SOURCE.to_string(),
-            source_file: SOURCE_FILE.to_string(),
-            previous_source_generation: Some(1),
-            source_generation: 2,
-            publication_revision: 4,
-            captured_host_revisions: vec![
-                McpOpenHostRevision {
-                    source_host: HOST_A.to_string(),
-                    publication_revision: 3,
-                },
-                McpOpenHostRevision {
-                    source_host: HOST_B.to_string(),
-                    publication_revision: 2,
-                },
-            ],
-        })
-        .await
-        .context("failed to prepare replacement MCP compatibility candidates")?;
-    drop(compatibility_writer);
-    if readiness.affected_session_count != 6
-        || readiness.prepared_session_count != 6
-        || readiness.tombstone_count != 1
-    {
-        bail!("incomplete replacement compatibility readiness: {readiness:?}");
-    }
-
-    assert_complete_after_reconstruction(
-        clickhouse,
-        database,
-        "compatibility_preparation_durable",
-        DurableBoundaryState {
-            model: ExpectedPublicationModel::GenerationOne,
-            legacy_model: ExpectedPublicationModel::GenerationOne,
-            prepared_header_count: Some(6),
-            final_checkpoint_durable: false,
-            final_readiness_durable: false,
-        },
-    )
-    .await?;
-
+    // The v1 compatibility bridge's prepare step retired with the projection
+    // (issue #603 WI-10): the canonical protocol's boundaries are the final
+    // checkpoint, the final readiness, and the head publish alone.
     let checkpoint_writer = reconstruct_clickhouse_client(clickhouse)?;
     persist_final_checkpoint(&checkpoint_writer, database).await?;
     drop(checkpoint_writer);
@@ -3025,8 +2835,6 @@ pub(super) async fn run(
         "final_checkpoint_durable",
         DurableBoundaryState {
             model: ExpectedPublicationModel::GenerationOne,
-            legacy_model: ExpectedPublicationModel::GenerationOne,
-            prepared_header_count: Some(6),
             final_checkpoint_durable: true,
             final_readiness_durable: false,
         },
@@ -3042,23 +2850,11 @@ pub(super) async fn run(
         "final_readiness_durable",
         DurableBoundaryState {
             model: ExpectedPublicationModel::GenerationOne,
-            legacy_model: ExpectedPublicationModel::GenerationOne,
-            prepared_header_count: Some(6),
             final_checkpoint_durable: true,
             final_readiness_durable: true,
         },
     )
     .await?;
-
-    let prehead_activation_client = reconstruct_clickhouse_client(clickhouse)?;
-    if prehead_activation_client
-        .activate_mcp_open_publication("source-publication-g2")
-        .await
-        .context("failed to test compatibility activation before the source head")?
-    {
-        bail!("compatibility candidate activated before its required source head was current");
-    }
-    drop(prehead_activation_client);
 
     let as_of_before = current_head(clickhouse, database).await?;
     let history_before = logical_head_history_count(clickhouse, database).await?;
@@ -3117,11 +2913,9 @@ pub(super) async fn run(
     assert_complete_after_reconstruction(
         clickhouse,
         database,
-        "source_head_durable_before_compatibility_activation",
+        "source_head_durable",
         DurableBoundaryState {
             model: ExpectedPublicationModel::GenerationTwo,
-            legacy_model: ExpectedPublicationModel::GenerationOne,
-            prepared_header_count: Some(6),
             final_checkpoint_durable: true,
             final_readiness_durable: true,
         },
@@ -3168,43 +2962,15 @@ pub(super) async fn run(
         "source_head_response_loss_retry_durable",
         DurableBoundaryState {
             model: ExpectedPublicationModel::GenerationTwo,
-            legacy_model: ExpectedPublicationModel::GenerationOne,
-            prepared_header_count: Some(6),
             final_checkpoint_durable: true,
             final_readiness_durable: true,
         },
     )
     .await?;
 
-    // Compatibility activation itself runs through another fresh client,
-    // modeling repair after a writer restart in the post-head window.
-    let (activation_client, activation_repository) = reconstruct_reader_runtime(clickhouse)?;
-    drop(activation_repository);
-    if !activation_client
-        .activate_mcp_open_publication("source-publication-g2")
-        .await
-        .context("failed to activate replacement MCP compatibility candidate")?
-    {
-        bail!("prepared MCP compatibility candidate was not activated");
-    }
-    drop(activation_client);
-
-    assert_complete_after_reconstruction(
-        clickhouse,
-        database,
-        "compatibility_activation_durable",
-        DurableBoundaryState {
-            model: ExpectedPublicationModel::GenerationTwo,
-            legacy_model: ExpectedPublicationModel::GenerationTwo,
-            prepared_header_count: Some(6),
-            final_checkpoint_durable: true,
-            final_readiness_durable: true,
-        },
-    )
-    .await?;
     assert_monitor_http_surfaces(
         clickhouse,
-        "compatibility_activation_durable",
+        "source_head_durable",
         ExpectedPublicationModel::GenerationTwo,
     )
     .await?;
@@ -3240,18 +3006,21 @@ pub(super) async fn run(
     if stale_stable_count != 0 {
         bail!("old-generation stable event handle remained live: {stale_stable_count}");
     }
-    if repository.get_mcp_event(STABLE_UIDS.at(1)).await?.is_some() {
+    if repository
+        .canonical_open_event(STABLE_UIDS.at(1))
+        .await?
+        .is_some()
+    {
         bail!("unchanged replay left the generation-one physical event handle resolvable");
     }
     let stable_event = repository
-        .get_mcp_event(STABLE_UIDS.at(2))
+        .canonical_open_event(STABLE_UIDS.at(2))
         .await?
         .context("unchanged replay generation-two event handle is missing")?;
     if stable_event.event.text_content != "stable commonterm identicalterm" {
         bail!("unchanged replay changed stable event content");
     }
-    if repository
-        .get_mcp_session("stable-session")
+    if super::canonical_session(&repository, "stable-session")
         .await?
         .is_none()
     {
@@ -3293,28 +3062,27 @@ pub(super) async fn run(
     )
     .await?;
     if repository
-        .get_mcp_event(DELETED_UIDS.at(1))
+        .canonical_open_event(DELETED_UIDS.at(1))
         .await?
         .is_some()
     {
         bail!("old-generation event handle survived replacement tombstone");
     }
     if repository
-        .get_mcp_event(CHANGED_UIDS.at(1))
+        .canonical_open_event(CHANGED_UIDS.at(1))
         .await?
         .is_some()
     {
         bail!("replaced generation-one event handle resolved generation-two content");
     }
     let changed = repository
-        .get_mcp_event(CHANGED_UIDS.at(2))
+        .canonical_open_event(CHANGED_UIDS.at(2))
         .await?
         .context("current generation-two changed-event handle is missing")?;
     if !changed.event.text_content.contains("replacementterm") {
         bail!("current event handle returned pre-replacement content");
     }
-    if repository
-        .get_mcp_session("changed-session")
+    if super::canonical_session(&repository, "changed-session")
         .await?
         .is_none()
     {
@@ -3449,9 +3217,7 @@ pub(super) async fn run(
                         toUInt64(sum(data_compressed_bytes)) AS compressed_bytes \
                  FROM system.parts WHERE active AND database = '{}' AND table IN ( \
                    'published_source_generations', 'ingest_checkpoint_transitions', \
-                   'source_generation_publication_readiness', 'ingest_append_control', \
-                   'mcp_open_publication_headers', \
-                   'mcp_open_generation_readiness' \
+                   'source_generation_publication_readiness', 'ingest_append_control' \
                  ) GROUP BY table ORDER BY table FORMAT JSONEachRow",
                 database.as_str(),
             ),
@@ -3463,12 +3229,12 @@ pub(super) async fn run(
         .iter()
         .map(|row| row.table.as_str())
         .collect::<Vec<_>>();
+    // The two `mcp_open_*` control relations left this census with the
+    // projection they served (issue #603 WI-10 / migration 041).
     if control_tables
         != [
             "ingest_append_control",
             "ingest_checkpoint_transitions",
-            "mcp_open_generation_readiness",
-            "mcp_open_publication_headers",
             "published_source_generations",
             "source_generation_publication_readiness",
         ]

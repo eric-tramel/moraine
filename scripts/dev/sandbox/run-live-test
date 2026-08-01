@@ -27,7 +27,6 @@ Modes:
   analytics-parity  Run live_monitor_repository_semantic_parity exactly.
   source-publication
                     Run live_source_publication_cutover_crash_recovery exactly.
-  mcp-backfill      Run live_mcp_open_batched_backfill_resources exactly.
   envelope-query-log
                     Run live_envelope_query_log_coverage exactly.
   envelope-cancellation
@@ -75,9 +74,6 @@ case "$1" in
         ;;
     source-publication)
         test_function="live_source_publication_cutover_crash_recovery"
-        ;;
-    mcp-backfill)
-        test_function="live_mcp_open_batched_backfill_resources"
         ;;
     envelope-query-log)
         test_function="live_envelope_query_log_coverage"

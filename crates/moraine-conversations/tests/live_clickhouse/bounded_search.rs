@@ -237,8 +237,9 @@ pub(super) async fn statement_execution() -> Result<()> {
             let repo = repository(&clickhouse, None);
             if !repo.canonical_reader_ready().await {
                 bail!(
-                    "the canonical path must be selected before this gate can \
-                     mean anything: the v1 engine would answer every arm"
+                    "the canonical path must be ready before this gate can \
+                     mean anything: an unready store refuses every arm typed, \
+                     and a gate that measures refusals measures nothing"
                 );
             }
             let scoped = repository(&clickhouse, Some(&[SCOPE_ROOT]));

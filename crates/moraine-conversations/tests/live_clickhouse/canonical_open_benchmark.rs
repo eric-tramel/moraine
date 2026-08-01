@@ -52,7 +52,11 @@ const PAGE_LIMIT: u16 = 25;
 const MONSTER_SESSION: &str = "issue598-monster";
 const MONSTER_EVENTS: u64 = 50_000;
 const EVENTS_PER_TURN: u64 = 10;
-/// The interactive memory ceiling (issue-598.md:160, BINDING D10).
+/// The interactive memory ceiling: peak per-query `memory_usage` while opening
+/// the monster session must stay at or under 512 MiB (issue #598 BINDING D10).
+/// `docs/development/testing.md` records the same figure as this benchmark's
+/// pass condition — the spec file it used to cite lived under gitignored
+/// `plans/` and resolved for nobody.
 const MEMORY_CEILING_BYTES: u64 = 512 * 1024 * 1024;
 /// A continuation page's `read_rows` ceiling: 8 granules at the default
 /// `index_granularity` of 8192. Any point read costs at least one full granule
@@ -63,7 +67,7 @@ const MEMORY_CEILING_BYTES: u64 = 512 * 1024 * 1024;
 /// fixed-append work-independence, so this gate never needs to scale with the
 /// fixture.
 const MIDPAGE_READ_ROWS_CEILING: u64 = 65_536;
-/// The issue-598.md:160 reread aspiration (traversal reads ≤ this multiple of
+/// The issue #598 reread aspiration (traversal reads ≤ this multiple of
 /// one narrow reference scan). NOT an asserted gate: small pages pay granule
 /// floors that make a fixed multiple of one narrow scan unsatisfiable physics
 /// (see the per-page read budget below, which is the asserted contract).

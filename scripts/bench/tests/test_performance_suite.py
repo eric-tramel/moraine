@@ -433,10 +433,8 @@ class LifecycleTests(unittest.TestCase):
                 return next(search_counts)
             if "FROM system.tables" in sql:
                 return "1"
-            if "mcp_open_projection_state" in sql:
+            if "mcp_read_index_state" in sql:
                 return "1"
-            if "countIf(dirty.dirty_revision" in sql:
-                return "0"
             return ""
 
         sandbox = mock.Mock(
@@ -448,8 +446,11 @@ class LifecycleTests(unittest.TestCase):
 
         sandbox.reconcile_seeded_read_model.assert_called_once_with()
         sandbox.checkpoint.assert_called_once_with("seeded")
-        self.assertTrue(any("mcp_open_projection_state" in sql for sql in queries))
-        self.assertTrue(any("countIf(dirty.dirty_revision" in sql for sql in queries))
+        # Issue #603 WI-10: readiness is the canonical `open_v2` publication,
+        # not the retired projection's global-ready flag plus a dirty queue.
+        self.assertTrue(any("mcp_read_index_state" in sql for sql in queries))
+        self.assertTrue(any("state_key = 'open_v2'" in sql for sql in queries))
+        self.assertFalse(any("mcp_open_" in sql for sql in queries))
 
     def test_owned_sandbox_reconciles_with_frozen_binary(self) -> None:
         sandbox = OwnedSandbox(
@@ -1034,25 +1035,6 @@ FORMAT JSONEachRow""",
         self.assertIsNone(unavailable["rbytes"])
         self.assertEqual(unavailable["reason"], "cgroup_io_stat_unavailable")
 
-    def test_publication_replay_refresh_inventory_is_query_log_classified(self) -> None:
-        with mock.patch.object(
-            suite, "_clickhouse_query", side_effect=("", "4\t1\t3")
-        ) as query:
-            observed = suite._compatibility_refresh_snapshot(
-                "http://127.0.0.1:8123"
-            )
-        self.assertEqual(
-            observed,
-            {
-                "total_refresh_count": 4,
-                "activation_refresh_count": 1,
-                "per_chunk_refresh_count": 3,
-            },
-        )
-        self.assertEqual(query.call_args_list[0].args[1], "SYSTEM FLUSH LOGS")
-        self.assertIn("query_kind = 'Insert'", query.call_args_list[1].args[1])
-        self.assertIn("mcp_open_sessions", query.call_args_list[1].args[1])
-
     def test_source_publication_replay_artifact_validates_availability_and_gates(
         self,
     ) -> None:
@@ -1089,7 +1071,7 @@ FORMAT JSONEachRow""",
         }
         document = {
             "document_type": "source_publication_replay_probe",
-            "schema_version": "moraine.source-publication-replay-probe.v1",
+            "schema_version": "moraine.source-publication-replay-probe.v2",
             "status": "pass",
             "git_commit": "a" * 40,
             "run": {
@@ -1124,16 +1106,6 @@ FORMAT JSONEachRow""",
                 "batch_count": 2,
                 "event_identity_count": 5000,
                 "batch_sequences": [2, 3],
-            },
-            "compatibility": {
-                "total_refresh_count": 1,
-                "activation_refresh_count": 1,
-                "per_chunk_refresh_count": 0,
-                "readiness_rows": 1,
-                "affected_session_count": 1,
-                "prepared_session_count": 1,
-                "ready_rows": 1,
-                "visible_compatibility_rows": 1,
             },
             "process_resources": {
                 "cpu": {
@@ -1192,9 +1164,12 @@ FORMAT JSONEachRow""",
         self.assertEqual(args.events, suite.PUBLICATION_REPLAY_DEFAULT_EVENTS)
         self.assertEqual(args.timeout_seconds, 180.0)
 
+        # Issue #603 WI-10 removed the `compatibility` evidence block with
+        # the projection it observed; the replay evidence beside it keeps
+        # its own negative case.
         changed = copy.deepcopy(document)
-        changed["compatibility"]["per_chunk_refresh_count"] = 1
-        with self.assertRaisesRegex(suite.SuiteFailure, "compatibility evidence"):
+        changed["replay"]["batch_sequences"] = [3, 2]
+        with self.assertRaisesRegex(suite.SuiteFailure, "batch evidence"):
             suite.validate_source_publication_replay_probe(changed)
 
         changed = copy.deepcopy(document)

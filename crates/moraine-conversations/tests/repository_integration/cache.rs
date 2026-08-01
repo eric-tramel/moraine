@@ -1,23 +1,5 @@
 use super::*;
 
-fn mcp_candidate_metadata(scope_exists: u8, docs: u64) -> serde_json::Value {
-    json!({
-        "row_kind": 1_u8,
-        "event_uid": "",
-        "session_id": "",
-        "slot": 0_u8,
-        "generation": 0_u64,
-        "raw_score": 0.0,
-        "matched_terms": 0_u64,
-        "event_unix_ms": 0_i64,
-        "docs": docs,
-        "total_doc_len": docs.saturating_mul(50),
-        "scope_exists": scope_exists,
-        "projection_ready": 1_u8,
-        "projection_clean": 1_u8
-    })
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn search_mcp_events_result_cache_reuses_repository_across_requests() {
     scoped(async {
@@ -182,17 +164,21 @@ async fn session_scoped_mcp_search_never_uses_the_result_cache() {
 #[tokio::test(flavor = "multi_thread")]
 async fn search_mcp_events_does_not_cache_a_missing_scope() {
     scoped(async {
+        // The canonical engine's statement order for a session-scoped search:
+        // one corpus-stats read (cached across the two calls), then the
+        // scope-existence point read per call, then — once the scope exists —
+        // the bounded ranking pass. A missing scope short-circuits after its
+        // point read, so caching it would skip the second read entirely.
         let responses = vec![
             ScriptedResponse::rows(
-                &["toUInt8(0) AS row_kind"],
-                json!([mcp_candidate_metadata(0, 100)]),
+                &["search_corpus_stats"],
+                json!([{ "docs": 100_u64, "total_doc_len": 5_000_u64 }]),
             ),
-            ScriptedResponse::rows(
-                &["toUInt8(0) AS row_kind"],
-                json!([mcp_candidate_metadata(1, 100)]),
-            ),
+            ScriptedResponse::rows(&["AS scope_exists"], json!([{ "scope_exists": 0_u8 }])),
+            ScriptedResponse::rows(&["AS scope_exists"], json!([{ "scope_exists": 1_u8 }])),
+            ScriptedResponse::rows(&["term_postings AS ("], json!([])),
         ];
-        let (repo, state) = build_scripted_repo_with_readiness(responses, false).await;
+        let (repo, state) = build_scripted_repo_with_readiness(responses, true).await;
         let query = SearchMcpEventsQuery {
             query: "newly published session".to_string(),
             session_id: Some("session-new".to_string()),
@@ -213,7 +199,7 @@ async fn search_mcp_events_does_not_cache_a_missing_scope() {
             .await
             .expect("newly published scope response");
         assert!(published.scope_exists);
-        assert_script_consumed(&state, 2);
+        assert_script_consumed(&state, 4);
     })
     .await;
 }
@@ -234,7 +220,7 @@ async fn analytics_cache_hit_and_distinct_key_are_request_count_proven() {
             json!([]),
             json!([]),
         ));
-        let (repo, state) = build_scripted_repo_with_readiness(responses, false).await;
+        let (repo, state) = build_scripted_repo_with_readiness(responses, true).await;
         let clone = repo.clone();
 
         let first = repo
@@ -288,7 +274,7 @@ async fn analytics_expired_entry_refills_from_the_repository() {
             json!([]),
             json!([]),
         ));
-        let (repo, state) = build_scripted_repo_with_readiness(responses, false).await;
+        let (repo, state) = build_scripted_repo_with_readiness(responses, true).await;
 
         let first = repo
             .analytics_series(AnalyticsRange::TwentyFourHours)
@@ -328,7 +314,7 @@ async fn analytics_stage_error_is_not_cached_and_empty_retry_succeeds() {
             ),
         ];
         responses.extend(success);
-        let (repo, state) = build_scripted_repo_with_readiness(responses, false).await;
+        let (repo, state) = build_scripted_repo_with_readiness(responses, true).await;
 
         let error = repo
             .analytics_series(AnalyticsRange::TwentyFourHours)
@@ -406,7 +392,7 @@ async fn analytics_anchor_decode_and_late_stage_errors_are_not_cached() {
 
         for (stage, mut responses, expected_requests) in scenarios {
             responses.extend(success.clone());
-            let (repo, state) = build_scripted_repo_with_readiness(responses, false).await;
+            let (repo, state) = build_scripted_repo_with_readiness(responses, true).await;
             repo.analytics_series(AnalyticsRange::TwentyFourHours)
                 .await
                 .expect_err(stage);
@@ -508,7 +494,7 @@ async fn analytics_different_ranges_fill_concurrently() {
             turns(),
             concurrency(),
         ];
-        let (repo, state) = build_scripted_repo_with_readiness(responses, false).await;
+        let (repo, state) = build_scripted_repo_with_readiness(responses, true).await;
         let repo = Arc::new(repo);
 
         let one_hour_repo = repo.clone();
@@ -574,7 +560,7 @@ async fn analytics_cancelled_fill_releases_slot_and_recovery_is_cached() {
         let release = Arc::new(Notify::new());
         let mut responses = vec![success[0].clone().blocked(reached.clone(), release.clone())];
         responses.extend(success);
-        let (repo, state) = build_scripted_repo_with_readiness(responses, false).await;
+        let (repo, state) = build_scripted_repo_with_readiness(responses, true).await;
         let repo = Arc::new(repo);
 
         let first_repo = repo.clone();

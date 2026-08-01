@@ -1,9 +1,14 @@
-//! Issue #598 WI-10 exit-gate live tests: prove on a real ClickHouse that the
-//! v2 canonical `open` reader (design-598-final §5, `canonical_open.rs`) is
-//! field-parity with the v1 projector reader across a rich fixture corpus, that
-//! `open(event)` rejects non-live generations via `mcp_event_locator`, that
-//! cursor continuation is correct under concurrent append-only mutation and the
-//! anchor boundary guard, and that an append-fenced source (#602) serves the
+//! Issue #598 WI-10 exit-gate live tests over the canonical `open` reader
+//! (design-598-final §5, `canonical_open.rs`). Until issue #603 WI-10 retired
+//! the v1 projector, the parity gate byte-diffed the two readers; the v1
+//! oracle is gone with the projection, so `parity` now proves the properties
+//! the diff certified that still have an oracle: page-size independence (the
+//! same corpus read under multi-page traversal equals the single-page read),
+//! pinned derivation values (turn_id, metadata precedence, sentinel
+//! ordering), and origin-scope visibility. The other gates are unchanged:
+//! `open(event)` rejects non-live generations via `mcp_event_locator`, cursor
+//! continuation is correct under concurrent append-only mutation and the
+//! anchor boundary guard, and an append-fenced source (#602) serves the
 //! pinned pre-fence state without a spurious reopen while a genuine revision
 //! move returns the structured reopen (BINDING D9).
 //!
@@ -21,8 +26,8 @@
 use super::*;
 use moraine_config::{QueryBudgetsConfig, ValidatedQueryBudgets};
 use moraine_conversations::{
-    CanonicalContinuation, CanonicalReadOutcome, ConversationRepository, McpEventOpen,
-    McpSessionOpen, McpTurnOpen, RepoError, SessionOriginScope,
+    CanonicalContinuation, CanonicalReadOutcome, ConversationRepository, McpSessionOpen,
+    McpTurnOpen, RepoError, SessionOriginScope,
 };
 use serde_json::Value;
 
@@ -249,19 +254,14 @@ fn admin_budget() -> moraine_config::ValidatedQueryBudget {
         .administrative
 }
 
-/// Publish every not-yet-published source head, then backfill BOTH read models:
-/// the v1 projector (`mcp_open_*`, drives `get_mcp_*`) and the v2 canonical
-/// indexes (migration-036 directory/locator/navigation, drive `canonical_*`).
-/// Driving both readers off one seeded canonical corpus is the parity contract.
-async fn publish_and_backfill_both(
+/// Publish every not-yet-published source head, then backfill the canonical
+/// read indexes (migration-036 directory/locator/navigation, driving the
+/// `canonical_*` readers — the only `open` read model since issue #603 WI-10).
+async fn publish_and_backfill(
     clickhouse: &ClickHouseClient,
     database: &OwnedDatabaseName,
 ) -> Result<()> {
     publish_missing_schema_fixture_sources(clickhouse, database).await?;
-    clickhouse
-        .backfill_mcp_open_read_model()
-        .await
-        .context("failed to backfill the v1 projector read model")?;
     clickhouse
         .backfill_canonical_read_indexes(true, &live_fixture_budget(), &admin_budget(), |_| {})
         .await
@@ -344,114 +344,92 @@ async fn open_turn_v2(
     Ok(merged)
 }
 
-// --- parity normalization (the explicit whitelist) --------------------------
+// --- page-size self-parity (the post-retirement oracle) ---------------------
 //
-// design-598-final LIVE TEST PLAN §2 whitelists exactly three v1/v2 open
-// divergences: (1) `snapshot` is Some in v1 and always None in v2 (v2 uses the
-// continuation, not generation-pinned snapshots); (2) the v1 trichotomy
-// "canonical exists but projection missing" ReadModelChanged arm collapses to
-// Ok(None); (3) the deterministic v2 `turn_id` (the first member row's
-// `turn_index`, canonical_derivations `deterministic_turn_id_expr`) may differ
-// from v1's nondeterministic `anyIf(turn_id, turn_id != '')` ONLY within a
-// turn that mixes `turn_index` values. No turn in this corpus mixes values
-// (counter-path turns are all-`turn_index = 0`; each `parity-override` turn
-// carries a single explicit index), so (3) never applies here and `turn_id`
-// is byte-diffed like every other field. Blanking it corpus-wide would mask a
-// v2 regression to the `turn_seq` fallback, which diverges from v1's "0" on
-// every counter-path turn with `turn_seq >= 2` — that derivation is pinned
-// explicitly by [`assert_counter_turn_id_pins_turn_index`]. `null_snapshot`
-// nulls (1) so a direct serde_json equality proves everything else.
-
-fn null_snapshot(value: &mut Value) {
-    if let Some(object) = value.as_object_mut() {
-        object.insert("snapshot".to_string(), Value::Null);
-    }
-}
+// The retired v1 reader was the original parity oracle (design-598-final LIVE
+// TEST PLAN §2). What replaces it is the property the multi-page traversal
+// was stressing all along: the reader's continuation must be a pure
+// re-anchoring, so the SAME corpus read at a stressed page size (forcing
+// multi-page traversal and anchor re-derivation on every boundary) must be
+// byte-identical to the single-page read (limit 500, no continuation taken).
+// A paging regression — a dropped boundary row, a re-read window, an anchor
+// derived off the wrong tuple — diverges the two; concrete derivation VALUES
+// (turn_id, metadata precedence, sentinel order) are pinned separately so a
+// both-page-sizes-wrong drift cannot pass.
+const SINGLE_PAGE_LIMIT: u16 = 500;
 
 fn normalized_session(open: &McpSessionOpen) -> Result<Value> {
-    let mut value = serde_json::to_value(open).context("failed to serialize session open")?;
-    null_snapshot(&mut value);
-    Ok(value)
+    serde_json::to_value(open).context("failed to serialize session open")
 }
 
 fn normalized_turn(open: &McpTurnOpen) -> Result<Value> {
-    let mut value = serde_json::to_value(open).context("failed to serialize turn open")?;
-    null_snapshot(&mut value);
-    Ok(value)
+    serde_json::to_value(open).context("failed to serialize turn open")
 }
 
-fn normalized_event(open: &McpEventOpen) -> Result<Value> {
-    serde_json::to_value(open).context("failed to serialize event open")
-}
-
-/// Assert the v1 and v2 readers agree on `open(session)` after the whitelist.
+/// Assert `open(session)` at a stressed page size equals the single-page read.
 async fn assert_session_parity(
     repository: &ClickHouseConversationRepository,
     session_id: &str,
     limit: u16,
 ) -> Result<McpSessionOpen> {
-    let v1 = repository
-        .get_mcp_session(session_id)
-        .await
-        .map_err(|error| anyhow!("v1 session open failed for {session_id}: {error:#}"))?
-        .with_context(|| format!("v1 session open returned None for {session_id}"))?;
-    let v2 = open_session_v2(repository, session_id, limit)
+    let single = open_session_v2(repository, session_id, SINGLE_PAGE_LIMIT)
         .await?
-        .with_context(|| format!("v2 session open returned None for {session_id}"))?;
-    let v1_norm = normalized_session(&v1)?;
-    let v2_norm = normalized_session(&v2)?;
-    if v1_norm != v2_norm {
-        bail!("session-open parity mismatch for {session_id}\n  v1={v1_norm}\n  v2={v2_norm}");
+        .with_context(|| format!("single-page session open returned None for {session_id}"))?;
+    let paged = open_session_v2(repository, session_id, limit)
+        .await?
+        .with_context(|| format!("paged session open returned None for {session_id}"))?;
+    let single_norm = normalized_session(&single)?;
+    let paged_norm = normalized_session(&paged)?;
+    if single_norm != paged_norm {
+        bail!(
+            "session-open page-size parity mismatch for {session_id}\n  single={single_norm}\n  paged={paged_norm}"
+        );
     }
-    Ok(v2)
+    Ok(paged)
 }
 
-/// Assert the v1 and v2 readers agree on `open(turn)` after the whitelist.
+/// Assert `open(turn)` at a stressed page size equals the single-page read.
 async fn assert_turn_parity(
     repository: &ClickHouseConversationRepository,
     session_id: &str,
     turn_seq: u32,
     limit: u16,
 ) -> Result<()> {
-    let v1 = repository
-        .get_mcp_turn(session_id, turn_seq)
-        .await
-        .map_err(|error| {
-            anyhow!("v1 turn open failed for {session_id} turn {turn_seq}: {error:#}")
-        })?
-        .with_context(|| format!("v1 turn open returned None for {session_id} turn {turn_seq}"))?;
-    let v2 = open_turn_v2(repository, session_id, turn_seq, limit)
+    let single = open_turn_v2(repository, session_id, turn_seq, SINGLE_PAGE_LIMIT)
         .await?
-        .with_context(|| format!("v2 turn open returned None for {session_id} turn {turn_seq}"))?;
-    let v1_norm = normalized_turn(&v1)?;
-    let v2_norm = normalized_turn(&v2)?;
-    if v1_norm != v2_norm {
+        .with_context(|| {
+            format!("single-page turn open returned None for {session_id} turn {turn_seq}")
+        })?;
+    let paged = open_turn_v2(repository, session_id, turn_seq, limit)
+        .await?
+        .with_context(|| {
+            format!("paged turn open returned None for {session_id} turn {turn_seq}")
+        })?;
+    let single_norm = normalized_turn(&single)?;
+    let paged_norm = normalized_turn(&paged)?;
+    if single_norm != paged_norm {
         bail!(
-            "turn-open parity mismatch for {session_id} turn {turn_seq}\n  v1={v1_norm}\n  v2={v2_norm}"
+            "turn-open page-size parity mismatch for {session_id} turn {turn_seq}\n  single={single_norm}\n  paged={paged_norm}"
         );
     }
     Ok(())
 }
 
-/// Assert the v1 and v2 readers agree on `open(event)` after the whitelist.
+/// Assert `open(event)` resolves the referenced uid to its own row.
 async fn assert_event_parity(
     repository: &ClickHouseConversationRepository,
     event_uid: &str,
 ) -> Result<()> {
-    let v1 = repository
-        .get_mcp_event(event_uid)
-        .await
-        .map_err(|error| anyhow!("v1 event open failed for {event_uid}: {error:#}"))?
-        .with_context(|| format!("v1 event open returned None for {event_uid}"))?;
-    let v2 = repository
+    let event = repository
         .canonical_open_event(event_uid)
         .await
         .with_context(|| format!("v2 event open failed for {event_uid}"))?
         .with_context(|| format!("v2 event open returned None for {event_uid}"))?;
-    let v1_norm = normalized_event(&v1)?;
-    let v2_norm = normalized_event(&v2)?;
-    if v1_norm != v2_norm {
-        bail!("event-open parity mismatch for {event_uid}\n  v1={v1_norm}\n  v2={v2_norm}");
+    if event.event.event_uid != event_uid {
+        bail!(
+            "event open resolved the wrong row: asked {event_uid}, got {}",
+            event.event.event_uid
+        );
     }
     Ok(())
 }
@@ -477,10 +455,17 @@ where
 // Gate 1: canonical-open-parity
 // ===========================================================================
 
-/// Byte-parity of the v2 canonical reader against the v1 projector across the
-/// rich fixture corpus enumerated in the LIVE TEST PLAN §2. Both readers are
-/// driven off the same seeded `events` corpus; every case is diffed
-/// field-by-field for `open(session|turn|event)` under the whitelist above.
+/// The canonical reader over the rich fixture corpus enumerated in the LIVE
+/// TEST PLAN §2.
+///
+/// This gate WAS a byte-parity diff of the v2 reader against the v1 projector,
+/// both driven off one seeded `events` corpus. Issue #603 WI-10 deleted the
+/// projector, so the oracle is gone and nothing here diffs two readers. What
+/// runs is the subset of that contract with a surviving oracle, over the same
+/// corpus and the same cases: page-size independence (a multi-page traversal
+/// equals the single-page read), pinned derivation values, sentinel ordering,
+/// and origin-scope visibility. Comments below that describe what "v1" did are
+/// the record of where a pinned expectation came from.
 pub(super) async fn parity() -> Result<()> {
     with_owned_live_db(
         "canonical-open parity gate",
@@ -491,31 +476,22 @@ pub(super) async fn parity() -> Result<()> {
                 .context("failed to migrate canonical-open parity database")?;
 
             seed_parity_corpus(&clickhouse).await?;
-            publish_and_backfill_both(&clickhouse, &database).await?;
+            publish_and_backfill(&clickhouse, &database).await?;
 
             let repository =
                 ClickHouseConversationRepository::new(clickhouse.clone(), RepoConfig::default());
 
-            // (a) Empty / absent session: both readers agree on Ok(None), and a
-            // blank-session row is excluded from both (notEmpty(session_id) MV
-            // filter + v1 projector).
-            assert!(repository
-                .get_mcp_session("parity-does-not-exist")
-                .await?
-                .is_none());
+            // (a) Empty / absent session: Ok(None) for an absent id, and a
+            // blank-session row is excluded (the notEmpty(session_id) MV
+            // filter).
             assert!(open_session_v2(&repository, "parity-does-not-exist", 25)
                 .await?
                 .is_none());
-            // Blank ids are rejected identically by BOTH readers at the shared
-            // validation layer (`validate_session_id`), before any SQL runs —
-            // that rejection parity, not Ok(None), is the contract. The blank
-            // ROW seeded above is excluded from listings by the MV/projector
-            // `notEmpty(session_id)` filters, which the directory census in
-            // later cases exercises.
-            assert!(matches!(
-                repository.get_mcp_session("").await,
-                Err(RepoError::InvalidArgument(_))
-            ));
+            // Blank ids are rejected at the shared validation layer
+            // (`validate_session_id`) before any SQL runs — the typed
+            // rejection, not Ok(None), is the contract. The blank ROW seeded
+            // above is excluded from listings by the MV `notEmpty(session_id)`
+            // filter, which the directory census in later cases exercises.
             assert!(matches!(
                 repository.canonical_open_session_page("", 25, None).await,
                 Err(RepoError::InvalidArgument(_))
@@ -570,12 +546,13 @@ pub(super) async fn parity() -> Result<()> {
             // (f2) an early high-override stray is served complete across
             // limit-1 pagination (the from-anchor window can never re-read
             // it); (f3) continuation anchors on float-lossy 2038 sort_times
-            // resume exactly. All three sessions diff v1 == v2 byte-for-byte
-            // across full pagination.
-            // parity-epoch is deliberately NOT byte-diffed: a malformed
-            // record_ts row's ORDER legitimately diverges (v2 sorts it at the
-            // deterministic epoch sentinel, v1 at its ingested_at fallback) —
-            // the same whitelisted class as parity-malformed. What must hold
+            // resume exactly. All three sessions read identically under
+            // single-page and paginated traversal.
+            // parity-epoch was deliberately NOT byte-diffed against v1: a
+            // malformed record_ts row's ORDER legitimately diverged (v2 sorts
+            // it at the deterministic epoch sentinel, v1 at its ingested_at
+            // fallback) — the same whitelisted class as parity-malformed. What
+            // must hold
             // is that v2 still HYDRATES the row: the finding's failure mode
             // was the temporal bound silently excluding it, so open(event)
             // returned None and turn membership lost its content.
@@ -616,12 +593,11 @@ pub(super) async fn parity() -> Result<()> {
             // 035 metadata precedence surface: OPEN per-field-latest title/name/
             // summary/slug from session_meta + omp title/title_change, with the omp
             // dispatch-title fallback. The `parity-metadata` session above already
-            // diffed equal end-to-end; assert the concrete resolved values so a
-            // silent both-wrong regression cannot pass parity.
-            let metadata_session = repository
-                .get_mcp_session("parity-metadata")
+            // page-size-diffed equal end-to-end; assert the concrete resolved
+            // values so a both-page-sizes-wrong regression cannot pass.
+            let metadata_session = open_session_v2(&repository, "parity-metadata", 25)
                 .await?
-                .context("metadata session missing from v1 reader")?;
+                .context("metadata session missing from the canonical reader")?;
             assert_eq!(
                 metadata_session.title.as_deref(),
                 Some("Latest Explicit Title")
@@ -635,7 +611,7 @@ pub(super) async fn parity() -> Result<()> {
 
             // Scope in/out including trailing-slash root/origin shapes (design R8):
             // a scoped repository sees only sessions whose origin_cwd is under the
-            // configured root, identically across both readers.
+            // configured root.
             assert_scope_parity(&clickhouse).await?;
 
             Ok(())
@@ -651,7 +627,7 @@ pub(super) async fn parity() -> Result<()> {
 async fn seed_parity_corpus(clickhouse: &ClickHouseClient) -> Result<()> {
     let mut rows: Vec<Ev> = Vec::new();
 
-    // Blank-session row: excluded from both readers.
+    // Blank-session row: excluded by the reader.
     rows.push(Ev::new("", "parity-blank-1", 1).user());
 
     // Single-turn: one user + one assistant, counter path. Origin carries a
@@ -665,7 +641,7 @@ async fn seed_parity_corpus(clickhouse: &ClickHouseClient) -> Result<()> {
     rows.push(Ev::new("parity-single-turn", "single-a1", 11).cwd("/repo/"));
 
     // Out-of-scope: origin under a different root; hidden from a `/repo`-scoped
-    // repository by both readers.
+    // repository.
     rows.push(
         Ev::new("parity-out-of-scope", "oos-u1", 12)
             .user()
@@ -729,9 +705,10 @@ async fn seed_parity_corpus(clickhouse: &ClickHouseClient) -> Result<()> {
     rows.push(Ev::new("parity-override", "ovr-a1-late", 64).turn(1));
 
     // Malformed record_ts (sentinel divergence, LIVE TEST PLAN §2 whitelist):
-    // `mal-a1`'s record_ts fails BestEffort parse, so v2's deterministic
-    // sort_time is the epoch sentinel (sorts at session start) while v1 sorts it
-    // at its ingested_at position. Asserted separately, never diffed v1==v2.
+    // `mal-a1`'s record_ts fails BestEffort parse, so the deterministic
+    // sort_time is the epoch sentinel (sorts at session start) — where v1
+    // sorted it at its ingested_at position. This was the whitelisted
+    // divergence when the two readers were diffed; it is asserted directly.
     rows.push(Ev::new("parity-malformed", "mal-u1", 80).user());
     rows.push(
         Ev::new("parity-malformed", "mal-a1", 81)
@@ -760,8 +737,9 @@ async fn seed_parity_corpus(clickhouse: &ClickHouseClient) -> Result<()> {
     // normalizer cannot parse record_ts it stores the EPOCH SENTINEL in
     // events.event_ts (never a well-formed time), while the navigation MV's
     // display_time falls back to ingested_at. Hydration must still return the
-    // row (the temporal bound carries an epoch-sentinel branch); both readers
-    // sort an epoch event_ts first, so the session diffs v1 == v2.
+    // row (the temporal bound carries an epoch-sentinel branch); an epoch
+    // event_ts sorts first, which is where v1 put it too, so this session was
+    // inside the diffed set rather than whitelisted out of it.
     rows.push(Ev::new("parity-epoch", "epoch-u1", 90).user());
     rows.push(
         Ev::new("parity-epoch", "epoch-a1", 91)
@@ -777,8 +755,9 @@ async fn seed_parity_corpus(clickhouse: &ClickHouseClient) -> Result<()> {
     // anchor lands past every row of turn 2. A from-anchor continuation window
     // can never see turn 2 again, so the page reader must re-fold from the
     // session start to serve it. Overrides stay dense (max turn_index equals
-    // the turn count) because the projector's total_turns identity makes a
-    // sparse high override unrepresentable in the v1 read model.
+    // the turn count) because the projector's total_turns identity made a
+    // sparse high override unrepresentable in the v1 read model, and the
+    // canonical reader inherits that identity.
     rows.push(
         Ev::new("parity-override-early", "oe-u2", 100)
             .user()
@@ -903,59 +882,42 @@ async fn assert_epoch_sentinel_rows_hydrate(
     Ok(())
 }
 
-/// Assert the override turn's deterministic v2 turn_id lies within the v1
-/// value set (the LIVE TEST PLAN §2 turn_id membership rule). The turn's only
-/// `turn_index` value is 1 — and there `turn_index == turn_seq`, so this
-/// checkpoint alone cannot distinguish the correct derivation (first row's
-/// turn_index) from the turn_seq fallback; that distinction is pinned by
-/// [`assert_counter_turn_id_pins_turn_index`].
+/// Assert the override turn's deterministic turn_id equals its single member
+/// `turn_index` value (the LIVE TEST PLAN §2 turn_id membership rule). The
+/// turn's only `turn_index` value is 1 — and there `turn_index == turn_seq`,
+/// so this checkpoint alone cannot distinguish the correct derivation (first
+/// row's turn_index) from the turn_seq fallback; that distinction is pinned
+/// by [`assert_counter_turn_id_pins_turn_index`].
 async fn assert_override_turn_id_within_value_set(
     repository: &ClickHouseConversationRepository,
     session_id: &str,
 ) -> Result<()> {
-    let v1 = repository
-        .get_mcp_turn(session_id, 1)
+    let turn = open_turn_v2(repository, session_id, 1, 8)
         .await?
-        .context("override turn 1 missing from v1 reader")?;
-    let v2 = open_turn_v2(repository, session_id, 1, 8)
-        .await?
-        .context("override turn 1 missing from v2 reader")?;
-    // Both derive turn_id from a member row's `toString(turn_index)`; the
-    // turn's only turn_index value is "1", so the deterministic v2 value must
-    // equal the (here unambiguous) v1 value.
-    assert_eq!(
-        v1.metadata.turn_id, v2.metadata.turn_id,
-        "override turn_id diverged outside the whitelisted value set"
-    );
-    assert_eq!(v2.metadata.turn_id, "1");
+        .context("override turn 1 missing from the canonical reader")?;
+    // turn_id derives from a member row's `toString(turn_index)`; the turn's
+    // only turn_index value is "1".
+    assert_eq!(turn.metadata.turn_id, "1");
     Ok(())
 }
 
 /// Pin the turn_id derivation on a case where the two candidate rules actually
 /// diverge: `parity-multi-turn` turn 3 is counter-path (`turn_index = 0` on
-/// every row) with `turn_seq = 3`, so the correct turn_id — v1's
-/// `anyIf(toString(turn_index))` and v2's first-member-row `turn_index`
-/// (design R1(d)) — is "0", while a v2 regression to the `turn_seq` fallback
-/// (canonical_open.rs `assemble_turn_compact`) would report "3". The parity
-/// diffs above already byte-compare turn_id; this assert additionally pins the
-/// concrete value so a both-readers-wrong drift cannot pass unnoticed.
+/// every row) with `turn_seq = 3`, so the correct turn_id — the
+/// first-member-row `turn_index` (design R1(d), the retired v1 reader's
+/// `anyIf(toString(turn_index))` agreed) — is "0", while a regression to the
+/// `turn_seq` fallback (canonical_open.rs `assemble_turn_compact`) would
+/// report "3". The page-size diffs above compare turn_id across page sizes;
+/// this assert pins the concrete value so a both-wrong drift cannot pass.
 async fn assert_counter_turn_id_pins_turn_index(
     repository: &ClickHouseConversationRepository,
 ) -> Result<()> {
-    let v1 = repository
-        .get_mcp_turn("parity-multi-turn", 3)
+    let turn = open_turn_v2(repository, "parity-multi-turn", 3, 8)
         .await?
-        .context("counter turn 3 missing from v1 reader")?;
-    let v2 = open_turn_v2(repository, "parity-multi-turn", 3, 8)
-        .await?
-        .context("counter turn 3 missing from v2 reader")?;
+        .context("counter turn 3 missing from the canonical reader")?;
     assert_eq!(
-        v1.metadata.turn_id, "0",
-        "v1 counter-path turn_id must derive from turn_index, not turn_seq"
-    );
-    assert_eq!(
-        v2.metadata.turn_id, "0",
-        "v2 counter-path turn_id must derive from the first member row's turn_index, not the turn_seq fallback"
+        turn.metadata.turn_id, "0",
+        "counter-path turn_id must derive from the first member row's turn_index, not the turn_seq fallback"
     );
     Ok(())
 }
@@ -1037,9 +999,9 @@ async fn assert_malformed_timestamp_divergence(
     Ok(())
 }
 
-/// Trailing-slash root/origin scope parity (design R8): a repository scoped to
-/// `/repo` (no trailing slash) must, identically across both readers, expose a
-/// session whose origin_cwd is `/repo/` and hide a session originating outside.
+/// Trailing-slash root/origin scope visibility (design R8): a repository
+/// scoped to `/repo` (no trailing slash) must expose a session whose
+/// origin_cwd is `/repo/` and hide a session originating outside.
 async fn assert_scope_parity(clickhouse: &ClickHouseClient) -> Result<()> {
     let scoped = ClickHouseConversationRepository::new(
         clickhouse.clone(),
@@ -1052,21 +1014,19 @@ async fn assert_scope_parity(clickhouse: &ClickHouseClient) -> Result<()> {
     );
 
     // In-scope: origin_cwd `/repo/` (trailing slash) is under root `/repo`.
-    let in_scope_v1 = scoped.get_mcp_session("parity-single-turn").await?;
-    let in_scope_v2 = open_session_v2(&scoped, "parity-single-turn", 25).await?;
+    let in_scope = open_session_v2(&scoped, "parity-single-turn", 25).await?;
     assert!(
-        in_scope_v1.is_some() && in_scope_v2.is_some(),
-        "in-scope session must be visible to both readers under the scoped repo"
+        in_scope.is_some(),
+        "in-scope session must be visible under the scoped repo"
     );
 
     // Out-of-scope: `parity-tool-only` originates under `/repo` too by default,
     // so seed comparison relies on an explicitly out-of-root origin. The
     // multi-host fixture keeps `/repo`; use a dedicated out-of-scope probe.
-    let out_v1 = scoped.get_mcp_session("parity-out-of-scope").await?;
-    let out_v2 = open_session_v2(&scoped, "parity-out-of-scope", 25).await?;
+    let out = open_session_v2(&scoped, "parity-out-of-scope", 25).await?;
     assert!(
-        out_v1.is_none() && out_v2.is_none(),
-        "out-of-scope session must be hidden from both readers under the scoped repo"
+        out.is_none(),
+        "out-of-scope session must be hidden under the scoped repo"
     );
     Ok(())
 }
@@ -1077,7 +1037,7 @@ async fn assert_scope_parity(clickhouse: &ClickHouseClient) -> Result<()> {
 
 /// `open(event)` via `mcp_event_locator` rejects a non-live (superseded or
 /// replaying-only) generation and resolves a live one; the locator seek reads
-/// no unrelated session's rows (LIVE TEST PLAN §3, issue-598.md:161).
+/// no unrelated session's rows (issue #598 LIVE TEST PLAN §3).
 pub(super) async fn locator() -> Result<()> {
     with_owned_live_db(
         "canonical-open locator gate",
@@ -1119,7 +1079,7 @@ pub(super) async fn locator() -> Result<()> {
             // --- Phase 1: generation 1 is the only published head. ---
             seed_events(&clickhouse, &gen1).await?;
             seed_events(&clickhouse, &unrelated).await?;
-            publish_and_backfill_both(&clickhouse, &database).await?;
+            publish_and_backfill(&clickhouse, &database).await?;
 
             let repository =
                 ClickHouseConversationRepository::new(clickhouse.clone(), RepoConfig::default());
@@ -1297,7 +1257,7 @@ pub(super) async fn continuation() -> Result<()> {
                     .source("fixture", "/fixtures/cont-other.jsonl"),
             );
             seed_events(&clickhouse, &rows).await?;
-            publish_and_backfill_both(&clickhouse, &database).await?;
+            publish_and_backfill(&clickhouse, &database).await?;
 
             let repository =
                 ClickHouseConversationRepository::new(clickhouse.clone(), RepoConfig::default());
@@ -1662,7 +1622,7 @@ pub(super) async fn fence() -> Result<()> {
             );
         }
         seed_events(&clickhouse, &rows).await?;
-        publish_and_backfill_both(&clickhouse, &database).await?;
+        publish_and_backfill(&clickhouse, &database).await?;
 
         let repository =
             ClickHouseConversationRepository::new(clickhouse.clone(), RepoConfig::default());
@@ -1763,7 +1723,7 @@ async fn assert_revision_move_reopens(
 // Gate 5: append-to-visible (WI-11, BINDING D8 / R5)
 // ===========================================================================
 //
-// The spec realtime contract (issue-598.md §Realtime): a committed append to a
+// The spec realtime contract (issue #598 §Realtime): a committed append to a
 // live file-backed session must become visible through `open` within 2s p95 on
 // the reference host. Per BINDING D8 the clock STARTS at durable canonical
 // insert acknowledgment (`insert_json_rows_sync` returning) and STOPS at the
@@ -1790,7 +1750,7 @@ async fn append_probe_setup(
         Ev::new("probe-session", "probe-base-a0", 11),
     ];
     seed_events(clickhouse, &base).await?;
-    publish_and_backfill_both(clickhouse, database).await?;
+    publish_and_backfill(clickhouse, database).await?;
     Ok(ClickHouseConversationRepository::new(
         clickhouse.clone(),
         RepoConfig::default(),

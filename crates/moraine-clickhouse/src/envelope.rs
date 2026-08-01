@@ -4,8 +4,8 @@
 //!
 //! The active envelope rides a tokio task-local: it follows `.await`s within
 //! one task but does NOT propagate into `tokio::spawn`, `spawn_blocking`, or
-//! any executor handoff. A spawned worker (projection worker, publication
-//! actor, janitor, backfill task) must establish its own class envelope via
+//! any executor handoff. A spawned worker (publication actor, janitor,
+//! reclaim driver, backfill task) must establish its own class envelope via
 //! [`QueryEnvelope::new`] + [`QueryEnvelope::scope`]; statements issued from
 //! an unscoped spawn fail closed at the transport.
 //! logical Moraine operation issues shares one absolute deadline, one fixed

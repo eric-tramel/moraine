@@ -65,11 +65,6 @@ def fixture_database_evidence(recipe: Mapping[str, Any]) -> dict[str, Any]:
         "document_max_uid": f"perf-event-{documents - 1:08d}",
         "posting_documents": documents,
         "corpus_documents": documents,
-        "projected_sessions": 17,
-        "projected_session_events": documents,
-        "projected_events": documents,
-        "dirty_session_count": 0,
-        "projection_ready_rows": 1,
         "publication_head_count": 1,
         "active_checkpoint_count": 1,
         "publication_readiness_count": 1,
@@ -734,11 +729,6 @@ class NativeBurstTests(unittest.TestCase):
                     "document_max_uid",
                     "posting_documents",
                     "corpus_documents",
-                    "projected_sessions",
-                    "projected_session_events",
-                    "projected_events",
-                    "dirty_session_count",
-                    "projection_ready_rows",
                     "publication_head_count",
                     "active_checkpoint_count",
                     "publication_readiness_count",
@@ -753,19 +743,15 @@ class NativeBurstTests(unittest.TestCase):
                 evidence = burst._fixture_database_evidence(selection, recipe)
             self.assertTrue(evidence["pass"])
             fixture_sql = query.call_args_list[-1].args[1]
-            self.assertIn("mcp_open_projection_state", fixture_sql)
-            self.assertIn("mcp_open_dirty_sessions", fixture_sql)
             self.assertIn("v_current_published_source_generations", fixture_sql)
             self.assertIn("v_current_ingest_checkpoint_transitions", fixture_sql)
             self.assertIn(
                 "v_current_source_generation_publication_readiness", fixture_sql
             )
             self.assertIn("v_current_ingest_append_control", fixture_sql)
-            self.assertIn("INNER JOIN `moraine_native_test`.mcp_open_sessions", fixture_sql)
-            self.assertNotIn(
-                "ANY INNER JOIN `moraine_native_test`.mcp_open_sessions",
-                fixture_sql,
-            )
+            # Issue #603 WI-10: the fixture evidence no longer observes the
+            # retired projection, so no dropped relation may reappear here.
+            self.assertNotIn("mcp_open", fixture_sql)
 
             route.joinpath(".moraine.toml").write_text(
                 'backend = "team"\n', encoding="utf-8"
@@ -773,7 +759,7 @@ class NativeBurstTests(unittest.TestCase):
             with self.assertRaisesRegex(burst.NativeBurstFailure, "non-default backend"):
                 burst._resolve_backend_selection(config, route)
 
-            row["projected_events"] -= 1
+            row["posting_documents"] -= 1
             with mock.patch.object(
                 burst,
                 "_clickhouse_query",

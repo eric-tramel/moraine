@@ -157,8 +157,8 @@ nothing can be.
 - **Never project scope.** A `--project-only` backend does not rank
   out-of-scope sessions at all. Scope is applied while candidates are still
   being chosen — against the navigation `argMinIf(cwd, …)` on the canonical
-  path, and against `mcp_open_publication_headers.origin_cwd` on the
-  pre-cutover path — so an out-of-scope session never enters the ranked set and
+  path (the only path since issue #603 WI-10 retired the projection) — so an
+  out-of-scope session never enters the ranked set and
   can never be part of `limit - result_count`. This route therefore cannot be
   used to count out-of-scope activity for a search term. The identical scope
   rule is re-applied after hydration as well, so that one function decides
@@ -196,15 +196,24 @@ to have loaded could never select a harness absent from the loaded pages.
 canonical read indexes — the same readiness the MCP `open` tool and the session
 feed's own read path gate on. Until then the route returns `503` with
 `code: "canonical_reader_unavailable"` rather than reading indexes whose
-backfill or overlap audit has not completed. Session summaries stay available
-throughout; only the transcript detail is withheld.
+backfill or overlap audit has not completed.
 
-That sentence covers **both** discovery routes. `/api/v1/sessions` and
-`/api/v1/sessions/search` branch on the same readiness key and hydrate their
-summaries from the pre-cutover projected headers while it is unset, so a
-not-ready backend answers a search with the sessions that matched — never with
-an empty `sessions` array, which would assert that the whole corpus was searched
-and nothing matched.
+**Every discovery route gates on that same key, and all of them refuse.** Since
+issue #603 WI-10 retired the `mcp_open_*` projection there is no second read
+model to fall back to, so `/api/v1/sessions` and `/api/v1/sessions/search`
+refuse an unpublished backend rather than answering from an empty canonical
+index — an empty `sessions` array would assert that the whole corpus was
+searched and nothing matched. Their refusal is a plain `503` carrying the
+repository's message in `error` and **no** `code` key: it travels as an
+ordinary backend failure, unlike the transcript route's typed
+`canonical_reader_unavailable`. The message names the recovery — run
+`moraine db migrate`, whose canonical sweep publishes `open_v2` readiness, or
+`moraine db core-index rebuild` if the sweep keeps failing. Clients should read
+it as "this backend is not serving yet", never as "this backend has no
+sessions".
+
+That state is reachable only before a store's first canonical sweep, or on a
+store whose overlap audit is failing.
 
 Successful analytics, web-search, session, and session-search responses carry
 `"read_model":"live"`: their rows are authorized against published source
@@ -536,7 +545,7 @@ succeed on retry. Clients must not render a `400` as a service outage.
 | `405 Method Not Allowed` | The path exists but does not support the requested HTTP method. A JSON error envelope is not guaranteed. |
 | `429 Too Many Requests` | Concurrent-read admission overflow, or a repository read that exhausted a non-time query budget. Carries `code: "resource_exhausted"`. |
 | `500 Internal Server Error` | The static root cannot be resolved or a selected static file cannot be read. |
-| `503 Service Unavailable` | A required repository or ClickHouse read failed with no budget classification **and was not the caller's fault** — a rejected argument or cursor is a `400`, not this — or `/api/v1/sessions/:id/page` was called on a backend that has not published its canonical read indexes, which carries `code: "canonical_reader_unavailable"`. Handler-generated responses use the JSON error envelope. |
+| `503 Service Unavailable` | A required repository or ClickHouse read failed with no budget classification **and was not the caller's fault** — a rejected argument or cursor is a `400`, not this — or a discovery route was called on a backend that has not published its canonical read indexes. Since issue #603 WI-10 retired the `mcp_open_*` projection there is no fallback read model, so **all three** discovery routes refuse, in **two** envelope shapes: `/api/v1/sessions/:id/page` carries `code: "canonical_reader_unavailable"`, while `/api/v1/sessions` and `/api/v1/sessions/search` carry the repository's message in `error` and **no** `code` key. Neither shape is an outage and neither means "this backend has no sessions" — see *Every discovery route gates on that same key, and all of them refuse*. Handler-generated responses use the JSON error envelope. |
 | `504 Gateway Timeout` | A repository read exceeded its query-budget deadline. Carries `code: "deadline_exceeded"`. |
 
 `/api/v1/health` returns `503` when the required store-health read, ping, or

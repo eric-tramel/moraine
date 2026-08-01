@@ -137,11 +137,10 @@ PUBLICATION_REPLAY_STORAGE_TABLES = tuple(
             "published_source_generations",
             "ingest_checkpoint_transitions",
             "source_generation_publication_readiness",
-            "mcp_open_publication_headers",
-            "mcp_open_generation_readiness",
-            "mcp_open_sessions",
-            "mcp_open_turns",
-            "mcp_open_events",
+            # The five `mcp_open_*` compatibility tables this probe used to
+            # measure retired with the projection (issue #603 WI-10 /
+            # migration 041); the canonical read indexes are content-free and
+            # rebuildable, so they are not the replay probe's storage story.
         )
     )
 )
@@ -255,29 +254,20 @@ def _seed_owned_sandbox(sandbox: Any, recipe: Mapping[str, Any]) -> None:
     observed = _clickhouse_query(url, f"SELECT count() FROM {database}.search_documents")
     if observed != str(expected):
         raise SuiteFailure(f"seed cardinality mismatch: expected {expected}, observed {observed}")
-    projection_ready = _clickhouse_query(
+    # Issue #603 WI-10 retired the v1 projection, so "did the read model catch
+    # up" is no longer a dirty-queue question: the canonical read indexes are
+    # maintained by the insert's own MVs and the sweep publishes readiness.
+    # `reconcile_seeded_read_model` above ran `moraine db migrate`, which is
+    # what performs that sweep, so the check is that it published — the same
+    # durable authority the reader dispatch consults.
+    index_ready = _clickhouse_query(
         url,
         f"""SELECT if(count() = 0, 0, max(ready))
-FROM {database}.mcp_open_projection_state FINAL
-WHERE state_key = 'global'""",
+FROM {database}.mcp_read_index_state FINAL
+WHERE state_key = 'open_v2'""",
     )
-    projection_dirty = _clickhouse_query(
-        url,
-        f"""SELECT countIf(dirty.dirty_revision > ifNull(published.dirty_revision, 0))
-FROM
-(
-  SELECT session_id, dirty_revision
-  FROM {database}.mcp_open_dirty_sessions FINAL
-  WHERE notEmpty(session_id)
-) AS dirty
-LEFT JOIN
-(
-  SELECT session_id, dirty_revision
-  FROM {database}.mcp_open_sessions FINAL
-) AS published ON published.session_id = dirty.session_id""",
-    )
-    if projection_ready != "1" or projection_dirty != "0":
-        raise SuiteFailure("seeded MCP read model did not reconcile completely")
+    if index_ready != "1":
+        raise SuiteFailure("seeded canonical read indexes did not publish open_v2")
     sandbox.checkpoint("seeded")
 
 
@@ -578,146 +568,6 @@ FORMAT TSVRaw""",
     if not generations or generations != sorted(set(generations)):
         raise SuiteFailure("source-publication replay history is invalid")
     return generations
-
-
-def _publication_replay_mcp_readiness(
-    url: str, *, source_host: str, generation: int, database: str = "moraine"
-) -> dict[str, int]:
-    raw = _clickhouse_query(
-        url,
-        f"""SELECT
-  count() AS readiness_rows,
-  sum(affected_session_count) AS affected_session_count,
-  sum(prepared_session_count) AS prepared_session_count,
-  countIf(ready = 1) AS ready_rows
-FROM {database}.v_current_mcp_open_generation_readiness
-WHERE source_host = {_clickhouse_literal(source_host)}
-  AND source_name = {_clickhouse_literal(PUBLICATION_REPLAY_SOURCE_NAME)}
-  AND source_file = {_clickhouse_literal(PUBLICATION_REPLAY_SOURCE_FILE)}
-  AND source_generation = {generation}
-FORMAT TSVRaw""",
-    )
-    fields = raw.split("\t")
-    if len(fields) != 4:
-        raise SuiteFailure("source-publication MCP readiness has an invalid shape")
-    try:
-        result = {
-            name: int(value)
-            for name, value in zip(
-                (
-                    "readiness_rows",
-                    "affected_session_count",
-                    "prepared_session_count",
-                    "ready_rows",
-                ),
-                fields,
-                strict=True,
-            )
-        }
-    except ValueError as error:
-        raise SuiteFailure("source-publication MCP readiness is malformed") from error
-    if any(value < 0 for value in result.values()):
-        raise SuiteFailure("source-publication MCP readiness is invalid")
-    return result
-
-
-def _publication_replay_compatibility_rows(
-    url: str, *, source_host: str, generation: int, database: str = "moraine"
-) -> int:
-    raw = _clickhouse_query(
-        url,
-        f"""SELECT count()
-FROM {database}.mcp_open_sessions AS sessions FINAL
-INNER JOIN {database}.mcp_open_publication_headers AS headers FINAL
-  ON headers.session_id = sessions.session_id
- AND headers.generation = sessions.generation
-INNER JOIN {database}.v_current_mcp_open_generation_readiness AS readiness
-  ON readiness.candidate_publication_id = headers.candidate_publication_id
-WHERE readiness.source_host = {_clickhouse_literal(source_host)}
-  AND readiness.source_name = {_clickhouse_literal(PUBLICATION_REPLAY_SOURCE_NAME)}
-  AND readiness.source_file = {_clickhouse_literal(PUBLICATION_REPLAY_SOURCE_FILE)}
-  AND readiness.source_generation = {generation}
-  AND readiness.ready = 1
-  AND headers.tombstone = 0
-FORMAT TSVRaw""",
-    )
-    try:
-        rows = int(raw)
-    except ValueError as error:
-        raise SuiteFailure("source-publication compatibility row count is malformed") from error
-    if rows < 0:
-        raise SuiteFailure("source-publication compatibility row count is invalid")
-    return rows
-
-
-def _wait_for_publication_replay_compatibility(
-    url: str,
-    *,
-    source_host: str,
-    generation: int,
-    timeout_s: float,
-    poll_interval_s: float = PUBLICATION_REPLAY_POLL_INTERVAL_S,
-) -> int:
-    deadline = time.monotonic() + timeout_s
-    last_rows = 0
-    while time.monotonic() < deadline:
-        last_rows = _publication_replay_compatibility_rows(
-            url, source_host=source_host, generation=generation
-        )
-        if last_rows == 1:
-            return last_rows
-        if last_rows > 1:
-            raise SuiteFailure("replacement replay published duplicate compatibility rows")
-        time.sleep(poll_interval_s)
-    raise SuiteFailure(
-        "replacement replay compatibility activation did not become visible: "
-        f"rows={last_rows}"
-    )
-
-
-def _compatibility_refresh_snapshot(
-    url: str, database: str = "moraine"
-) -> dict[str, int]:
-    _clickhouse_query(url, "SYSTEM FLUSH LOGS")
-    raw = _clickhouse_query(
-        url,
-        f"""SELECT
-  count() AS total_refresh_count,
-  countIf(position(query, 'mcp_open_publication_headers FINAL') > 0)
-    AS activation_refresh_count,
-  countIf(position(query, 'mcp_open_publication_headers FINAL') = 0)
-    AS per_chunk_refresh_count
-FROM system.query_log
-WHERE type = 'QueryFinish'
-  AND query_kind = 'Insert'
-  AND has(tables, '{database}.mcp_open_sessions')
-FORMAT TSVRaw""",
-    )
-    fields = raw.split("\t")
-    if len(fields) != 3:
-        raise SuiteFailure("compatibility refresh inventory has an invalid shape")
-    try:
-        result = {
-            name: int(value)
-            for name, value in zip(
-                (
-                    "total_refresh_count",
-                    "activation_refresh_count",
-                    "per_chunk_refresh_count",
-                ),
-                fields,
-                strict=True,
-            )
-        }
-    except ValueError as error:
-        raise SuiteFailure("compatibility refresh inventory is malformed") from error
-    if (
-        any(value < 0 for value in result.values())
-        or result["total_refresh_count"]
-        != result["activation_refresh_count"] + result["per_chunk_refresh_count"]
-    ):
-        raise SuiteFailure("compatibility refresh inventory is invalid")
-    return result
 
 
 def _counter_delta(
@@ -2645,7 +2495,6 @@ def validate_source_publication_replay_probe(document: Any) -> None:
         "fixture",
         "publication",
         "replay",
-        "compatibility",
         "process_resources",
         "cgroup_resources",
         "storage",
@@ -2656,7 +2505,7 @@ def validate_source_publication_replay_probe(document: Any) -> None:
     if (
         document.get("document_type") != "source_publication_replay_probe"
         or document.get("schema_version")
-        != "moraine.source-publication-replay-probe.v1"
+        != "moraine.source-publication-replay-probe.v2"
         or document.get("status") not in {"pass", "fail"}
         or not isinstance(document.get("git_commit"), str)
         or len(document["git_commit"]) != 40
@@ -2669,7 +2518,6 @@ def validate_source_publication_replay_probe(document: Any) -> None:
     fixture = document["fixture"]
     publication = document["publication"]
     replay = document["replay"]
-    compatibility = document["compatibility"]
     process_resources = document["process_resources"]
     cgroup_resources = document["cgroup_resources"]
     storage = document["storage"]
@@ -2790,33 +2638,6 @@ def validate_source_publication_replay_probe(document: Any) -> None:
         or replay["event_identity_count"] < fixture["replacement_events"]
     ):
         raise SuiteFailure("source-publication replay batch evidence is invalid")
-    compatibility_fields = {
-        "total_refresh_count",
-        "activation_refresh_count",
-        "per_chunk_refresh_count",
-        "readiness_rows",
-        "affected_session_count",
-        "prepared_session_count",
-        "ready_rows",
-        "visible_compatibility_rows",
-    }
-    if (
-        not isinstance(compatibility, dict)
-        or set(compatibility) != compatibility_fields
-        or any(
-            isinstance(value, bool) or not isinstance(value, int) or value < 0
-            for value in compatibility.values()
-        )
-        or compatibility["total_refresh_count"] != 1
-        or compatibility["activation_refresh_count"] != 1
-        or compatibility["per_chunk_refresh_count"] != 0
-        or compatibility["readiness_rows"] != 1
-        or compatibility["affected_session_count"] != 1
-        or compatibility["prepared_session_count"] != 1
-        or compatibility["ready_rows"] != 1
-        or compatibility["visible_compatibility_rows"] != 1
-    ):
-        raise SuiteFailure("source-publication replay compatibility evidence is invalid")
     if (
         not isinstance(process_resources, dict)
         or set(process_resources) != {"cpu", "peak_rss", "disk_io"}
@@ -2925,8 +2746,6 @@ def validate_source_publication_replay_probe(document: Any) -> None:
         raise SuiteFailure("source-publication replay storage delta differs")
     passed = bool(
         replay["batch_count"] >= fixture["minimum_replay_batches"]
-        and compatibility["activation_refresh_count"] == 1
-        and compatibility["per_chunk_refresh_count"] == 0
         and storage["net_bytes_on_disk_growth"] > 0
         and process_resources["cpu"]["seconds"] > 0
         and (not run["authoritative"] or cgroup_pass)
@@ -2994,14 +2813,11 @@ def run_source_publication_replay_probe(
         )
         sandbox.wait_ingest_drained(timeout_s=max(30.0, min(timeout_s, 120.0)))
         url = f"http://127.0.0.1:{sandbox.clickhouse_port}"
-        _wait_for_publication_replay_compatibility(
-            url,
-            source_host=before_publication["source_host"],
-            generation=1,
-            timeout_s=timeout_s,
-        )
+        # The generation-1 compatibility wait this block used to end with
+        # waited for the v1 projector to catch up before the replacement was
+        # staged. Issue #603 WI-10 retired the projection; `wait_ingest_drained`
+        # above is the whole quiescence condition now.
         ack_cursor = sandbox.read_ingest_ack_logs().next_cursor
-        compatibility_before = _compatibility_refresh_snapshot(url)
         storage_before = _publication_replay_storage(url)
         replacement_staged = _stage_durable_source(destination, replacement_payload)
         process_before = _ingest_process_snapshot(sandbox)
@@ -3014,12 +2830,6 @@ def run_source_publication_replay_probe(
             expected_last_line=2 * events,
             timeout_s=timeout_s,
         )
-        visible_compatibility_rows = _wait_for_publication_replay_compatibility(
-            url,
-            source_host=after_publication["source_host"],
-            generation=2,
-            timeout_s=timeout_s,
-        )
         completed_ns = time.perf_counter_ns()
         cgroup_resources = sandbox.finish_resource_window(resource_before)
         process_after = _ingest_process_snapshot(sandbox)
@@ -3027,19 +2837,6 @@ def run_source_publication_replay_probe(
         replay_acks = sandbox.read_ingest_ack_logs(ack_cursor)
         if replay_acks.gap_detected:
             raise SuiteFailure("source-publication replay ACK log cursor was truncated")
-        compatibility_after = _compatibility_refresh_snapshot(url)
-        compatibility = _counter_delta(
-            compatibility_before,
-            compatibility_after,
-            context="source-publication compatibility refresh",
-        )
-        mcp_readiness = _publication_replay_mcp_readiness(
-            url,
-            source_host=after_publication["source_host"],
-            generation=2,
-        )
-        compatibility.update(mcp_readiness)
-        compatibility["visible_compatibility_rows"] = visible_compatibility_rows
         storage_after = _publication_replay_storage(url)
         storage_delta = _publication_replay_storage_delta(
             storage_before, storage_after
@@ -3077,8 +2874,6 @@ def run_source_publication_replay_probe(
     }
     passed = bool(
         replay["batch_count"] >= PUBLICATION_REPLAY_MIN_BATCHES
-        and compatibility["activation_refresh_count"] == 1
-        and compatibility["per_chunk_refresh_count"] == 0
         and net_bytes_on_disk_growth > 0
         and process_resources["cpu"]["seconds"] > 0
         and (
@@ -3088,7 +2883,7 @@ def run_source_publication_replay_probe(
     )
     document: dict[str, Any] = {
         "document_type": "source_publication_replay_probe",
-        "schema_version": "moraine.source-publication-replay-probe.v1",
+        "schema_version": "moraine.source-publication-replay-probe.v2",
         "status": "pass" if passed else "fail",
         "git_commit": str(prepared.protocol["git_commit"]),
         "run": {
@@ -3112,7 +2907,6 @@ def run_source_publication_replay_probe(
             "history_generations": history,
         },
         "replay": replay,
-        "compatibility": compatibility,
         "process_resources": process_resources,
         "cgroup_resources": cgroup_resources,
         "storage": storage,

@@ -762,7 +762,7 @@ central_connect_timeout_ms = 250
 | `async_log_writes` | `true` | Writes MCP observability rows asynchronously so tool calls stay responsive. |
 | `protocol_version` | `2024-11-05` | MCP protocol version advertised by the server. |
 | `max_parallel_requests` | `8` | Maximum retrieval requests executed concurrently by each MCP server process. At most 16 additional requests wait in FIFO order until capacity is available or the request is cancelled. A full queue is rejected immediately with a structured retryable error. A configured value must be greater than zero. |
-| `open_reader` | `auto` | Which repository reader backs the `open(session\|turn\|event)` tool family (issue #598). `auto` uses the canonical page-aware v2 reader once its read indexes are published on the default Local backend, otherwise the legacy v1 projected reader; `v1` forces the legacy reader (the non-silent kill-switch); `v2` forces the canonical reader and fails typed if its indexes are not ready. Validated at config load. |
+| `open_reader` | `auto` | Reader selector for the `open(session\|turn\|event)` tool family (issue #598; single reader since issue #603 WI-10 retired the v1 projection). `auto` and `v2` are synonyms: serve the canonical page-aware reader once its read indexes are published, fail typed otherwise. `v1` — the former kill-switch — is still **accepted** so an existing config cannot brick the load, but it selects nothing: reads are served by the canonical reader and `moraine status` / `moraine db doctor` surface a retirement note; remove the key at leisure. Validated at config load (an unknown string is still rejected). |
 | `use_central_server` | `true` | Makes `moraine run mcp` prefer the shared central server socket, with embedded fallback. |
 | `central_socket_path` | `mcp.sock` | Unix socket path. Bare filenames resolve under `runtime.pids_dir`; absolute paths are used verbatim. |
 | `central_connect_timeout_ms` | `250` | Milliseconds a proxy client waits for the central socket before falling back to embedded mode. |
@@ -773,14 +773,17 @@ Leave `prewarm_on_initialize` disabled for harnesses that launch multiple MCP
 processes at once; enabling it trades startup CPU/database work for lower
 first-search latency.
 
-Leave `open_reader` unset (equivalent to `auto`). It selects the canonical
-page-aware `open` reader (issue #598) once migration 036's read indexes finish
-backfilling on the default Local backend, and otherwise keeps the legacy
-projected reader — no manual action is required for a normal local install.
-Use `v1` as an immediate, non-silent kill-switch (surfaced in `moraine status`
-and `moraine db doctor`), and `v2` only for testing or a promoted shared
-backend. Binaries older than the #598 PR window reject unknown `[mcp]` keys,
-so remove the key from `moraine.toml` before any binary-downgrade rollback.
+Leave `open_reader` unset (equivalent to `auto`). The canonical page-aware
+`open` reader (issue #598) is the only reader since issue #603 WI-10 retired
+the v1 projection: `auto` and `v2` are synonyms, and reads fail with a typed
+error naming the canonical sweep until migration 036's read indexes finish
+backfilling — no manual action is required for a normal local install. A
+config that still says `v1` (the former kill-switch) keeps loading: the value
+is accepted-and-noted, reads are served by the canonical reader, and
+`moraine status` / `moraine db doctor` render the retirement note until the
+key is removed. Binaries older than the #598 PR window reject unknown `[mcp]`
+keys, so remove the key from `moraine.toml` before any binary-downgrade
+rollback.
 Readiness, operator commands
 (`moraine db core-index status|rebuild|promote`), and rollback are documented
 in
@@ -900,7 +903,7 @@ Per-class defaults:
 | Class | Used by | `deadline_seconds` | `memory_bytes` | `spill_bytes` | `read_rows` | `read_bytes` | `statement_cap` |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `interactive` | MCP tools, monitor reads, CLI status/doctor reads | `15.0` | 1 GiB | 256 MiB | 500M | 10 GiB | `256` |
-| `background` | Ingest publication inspections, projection refreshes, janitor work | `600.0` | 2 GiB | 512 MiB | 5B | 100 GiB | `512` |
+| `background` | Ingest publication inspections, janitor work | `600.0` | 2 GiB | 512 MiB | 5B | 100 GiB | `512` |
 | `migration` | Schema migrations, read-model backfills | `600.0` | 4 GiB | 1 GiB | 10B | 200 GiB | `1024` |
 | `administrative` | KILL statements and telemetry one-shots only | `5.0` | 256 MiB | 64 MiB | 1M | 256 MiB | `4` |
 | `export` | `moraine export` streaming reads | `600.0` | 2 GiB | 512 MiB | 10B | 200 GiB | `64` |
@@ -916,9 +919,9 @@ Validation is fail-closed and applies to every class:
   the primary enforcement mechanism and apply to external ClickHouse backends
   too; the server profile is only the last-resort bound for managed installs.
 
-The `background` deadline intentionally matches the projection debounce
-ceiling so the worst-case legitimate projection refresh completes within one
-budget instead of retrying forever. Migrations additionally keep honoring a
+The `background` deadline is sized for the janitor's largest legitimate
+single unit, so a healthy background pass completes within one budget instead
+of retrying forever. Migrations additionally keep honoring a
 larger operator-configured client timeout when one is set; the migration
 budget never tightens below it.
 
@@ -939,7 +942,7 @@ physical table into one of five classes:
 | --- | --- | --- |
 | `canonical_history` | `events` | **Kept forever.** Deletion requires an explicit key. |
 | `raw_audit` | `raw_events`, `ingest_errors` | **Kept forever.** Deletion requires an explicit key. |
-| `derived` | the `mcp_open_*` projection, the canonical read indexes, `search_documents`/`search_postings`, `tool_io`, `event_links`, `file_attention_project_roots` | Rebuildable; eligible for automatic reclamation once its replacement is verified. |
+| `derived` | the canonical read indexes, `search_documents`/`search_postings`, `tool_io`, `event_links`, `file_attention_project_roots` | Rebuildable; eligible for automatic reclamation once its replacement is verified. |
 | `telemetry` | `ingest_heartbeats`, `search_query_log`, `search_hit_log`, `search_interaction_log`, and the ClickHouse system logs | Bounded by a default TTL. |
 | `never_delete` | publication truth, revision allocators, control fences, the migration ledger, the reclaim ledger, `search_conversation_terms` | No code path may ever delete it. |
 
@@ -993,12 +996,13 @@ would touch, and refuses a bucket-1/2 scope unless the matching key above is
 present — naming the missing key. Export before pruning with
 `moraine export events --format jsonl`.
 
-Four scopes delete in this release:
+Two scopes delete in this release (the two `mcp_open_*` scopes earlier
+releases carried were retired with the projection they collected — issue #603
+WI-10 / migration 041 drops the whole family at once, settling any unsettled
+ledger units for those scopes as `abandoned`):
 
 | Scope | What it collects |
 |---|---|
-| `mcp_open_orphan` | Child rows whose `(session, candidate generation)` has **no publication header**. No reader can authorize them on either engine, so this is safe independently of the canonical-read cutover. |
-| `mcp_open_retired_lineage` | Complete snapshots in a source lineage the session has left, once a newer lineage is published *and* live for that session and the old one is unselectable by any request. |
 | `read_index_generation` | Canonical read-index rows (`mcp_session_directory`, `mcp_event_locator`, `mcp_event_navigation`) belonging to **retired** source generations: generations publication history records as published and that a later publication has displaced from the current head, once that supersession is older than `derived_horizon_hours`. The three tables are content-free and rebuildable with `moraine db core-index rebuild`; see [canonical read indexes](operations/canonical-read-indexes.md#reclaiming-superseded-generations) for the rollback caveat this horizon is the window for. |
 | `canonical_generation` | **User history — buckets 1 and 2, opt-in only.** Superseded source generations in `events`, `raw_events` and `ingest_errors`, together with their derived satellites (`search_documents`, `search_postings`, `tool_io`, `event_links`). Retirement is the same publication-truth notion as `read_index_generation`, but the horizon is the **stricter (larger)** of the two protected keys: `events` is gated by `canonical_history_horizon_days`, the two audit tables by `raw_audit_horizon_days`, and one generation is one unit, so it becomes claimable only when **both** horizons have passed; the satellites go with the unit, because a satellite that outlived its canonical parent would be a permanent orphan. Deletes run satellites first and `events` last, so an interruption leaves rebuildable derived gaps, never orphaned derived rows. |
 
@@ -1022,9 +1026,10 @@ residues, never candidates.
 Each unit is written to the reclaim ledger *before* its first delete and
 settled after its last, and every run finishes the ledger's unsettled units
 before planning new ones. A process killed mid-unit therefore resumes rather
-than stranding rows — which is the defect this machinery exists to fix, and
-the reason the reference host carries roughly 11 million unreachable
-projection rows written by the path that had no ledger. A unit that fails
+than stranding rows — which is the defect this machinery exists to fix: the
+reference host carried roughly 11 million unreachable rows written by the
+retired v1 projector's ledgerless delete path before migration 041 dropped
+that family outright. A unit that fails
 repeatedly is retried on later runs and marked `abandoned` after 24 hours
 unsettled, so one bad unit cannot stall its scope indefinitely.
 
@@ -1036,16 +1041,13 @@ storage_reclaim_maintenance = true   # default: false
 ```
 
 `moraine db reclaim run --confirm` is always available. This key decides only
-whether the ingest maintenance tick *also* reclaims the three bucket-3 scopes
-on its own, roughly once a minute.
+whether the ingest maintenance tick *also* reclaims the bucket-3
+`read_index_generation` scope on its own, roughly once a minute.
 
 **It defaults to `false`, deliberately.** Reclamation makes a disk fuller
 before it makes it emptier: ClickHouse rewrites these `DELETE`s into mutations
 that mark rows with a `_row_exists` mask, and the space returns only when a
-background merge rewrites the affected parts. The delete against
-`mcp_open_events` also cannot use an index — that table is ordered by
-`event_uid` while a reclaim unit is keyed by `(session_id,
-candidate_generation)`, so every part is read. Running that unattended on a
+background merge rewrites the affected parts. Running that unattended on a
 host with no headroom turns disk pressure into an outage.
 
 When enabled, the tick claims at most 8 units per scope per pass and declines

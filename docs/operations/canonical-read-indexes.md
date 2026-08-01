@@ -1,10 +1,12 @@
 # Canonical read indexes and the `open` reader
 
-Moraine is migrating the `open` tool family (`open(session|turn|event)`) off the
-full-content `mcp_open_*` projection and onto a page-aware reader backed by
-content-free **canonical read indexes** (issue #598). This page is the operator
-reference for that reader: how to select it, how to inspect its readiness, and
-how to repair or roll it back.
+Moraine's `open` tool family (`open(session|turn|event)`) reads through a
+page-aware reader backed by content-free **canonical read indexes** (issue
+#598). The full-content `mcp_open_*` projection it replaced is retired: issue
+#603 WI-10 removed the v1 reader and projector, and migration 041 drops the
+projection tables outright once a store has cut over. This page is the
+operator reference for the canonical reader: how to inspect its readiness and
+how to repair it.
 
 ## Architecture overview
 
@@ -72,9 +74,10 @@ Readiness lives in `mcp_read_index_state` under three keys:
 The canonical reader is landing one consumer at a time, not as a single
 cross-surface switch. As of this build:
 
-- **`open(session|turn|event)` is cut over.** When `open_reader` resolves to v2
-  (published and Local, or forced), the `open` tool family reads canonical rows
-  through the page-aware reader. This is a one-way flip per process.
+- **`open(session|turn|event)` is cut over.** The `open` tool family reads
+  canonical rows through the page-aware reader — the only reader since issue
+  #603 WI-10. While a fresh store's first sweep has not yet published
+  `open_v2` readiness, `open` fails with a typed error naming the sweep.
 - **Session discovery is cut over** (issue #599). MCP `list_sessions` and the
   monitor `/api/v1/sessions` feed are now one shared repository operation that
   selects candidates from `mcp_session_directory` and hydrates only the
@@ -91,23 +94,22 @@ cross-surface switch. As of this build:
     `updated_at` it reports is the same `max(max_observed_event_time)` the feed
     orders, pages and renders by rather than a second aggregate of its own —
     which is what lets both surfaces derive the same `status` for one session at
-    one instant. It branches on the readiness gate below exactly as the
-    feed does and falls back to the same projected headers, so a not-ready store
-    answers a search with the sessions that matched rather than with an empty
+    one instant. It branches on the readiness gate below exactly as the feed
+    does: a not-ready store refuses typed rather than answering with an empty
     result set that would read as "the whole corpus was searched".
-  - **Readiness gate.** The shared operation selects the directory path only
-    when the `open_v2` key reads ready — the same key `open` consults — and
-    otherwise serves the pre-#599 `mcp_open_publication_headers` page. The
-    negative is never cached, so the flip needs no restart; the positive is
-    latched per process.
+  - **Readiness gate.** The shared operation serves the directory path only
+    when the `open_v2` key reads ready — the same key `open` consults. With
+    the projected-header fallback retired (issue #603 WI-10), an unpublished
+    store refuses the page with a typed error instead of answering from an
+    incomplete index. The negative is never cached, so the flip needs no
+    restart; the positive is latched per process.
   - **Continuation tokens are path-tagged.** A cursor minted by one path is
     refused by the other with a cursor mismatch rather than silently resuming,
     because the two paths anchor on values that a readiness flip can move
     apart. A client that sees a mismatch restarts its feed from page 1.
-  - **`mcp_open_publication_headers` is still written and read** by that
-    fallback, so a store whose backfill has not published readiness keeps
-    working unchanged. The fallback is deliberately short-lived; it is removed
-    once the #599 live gates are green in CI.
+  - The projected-header fallback those tokens used to guard against is gone
+    (its tables with it, migration 041); the path tag survives so a token
+    minted before the retirement is refused with the same cursor mismatch.
   - **Directory scan cost is linear in sessions, not in event bytes.**
     `mcp_session_directory` leads its sort key with `session_id`, so a
     time-windowed candidate page cannot be granule-pruned and the candidate
@@ -118,20 +120,19 @@ cross-surface switch. As of this build:
     or its wall time exceeds 500 ms at 100k sessions, that is the trigger to
     add a time-leading projection in a follow-up migration — not something to
     tune here.
-- **Search still reads v1** (issue #597). Search ranking and result hydration
-  continue to use the projected read model.
-- **The v1 projector, its dirty-session materialized view, the janitor, and the
-  publication bridge keep running** as the compatibility reconciler. They keep
-  `mcp_open_*` current for the consumers still on v1 — and that is exactly what
-  makes a binary downgrade a safe full rollback for this whole change (see
-  [Rollback](#rollback)).
-
-Only after search (#597) has cut over, and after the #599 readiness-gated
-fallback has been removed, does a later, separate retirement change stop the
-projector and dirty writes and drop the compatibility tables. Until then, expect
-steady-state reads and writes against `mcp_open_*` from search, from the
-projector itself, and from any backend that has not published readiness; they
-are not a sign the canonical reader is inactive.
+- **Search reads the bounded canonical engine.** Ranking runs over
+  `search_postings` joined to the live locator, and hydration reads the
+  navigation index plus bounded canonical `events` rows.
+- **The v1 projector is retired** (issue #603 WI-10). The projector, its
+  dirty-session materialized view, the compatibility publication bridge, the
+  startup backfill, and the `mcp_open` reclaim scopes are gone from the
+  binary, and migration 041 drops the `mcp_open_*` tables themselves. The
+  drop is gated: on a store that has not cut over, the migration defers with
+  a named reason until the canonical sweep publishes `open_v2` readiness (the
+  migrate/`up` sequence retries it in the same startup), so the projection
+  bytes are only released once nothing can need them. The migration's
+  preflight note reports the compressed column bytes the drop returned
+  (`sum(data_compressed_bytes)` over the family's active `system.parts`).
 
 The cutover is validated by three live gates —
 `scripts/dev/sandbox/run-live-test list-parity`, `… list-query-log`, and
@@ -143,7 +144,7 @@ For an active file-backed session on the reference host, a committed append
 becomes visible through the canonical `open` reader within **2 seconds at p95**,
 measured from ingest acknowledgement (the durable `events` insert) to the first
 valid `open` that reflects the appended event. This is the realtime contract the
-canonical reader must hold; the projector rebuild it replaces could stall this
+canonical reader must hold; the projector rebuild it replaced could stall this
 path under load.
 
 The gate is validated by the pre-wired live-test modes `append-to-visible`
@@ -155,29 +156,26 @@ their documented polling latency until their delta-scan follow-up lands. See
 [Testing and benchmarking](../development/testing.md) for how to run these
 modes.
 
-## Selecting the reader: `[mcp] open_reader`
+## The reader selector: `[mcp] open_reader` (retired to one reader)
 
 ```toml
 [mcp]
-# "auto" (default) | "v1" | "v2"
-open_reader = "auto"
+# "auto" (default) | "v2" (synonym) | "v1" (accepted-and-noted, retired)
+# open_reader = "auto"   # leave unset
 ```
 
 The value is validated at config load; an unknown value is rejected with a
-friendly error. The selector resolves as follows (a config override always beats
-the process-cached readiness at process start):
+friendly error. Since issue #603 WI-10 retired the v1 projection there is one
+reader, so the selector resolves as follows:
 
-- **`auto`** (default): use the canonical v2 reader **iff** `open_v2.ready == 1`
-  **and** the backend is the default single-owner Local backend; otherwise stay
-  on the legacy v1 projected reader. Once v2 is selected in a process it stays
-  selected (monotonic; no mid-run demotion).
-- **`v1`**: force the legacy v1 reader regardless of published readiness. This is
-  the **non-silent kill-switch** — `moraine status` and `moraine db doctor`
-  display that a config override is in effect. It takes effect at process start
-  and is the immediate operational escape hatch.
-- **`v2`**: force the canonical v2 reader (for testing, or a promoted Shared
-  backend). When the indexes are not ready the reader fails with a typed error
-  rather than silently falling back to v1.
+- **`auto`** (default) and **`v2`** are synonyms: serve the canonical reader
+  once `open_v2.ready == 1`; fail with a typed error naming the sweep
+  otherwise. Once readiness is observed in a process it stays observed
+  (monotonic; no mid-run demotion).
+- **`v1`** — the former kill-switch — is still **accepted** so an existing
+  `moraine.toml` cannot brick the load on upgrade, but it selects nothing:
+  reads are served by the canonical reader, and `moraine status` /
+  `moraine db doctor` render a retirement note until the key is removed.
 
 ## Inspecting readiness
 
@@ -199,8 +197,8 @@ The same fields are additive JSON under `--output json`, and are surfaced by:
   (`--output json` nests them under `core_index` beside the existing `doctor`
   object; the `doctor` shape is unchanged).
 - `moraine status` — a concise `core indexes: … | open reader: …` line in the
-  Database panel, plus a prominent note whenever a config override or a
-  forced-v2-not-ready misconfiguration is in effect.
+  Database panel, plus a prominent note whenever the retired `v1` selector is
+  still configured or the indexes are not ready.
 
 Core-index readiness is a normal transient state (like publication replaying);
 it does **not** fail the doctor exit code.
@@ -208,12 +206,11 @@ it does **not** fail the doctor exit code.
 > **Status/doctor read live state; serving processes do not.** Each backend or
 > MCP process samples `open_v2` readiness once at construction and keeps that
 > answer for its lifetime. After an in-place `moraine db migrate` publishes
-> readiness under a running backend daemon, `status`/`doctor` report the v2
-> reader as active while the daemon keeps dispatching v1 until it is restarted
-> (`moraine down && moraine up`). This divergence is safe in direction (v1
-> serves correctly) but means doctor output describes the state a *newly
-> started* process would adopt, not necessarily what a long-running daemon is
-> doing right now.
+> readiness under a running backend daemon, `status`/`doctor` report the
+> canonical reader as ready while the daemon keeps refusing `open` reads with
+> the typed unready error until it is restarted (`moraine down && moraine
+> up`). Doctor output describes the state a *newly started* process would
+> adopt, not necessarily what a long-running daemon is doing right now.
 >
 > **Session discovery is the one exception.** Its readiness gate caches only a
 > ready answer, never a not-ready one, so a long-running daemon adopts the
@@ -258,14 +255,14 @@ Before (or immediately after) starting a rebuild, restart the running stack:
 moraine down && moraine up
 ```
 
-Processes started while `open_v2.ready` is 0 resolve `auto` to v1 and adopt v2
-at their next start after the rebuild republishes readiness. The `rebuild`
-command prints this warning before touching anything.
+Processes started while `open_v2.ready` is 0 refuse `open`/`list` reads with
+a typed error and adopt the canonical reader at their next start after the
+rebuild republishes readiness. The `rebuild` command prints this warning
+before touching anything — mid-rebuild reads are refusals, not stale answers,
+so schedule the rebuild accordingly.
 
-On a Shared backend, additionally set `open_reader = "v1"` on all reader
-processes first (a restart alone re-probes readiness, and mid-rebuild that
-yields v1 anyway — the explicit kill-switch makes it deterministic), run the
-rebuild, then re-`promote`.
+On a Shared backend, run the rebuild and then re-`promote`; reader processes
+serve typed refusals until the promotion republishes readiness.
 
 A rebuild also honors the promote ceremony: when the pre-rebuild `open_v2` row
 was published with `operator-promote` provenance, the rebuild withholds the
@@ -360,21 +357,23 @@ after it was displaced, run the rebuild afterwards.
 
 ## Rollback
 
-- **Kill-switch (fastest):** set `open_reader = "v1"` and restart the reader
-  process(es). This is a non-silent override surfaced in status/doctor and takes
-  effect immediately at process start, ahead of any cached readiness.
-- **Binary downgrade (full rollback):** downgrading the Moraine binary is a
-  supported rollback for the entire #598 PR window. The v1 projector, dirty
-  materialized view, janitor, and publication bridge keep running as a
-  compatibility reconciler, so `mcp_open_*` stays current and a downlevel binary
-  reads it exactly as before. (This holds until the separate step-6 retirement
-  PR removes the v1 writers.)
+The v1 reader and its projection are retired (issue #603 WI-10), so there is
+no kill-switch back to it. What remains:
 
-  **Remove `open_reader` from `moraine.toml` before downgrading.** Downlevel
-  binaries reject unknown `[mcp]` keys at config load, so a config still
-  carrying `open_reader` (for example after applying the kill-switch above)
-  makes every service — `up`, the backend daemon, ingest, MCP — refuse to
-  start on the old binary. Delete the line, then downgrade.
+- **Repair in place (preferred):** every canonical-reader defect is
+  recoverable with `moraine db core-index rebuild` — the indexes are
+  content-free derivations of canonical `events`, and the rebuild re-sweeps,
+  re-audits, and republishes readiness.
+- **Binary downgrade:** a pre-retirement binary can be restored ONLY on a
+  store where migration 041 has not applied (the projection tables still
+  exist); the downlevel projector then reconciles `mcp_open_*` and serves v1
+  reads as before. Once 041 has dropped the family there is no in-place
+  downgrade path — the projection would have to be rebuilt by the downlevel
+  binary's own backfill against canonical `events`, which is a full
+  re-projection, not a rollback. Take a `moraine export events --format
+  jsonl` before any deliberate downgrade experiment, and remove `open_reader`
+  from `moraine.toml` first if it is set: binaries older than the #598 PR
+  window reject unknown `[mcp]` keys at config load.
 
 ## DB-level reset recipe (CLI unavailable)
 

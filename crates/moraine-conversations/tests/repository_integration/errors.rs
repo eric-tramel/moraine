@@ -133,7 +133,7 @@ async fn typed_budget_errors_take_the_consistency_non_retry_arm() {
         // A typed deadline error must propagate after exactly one attempt: one
         // snapshot capture, one operation read, no revalidation, no retry.
         // The readiness gate is declared, so the probe never consumes a script.
-        let (repo, state) = build_scripted_header_repo(vec![ScriptedResponse::failure(
+        let (repo, state) = build_scripted_directory_repo(vec![ScriptedResponse::failure(
             &[],
             "Code: 159. DB::Exception: Timeout exceeded: elapsed 2.0 seconds",
         )])
@@ -228,7 +228,7 @@ async fn scope_outcomes_stay_scope_outcomes_under_an_active_envelope() {
     let budget = interactive_test_budget(15.0);
 
     let session = QueryEnvelope::new("request", QueryClass::Interactive, &budget)
-        .scope(repo.get_mcp_session("sess-out-of-scope"))
+        .scope(repo.get_session_metadata("sess-out-of-scope"))
         .await
         .expect("scope rejection is not an error");
     assert!(session.is_none(), "out-of-scope session must stay hidden");

@@ -1138,19 +1138,17 @@ mod tests {
                 "a config missing a protected key must yield no horizon, not a default"
             );
         }
-        // The three bucket-3 scopes keep the derived horizon.
-        for scope in [
-            ReclaimScope::McpOpenOrphan,
-            ReclaimScope::McpOpenRetiredLineage,
-            ReclaimScope::ReadIndexGeneration,
-        ] {
-            assert_eq!(
-                probe_horizon_seconds(scope, &RetentionConfig::default()).expect("bucket 3"),
-                RetentionConfig::default()
-                    .derived_horizon_seconds()
-                    .max(0.0) as u64
-            );
-        }
+        // The bucket-3 scope keeps the derived horizon.
+        assert_eq!(
+            probe_horizon_seconds(
+                ReclaimScope::ReadIndexGeneration,
+                &RetentionConfig::default()
+            )
+            .expect("bucket 3"),
+            RetentionConfig::default()
+                .derived_horizon_seconds()
+                .max(0.0) as u64
+        );
     }
 
     /// **OQ-1, asserted as the resolution it records** (hazard H5). Three

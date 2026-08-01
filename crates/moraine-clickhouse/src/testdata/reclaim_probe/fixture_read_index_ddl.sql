@@ -19,12 +19,12 @@
 --
 -- ## The DDL below is NOT the schema of record
 --
--- Same contract as `fixture.sql`: each table is reduced to the columns the
--- probe and the deletes read, but every ENGINE, ORDER BY and PARTITION BY is
--- the shipped one (`sql/036`), because the tuple-delete's extent argument and
--- the collapse behaviour both depend on them. The two publication views are
--- stood in for by tables because `clickhouse local` has nothing to derive
--- them from; `sql/031` is their schema of record.
+-- Same contract as `fixture_canonical_ddl.sql`: each table is reduced to the
+-- columns the probe and the deletes read, but every ENGINE, ORDER BY and
+-- PARTITION BY is the shipped one (`sql/036`), because the tuple-delete's
+-- extent argument and the collapse behaviour both depend on them. The two
+-- publication views are stood in for by tables because `clickhouse local` has
+-- nothing to derive them from; `sql/031` is their schema of record.
 
 CREATE DATABASE IF NOT EXISTS moraine;
 

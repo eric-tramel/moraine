@@ -51,7 +51,7 @@ pub(super) const fn analytics_range_index(range: AnalyticsRange) -> usize {
 /// `docs` / `avgdl` come from `search_corpus_stats` —
 /// `count()` / `sum(doc_len)` over `v_live_search_documents`, i.e.
 /// published-generation-authorized document revisions with `doc_len > 0` — for
-/// EVERY search path, v1 and v2 alike. There is exactly one statement, so
+/// EVERY search path this build serves. There is exactly one statement, so
 /// there is exactly one entry, and a single slot is the whole cache rather than
 /// two populations taking turns evicting each other.
 ///
@@ -449,15 +449,7 @@ impl ClickHouseConversationRepository {
             .map(|row| (row.docs, row.total_doc_len))
             .unwrap_or((0, 0));
 
-        if let Some(publication_token) = publication_cache_key("corpus-stats") {
-            let mut cache = self.stats_cache.write().await;
-            cache.corpus_stats = Some(CorpusStatsCacheEntry {
-                publication_token,
-                docs: resolved.0,
-                total_doc_len: resolved.1,
-                fetched_at: now,
-            });
-        }
+        self.cache_corpus_stats(resolved.0, resolved.1, now).await;
         Ok(resolved)
     }
 

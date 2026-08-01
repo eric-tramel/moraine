@@ -319,15 +319,6 @@ impl PublicationSnapshot {
         }
     }
 
-    /// Scalar array expression containing the exact source heads reconstructed
-    /// at this snapshot. Large head sets remain inside ClickHouse.
-    pub(super) fn captured_source_heads_sql(&self, history_ref: &str) -> String {
-        let predicate = self.publication_revision_predicate("history");
-        format!(
-            "(SELECT groupArray(CAST(tuple(captured.source_host, captured.source_name, captured.source_file, captured.source_generation, captured.publication_revision), 'Tuple(source_host String, source_name String, source_file String, source_generation UInt32, publication_revision UInt64)'))\nFROM (\n  SELECT\n    grouped.source_host AS source_host,\n    grouped.source_name AS source_name,\n    grouped.source_file AS source_file,\n    toUInt32(tupleElement(grouped.head, 1)) AS source_generation,\n    toUInt64(tupleElement(grouped.head, 2)) AS publication_revision\n  FROM (\n    SELECT\n      history.source_host AS source_host,\n      history.source_name AS source_name,\n      history.source_file AS source_file,\n      argMax(tuple(history.source_generation, history.publication_revision), history.publication_revision) AS head\n    FROM {history_ref} AS history\n    WHERE {predicate}\n    GROUP BY history.source_host, history.source_name, history.source_file\n  ) AS grouped\n) AS captured)"
-        )
-    }
-
     fn read_allowed(&self, class: PublicationReadClass, scope: &PublicationReadScope) -> bool {
         self.controls
             .iter()
@@ -1012,33 +1003,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "MCP search session reads requires an active publication snapshot")]
-    fn snapshotless_mcp_search_session_source_panics() {
-        let repository = repository_with_publication_mode(PublicationConsistencyMode::Local);
-        let _ = repository.mcp_search_sessions_source();
-    }
-
-    #[tokio::test]
-    #[should_panic(
-        expected = "projected MCP session reads requires an active publication snapshot"
-    )]
-    async fn snapshotless_projected_session_read_panics() {
-        let repository = repository_with_publication_mode(PublicationConsistencyMode::Local);
-        let _ = repository.load_projected_session("session-a").await;
-    }
-
-    #[tokio::test]
-    #[should_panic(
-        expected = "canonical MCP event existence reads requires an active publication snapshot"
-    )]
-    async fn snapshotless_canonical_event_existence_read_panics() {
-        let repository = repository_with_publication_mode(PublicationConsistencyMode::Local);
-        let _ = repository
-            .canonical_event_exists_in_snapshot("event-a")
-            .await;
-    }
-
-    #[test]
     fn local_snapshot_query_captures_heads_and_fences_in_one_ordered_statement() {
         let repository = repository_with_publication_mode(PublicationConsistencyMode::Local);
         let query = repository.publication_snapshot_query(PublicationSnapshotPhase::Capture);
@@ -1399,24 +1363,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn captured_head_aggregation_qualifies_raw_revision_inputs() {
-        let snapshot = PublicationSnapshot::new(
-            PublicationConsistencyMode::Shared,
-            vec![host_state("host-a", 7, "heads-a")],
-            Vec::new(),
-        );
-        let sql = snapshot.captured_source_heads_sql("history");
-
-        assert!(sql.contains(
-            "argMax(tuple(history.source_generation, history.publication_revision), history.publication_revision)"
-        ));
-        assert!(
-            sql.contains("GROUP BY history.source_host, history.source_name, history.source_file")
-        );
-        assert!(!sql.contains("tuple(source_generation, publication_revision)"));
-    }
-
     #[tokio::test]
     async fn captured_live_events_use_portable_final_alias_order() {
         let client = ClickHouseClient::new(moraine_config::ClickHouseConfig::default())
@@ -1542,31 +1488,6 @@ mod tests {
                 ));
                 assert!(!sql.contains("tuple(source_generation, publication_revision)"));
                 assert!(!sql.contains(&unsupported_final_alias));
-            })
-            .await;
-    }
-
-    #[tokio::test]
-    async fn captured_mcp_search_sessions_publish_unqualified_column_names() {
-        let snapshot = PublicationSnapshot::new(
-            PublicationConsistencyMode::Local,
-            vec![host_state("", 4, "heads-a")],
-            vec![control("idle", 7, false)],
-        );
-        let client = ClickHouseClient::new(moraine_config::ClickHouseConfig::default())
-            .expect("build ClickHouse client");
-        let repository = ClickHouseConversationRepository::new(client, RepoConfig::default());
-
-        ACTIVE_PUBLICATION_SNAPSHOT
-            .scope(snapshot, async {
-                let sql = repository.mcp_search_sessions_source();
-
-                assert!(sql.contains("h.session_id AS session_id"));
-                assert!(sql.contains("toUInt8(h.slot) AS slot"));
-                assert!(sql.contains("toUInt64(h.generation) AS generation"));
-                assert!(sql.contains("h.first_event_time AS first_event_time"));
-                assert!(sql.contains("h.origin_cwd AS origin_cwd"));
-                assert!(!sql.contains("SELECT h.*\nFROM head_authorized_headers AS h"));
             })
             .await;
     }

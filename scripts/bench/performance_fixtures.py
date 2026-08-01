@@ -1034,18 +1034,11 @@ VALUES
   'performance-fixture', '{operation_id}:head'
 )
 """.strip()
-    dirty = f"""
-INSERT INTO {database}.mcp_open_dirty_sessions
-  (session_id, dirty_revision, observed_at)
-SELECT session_id, generateSnowflakeID(), now64(3)
-FROM
-(
-  SELECT DISTINCT session_id
-  FROM {database}.v_live_events
-  WHERE notEmpty(session_id)
-)
-""".strip()
-    return checkpoint, readiness, head, dirty
+    # Issue #603 WI-10 retired the v1 projection, so a directly seeded fixture
+    # has no dirty queue to prime: the canonical read indexes are maintained by
+    # the insert's own materialized views, and the suite's
+    # `reconcile_seeded_read_model` (`moraine db migrate`) publishes readiness.
+    return checkpoint, readiness, head
 
 
 def codex_event_lines(event: Mapping[str, Any]) -> bytes:

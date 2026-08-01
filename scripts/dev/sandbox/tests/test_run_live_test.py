@@ -455,10 +455,13 @@ class RunLiveTestTests(unittest.TestCase):
             "live_source_publication_cutover_crash_recovery",
         )
 
-    def test_mcp_backfill_mode_runs_only_exact_ignored_function(self) -> None:
-        self.assert_exact_invocation(
-            "mcp-backfill", "live_mcp_open_batched_backfill_resources"
-        )
+    def test_retired_mcp_backfill_mode_is_rejected(self) -> None:
+        # Issue #603 WI-10 retired the projection this mode benchmarked; the
+        # dispatcher must refuse it as unknown rather than silently running
+        # nothing.
+        result = self.run_wrapper("mcp-backfill")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unknown mode", result.stderr + result.stdout)
 
     def test_envelope_query_log_mode_runs_only_exact_ignored_function(self) -> None:
         self.assert_exact_invocation(

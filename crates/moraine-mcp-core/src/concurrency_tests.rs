@@ -1,12 +1,12 @@
 use super::*;
 use moraine_conversations::{
-    AnalyticsRange, AnalyticsSnapshot, Conversation, ConversationDetailOptions,
+    AnalyticsRange, AnalyticsSnapshot, CanonicalContinuation, CanonicalReadOutcome,
+    CanonicalSessionPage, CanonicalTurnPage, Conversation, ConversationDetailOptions,
     ConversationListFilter, ConversationSearchQuery, ConversationSearchResults, FileAttentionQuery,
     FileAttentionTouch, InMemoryConversationRepository, IngestHeartbeatRead, McpEventOpen,
-    McpSessionListFilter, McpSessionListItem, McpSessionOpen, McpTurnOpen, OpenContext,
-    OpenEventRequest, Page, PageRequest, RepoConfig, RepoResult, SearchEventsQuery,
-    SearchEventsResult, SearchMcpEventsQuery, SearchMcpEventsResult, SessionAnalytics,
-    SessionAnalyticsQuery, SessionEventsQuery, SessionMetadata, SessionSearchQuery,
+    McpSessionListFilter, McpSessionListItem, OpenContext, OpenEventRequest, Page, PageRequest,
+    RepoConfig, RepoResult, SearchEventsQuery, SearchEventsResult, SearchMcpEventsQuery,
+    SearchMcpEventsResult, SessionEventsQuery, SessionMetadata, SessionSearchQuery,
     SessionSearchResults, StoreDiagnostics, StoreHealth, TablePreview, TablePreviewQuery,
     TableSummaries, TraceEvent, Turn, TurnListFilter, TurnSummary, WebSearchEvent,
 };
@@ -124,16 +124,6 @@ impl ConversationRepository for BlockingRepository {
         self.inner.prewarm_mcp_search_state().await
     }
 
-    // Pass-through for a method deprecated pending projector retirement; the
-    // wrapper must keep delegating it while the trait declares it.
-    #[allow(deprecated)]
-    async fn list_session_analytics(
-        &self,
-        query: SessionAnalyticsQuery,
-    ) -> RepoResult<Vec<SessionAnalytics>> {
-        self.inner.list_session_analytics(query).await
-    }
-
     async fn analytics_series(&self, range: AnalyticsRange) -> RepoResult<AnalyticsSnapshot> {
         self.inner.analytics_series(range).await
     }
@@ -182,11 +172,42 @@ impl ConversationRepository for BlockingRepository {
         self.inner.get_session_metadata(session_id).await
     }
 
-    async fn get_mcp_session(&self, session_id: &str) -> RepoResult<Option<McpSessionOpen>> {
+    async fn canonical_reader_ready(&self) -> bool {
+        self.inner.canonical_reader_ready().await
+    }
+
+    // The canonical `open` reader path (the only reader since issue #603
+    // WI-10): BLOCK_OPEN hooks the session page, which every `open` summary
+    // read reaches first.
+    async fn canonical_open_session_page(
+        &self,
+        session_id: &str,
+        limit: u16,
+        after: Option<CanonicalContinuation>,
+    ) -> RepoResult<Option<CanonicalReadOutcome<CanonicalSessionPage>>> {
         if self.mode.load(Ordering::Acquire) == BLOCK_OPEN {
             self.block_forever().await
         }
-        self.inner.get_mcp_session(session_id).await
+        self.inner
+            .canonical_open_session_page(session_id, limit, after)
+            .await
+    }
+
+    async fn canonical_open_turn_page(
+        &self,
+        session_id: &str,
+        turn_seq: u32,
+        limit: u16,
+        include_events: bool,
+        after: Option<CanonicalContinuation>,
+    ) -> RepoResult<Option<CanonicalReadOutcome<CanonicalTurnPage>>> {
+        self.inner
+            .canonical_open_turn_page(session_id, turn_seq, limit, include_events, after)
+            .await
+    }
+
+    async fn canonical_open_event(&self, event_uid: &str) -> RepoResult<Option<McpEventOpen>> {
+        self.inner.canonical_open_event(event_uid).await
     }
 
     async fn list_mcp_sessions(
@@ -220,20 +241,8 @@ impl ConversationRepository for BlockingRepository {
         self.inner.get_turn(session_id, turn_seq).await
     }
 
-    async fn get_mcp_turn(
-        &self,
-        session_id: &str,
-        turn_seq: u32,
-    ) -> RepoResult<Option<McpTurnOpen>> {
-        self.inner.get_mcp_turn(session_id, turn_seq).await
-    }
-
     async fn open_event(&self, request: OpenEventRequest) -> RepoResult<OpenContext> {
         self.inner.open_event(request).await
-    }
-
-    async fn get_mcp_event(&self, event_uid: &str) -> RepoResult<Option<McpEventOpen>> {
-        self.inner.get_mcp_event(event_uid).await
     }
 
     async fn list_session_events(
@@ -317,7 +326,6 @@ fn test_state_with_admission(
             max_queued_requests,
         )),
         query_budgets,
-        false,
         true,
     )
 }

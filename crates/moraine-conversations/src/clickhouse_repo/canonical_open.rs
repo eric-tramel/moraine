@@ -4,15 +4,16 @@
 //! from live canonical `events` rows plus the migration-036 content-free
 //! indexes (`mcp_session_directory`, `mcp_event_locator`, `mcp_event_navigation`)
 //! — never `mcp_open_*`. It implements the spec's narrow query shape
-//! (issue-598.md §4):
+//! (issue #598 §4):
 //!
 //! 1. Read narrow ordering/classification/version columns first (payload-free,
 //!    asserted by the SQL-shape tests: no statement here lists `text_content`
 //!    or `payload_json` except the two explicitly wide statements — the bounded
 //!    metadata read and the page hydration).
 //! 2. Derive order/turns/summaries/neighbors over the *bounded page set* using
-//!    the WI-01 shared fragments ([`cd`], [`DerivationColumns::EVENTS`]) so the
-//!    derivation matches the projector byte-for-byte where it must.
+//!    the WI-01 shared fragments ([`cd`], [`DerivationColumns::EVENTS`]), the
+//!    same authority the retired projector derived from, so the values a
+//!    caller sees did not move at the cutover.
 //! 3. Keyset pagination with `LIMIT K + 1` in SQL.
 //! 4. Read `text_content` / `payload_json` only for the selected page's events.
 //! 5. Read session metadata only from metadata-bearing rows (the
@@ -24,11 +25,16 @@
 //! REPOSITORY reader; the tool-facing `open_v2` cursor is WI-07, which consumes
 //! the page-in/page-out API defined here (keyed by [`CanonicalContinuation`]).
 //!
-//! Exact live parity with the v1 projector (event-ordinal edge cases,
-//! non-contiguous stray-override folding, the summary two-phase selection, and
-//! the total-turns counter refinement in the VERIFIER ADDENDUM) is pinned and
-//! verified by the WI-10 live parity fixtures; the folds here are structured to
-//! that contract and unit-tested for their SQL shape and forward arithmetic.
+//! These folds were built against exact live parity with the v1 projector
+//! (event-ordinal edge cases, non-contiguous stray-override folding, the
+//! summary two-phase selection, and the total-turns counter refinement in the
+//! VERIFIER ADDENDUM). **That oracle is gone**: issue #603 WI-10 deleted the
+//! projector, so nothing can byte-diff the two readers any more. What still
+//! runs is the `canonical-open-parity` gate over the properties the diff
+//! certified that retain an oracle — page-size independence, pinned derivation
+//! values, origin-scope visibility — plus the unit tests here on SQL shape and
+//! forward arithmetic. Read the parity contract as the reason these folds are
+//! shaped this way, not as something under test.
 
 use super::consistency::EventTsBounds;
 use super::*;
@@ -848,8 +854,12 @@ fn first_non_empty(candidates: &[&str]) -> String {
         .unwrap_or_default()
 }
 
-/// The projector's OPEN title/summary coalesce chains (`projection.rs`):
-/// omp sources fall through to the dispatch title, non-omp sources do not.
+/// The retired projector's OPEN title/summary coalesce chains, reproduced so
+/// the canonical reader answers what v1 answered: omp sources fall through to
+/// the dispatch title, non-omp sources do not. The surviving record of the
+/// exact chains is
+/// `moraine-clickhouse/src/testdata/projector_golden/`
+/// `projected_publication_header.sql:120,122`.
 fn open_title_and_summary(source: &str, p: &MetadataPrecedence) -> (String, String) {
     let (title, summary) = if source == "omp" {
         omp_title_and_summary(p)
@@ -866,10 +876,11 @@ fn open_title_and_summary(source: &str, p: &MetadataPrecedence) -> (String, Stri
     (title, summary)
 }
 
-/// The projector's LIST title/summary chains — `list_title` /
-/// `list_session_summary` in the `mcp_open_publication_headers` INSERT
-/// (`mcp_open_projection.rs`, golden
-/// `testdata/projector_golden/projected_publication_header.sql`). Migration
+/// The LIST title/summary chains the retired v1 projector produced —
+/// `list_title` / `list_session_summary` in its `mcp_open_publication_headers`
+/// INSERT. Issue #603 WI-10 deleted the projector itself; the frozen golden
+/// `moraine-clickhouse/src/testdata/projector_golden/projected_publication_header.sql`
+/// is what still records the exact chains this fold must reproduce. Migration
 /// `sql/035_mcp_list_metadata_projection.sql` exists precisely to preserve this
 /// divergence from [`open_title_and_summary`]: the omp branch is shared, while
 /// the non-omp branch reads the session-meta-only inputs instead of the
@@ -1439,7 +1450,6 @@ impl ClickHouseConversationRepository {
             turns: compact_turns,
             completed: header.completed,
             terminal_event_uid: header.terminal_event_uid,
-            snapshot: None,
         };
         Ok(Some(CanonicalReadOutcome::Page(CanonicalSessionPage {
             session,
@@ -1563,7 +1573,6 @@ impl ClickHouseConversationRepository {
             next_turn,
             first_event: compact.first_event,
             last_event: compact.last_event,
-            snapshot: None,
         };
         Ok(Some(CanonicalReadOutcome::Page(CanonicalTurnPage {
             turn,
@@ -1864,9 +1873,12 @@ fn turn_ref_map(
     map
 }
 
-/// The reader's preview compaction, matching the projector's
-/// `compact_projected_source` contract: payload previews get a wider source
-/// budget before compaction, empty sources collapse to `None`.
+/// The reader's preview compaction. It reproduces the retired projector's
+/// compaction contract, which the projector applied in Rust rather than in SQL
+/// and which therefore left no golden behind: payload previews get a wider
+/// source budget before compaction, and an empty source collapses to `None`
+/// instead of to an empty preview. Both halves are pinned below rather than
+/// inherited by citation.
 pub(super) fn canonical_preview(
     source: &str,
     is_payload: bool,

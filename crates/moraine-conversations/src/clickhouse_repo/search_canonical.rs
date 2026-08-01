@@ -123,8 +123,8 @@ impl ClickHouseConversationRepository {
     /// existence does not depend on merge state.
     ///
     /// **The configured project scope is part of existence, not a result
-    /// filter.** v1's `scope_state_sql` filtered its `authorized_sessions` read
-    /// by `origin_cwd` (`search.rs`, `projected_origin_clause("scope_s")`); a
+    /// filter.** The retired v1 `scope_state_sql` filtered its
+    /// `authorized_sessions` read by the projected header's `origin_cwd`; a
     /// scoped caller asking about a session outside `cfg.session_scope` got
     /// `scope_exists = 0` and therefore `not_found`, which is the same answer a
     /// session id that does not exist at all produces. Dropping the predicate
@@ -166,8 +166,8 @@ impl ClickHouseConversationRepository {
     ///
     /// The configured project scope gates this statement too, and for the same
     /// reason it gates [`Self::build_search_scope_exists_sql`]: a turn-scoped
-    /// request is the OTHER door into `scope_exists`, and v1 applied
-    /// `projected_origin_clause` to its turn branch as well. The gate here is
+    /// request is the OTHER door into `scope_exists`, and v1 applied the same
+    /// origin filter to its turn branch as well. The gate here is
     /// the EXACT origin `cwd` — `argMinIf(n.cwd, …)` over the same session's
     /// navigation rows, which is the identical authority the Phase 4 per-hit
     /// re-check uses — so turn existence can never disagree with hit
@@ -1145,10 +1145,11 @@ mod tests {
     ///
     /// MUTATION: point any one builder back at `mcp_open_events` /
     /// `mcp_open_turns` / `mcp_open_publication_headers` and this fails naming
-    /// that builder. The gate is deliberately unconditional HERE (these are the
-    /// v2 builders, which exist only for the canonical path) — the live gate is
-    /// the one that must be conditioned on the readiness latch, because the v1
-    /// engine legitimately still reads the projection while `open_v2.ready = 0`.
+    /// that builder. The gate is unconditional, and since issue #603 WI-10 so
+    /// is its live counterpart (`live_session_list_query_log_clean`): with the
+    /// projection dropped there is no readiness state in which reading one of
+    /// those relations is legitimate, and a builder that reopened one would
+    /// fail on the missing table before any log assertion saw it.
     #[tokio::test]
     async fn every_v2_search_builder_is_free_of_the_projection() {
         let terms = terms();
@@ -1327,38 +1328,6 @@ mod tests {
             wide.matches("`moraine`.`events`").count(),
             1,
             "winner hydration is the one and only canonical events read:\n{wide}"
-        );
-    }
-
-    /// The v1 engine still reads the projection, and MUST keep doing so while
-    /// `open_v2.ready = 0`.
-    ///
-    /// Without this negative case the projection gate above is unfalsifiable in
-    /// one direction: someone "fixing" a live query-log gate that fires on an
-    /// un-promoted box would delete the v1 reads and silently break the
-    /// fallback engine. This pins that the fallback is still the fallback.
-    #[tokio::test]
-    async fn the_v1_engine_still_reads_the_projection() {
-        let sql = build(repo(), |repo| {
-            repo.build_search_mcp_events_sql(
-                &terms(),
-                &[McpEventType::AssistantResponse],
-                None,
-                None,
-                None,
-                None,
-                1,
-                0.0,
-                Some((100, 5_000)),
-                9,
-            )
-            .expect("v1 ranking sql")
-        })
-        .await;
-        assert!(
-            sql.contains("mcp_open_events") && sql.contains("mcp_open_projection_state"),
-            "the v1 engine is the projected-header path; if this ever stops \
-             being true the fallback is dead and the latch branch is a lie"
         );
     }
 
