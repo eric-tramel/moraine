@@ -85,7 +85,7 @@ async fn file_attention_merges_normalized_exact_lookup_with_suffix_fallback() {
     assert!(exact_query.contains("project_id = 'project-a'"));
     assert!(exact_query.contains("tool_phase = 'request'"));
     assert!(exact_query.contains("harness = 'codex'"));
-    assert!(exact_query.contains("e.source_name = 'codex'"));
+    assert!(exact_query.contains("ti.source_name = 'codex'"));
     assert!(
         !exact_query.contains("JSONExtractString(input_json"),
         "exact lookup should not depend on legacy JSON suffix extraction: {exact_query}"
@@ -107,14 +107,14 @@ async fn file_attention_merges_normalized_exact_lookup_with_suffix_fallback() {
         .expect("Tier-0 suffix file_attention query should be captured");
     assert!(fallback_query.contains("crates/foo.rs"));
     assert!(fallback_query.contains("harness = 'codex'"));
-    assert!(fallback_query.contains("e.source_name = 'codex'"));
+    assert!(fallback_query.contains("ti.source_name = 'codex'"));
     assert!(
         fallback_query.contains("ti.project_id = 'project-a'")
             && fallback_query.contains(
                 "ti.project_id != '' AND NOT startsWith(ti.project_id, 'git:')"
             )
             && fallback_query.contains("has(project_roots, ti.worktree_root)")
-            && fallback_query.contains("ti.project_id = '' AND e.project_id = 'project-a'")
+            && fallback_query.contains("ti.project_id = '' AND ti.event_project_id = 'project-a'")
             && fallback_query.contains("legacy_candidate_root")
             && fallback_query.contains("verified_project_root")
             && fallback_query.contains(
@@ -130,13 +130,13 @@ async fn file_attention_merges_normalized_exact_lookup_with_suffix_fallback() {
             && fallback_query
                 .contains("arrayCount(path -> path != '', legacy_scalar_paths) = 1")
             && fallback_query.contains(
-                "= concat(ifNull(e.cwd, ''), '/', 'crates/foo.rs')"
+                "= concat(ifNull(ti.cwd, ''), '/', 'crates/foo.rs')"
             ),
         "legacy root recovery must require exactly one top-level scalar path and no second structured or shell path evidence: {fallback_query}"
     );
     assert!(
         fallback_query.contains("position(legacy_scalar_path")
-            && fallback_query.contains("position(ifNull(e.cwd, ''), ';') = 0"),
+            && fallback_query.contains("position(ifNull(ti.cwd, ''), ';') = 0"),
         "legacy compound path captures must not become roots: {fallback_query}"
     );
     assert!(
@@ -160,13 +160,41 @@ async fn file_attention_merges_normalized_exact_lookup_with_suffix_fallback() {
         query_ids,
         [
             "test-file-attention-normalized-exact",
-            "test-file-attention-normalized-suffix",
+            "test-file-attention-normalized-indexed-suffix",
         ]
     );
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn file_attention_project_scope_recovers_durable_only_deleted_root() {
+    let suffix_response = ScriptedResponse::rows(
+        &[
+            "NOT startsWith(ti.project_id, 'git:')",
+            "has(project_roots, ti.worktree_root)",
+            "'/worktree-a'",
+            "arrayFirst(root -> legacy_candidate_root = root, project_roots)",
+            "ti.event_project_id = '' AND verified_project_root != ''",
+            "SELECT groupArray(worktree_root) FROM `moraine`.`file_attention_project_roots` FINAL",
+            "WHERE project_id = 'git:new-project-id' AND worktree_root != ''",
+        ],
+        json!([{
+            "session_id": "sess-pre-digest",
+            "event_uid": "evt-pre-digest",
+            "tool_call_id": "call-pre-digest",
+            "harness": "codex",
+            "tool_name": "read",
+            "tool_phase": "request",
+            "matched_path": "/worktree-b/crates/foo.rs",
+            "match_kind": "path_suffix",
+            "worktree_root": "/worktree-b",
+            "cwd": "/worktree-b",
+            "event_unix_ms": 1769940000000_i64,
+            "event_order": 10_u64,
+            "turn_seq": 1_u32,
+            "input_preview": "{\"path\":\"crates/foo.rs\"}",
+            "output_preview": ""
+        }]),
+    );
     let responses = vec![
         ScriptedResponse::rows(&["repo_rel_path = 'crates/foo.rs'"], json!([])),
         ScriptedResponse::raw(
@@ -176,34 +204,8 @@ async fn file_attention_project_scope_recovers_durable_only_deleted_root() {
             ],
             "",
         ),
-        ScriptedResponse::rows(
-            &[
-                "NOT startsWith(ti.project_id, 'git:')",
-                "has(project_roots, ti.worktree_root)",
-                "'/worktree-a'",
-                "arrayFirst(root -> legacy_candidate_root = root, project_roots)",
-                "e.project_id = '' AND verified_project_root != ''",
-                "SELECT groupArray(worktree_root) FROM `moraine`.`file_attention_project_roots` FINAL",
-                "WHERE project_id = 'git:new-project-id' AND worktree_root != ''",
-            ],
-            json!([{
-                "session_id": "sess-pre-digest",
-                "event_uid": "evt-pre-digest",
-                "tool_call_id": "call-pre-digest",
-                "harness": "codex",
-                "tool_name": "read",
-                "tool_phase": "request",
-                "matched_path": "/worktree-b/crates/foo.rs",
-                "match_kind": "path_suffix",
-                "worktree_root": "/worktree-b",
-                "cwd": "/worktree-b",
-                "event_unix_ms": 1769940000000_i64,
-                "event_order": 10_u64,
-                "turn_seq": 1_u32,
-                "input_preview": "{\"path\":\"crates/foo.rs\"}",
-                "output_preview": ""
-            }]),
-        ),
+        suffix_response.clone(),
+        suffix_response,
     ];
     let (repo, _state) = build_scripted_repo(responses).await;
 
@@ -234,6 +236,15 @@ async fn file_attention_project_scope_recovers_durable_only_deleted_root() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn file_attention_project_scope_excludes_unmapped_pruned_legacy_root() {
+    let suffix_response = ScriptedResponse::rows(
+        &[
+            "has(project_roots, ti.worktree_root)",
+            "SELECT groupArray(worktree_root) FROM `moraine`.`file_attention_project_roots` FINAL",
+            "WHERE project_id = 'git:new-project-id' AND worktree_root != ''",
+        ],
+        json!([]),
+    )
+    .forbidding(&["'/worktree-b'"]);
     let responses = vec![
         ScriptedResponse::rows(&["repo_rel_path = 'crates/foo.rs'"], json!([])),
         ScriptedResponse::raw(
@@ -243,15 +254,8 @@ async fn file_attention_project_scope_excludes_unmapped_pruned_legacy_root() {
             ],
             "",
         ),
-        ScriptedResponse::rows(
-            &[
-                "has(project_roots, ti.worktree_root)",
-                "SELECT groupArray(worktree_root) FROM `moraine`.`file_attention_project_roots` FINAL",
-                "WHERE project_id = 'git:new-project-id' AND worktree_root != ''",
-            ],
-            json!([]),
-        )
-        .forbidding(&["'/worktree-b'"]),
+        suffix_response.clone(),
+        suffix_response,
     ];
     let (repo, _state) = build_scripted_repo(responses).await;
 
@@ -345,7 +349,7 @@ async fn file_attention_all_scope_keeps_the_configured_server_floor_only() {
     let queries = state.queries.lock().expect("queries lock").clone();
     let attention_queries = queries
         .iter()
-        .filter(|query| query.contains("FROM `moraine`.`tool_io` FINAL"))
+        .filter(|query| query.contains("FROM `moraine`.`events` FINAL"))
         .collect::<Vec<_>>();
     assert_eq!(attention_queries.len(), 2);
     for query in attention_queries {

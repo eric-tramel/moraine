@@ -107,10 +107,10 @@ use crate::repo::ConversationRepository;
 
 mod analytics;
 mod cache;
+mod canonical_open;
 mod file_attention;
 mod helpers;
 mod list;
-mod mcp_open_read;
 mod open;
 mod operations;
 mod repo_impl;

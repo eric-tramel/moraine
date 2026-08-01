@@ -2,8 +2,9 @@
 //! file, across every worktree, drillable through `open`.
 //!
 //! Given a path, this suffix-matches the project-relative tail against the raw
-//! `file_path` (and `notebook_path` / `path`) recorded in `tool_io`, plus a
-//! substring fallback for shell commands. Matching the tail is what unifies the
+//! `file_path` (and `notebook_path` / `path`) metadata carried by canonical
+//! tool events, plus a substring fallback for shell commands. Matching the tail
+//! unifies the
 //! main checkout, sibling worktrees, and agent-isolation worktrees (which share
 //! no leading path) into one answer — including work that never landed in git.
 //! It returns typed `session:` / `event:` IDs that drill down through `open`;
@@ -757,8 +758,8 @@ fn event_json(rank: usize, touch: &FileAttentionTouch) -> Result<Value, Contract
     }))
 }
 
-/// A short, human-oriented preview of what the touch did, drawn from the
-/// previews already on `tool_io` (we do not re-parse diffs in Phase 0).
+/// A short, human-oriented preview drawn from the canonical event's bounded
+/// tool-input and tool-output previews (we do not re-parse diffs in Phase 0).
 fn action_preview(touch: &FileAttentionTouch) -> Option<String> {
     let raw = if !touch.input_preview.is_empty() {
         &touch.input_preview

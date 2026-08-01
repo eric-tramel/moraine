@@ -17,7 +17,7 @@ use moraine_clickhouse::{is_oversized_json_each_row_insert_error, ClickHouseClie
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -327,7 +327,6 @@ pub(crate) fn spawn_sink_task(
         let mut raw_rows = Vec::<Value>::new();
         let mut event_rows = Vec::<Value>::new();
         let mut link_rows = Vec::<Value>::new();
-        let mut tool_rows = Vec::<Value>::new();
         let mut error_rows = Vec::<Value>::new();
         let mut checkpoint_updates = HashMap::<String, Checkpoint>::new();
         let mut pending_batch_bytes = 0usize;
@@ -372,7 +371,6 @@ pub(crate) fn spawn_sink_task(
                     &raw_rows,
                     &event_rows,
                     &link_rows,
-                    &tool_rows,
                     &error_rows,
                     &checkpoint_updates,
                 )
@@ -384,7 +382,6 @@ pub(crate) fn spawn_sink_task(
                     &mut raw_rows,
                     &mut event_rows,
                     &mut link_rows,
-                    &mut tool_rows,
                     &mut error_rows,
                     &mut checkpoint_updates,
                     checkpoint_cursor_columns,
@@ -439,13 +436,13 @@ pub(crate) fn spawn_sink_task(
                             raw_rows.extend(batch.raw_rows);
                             event_rows.extend(batch.event_rows);
                             link_rows.extend(batch.link_rows);
-                            tool_rows.extend(batch.tool_rows);
                             error_rows.extend(batch.error_rows);
                             if let Some(cp) = batch.checkpoint {
                                 merge_checkpoint(&mut checkpoint_updates, cp);
                             }
 
-                            let total_rows = raw_rows.len() + event_rows.len() + link_rows.len() + tool_rows.len() + error_rows.len();
+                            let total_rows =
+                                raw_rows.len() + event_rows.len() + link_rows.len() + error_rows.len();
                             if total_rows >= config.ingest.batch_size
                                 || pending_batch_bytes >= config.ingest.max_batch_bytes.max(1)
                             {
@@ -456,7 +453,6 @@ pub(crate) fn spawn_sink_task(
                                     &mut raw_rows,
                                     &mut event_rows,
                                     &mut link_rows,
-                                    &mut tool_rows,
                                     &mut error_rows,
                                     &mut checkpoint_updates,
                                     checkpoint_cursor_columns,
@@ -482,7 +478,7 @@ pub(crate) fn spawn_sink_task(
                     }
                 }
                 _ = flush_tick.tick() => {
-                    if has_pending_data(&raw_rows, &event_rows, &link_rows, &tool_rows, &error_rows, &checkpoint_updates) {
+                    if has_pending_data(&raw_rows, &event_rows, &link_rows, &error_rows, &checkpoint_updates) {
                         let flush_ok = flush_pending_with_ack(
                             &clickhouse,
                             &checkpoints,
@@ -490,7 +486,6 @@ pub(crate) fn spawn_sink_task(
                             &mut raw_rows,
                             &mut event_rows,
                             &mut link_rows,
-                            &mut tool_rows,
                             &mut error_rows,
                             &mut checkpoint_updates,
                             checkpoint_cursor_columns,
@@ -522,7 +517,6 @@ pub(crate) fn spawn_sink_task(
             &raw_rows,
             &event_rows,
             &link_rows,
-            &tool_rows,
             &error_rows,
             &checkpoint_updates,
         ) {
@@ -533,7 +527,6 @@ pub(crate) fn spawn_sink_task(
                 &mut raw_rows,
                 &mut event_rows,
                 &mut link_rows,
-                &mut tool_rows,
                 &mut error_rows,
                 &mut checkpoint_updates,
                 checkpoint_cursor_columns,
@@ -551,14 +544,12 @@ fn has_pending_data(
     raw_rows: &[Value],
     event_rows: &[Value],
     link_rows: &[Value],
-    tool_rows: &[Value],
     error_rows: &[Value],
     checkpoint_updates: &HashMap<String, Checkpoint>,
 ) -> bool {
     !(raw_rows.is_empty()
         && event_rows.is_empty()
         && link_rows.is_empty()
-        && tool_rows.is_empty()
         && error_rows.is_empty()
         && checkpoint_updates.is_empty())
 }
@@ -650,9 +641,7 @@ fn oversized_row_fragment(row: &Value) -> String {
 enum SinkStage {
     RawEvents,
     Events,
-    McpOpenProjection,
     EventLinks,
-    ToolIo,
     IngestErrors,
     IngestCheckpoints,
 }
@@ -662,9 +651,7 @@ impl SinkStage {
         match self {
             Self::RawEvents => "raw_events",
             Self::Events => "events",
-            Self::McpOpenProjection => "mcp_open_projection",
             Self::EventLinks => "event_links",
-            Self::ToolIo => "tool_io",
             Self::IngestErrors => "ingest_errors",
             Self::IngestCheckpoints => "ingest_checkpoints",
         }
@@ -698,7 +685,6 @@ struct PendingSinkData<'a> {
     raw_rows: &'a [Value],
     event_rows: &'a [Value],
     link_rows: &'a [Value],
-    tool_rows: &'a [Value],
     error_rows: &'a [Value],
     checkpoint_updates: &'a HashMap<String, Checkpoint>,
 }
@@ -708,9 +694,7 @@ impl PendingSinkData<'_> {
         let stage_rows = match stage {
             SinkStage::RawEvents => self.raw_rows,
             SinkStage::Events => self.event_rows,
-            SinkStage::McpOpenProjection => self.event_rows,
             SinkStage::EventLinks => self.link_rows,
-            SinkStage::ToolIo => self.tool_rows,
             SinkStage::IngestErrors => self.error_rows,
             SinkStage::IngestCheckpoints => &[],
         };
@@ -735,9 +719,7 @@ impl PendingSinkData<'_> {
         match stage {
             SinkStage::RawEvents => self.raw_rows.len(),
             SinkStage::Events => self.event_rows.len(),
-            SinkStage::McpOpenProjection => self.event_rows.len(),
             SinkStage::EventLinks => self.link_rows.len(),
-            SinkStage::ToolIo => self.tool_rows.len(),
             SinkStage::IngestErrors => self.error_rows.len(),
             SinkStage::IngestCheckpoints => self.checkpoint_updates.len(),
         }
@@ -747,7 +729,6 @@ impl PendingSinkData<'_> {
         self.raw_rows.len()
             + self.event_rows.len()
             + self.link_rows.len()
-            + self.tool_rows.len()
             + self.error_rows.len()
             + self.checkpoint_updates.len()
     }
@@ -837,14 +818,12 @@ fn clear_pending_sink_data(
     raw_rows: &mut Vec<Value>,
     event_rows: &mut Vec<Value>,
     link_rows: &mut Vec<Value>,
-    tool_rows: &mut Vec<Value>,
     error_rows: &mut Vec<Value>,
     checkpoint_updates: &mut HashMap<String, Checkpoint>,
 ) {
     raw_rows.clear();
     event_rows.clear();
     link_rows.clear();
-    tool_rows.clear();
     error_rows.clear();
     checkpoint_updates.clear();
 }
@@ -960,7 +939,7 @@ async fn flush_pending(
     raw_rows: &mut Vec<Value>,
     event_rows: &mut Vec<Value>,
     link_rows: &mut Vec<Value>,
-    tool_rows: &mut Vec<Value>,
+    _tool_rows: &mut Vec<Value>,
     error_rows: &mut Vec<Value>,
     checkpoint_updates: &mut HashMap<String, Checkpoint>,
     checkpoint_cursor_columns: bool,
@@ -975,7 +954,6 @@ async fn flush_pending(
         raw_rows,
         event_rows,
         link_rows,
-        tool_rows,
         error_rows,
         checkpoint_updates,
         checkpoint_cursor_columns,
@@ -994,7 +972,6 @@ async fn flush_pending_with_ack(
     raw_rows: &mut Vec<Value>,
     event_rows: &mut Vec<Value>,
     link_rows: &mut Vec<Value>,
-    tool_rows: &mut Vec<Value>,
     error_rows: &mut Vec<Value>,
     checkpoint_updates: &mut HashMap<String, Checkpoint>,
     checkpoint_cursor_columns: bool,
@@ -1046,8 +1023,7 @@ async fn flush_pending_with_ack(
         Ok(
             quarantine_oversized_rows("raw_events", raw_rows, error_rows)?
                 + quarantine_oversized_rows("events", event_rows, error_rows)?
-                + quarantine_oversized_rows("event_links", link_rows, error_rows)?
-                + quarantine_oversized_rows("tool_io", tool_rows, error_rows)?,
+                + quarantine_oversized_rows("event_links", link_rows, error_rows)?,
         )
     })() {
         Ok(quarantined) => quarantined,
@@ -1068,16 +1044,6 @@ async fn flush_pending_with_ack(
             "quarantined oversized rows before ClickHouse insert"
         );
     }
-
-    let projected_session_ids = event_rows
-        .iter()
-        .filter_map(|row| {
-            row.get("session_id")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        })
-        .filter(|session_id| !session_id.is_empty())
-        .collect::<BTreeSet<_>>();
 
     let flush_result = async {
         if !raw_rows.is_empty() {
@@ -1104,10 +1070,6 @@ async fn flush_pending_with_ack(
                 .insert_json_rows_sync("events", event_rows)
                 .await
                 .map_err(|error| SinkFlushFailure::new(SinkStage::Events, error))?;
-            clickhouse
-                .refresh_mcp_open_read_model(projected_session_ids.iter().map(String::as_str))
-                .await
-                .map_err(|error| SinkFlushFailure::new(SinkStage::McpOpenProjection, error))?;
             metrics
                 .event_rows_written
                 .fetch_add(event_rows.len() as u64, Ordering::Relaxed);
@@ -1123,14 +1085,6 @@ async fn flush_pending_with_ack(
                 .await
                 .map_err(|error| SinkFlushFailure::new(SinkStage::EventLinks, error))?;
             link_rows.clear();
-        }
-
-        if !tool_rows.is_empty() {
-            clickhouse
-                .insert_json_rows("tool_io", tool_rows)
-                .await
-                .map_err(|error| SinkFlushFailure::new(SinkStage::ToolIo, error))?;
-            tool_rows.clear();
         }
 
         if !error_rows.is_empty() {
@@ -1172,9 +1126,7 @@ async fn flush_pending_with_ack(
         Err(failure) => {
             metrics.flush_failures.fetch_add(1, Ordering::Relaxed);
             let error_text = failure.error.to_string();
-            if failure.stage != SinkStage::McpOpenProjection
-                && is_oversized_json_each_row_insert_error(&failure.error)
-            {
+            if is_oversized_json_each_row_insert_error(&failure.error) {
                 let last_error = format!(
                     "non-retryable sink flush failure at {}: {error_text}",
                     failure.stage.table()
@@ -1197,7 +1149,6 @@ async fn flush_pending_with_ack(
                         raw_rows,
                         event_rows,
                         link_rows,
-                        tool_rows,
                         error_rows,
                         checkpoint_updates,
                     },
@@ -1249,7 +1200,6 @@ async fn flush_pending_with_ack(
                     raw_rows,
                     event_rows,
                     link_rows,
-                    tool_rows,
                     error_rows,
                     checkpoint_updates,
                 );
@@ -1586,7 +1536,6 @@ mod tests {
         let mut raw_rows = vec![json!({"event_uid": "event-1"})];
         let mut event_rows = vec![json!({"event_uid": "event-1"})];
         let mut link_rows = vec![json!({"event_uid": "event-1"})];
-        let mut tool_rows = Vec::new();
         let mut error_rows = Vec::new();
         let mut checkpoint_updates = HashMap::new();
 
@@ -1598,7 +1547,6 @@ mod tests {
                 &mut raw_rows,
                 &mut event_rows,
                 &mut link_rows,
-                &mut tool_rows,
                 &mut error_rows,
                 &mut checkpoint_updates,
                 true,
@@ -1619,7 +1567,6 @@ mod tests {
                 &mut raw_rows,
                 &mut event_rows,
                 &mut link_rows,
-                &mut tool_rows,
                 &mut error_rows,
                 &mut checkpoint_updates,
                 true,
@@ -2311,71 +2258,6 @@ mod tests {
             state.contains_key(&checkpoint_key_value),
             "checkpoint cache should advance after quarantining the row"
         );
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn flush_pending_quarantines_oversized_tool_rows() {
-        let (clickhouse, mock_state) = spawn_mock_clickhouse("unused-table").await;
-        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
-        let metrics = Arc::new(Metrics::default());
-
-        let mut raw_rows = Vec::<Value>::new();
-        let mut event_rows = Vec::<Value>::new();
-        let mut link_rows = Vec::<Value>::new();
-        let mut tool_rows = vec![json!({
-            "event_uid": "evt-tool",
-            "session_id": "session-a",
-            "harness": "codex",
-            "source_name": "source-a",
-            "tool_call_id": "call-1",
-            "tool_name": "shell",
-            "tool_phase": "response",
-            "output_json": "x".repeat(CLICKHOUSE_JSON_EACH_ROW_OBJECT_MAX_BYTES),
-            "source_ref": "/tmp/source-a.jsonl:3:17",
-            "event_version": 1u64,
-        })];
-        let mut error_rows = Vec::<Value>::new();
-        let mut checkpoint_updates = HashMap::new();
-
-        assert!(
-            flush_pending(
-                &clickhouse,
-                &checkpoints,
-                &metrics,
-                &mut raw_rows,
-                &mut event_rows,
-                &mut link_rows,
-                &mut tool_rows,
-                &mut error_rows,
-                &mut checkpoint_updates,
-                true,
-                "",
-            )
-            .await,
-            "oversized tool rows should be quarantined without failing the flush"
-        );
-
-        assert!(
-            mock_state.rows("tool_io").is_empty(),
-            "oversized tool row must not be sent to tool_io"
-        );
-        let error_rows = mock_state.rows("ingest_errors");
-        assert_eq!(error_rows.len(), 1, "one compact ingest error is written");
-        let error = &error_rows[0];
-        assert_eq!(
-            error.get("source_file").and_then(Value::as_str),
-            Some("/tmp/source-a.jsonl")
-        );
-        assert_eq!(
-            error.get("source_generation").and_then(Value::as_u64),
-            Some(3)
-        );
-        assert_eq!(
-            error.get("source_line_no").and_then(Value::as_u64),
-            Some(17)
-        );
-        assert_eq!(error.get("source_inode").and_then(Value::as_u64), Some(0));
-        assert_eq!(metrics.err_rows_written.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test(flavor = "multi_thread")]

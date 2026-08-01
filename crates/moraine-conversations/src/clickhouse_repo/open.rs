@@ -1,7 +1,4 @@
 use super::*;
-use crate::domain::McpOpenSnapshot;
-
-const MAX_MCP_OPEN_SNAPSHOT_ATTEMPTS: usize = 4;
 
 impl ClickHouseConversationRepository {
     pub(super) async fn load_turns_for_session(
@@ -229,49 +226,7 @@ FORMAT JSONEachRow",
         session_id: &str,
     ) -> RepoResult<Option<McpSessionOpen>> {
         Self::validate_session_id(session_id)?;
-        self.ensure_mcp_open_read_model_ready().await?;
-        for _ in 0..MAX_MCP_OPEN_SNAPSHOT_ATTEMPTS {
-            let Some(session) = self.load_projected_session(session_id).await? else {
-                return Ok(None);
-            };
-            if !self.projected_session_in_scope(&session) {
-                return Ok(None);
-            }
-
-            let load_started = Instant::now();
-            let turns = self
-                .load_projected_turns(&session, None, false)
-                .await?
-                .into_iter()
-                .map(|turn| turn.compact)
-                .collect();
-            if !self.projected_snapshot_still_current(&session).await? {
-                continue;
-            }
-            tracing::debug!(
-                elapsed_ms = load_started.elapsed().as_millis() as u64,
-                "mcp_open_session_load"
-            );
-            return Ok(Some(McpSessionOpen {
-                metadata: session.metadata,
-                title: non_empty_string(session.row.title),
-                source: non_empty_string(session.row.source),
-                harness: non_empty_string(session.row.harness),
-                inference_provider: non_empty_string(session.row.inference_provider),
-                session_slug: non_empty_string(session.row.session_slug),
-                session_summary: non_empty_string(session.row.session_summary),
-                turns,
-                completed: session.row.completed != 0,
-                terminal_event_uid: non_empty_string(session.row.terminal_event_uid),
-                snapshot: Some(McpOpenSnapshot {
-                    slot: session.row.slot,
-                    generation: session.row.generation,
-                }),
-            }));
-        }
-        Err(RepoError::backend(
-            "MCP open session snapshot changed repeatedly",
-        ))
+        self.canonical_get_mcp_session(session_id).await
     }
 
     pub(super) async fn get_turn_impl(
@@ -296,56 +251,8 @@ FORMAT JSONEachRow",
         include_events: bool,
     ) -> RepoResult<Option<McpTurnOpen>> {
         Self::validate_session_id(session_id)?;
-        self.ensure_mcp_open_read_model_ready().await?;
-        for _ in 0..MAX_MCP_OPEN_SNAPSHOT_ATTEMPTS {
-            let Some(session) = self.load_projected_session(session_id).await? else {
-                return Ok(None);
-            };
-            if !self.projected_session_in_scope(&session) {
-                return Ok(None);
-            }
-
-            let load_started = Instant::now();
-            let turn = self
-                .load_projected_turns(&session, Some(turn_seq), include_events)
-                .await?
-                .into_iter()
-                .next();
-            if !self.projected_snapshot_still_current(&session).await? {
-                continue;
-            }
-            let Some(turn) = turn else {
-                return Ok(None);
-            };
-            tracing::debug!(
-                elapsed_ms = load_started.elapsed().as_millis() as u64,
-                "mcp_open_turn_load"
-            );
-            return Ok(Some(McpTurnOpen {
-                metadata: turn.compact.metadata,
-                events: turn.events,
-                parent_session_source: non_empty_string(session.row.source),
-                user_input_summary: turn.compact.user_input_summary,
-                final_response_summary: turn.compact.final_response_summary,
-                user_input_event: turn.compact.user_input_event,
-                final_response_event: turn.compact.final_response_event,
-                tools_called: turn.compact.tools_called,
-                normalized_event_types: turn.compact.normalized_event_types,
-                completed: turn.compact.completed,
-                terminal_event_uid: turn.compact.terminal_event_uid,
-                previous_turn: turn.previous_turn,
-                next_turn: turn.next_turn,
-                first_event: turn.compact.first_event,
-                last_event: turn.compact.last_event,
-                snapshot: Some(McpOpenSnapshot {
-                    slot: session.row.slot,
-                    generation: session.row.generation,
-                }),
-            }));
-        }
-        Err(RepoError::backend(
-            "MCP open turn snapshot changed repeatedly",
-        ))
+        self.canonical_get_mcp_turn(session_id, turn_seq, include_events)
+            .await
     }
 
     pub(super) async fn open_event_impl(&self, req: OpenEventRequest) -> RepoResult<OpenContext> {
@@ -556,108 +463,6 @@ FORMAT JSONEachRow",
             return Err(RepoError::invalid_argument("event_uid cannot be empty"));
         }
         Self::validate_event_uid(event_uid)?;
-        self.ensure_mcp_open_read_model_ready().await?;
-
-        for _ in 0..MAX_MCP_OPEN_SNAPSHOT_ATTEMPTS {
-            let candidates = self.load_projected_event_candidates(event_uid).await?;
-            let stale_candidates_observed = !candidates.is_empty();
-            let mut pinned = None;
-            for lookup in candidates {
-                let Some(session) = self.load_projected_session(&lookup.session_id).await? else {
-                    continue;
-                };
-                if session.row.slot == lookup.slot && session.row.generation == lookup.generation {
-                    pinned = Some((lookup, session));
-                    break;
-                }
-            }
-            let Some((lookup, session)) = pinned else {
-                if stale_candidates_observed {
-                    continue;
-                }
-                return Ok(None);
-            };
-            // Authorize the narrow UID ownership row before reading event content.
-            if !self.projected_session_in_scope(&session) {
-                return Ok(None);
-            }
-
-            let load_started = Instant::now();
-            let row = self.load_projected_event(&lookup).await?;
-            let parent_turn = match &row {
-                Some(row) => self
-                    .load_projected_turns(&session, Some(row.turn_seq), false)
-                    .await?
-                    .into_iter()
-                    .next(),
-                None => None,
-            };
-            let mut neighbors = match &row {
-                Some(row) => {
-                    let neighbor_uids =
-                        [row.previous_event_uid.clone(), row.next_event_uid.clone()]
-                            .into_iter()
-                            .filter(|event_uid| !event_uid.is_empty())
-                            .collect::<Vec<_>>();
-                    self.load_projected_event_refs(neighbor_uids, lookup.slot, lookup.generation)
-                        .await?
-                }
-                None => HashMap::new(),
-            };
-            if !self.projected_snapshot_still_current(&session).await? {
-                continue;
-            }
-            let (Some(row), Some(parent_turn)) = (row, parent_turn) else {
-                return Ok(None);
-            };
-            tracing::debug!(
-                elapsed_ms = load_started.elapsed().as_millis() as u64,
-                "mcp_open_event_load"
-            );
-
-            let previous_event = neighbors.remove(&row.previous_event_uid);
-            let next_event = neighbors.remove(&row.next_event_uid);
-            let event_type = row.event_type;
-            let event_ordinal = row.event_ordinal;
-            let event = TraceEvent {
-                session_id: row.session_id,
-                event_uid: row.event_uid,
-                event_order: row.event_order,
-                turn_seq: row.turn_seq,
-                event_time: row.event_time,
-                event_unix_ms: row.event_unix_ms,
-                actor_role: row.actor_role,
-                event_class: row.event_class,
-                payload_type: row.payload_type,
-                call_id: row.call_id,
-                name: row.name,
-                phase: row.phase,
-                item_id: row.item_id,
-                source_ref: row.source_ref,
-                text_content: row.text_content,
-                payload_json: row.payload_json,
-                token_usage_json: row.token_usage_json,
-                endpoint_kind: row.endpoint_kind,
-                token_usage_buckets: row.token_usage_buckets,
-                token_usage_native_units: row.token_usage_native_units,
-            };
-            return Ok(Some(McpEventOpen {
-                event,
-                event_type,
-                event_ordinal,
-                turn_completed: parent_turn.compact.completed,
-                turn_terminal_event_uid: parent_turn.compact.terminal_event_uid,
-                parent_session: session.metadata,
-                parent_session_source: non_empty_string(session.row.source),
-                parent_turn: parent_turn.compact.metadata,
-                previous_event,
-                next_event,
-                previous_turn: parent_turn.previous_turn,
-                next_turn: parent_turn.next_turn,
-            }));
-        }
-        Err(RepoError::backend(
-            "MCP open event snapshot changed repeatedly",
-        ))
+        self.canonical_get_mcp_event(event_uid).await
     }
 }

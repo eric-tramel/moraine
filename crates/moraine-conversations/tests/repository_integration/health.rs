@@ -148,12 +148,11 @@ async fn diagnostics_maps_doctor_partial_report_and_ping_short_circuit() {
     assert_eq!(
         diagnostics.missing_tables,
         vec![
+            "mcp_session_directory",
             "ingest_errors",
-            "mcp_open_sessions",
-            "mcp_open_turns",
-            "mcp_open_events",
-            "mcp_open_dirty_sessions",
-            "mcp_open_projection_state",
+            "mcp_event_locator",
+            "mcp_event_navigation",
+            "file_attention_project_roots",
         ]
     );
     assert_eq!(diagnostics.errors.len(), 2);

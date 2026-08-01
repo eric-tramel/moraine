@@ -3,9 +3,10 @@ use crate::sources::shared::{
     compact_json, event_uid, infer_rollout_record_ts_from_file, parse_event_ts, raw_hash,
     resolve_model_hint, truncate_chars, RecordContext, UNPARSEABLE_EVENT_TS,
 };
-use crate::sources::{registry, Preflight, SourceRecordContext};
+use crate::sources::{registry, NormalizedPartials, Preflight, SourceRecordContext};
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 
 pub use crate::sources::shared::{infer_session_date_from_file, infer_session_id_from_file};
 
@@ -155,7 +156,8 @@ pub(crate) fn normalize_record_with_ts_hint(
         event_ts: &event_ts,
     };
 
-    let partials = source.normalize(record, &ctx, &top_type, &base_uid, model_hint);
+    let mut partials = source.normalize(record, &ctx, &top_type, &base_uid, model_hint);
+    fold_tool_payloads_into_events(&mut partials)?;
     let hint_fallback = if metadata.model_hint_fallback.is_empty() {
         model_hint
     } else {
@@ -173,6 +175,100 @@ pub(crate) fn normalize_record_with_ts_hint(
         model_hint,
         cwd_hint: cwd,
     })
+}
+
+/// Preserve tool request/response detail on its canonical event. `tool_rows`
+/// remain in the normalized result for adapter/redaction compatibility, but
+/// the sink no longer persists the retired `tool_io` relation.
+fn fold_tool_payloads_into_events(partials: &mut NormalizedPartials) -> Result<()> {
+    let event_indexes = partials
+        .event_rows
+        .iter()
+        .enumerate()
+        .filter_map(|(index, event)| {
+            event
+                .get("event_uid")
+                .and_then(Value::as_str)
+                .map(|uid| (uid.to_string(), index))
+        })
+        .collect::<HashMap<_, _>>();
+
+    for tool in &partials.tool_rows {
+        let tool_object = tool
+            .as_object()
+            .ok_or_else(|| anyhow!("normalized tool_io row is not an object"))?;
+        let event_uid = tool_object
+            .get("event_uid")
+            .and_then(Value::as_str)
+            .filter(|uid| !uid.is_empty())
+            .ok_or_else(|| anyhow!("normalized tool_io row is missing a nonempty event_uid"))?;
+        let event_index = event_indexes.get(event_uid).copied().ok_or_else(|| {
+            anyhow!("normalized tool_io row references event_uid `{event_uid}` without an owner")
+        })?;
+        let event = partials.event_rows[event_index]
+            .as_object_mut()
+            .ok_or_else(|| anyhow!("normalized event `{event_uid}` is not an object"))?;
+
+        let source_payload = event
+            .get("payload_json")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(|value| {
+                serde_json::from_str::<Value>(value)
+                    .unwrap_or_else(|_| Value::String(value.to_string()))
+            })
+            .unwrap_or(Value::Null);
+        let mut canonical_payload = match source_payload {
+            Value::Object(object) => object,
+            value => {
+                let mut object = serde_json::Map::new();
+                if !value.is_null() {
+                    object.insert("source_payload".to_string(), value);
+                }
+                object
+            }
+        };
+        let tool_payload = tool_object
+            .iter()
+            .filter(|(key, _)| {
+                !matches!(
+                    key.as_str(),
+                    "event_uid"
+                        | "event_version"
+                        | "session_id"
+                        | "source_name"
+                        | "harness"
+                        | "record_ts"
+                )
+            })
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<serde_json::Map<_, _>>();
+        canonical_payload.insert("moraine_tool_io".to_string(), Value::Object(tool_payload));
+        for key in [
+            "tool_call_id",
+            "parent_tool_call_id",
+            "tool_name",
+            "tool_phase",
+            "tool_error",
+        ] {
+            if let Some(value) = tool_object.get(key) {
+                event.insert(key.to_string(), value.clone());
+            }
+        }
+        for key in ["project_id", "repo_rel_path", "worktree_root"] {
+            if let Some(value) = tool_object
+                .get(key)
+                .filter(|value| value.as_str().is_some_and(|text| !text.is_empty()))
+            {
+                event.insert(key.to_string(), value.clone());
+            }
+        }
+        event.insert(
+            "payload_json".to_string(),
+            Value::String(Value::Object(canonical_payload).to_string()),
+        );
+    }
+    Ok(())
 }
 
 /// Record-level cwd wins; otherwise fall back to the session-level hint

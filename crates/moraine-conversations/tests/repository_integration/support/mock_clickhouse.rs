@@ -13,9 +13,7 @@ use moraine_conversations::{ClickHouseConversationRepository, RepoConfig, Sessio
 use serde_json::json;
 use tokio::sync::Notify;
 
-use super::mcp_open_fixtures::{
-    event_lookup, event_ref_rows, full_event_row, session_row, turn_rows,
-};
+use super::canonical_open_fixtures::{hydrated_rows, navigation_rows};
 use super::responses::{json_each_row, trace_event_row, turn_summary_row};
 
 #[derive(Clone)]
@@ -85,10 +83,9 @@ impl ScriptedResponse {
 #[derive(Clone, Default)]
 pub(crate) struct MockOptions {
     pub(crate) omit_second_snippet_row: bool,
-    pub(crate) dirty_projection_on_first_candidate: bool,
     pub(crate) omit_first_mcp_detail_row: bool,
+    pub(crate) change_detail_event_version: bool,
     pub(crate) repeated_corpus_stats_barrier: Option<ScriptedBarrier>,
-    pub(crate) change_projection_revision_on_second_search_page: bool,
     pub(crate) repeat_duplicate_search_pages: bool,
     pub(crate) scripted_responses: Vec<ScriptedResponse>,
     pub(crate) query_barrier: Option<QueryBarrier>,
@@ -198,79 +195,53 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
             return (response.status, response.body);
         }
 
-        if query.contains("mcp_open_projection_state")
-            && query.contains("WHERE state_key = 'global'")
-            && !query.contains("toUInt8(0) AS row_kind")
-        {
-            return (StatusCode::OK, json_each_row(json!([{ "ready": 1_u8 }])));
-        }
-
-        if query.contains("FROM `moraine`.`mcp_open_sessions`")
-            && query.contains("FINAL")
-            && !query.contains("toUInt8(0) AS row_kind")
-        {
-            let session_id = query
-                .split("session_id = '")
-                .nth(1)
-                .and_then(|rest| rest.split('\'').next())
-                .unwrap_or("");
-            let rows = session_row(session_id).into_iter().collect::<Vec<_>>();
-            return (StatusCode::OK, json_each_row(json!(rows)));
-        }
-
-        if query.contains("FROM `moraine`.`mcp_open_turns`")
-            && query.contains("FINAL")
-            && !query.contains("toUInt8(0) AS row_kind")
-        {
-            let session_id = query
-                .split("session_id = '")
-                .nth(1)
-                .and_then(|rest| rest.split('\'').next())
-                .unwrap_or("");
-            let turn_seq = query
-                .split(" AND turn_seq = ")
-                .nth(1)
-                .and_then(|rest| rest.split_whitespace().next())
-                .and_then(|value| value.parse::<u32>().ok());
-            let mut rows = turn_rows(session_id, turn_seq);
-            if query.contains("'[]' AS event_summaries_json") {
-                for row in &mut rows {
-                    row["event_summaries_json"] = json!("[]");
-                }
-            }
-            return (StatusCode::OK, json_each_row(json!(rows)));
-        }
-
-        if query.contains("FROM `moraine`.`mcp_open_events` FINAL")
-            && query.contains("SELECT\n  event_uid,\n  session_id,")
+        if query.contains("FROM `moraine`.`mcp_event_locator` FINAL")
+            && query.contains("WHERE event_uid = '")
         {
             let event_uid = query
                 .split("WHERE event_uid = '")
                 .nth(1)
                 .and_then(|rest| rest.split('\'').next())
                 .unwrap_or("");
-            let rows = event_lookup(event_uid).into_iter().collect::<Vec<_>>();
+            let session_id = match event_uid {
+                "evt-open-full" | "evt-event-1" | "evt-event-3" => Some("sess-event"),
+                "evt-out-of-scope" => Some("sess-out-of-scope"),
+                _ => None,
+            };
+            let rows = session_id
+                .map(|session_id| json!({ "session_id": session_id }))
+                .into_iter()
+                .collect::<Vec<_>>();
             return (StatusCode::OK, json_each_row(json!(rows)));
         }
 
-        if query.contains("FROM `moraine`.`mcp_open_events`")
-            && query.contains("FINAL")
-            && query.contains("previous_event_uid")
+        if query.contains("FROM `moraine`.`mcp_event_navigation` AS n FINAL")
+            && query.contains("toUInt8(is_metadata_bearing) AS is_metadata_bearing")
         {
-            let event_uid = query
-                .split("event_uid = '")
+            let session_id = query
+                .split("WHERE n.session_id = '")
                 .nth(1)
                 .and_then(|rest| rest.split('\'').next())
                 .unwrap_or("");
-            let rows = full_event_row(event_uid).into_iter().collect::<Vec<_>>();
-            return (StatusCode::OK, json_each_row(json!(rows)));
+            return (
+                StatusCode::OK,
+                json_each_row(json!(navigation_rows(session_id))),
+            );
         }
 
-        if query.contains("FROM `moraine`.`mcp_open_events` FINAL")
+        if query.contains("FROM `moraine`.`events` FINAL")
+            && query.contains("token_usage_native_units")
             && query.contains("event_uid IN")
-            && !query.contains("toUInt8(0) AS row_kind")
         {
-            return (StatusCode::OK, json_each_row(json!(event_ref_rows())));
+            let session_id = query
+                .split("WHERE session_id = '")
+                .nth(1)
+                .and_then(|rest| rest.split('\'').next())
+                .unwrap_or("");
+            return (
+                StatusCode::OK,
+                json_each_row(json!(hydrated_rows(session_id))),
+            );
         }
 
         if query.starts_with("INSERT INTO `moraine`.`file_attention_project_roots`") {
@@ -308,7 +279,7 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
             );
         }
 
-        if query.contains("FROM `moraine`.`tool_io` FINAL")
+        if query.contains("FROM `moraine`.`mcp_event_locator` FINAL")
             && query.contains("repo_rel_path = 'crates/foo.rs'")
             && query.contains("project_id = 'project-a'")
             && !query.contains("JSONExtractString(input_json")
@@ -337,7 +308,8 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
             );
         }
 
-        if query.contains("FROM `moraine`.`tool_io` FINAL")
+        if (query.contains("JSONHas(payload_json, 'moraine_tool_io')")
+            || query.contains("JSONHas(e.payload_json, 'moraine_tool_io')"))
             && query.contains("JSONExtractString(input_json, 'path')")
             && query.contains("crates/foo.rs")
         {
@@ -803,7 +775,7 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
             );
         }
 
-        if query.contains("toUInt8(0) AS row_kind") && query.contains("projected_candidates AS") {
+        if query.contains("toUInt8(0) AS row_kind") && query.contains("ranked AS (") {
             let candidate_query_count = state
                 .queries
                 .lock()
@@ -811,7 +783,7 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
                 .iter()
                 .filter(|candidate_query| {
                     candidate_query.contains("toUInt8(0) AS row_kind")
-                        && candidate_query.contains("projected_candidates AS")
+                        && candidate_query.contains("ranked AS (")
                 })
                 .count();
             if candidate_query_count == 2 && query.contains("search_corpus_stats") {
@@ -820,18 +792,6 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
                     barrier.release.notified().await;
                 }
             }
-            let projection_clean = u8::from(
-                !state.options.dirty_projection_on_first_candidate || candidate_query_count != 1,
-            );
-            let projection_revision = if state
-                .options
-                .change_projection_revision_on_second_search_page
-                && query.contains("OFFSET 3")
-            {
-                2_u64
-            } else {
-                1_u64
-            };
             let candidate = |event_uid: &str,
                              raw_score: f64,
                              matched_terms: u64,
@@ -841,16 +801,13 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
                     "event_uid": event_uid,
                     "session_id": if event_uid.starts_with("evt-a") { "sess_a" } else if event_uid.starts_with("evt-b") { "sess_b" } else { "sess_c" },
                     "slot": 0_u8,
-                    "generation": 1_u64,
+                    "event_version": 1_u64,
                     "raw_score": raw_score,
                     "matched_terms": matched_terms,
                     "event_unix_ms": event_unix_ms,
                     "docs": 100_u64,
                     "total_doc_len": 5000_u64,
-                    "scope_exists": 1_u8,
-                    "projection_ready": 1_u8,
-                    "projection_clean": projection_clean,
-                    "projection_revision": projection_revision
+                    "scope_exists": 1_u8
                 })
             };
             let metadata = json!({
@@ -858,16 +815,13 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
                 "event_uid": "",
                 "session_id": "",
                 "slot": 0_u8,
-                "generation": 0_u64,
+                "event_version": 0_u64,
                 "raw_score": 0.0,
                 "matched_terms": 0_u64,
                 "event_unix_ms": 0_i64,
                 "docs": 100_u64,
                 "total_doc_len": 5000_u64,
-                "scope_exists": 1_u8,
-                "projection_ready": 1_u8,
-                "projection_clean": projection_clean,
-                "projection_revision": projection_revision
+                "scope_exists": 1_u8
             });
             let filter_clause = query
                 .split_once("WHERE ")
@@ -879,7 +833,9 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
                 filter_clause.contains("lowerUTF8(p.actor_role) = 'assistant'");
             let includes_tool_call = filter_clause.contains("p.event_class = 'tool_call'");
             let includes_tool_response = filter_clause.contains("p.event_class = 'tool_result'");
-            let mut rows = if query.contains("e.session_id = 'sess_c' AND e.turn_seq = 2") {
+            let mut rows = if query.contains("eligible_turn_events AS (")
+                && query.contains("WHERE session_id = 'sess_c'")
+            {
                 vec![candidate("evt-c-tool", 13.0, 2, 1_767_434_430_000)]
             } else if query.contains("p.session_id = 'sess_a'") {
                 vec![candidate("evt-a-11", 7.0, 1, 1_767_261_720_000)]
@@ -936,10 +892,9 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
             return (StatusCode::OK, json_each_row(json!(rows)));
         }
 
-        if query.contains("documents AS (")
+        if query.contains("nav_ranked AS (")
             && query.contains("AS session_started_at_unix_ms")
-            && query.contains("FROM documents")
-            && query.contains("mcp_open_events")
+            && query.contains("FROM hydrated AS h")
         {
             let detail = |event_uid: &str| {
                 let (session_id, event_time, event_unix_ms, event_order, turn_seq) = match event_uid
@@ -1026,6 +981,7 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
                 json!({
                     "event_uid": event_uid,
                     "session_id": session_id,
+                    "event_version": if state.options.change_detail_event_version { 2_u64 } else { 1_u64 },
                     "source_name": "codex",
                     "harness": "codex",
                     "inference_provider": "openai",

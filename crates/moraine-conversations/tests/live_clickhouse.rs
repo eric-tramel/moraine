@@ -523,170 +523,64 @@ struct OpenCostMetrics {
     duration_ms: u64,
 }
 
-async fn seed_mcp_open_benchmark_targets(clickhouse: &ClickHouseClient) -> Result<()> {
-    let timestamp = "2026-07-14 18:00:00.000";
-    let session_rows = [
-        ("issue532-target-session", 100_u32, 1_000_u64),
-        ("issue532-target-turn", 1_u32, 1_000_u64),
-        ("issue532-target-event", 1_u32, 500_u64),
-    ]
-    .into_iter()
-    .map(|(session_id, total_turns, total_events)| {
-        json!({
-            "session_id": session_id,
-            "slot": 0_u8,
-            "generation": 1_u64,
-            "source_revision": 1_u64,
-            "dirty_revision": 1_u64,
-            "first_event_time": timestamp,
-            "last_event_time": timestamp,
-            "total_turns": total_turns,
-            "total_events": total_events,
-            "user_messages": total_turns,
-            "assistant_messages": total_turns,
-            "tool_calls": 0_u64,
-            "tool_results": 0_u64,
-            "mode": "chat",
-            "first_event_uid": format!("{session_id}-0001"),
-            "last_event_uid": format!("{session_id}-{total_events:04}"),
-            "last_actor_role": "assistant",
-            "title": "Bounded-open benchmark target",
-            "source": "benchmark",
-            "harness": "codex",
-            "inference_provider": "openai",
-            "session_slug": session_id,
-            "session_summary": "Realistic bounded-open benchmark target",
-            "completed": 1_u8,
-            "terminal_event_uid": format!("{session_id}-{total_events:04}"),
-            "origin_cwd": "/repo"
-        })
-    })
-    .collect::<Vec<_>>();
-    clickhouse
-        .insert_json_rows_sync("mcp_open_sessions", &session_rows)
-        .await
-        .context("failed to seed realistic MCP session targets")?;
-
-    let substantial_summary = repeat_text("substantial projected summary ", 512);
-    let mut turn_rows = (1_u32..=100)
-        .map(|turn_seq| {
-            json!({
-                "session_id": "issue532-target-session",
-                "slot": 0_u8,
-                "generation": 1_u64,
-                "turn_seq": turn_seq,
-                "turn_id": format!("turn-{turn_seq}"),
-                "started_at": timestamp,
-                "ended_at": timestamp,
-                "total_events": 10_u64,
-                "user_messages": 1_u64,
-                "assistant_messages": 1_u64,
-                "user_input_summary_source": substantial_summary,
-                "final_response_summary_source": substantial_summary,
-                "completed": 1_u8,
-                "first_event_uid": format!("issue532-target-session-{:04}", (turn_seq - 1) * 10 + 1),
-                "last_event_uid": format!("issue532-target-session-{:04}", turn_seq * 10),
-                "event_summaries_json": "[]"
-            })
-        })
-        .collect::<Vec<_>>();
-    let event_summaries = (1_u64..=1_000)
-        .map(|event_order| {
-            json!({
-                "event_uid": format!("issue532-target-turn-{event_order:04}"),
-                "event_order": event_order,
-                "event_time": timestamp,
-                "event_unix_ms": 1_752_516_000_000_i64,
-                "actor_role": if event_order % 2 == 0 { "assistant" } else { "user" },
-                "event_class": "message",
-                "payload_type": "text",
-                "event_type": if event_order % 2 == 0 { "assistant_response" } else { "user_input" },
-                "call_id": "",
-                "name": "",
-                "phase": "",
-                "summary_source": substantial_summary,
-                "summary_is_payload": 0_u8
-            })
-        })
-        .collect::<Vec<_>>();
-    turn_rows.push(json!({
-        "session_id": "issue532-target-turn",
-        "slot": 0_u8,
-        "generation": 1_u64,
-        "turn_seq": 1_u32,
-        "turn_id": "turn-1",
-        "started_at": timestamp,
-        "ended_at": timestamp,
-        "total_events": 1_000_u64,
-        "user_messages": 500_u64,
-        "assistant_messages": 500_u64,
-        "user_input_summary_source": substantial_summary,
-        "final_response_summary_source": substantial_summary,
-        "completed": 1_u8,
-        "first_event_uid": "issue532-target-turn-0001",
-        "last_event_uid": "issue532-target-turn-1000",
-        "event_summaries_json": serde_json::to_string(&event_summaries)?
-    }));
-    turn_rows.push(json!({
-        "session_id": "issue532-target-event",
-        "slot": 0_u8,
-        "generation": 1_u64,
-        "turn_seq": 1_u32,
-        "turn_id": "turn-1",
-        "started_at": timestamp,
-        "ended_at": timestamp,
-        "total_events": 500_u64,
-        "user_messages": 250_u64,
-        "assistant_messages": 250_u64,
-        "completed": 1_u8,
-        "first_event_uid": "issue532-target-event-0001",
-        "last_event_uid": "issue532-target-event-0500",
-        "event_summaries_json": "[]"
-    }));
-    clickhouse
-        .insert_json_rows_sync("mcp_open_turns", &turn_rows)
-        .await
-        .context("failed to seed realistic MCP turn targets")?;
-
-    let event_rows = (1_u64..=500)
-        .map(|event_order| {
-            json!({
-                "event_uid": format!("issue532-target-event-{event_order:04}"),
-                "slot": 0_u8,
-                "generation": 1_u64,
-                "session_id": "issue532-target-event",
-                "event_order": event_order,
-                "turn_seq": 1_u32,
-                "event_time": timestamp,
-                "actor_role": if event_order % 2 == 0 { "assistant" } else { "user" },
-                "event_class": "message",
-                "payload_type": "text",
-                "event_type": if event_order % 2 == 0 { "assistant_response" } else { "user_input" },
-                "event_ordinal": event_order,
-                "call_id": "",
-                "name": "",
-                "phase": "",
-                "item_id": "",
-                "source_ref": format!("benchmark:{event_order}"),
-                "text_content": repeat_text("substantial transcript text ", 1_024),
-                "payload_json": json!({"text": repeat_text("substantial payload ", 2_048)}).to_string(),
-                "token_usage_json": "{}",
-                "endpoint_kind": "",
-                "token_usage_buckets": {},
-                "token_usage_native_units": {},
-                "previous_event_uid": if event_order == 1 { String::new() } else { format!("issue532-target-event-{:04}", event_order - 1) },
-                "next_event_uid": if event_order == 500 { String::new() } else { format!("issue532-target-event-{:04}", event_order + 1) }
-            })
-        })
-        .collect::<Vec<_>>();
-    clickhouse
-        .insert_json_rows_sync("mcp_open_events", &event_rows)
-        .await
-        .context("failed to seed realistic MCP event targets")
-}
-
-fn repeat_text(fragment: &str, minimum_chars: usize) -> String {
-    fragment.repeat(minimum_chars.div_ceil(fragment.len()))
+async fn seed_mcp_open_benchmark_targets(
+    clickhouse: &ClickHouseClient,
+    database: &str,
+) -> Result<()> {
+    for (session_id, total_events, actor_expression, turn_expression) in [
+        (
+            "issue532-target-session",
+            1_000_u64,
+            "if(number % 10 = 0, 'user', 'assistant')",
+            "toUInt32(intDiv(number, 10) + 1)",
+        ),
+        (
+            "issue532-target-turn",
+            1_000_u64,
+            "if(number = 0, 'user', 'assistant')",
+            "toUInt32(1)",
+        ),
+        (
+            "issue532-target-event",
+            500_u64,
+            "if(number = 0, 'user', 'assistant')",
+            "toUInt32(1)",
+        ),
+    ] {
+        let sql = format!(
+            r#"INSERT INTO `{database}`.`events`
+(
+  ingested_at, event_uid, session_id, session_date, source_name, harness,
+  source_file, source_offset, source_ref, record_ts, event_ts, event_kind,
+  actor_kind, payload_type, turn_index, text_content, payload_json, event_version
+)
+SELECT
+  now64(3),
+  concat('{session_id}-', leftPad(toString(number + 1), 4, '0')),
+  '{session_id}',
+  today(),
+  'fixture',
+  'codex',
+  'issue532-bounded-open-targets',
+  toUInt64(number + 1),
+  concat('benchmark:', toString(number + 1)),
+  '2026-07-14T18:00:00.000Z',
+  toDateTime64('2026-07-14 18:00:00.000', 3),
+  'message',
+  {actor_expression},
+  'text',
+  {turn_expression},
+  repeat('substantial transcript text ', 40),
+  concat('{{"text":"', repeat('substantial payload ', 80), '"}}'),
+  toUInt64(1)
+FROM numbers({total_events})"#
+        );
+        clickhouse
+            .request_text(&sql, None, Some(database), false, None)
+            .await
+            .with_context(|| format!("failed to seed canonical target {session_id}"))?;
+    }
+    Ok(())
 }
 
 async fn run_open_suite(
@@ -866,10 +760,6 @@ async fn live_schema_semantics_and_teardown() -> Result<()> {
         assert!(legacy_heartbeat.latest.is_none());
 
         install_schema_fixture(&clickhouse, &database).await?;
-        clickhouse
-            .backfill_mcp_open_read_model()
-            .await
-            .context("failed to project live-schema fixtures for bounded MCP open")?;
         assert_omp_session_metadata(&repository).await?;
         let commentary_turn = repository
             .get_mcp_turn("issue549-commentary-session", 1)
@@ -885,119 +775,6 @@ async fn live_schema_semantics_and_teardown() -> Result<()> {
                 && event.phase == "commentary"
         }));
 
-        #[derive(Deserialize)]
-        struct ProjectionRevisionRow {
-            generation: u64,
-            dirty_revision: u64,
-        }
-        #[derive(Deserialize)]
-        struct CountRow {
-            value: u64,
-        }
-        let commentary_head_query = format!(
-            "SELECT generation, dirty_revision \
-             FROM `{}`.`mcp_open_sessions` FINAL \
-             WHERE session_id = 'issue549-commentary-session' \
-             FORMAT JSONEachRow",
-            database.as_str()
-        );
-        let before_reset = clickhouse
-            .query_rows::<ProjectionRevisionRow>(
-                &commentary_head_query,
-                Some(database.as_str()),
-            )
-            .await
-            .context("failed to read commentary projection before reset")?
-            .into_iter()
-            .next()
-            .context("commentary projection head missing before reset")?;
-        clickhouse
-            .request_text(
-                &format!(
-                    "INSERT INTO `{0}`.`mcp_open_dirty_sessions` \
-                     (session_id, dirty_revision, observed_at) \
-                     SELECT session_id, generateSnowflakeID(), now64(3) \
-                     FROM (SELECT DISTINCT session_id FROM `{0}`.`events` FINAL)",
-                    database.as_str()
-                ),
-                None,
-                Some(database.as_str()),
-                false,
-                None,
-            )
-            .await
-            .context("failed to invalidate existing MCP open projections")?;
-        clickhouse
-            .request_text(
-                &format!(
-                    "INSERT INTO `{}`.`mcp_open_dirty_sessions` \
-                     (session_id, dirty_revision, observed_at) \
-                     VALUES ('', generateSnowflakeID(), now64(3))",
-                    database.as_str()
-                ),
-                None,
-                Some(database.as_str()),
-                false,
-                None,
-            )
-            .await
-            .context("failed to seed legacy blank-session dirty row")?;
-        clickhouse
-            .request_text(
-                &format!(
-                    "INSERT INTO `{}`.`mcp_open_projection_state` \
-                     (state_key, ready, generation, backfill_cursor) \
-                     VALUES ('global', 0, generateSnowflakeID(), '')",
-                    database.as_str()
-                ),
-                None,
-                Some(database.as_str()),
-                false,
-                None,
-            )
-            .await
-            .context("failed to reset MCP open projection state")?;
-        tokio::time::timeout(
-            Duration::from_secs(10),
-            clickhouse.backfill_mcp_open_read_model(),
-        )
-        .await
-        .context("reset MCP open projection did not bypass blank dirty session")??;
-        let after_reset = clickhouse
-            .query_rows::<ProjectionRevisionRow>(
-                &commentary_head_query,
-                Some(database.as_str()),
-            )
-            .await
-            .context("failed to read commentary projection after reset")?
-            .into_iter()
-            .next()
-            .context("commentary projection head missing after reset")?;
-        assert!(after_reset.generation > before_reset.generation);
-        assert!(after_reset.dirty_revision > before_reset.dirty_revision);
-        assert!(clickhouse.mcp_open_read_model_ready().await?);
-        let blank_projection_count = clickhouse
-            .query_rows::<CountRow>(
-                &format!(
-                    "SELECT count() AS value FROM `{}`.`mcp_open_sessions` FINAL \
-                     WHERE session_id = '' FORMAT JSONEachRow",
-                    database.as_str()
-                ),
-                Some(database.as_str()),
-            )
-            .await
-            .context("failed to count blank MCP open projections")?
-            .into_iter()
-            .next()
-            .context("blank MCP open projection count missing")?
-            .value;
-        assert_eq!(blank_projection_count, 0);
-        let rebuilt_commentary_turn = repository
-            .get_mcp_turn("issue549-commentary-session", 1)
-            .await
-            .context("rebuilt commentary turn projection failed")?
-            .context("rebuilt commentary turn missing")?;
-        assert!(rebuilt_commentary_turn.final_response_summary.is_none());
 
         #[derive(Deserialize)]
         struct TurnTimestampTypeRow {
@@ -1161,25 +938,6 @@ async fn live_schema_semantics_and_teardown() -> Result<()> {
             .collect::<Vec<_>>();
         assert_eq!(fixture_refs, vec!["issue454-web-z", "issue454-web-a"]);
 
-        #[derive(Deserialize)]
-        struct ProjectionHead {
-            slot: u8,
-            generation: u64,
-            source_revision: u64,
-            dirty_revision: u64,
-        }
-        let head_query = format!(
-            "SELECT slot, generation, source_revision, dirty_revision FROM `{}`.`mcp_open_sessions` FINAL \
-             WHERE session_id = 'issue454-dedup-session' FORMAT JSONEachRow",
-            database.as_str()
-        );
-        let before_head = clickhouse
-            .query_rows::<ProjectionHead>(&head_query, Some(database.as_str()))
-            .await
-            .context("failed to read pre-replacement projection head")?
-            .into_iter()
-            .next()
-            .context("pre-replacement projection head missing")?;
         clickhouse
             .request_text(
                 &format!(
@@ -1205,21 +963,6 @@ SELECT
             )
             .await
             .context("failed to insert canonical replacement fixture")?;
-        clickhouse
-            .refresh_mcp_open_read_model(["issue454-dedup-session"])
-            .await
-            .context("failed to refresh replacement projection")?;
-        let after_head = clickhouse
-            .query_rows::<ProjectionHead>(&head_query, Some(database.as_str()))
-            .await
-            .context("failed to read post-replacement projection head")?
-            .into_iter()
-            .next()
-            .context("post-replacement projection head missing")?;
-        assert_ne!(after_head.slot, before_head.slot);
-        assert!(after_head.generation > before_head.generation);
-        assert_ne!(after_head.source_revision, before_head.source_revision);
-        assert!(after_head.dirty_revision > before_head.dirty_revision);
 
         let replaced_turn = populated_repository
             .get_mcp_turn("issue454-dedup-session", 1)
@@ -1262,22 +1005,12 @@ SELECT
             )
             .await
             .context("failed to insert unprojected canonical replacement")?;
-        let still_committed = populated_repository
+        let latest_event = populated_repository
             .get_mcp_event("issue454-dedup")
             .await
-            .context("committed event read failed during dirty window")?
-            .context("committed event missing during dirty window")?;
-        assert_eq!(still_committed.event.text_content, "replacement-final");
-        clickhouse
-            .backfill_mcp_open_read_model()
-            .await
-            .context("failed to resume dirty MCP open projection")?;
-        let resumed_event = populated_repository
-            .get_mcp_event("issue454-dedup")
-            .await
-            .context("resumed MCP event projection failed")?
-            .context("resumed MCP event missing")?;
-        assert_eq!(resumed_event.event.text_content, "replacement-resumed");
+            .context("canonical event read failed after replacement")?
+            .context("canonical event missing after replacement")?;
+        assert_eq!(latest_event.event.text_content, "replacement-resumed");
         clickhouse
             .request_text(
                 &format!(
@@ -1307,10 +1040,6 @@ VALUES
             .await
             .context("failed to insert ordering fixture")?;
         clickhouse
-            .refresh_mcp_open_read_model(["issue532-order-session"])
-            .await
-            .context("failed to project ordering fixture")?;
-        clickhouse
             .request_text(
                 &format!(
                     r#"INSERT INTO `{}`.`events`
@@ -1332,10 +1061,6 @@ VALUES
             )
             .await
             .context("failed to insert ordering replacement")?;
-        clickhouse
-            .refresh_mcp_open_read_model(["issue532-order-session"])
-            .await
-            .context("failed to refresh reordered projection")?;
 
         let reordered = populated_repository
             .get_mcp_event("issue532-order-b")
@@ -1393,11 +1118,7 @@ async fn live_mcp_open_boundedness_benchmark() -> Result<()> {
             .await
             .context("failed to migrate bounded-open benchmark database")?;
         install_schema_fixture(&clickhouse, &database).await?;
-        clickhouse
-            .backfill_mcp_open_read_model()
-            .await
-            .context("failed to project bounded-open benchmark targets")?;
-        seed_mcp_open_benchmark_targets(&clickhouse).await?;
+        seed_mcp_open_benchmark_targets(&clickhouse, database.as_str()).await?;
         let repository =
             ClickHouseConversationRepository::new(clickhouse.clone(), RepoConfig::default());
 
@@ -1440,51 +1161,6 @@ async fn live_mcp_open_boundedness_benchmark() -> Result<()> {
                 .await
                 .context("failed to seed one-million-event canonical corpus")?;
         }
-        let seed_sessions = format!(
-            "INSERT INTO `{database_name}`.`mcp_open_sessions`
-             (session_id, slot, generation, source_revision, first_event_time, last_event_time,
-              total_turns, total_events, origin_cwd)
-             SELECT
-               concat('issue532-unrelated-session-', leftPad(toString(number), 7, '0')),
-               toUInt8(0), toUInt64(1), toUInt64(1), now64(3), now64(3),
-               toUInt32(1), toUInt64(10), '/benchmark'
-             FROM numbers({UNRELATED_SESSIONS})"
-        );
-        clickhouse
-            .request_text(&seed_sessions, None, Some(database_name), false, None)
-            .await
-            .context("failed to seed unrelated MCP session rows")?;
-        let seed_turns = format!(
-            "INSERT INTO `{database_name}`.`mcp_open_turns`
-             (session_id, slot, generation, turn_seq, total_events, event_summaries_json)
-             SELECT
-               concat('issue532-unrelated-session-', leftPad(toString(number), 7, '0')),
-               toUInt8(0), toUInt64(1), toUInt32(1), toUInt64(10), '[]'
-             FROM numbers({UNRELATED_SESSIONS})"
-        );
-        clickhouse
-            .request_text(&seed_turns, None, Some(database_name), false, None)
-            .await
-            .context("failed to seed unrelated MCP turn rows")?;
-        let seed_events = format!(
-            "INSERT INTO `{database_name}`.`mcp_open_events`
-             (event_uid, slot, generation, session_id, event_order, turn_seq,
-              event_time, actor_role, event_class, payload_type, event_type, event_ordinal,
-              text_content, payload_json)
-             SELECT
-               concat('issue532-unrelated-event-', leftPad(toString(number), 8, '0')),
-               toUInt8(0), toUInt64(1),
-               concat('issue532-unrelated-session-', leftPad(toString(intDiv(number, 10)), 7, '0')),
-               toUInt64((number % 10) + 1), toUInt32(1), now64(3), 'assistant', 'message',
-               'text', 'assistant_response', toUInt32((number % 10) + 1),
-               repeat('substantial transcript text ', 20),
-               concat('{{\"text\":\"', repeat('substantial payload ', 40), '\"}}')
-             FROM numbers({UNRELATED_EVENTS})"
-        );
-        clickhouse
-            .request_text(&seed_events, None, Some(database_name), false, None)
-            .await
-            .context("failed to seed one-million-event MCP projection corpus")?;
 
         let after = run_open_suite(&repository, "after", false).await?;
         let concurrent = run_open_suite(&repository, "concurrent", true).await?;

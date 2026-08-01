@@ -4,6 +4,87 @@ const FILE_ATTENTION_READ_TOOL_NAMES_SQL: &str =
     "'read', 'readfile', 'read_file', 'notebookread', 'notebook_read', 'view', 'cat', 'grep', 'rg', 'glob', 'ls', 'list', 'find'";
 
 impl ClickHouseConversationRepository {
+    fn tool_events_source(&self, rel: &str, use_candidate_index: bool) -> String {
+        let events_ref = self.table_ref("events");
+        let events = if use_candidate_index {
+            let locator = self.table_ref("mcp_event_locator");
+            let rel_sql = sql_quote(rel);
+            let slash_rel_sql = sql_quote(&format!("/{rel}"));
+            format!(
+                "(SELECT * FROM {events_ref} FINAL
+WHERE (session_id, event_uid) IN (
+  SELECT session_id, event_uid
+  FROM {locator} FINAL
+  WHERE arrayExists(path -> path = {rel_sql} OR endsWith(path, {slash_rel_sql}), path_tokens)
+))"
+            )
+        } else {
+            canonical_events_source(&events_ref)
+        };
+        let event_scope_columns = if use_candidate_index {
+            ",
+  e.project_id AS event_project_id,
+  e.worktree_root AS event_worktree_root"
+        } else {
+            ""
+        };
+        format!(
+            "(SELECT
+  e.session_id AS session_id,
+  e.event_uid AS event_uid,
+  e.tool_call_id AS tool_call_id,
+  e.harness AS harness,
+  e.tool_name AS tool_name,
+  e.tool_phase AS tool_phase,
+  JSONExtractString(JSONExtractRaw(e.payload_json, 'moraine_tool_io'), 'input_json') AS input_json,
+  JSONExtractString(JSONExtractRaw(e.payload_json, 'moraine_tool_io'), 'input_preview') AS input_preview,
+  JSONExtractString(JSONExtractRaw(e.payload_json, 'moraine_tool_io'), 'output_preview') AS output_preview,
+  JSONExtractString(JSONExtractRaw(e.payload_json, 'moraine_tool_io'), 'project_id') AS project_id,
+  JSONExtractString(JSONExtractRaw(e.payload_json, 'moraine_tool_io'), 'repo_rel_path') AS repo_rel_path,
+  JSONExtractString(JSONExtractRaw(e.payload_json, 'moraine_tool_io'), 'worktree_root') AS worktree_root,
+  e.source_name AS source_name,
+  e.cwd AS cwd{event_scope_columns}
+FROM {events} AS e
+WHERE JSONHas(e.payload_json, 'moraine_tool_io'))"
+        )
+    }
+
+    fn file_attention_navigation_source(&self, candidate_predicate: &str) -> String {
+        let locator = self.table_ref("mcp_event_locator");
+        let navigation = self.table_ref("mcp_event_navigation");
+        format!(
+            "(SELECT
+  session_id,
+  event_uid,
+  display_time AS event_time,
+  toUInt64(event_order) AS event_order,
+  if(turn_index > 0, turn_index, greatest(toUInt32(1), toUInt32(running_user_count))) AS turn_seq
+FROM (
+  SELECT
+    session_id,
+    event_uid,
+    display_time,
+    turn_index,
+    row_number() OVER (
+      PARTITION BY session_id
+      ORDER BY sort_time, source_file, source_generation, source_offset, source_line_no, event_uid
+    ) AS event_order,
+    countIf(is_user_message != 0) OVER (
+      PARTITION BY session_id
+      ORDER BY sort_time, source_file, source_generation, source_offset, source_line_no, event_uid
+      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS running_user_count
+  FROM {navigation} FINAL
+  WHERE session_id IN (
+    SELECT session_id FROM {locator} FINAL WHERE {candidate_predicate}
+  )
+)
+WHERE (session_id, event_uid) IN (
+  SELECT session_id, event_uid FROM {locator} FINAL WHERE {candidate_predicate}
+))"
+        )
+    }
+
     pub async fn file_attention(
         &self,
         query: FileAttentionQuery,
@@ -16,9 +97,10 @@ impl ClickHouseConversationRepository {
     ///
     /// Worktree unification is by construction: matching the repo-relative
     /// tail collapses the main checkout, sibling worktrees, and
-    /// agent-isolation worktrees into one result set. This intentionally scans
-    /// `tool_io` because `input_json` is not indexed yet; the trace/events
-    /// joins are bounded to exact matched `(session_id, event_uid)` pairs.
+    /// agent-isolation worktrees into one result set. The exact normalized-path
+    /// pass uses the canonical event locator; only its bounded matches are
+    /// hydrated from event payloads. The legacy suffix fallback still scans
+    /// payload JSON for records without normalized paths.
     pub(super) async fn file_attention_impl(
         &self,
         query: FileAttentionQuery,
@@ -37,7 +119,7 @@ impl ClickHouseConversationRepository {
         {
             return Ok(Vec::new());
         }
-
+        let limit_plus = query.max_rows.saturating_add(1);
         let mut touches = Vec::<FileAttentionTouch>::new();
         let normalized_schema_available = match self.file_attention_exact_impl(&query).await {
             Ok(rows) => {
@@ -74,18 +156,28 @@ impl ClickHouseConversationRepository {
         if query.apply_project_scope && !normalized_schema_available {
             return Ok(touches);
         }
+        if normalized_schema_available {
+            touches.extend(
+                self.file_attention_suffix_impl(
+                    &query,
+                    normalized_schema_available,
+                    project_root_mapping_available,
+                    true,
+                )
+                .await?,
+            );
+            return Ok(merge_file_attention_touches(touches, limit_plus));
+        }
         touches.extend(
             self.file_attention_suffix_impl(
                 &query,
                 normalized_schema_available,
                 project_root_mapping_available,
+                false,
             )
             .await?,
         );
-        Ok(merge_file_attention_touches(
-            touches,
-            query.max_rows.saturating_add(1),
-        ))
+        Ok(merge_file_attention_touches(touches, limit_plus))
     }
 
     async fn file_attention_exact_impl(
@@ -94,9 +186,8 @@ impl ClickHouseConversationRepository {
     ) -> RepoResult<Vec<FileAttentionTouch>> {
         let rel = query.rel.as_str();
 
-        let tool_io = self.table_ref("tool_io");
-        let events_source = canonical_events_source(&self.table_ref("events"));
-        let trace = self.table_ref("v_conversation_trace");
+        let locator = self.table_ref("mcp_event_locator");
+        let events = self.table_ref("events");
         let rel_sql = sql_quote(rel);
         let project_predicate = if query.apply_project_scope {
             let project_id = query
@@ -110,25 +201,28 @@ impl ClickHouseConversationRepository {
         } else {
             "project_id != ''".to_string()
         };
+        let exact_candidate_predicate =
+            format!("{project_predicate} AND repo_rel_path = {rel_sql}");
+        let attention_navigation =
+            self.file_attention_navigation_source(&exact_candidate_predicate);
 
-        let mut inner_clauses = vec![format!(
-            "tool_phase = 'request'
-      AND NOT (lowerUTF8(tool_name) = 'file_attention' OR endsWith(lowerUTF8(tool_name), '_file_attention'))
-      AND {project_predicate}
-      AND repo_rel_path = {rel_sql}"
-        )];
+        let mut inner_clauses = vec![
+            "e.tool_phase = 'request'
+      AND NOT (lowerUTF8(e.tool_name) = 'file_attention' OR endsWith(lowerUTF8(e.tool_name), '_file_attention'))"
+                .to_string(),
+        ];
         if let Some(tool) = query.tool.as_deref() {
-            inner_clauses.push(format!("lower(tool_name) = lower({})", sql_quote(tool)));
+            inner_clauses.push(format!("lower(e.tool_name) = lower({})", sql_quote(tool)));
         }
         if let Some(harness) = query.harness.as_deref() {
-            inner_clauses.push(format!("harness = {}", sql_quote(harness)));
+            inner_clauses.push(format!("e.harness = {}", sql_quote(harness)));
         }
         if query.mutations_only {
             inner_clauses.push(format!(
-                "lowerUTF8(tool_name) NOT IN ({FILE_ATTENTION_READ_TOOL_NAMES_SQL})"
+                "lowerUTF8(e.tool_name) NOT IN ({FILE_ATTENTION_READ_TOOL_NAMES_SQL})"
             ));
         }
-        if let Some(scope_clause) = self.session_scope_clause("session_id") {
+        if let Some(scope_clause) = self.session_scope_clause("e.session_id") {
             inner_clauses.push(scope_clause);
         }
         let match_predicate = inner_clauses.join("\n      AND ");
@@ -141,7 +235,7 @@ impl ClickHouseConversationRepository {
             outer_clauses.push(format!("toUnixTimestamp64Milli(tr.event_time) < {end}"));
         }
         if let Some(source_name) = query.source_name.as_deref() {
-            outer_clauses.push(format!("e.source_name = {}", sql_quote(source_name)));
+            outer_clauses.push(format!("ti.source_name = {}", sql_quote(source_name)));
         }
         let outer_where = if outer_clauses.is_empty() {
             "1".to_string()
@@ -161,9 +255,32 @@ impl ClickHouseConversationRepository {
         let normalized_root_condition = single_path_sql("ti.worktree_root");
 
         let sql = format!(
-            "WITH matched AS (
-    SELECT session_id, event_uid, tool_call_id, harness, tool_name, tool_phase, input_preview, output_preview, repo_rel_path, worktree_root
-    FROM {tool_io} FINAL
+            "WITH matched_ids AS (
+    SELECT session_id, event_uid, project_id, repo_rel_path, worktree_root
+    FROM {locator} FINAL
+    WHERE {project_predicate}
+      AND repo_rel_path = {rel_sql}
+  ),
+  matched AS (
+    SELECT
+      e.session_id AS session_id,
+      e.event_uid AS event_uid,
+      e.tool_call_id AS tool_call_id,
+      e.harness AS harness,
+      e.source_name AS source_name,
+      e.tool_name AS tool_name,
+      e.tool_phase AS tool_phase,
+      JSONExtractString(JSONExtractRaw(e.payload_json, 'moraine_tool_io'), 'input_preview') AS input_preview,
+      JSONExtractString(JSONExtractRaw(e.payload_json, 'moraine_tool_io'), 'output_preview') AS output_preview,
+      mi.repo_rel_path AS repo_rel_path,
+      mi.worktree_root AS worktree_root,
+      e.cwd AS cwd
+    FROM (
+      SELECT * FROM {events} FINAL
+      WHERE (session_id, event_uid) IN (SELECT session_id, event_uid FROM matched_ids)
+    ) AS e
+    ANY INNER JOIN matched_ids AS mi
+      ON mi.session_id = e.session_id AND mi.event_uid = e.event_uid
     WHERE {match_predicate}
   )
   SELECT
@@ -171,13 +288,13 @@ impl ClickHouseConversationRepository {
     ti.event_uid AS event_uid,
     ti.tool_call_id AS tool_call_id,
     ti.harness AS harness,
-    ifNull(e.source_name, '') AS source_name,
+    ti.source_name AS source_name,
     ti.tool_name AS tool_name,
     ti.tool_phase AS tool_phase,
     if({normalized_root_condition}, concat(ti.worktree_root, '/', ti.repo_rel_path), ti.repo_rel_path) AS matched_path,
     'path_suffix' AS match_kind,
     if({normalized_root_condition}, ti.worktree_root, '') AS worktree_root,
-    ifNull(e.cwd, '') AS cwd,
+    ti.cwd AS cwd,
     toInt64(toUnixTimestamp64Milli(tr.event_time)) AS event_unix_ms,
     toUInt64(ifNull(tr.event_order, toUInt64(0))) AS event_order,
     tr.turn_seq AS turn_seq,
@@ -185,16 +302,9 @@ impl ClickHouseConversationRepository {
     ti.output_preview AS output_preview
   FROM matched AS ti
   ANY LEFT JOIN (
-    SELECT session_id, event_uid, event_time, toUInt64(event_order) AS event_order, toUInt32(turn_seq) AS turn_seq
-    FROM {trace}
-    WHERE (session_id, event_uid) IN (SELECT session_id, event_uid FROM matched)
+    SELECT session_id, event_uid, event_time, event_order, turn_seq
+    FROM {attention_navigation}
   ) AS tr ON tr.session_id = ti.session_id AND tr.event_uid = ti.event_uid
-  ANY LEFT JOIN (
-    SELECT session_id, event_uid, any(cwd) AS cwd, any(source_name) AS source_name
-    FROM {events_source}
-    WHERE (session_id, event_uid) IN (SELECT session_id, event_uid FROM matched)
-    GROUP BY session_id, event_uid
-  ) AS e ON e.session_id = ti.session_id AND e.event_uid = ti.event_uid
   WHERE {outer_where}
   ORDER BY isNull(event_unix_ms) ASC, event_unix_ms DESC, event_order DESC, ti.event_uid DESC
   LIMIT {limit_plus}
@@ -245,14 +355,26 @@ SELECT {}, arrayJoin([{roots}]), toUInt64(toUnixTimestamp64Milli(now64(3)))",
         query: &FileAttentionQuery,
         normalized_schema_available: bool,
         project_root_mapping_available: bool,
+        use_candidate_index: bool,
     ) -> RepoResult<Vec<FileAttentionTouch>> {
         let rel = query.rel.as_str();
 
-        let tool_io = self.table_ref("tool_io");
-        let events_source = canonical_events_source(&self.table_ref("events"));
-        let trace = self.table_ref("v_conversation_trace");
+        let tool_events = self.tool_events_source(rel, use_candidate_index);
         let rel_sql = sql_quote(rel);
         let slash_rel_sql = sql_quote(&format!("/{rel}"));
+        let attention_navigation = if use_candidate_index {
+            let candidate_predicate = format!(
+                "arrayExists(path -> path = {rel_sql} OR endsWith(path, {slash_rel_sql}), path_tokens)"
+            );
+            self.file_attention_navigation_source(&candidate_predicate)
+        } else {
+            let trace = self.table_ref("v_conversation_trace");
+            format!(
+                "(SELECT session_id, event_uid, event_time, toUInt64(event_order) AS event_order, toUInt32(turn_seq) AS turn_seq
+FROM {trace}
+WHERE (session_id, event_uid) IN (SELECT session_id, event_uid FROM matched))"
+            )
+        };
         let rel_regex = regex::escape(rel);
         let slash_rel_regex = regex::escape(&format!("/{rel}"));
 
@@ -303,9 +425,9 @@ SELECT {}, arrayJoin([{roots}]), toUInt64(toUnixTimestamp64Milli(now64(3)))",
 
         let normalized_root_is_single = single_path_sql("ti.worktree_root");
         let event_root_expression = if normalized_schema_available {
-            "ifNull(e.worktree_root, '')"
+            "ifNull(ti.event_worktree_root, '')"
         } else {
-            "ifNull(e.cwd, '')"
+            "ifNull(ti.cwd, '')"
         };
         let event_root_is_single = single_path_sql(event_root_expression);
 
@@ -341,7 +463,7 @@ SELECT {}, arrayJoin([{roots}]), toUInt64(toUnixTimestamp64Milli(now64(3)))",
         let provenance_key_regex = sql_quote(&format!(
             "\"(?:{path_key_regex}|command|cmd)\"[[:space:]]*:"
         ));
-        let cwd_is_single = single_path_sql("ifNull(e.cwd, '')");
+        let cwd_is_single = single_path_sql("ifNull(ti.cwd, '')");
         let candidate_root_expr = if query.derive_legacy_roots && !rel.starts_with('/') {
             format!(
                 "if(
@@ -350,8 +472,8 @@ SELECT {}, arrayJoin([{roots}]), toUInt64(toUnixTimestamp64Milli(now64(3)))",
       AND {legacy_scalar_path_is_single}
       AND {cwd_is_single}
       AND (legacy_scalar_path = {rel_sql}
-           OR legacy_scalar_path = concat(ifNull(e.cwd, ''), '/', {rel_sql})),
-      ifNull(e.cwd, ''),
+           OR legacy_scalar_path = concat(ifNull(ti.cwd, ''), '/', {rel_sql})),
+      ifNull(ti.cwd, ''),
       '')"
             )
         } else {
@@ -373,7 +495,7 @@ SELECT {}, arrayJoin([{roots}]), toUInt64(toUnixTimestamp64Milli(now64(3)))",
             outer_clauses.push(format!("toUnixTimestamp64Milli(tr.event_time) < {end}"));
         }
         if let Some(source_name) = query.source_name.as_deref() {
-            outer_clauses.push(format!("e.source_name = {}", sql_quote(source_name)));
+            outer_clauses.push(format!("ti.source_name = {}", sql_quote(source_name)));
         }
         let mut project_roots_with = String::new();
         let verified_project_root_expr = if query.apply_project_scope {
@@ -421,15 +543,15 @@ SELECT {}, arrayJoin([{roots}]), toUInt64(toUnixTimestamp64Milli(now64(3)))",
                 root_membership("ti.worktree_root")
             );
             let legacy_event_scope = format!(
-                "(e.project_id != '' AND NOT startsWith(e.project_id, 'git:') AND {event_root_is_single} AND {})",
+                "(ti.event_project_id != '' AND NOT startsWith(ti.event_project_id, 'git:') AND {event_root_is_single} AND {})",
                 root_membership(event_root_expression)
             );
             outer_clauses.push(format!(
                 "(ti.project_id = {project_id_sql}
       OR {legacy_tool_scope}
-      OR (ti.project_id = '' AND e.project_id = {project_id_sql})
+      OR (ti.project_id = '' AND ti.event_project_id = {project_id_sql})
       OR (ti.project_id = '' AND legacy_candidate_root != ''
-          AND ({legacy_event_scope} OR (e.project_id = '' AND verified_project_root != ''))))"
+          AND ({legacy_event_scope} OR (ti.event_project_id = '' AND verified_project_root != ''))))"
             ));
             Some(verified_root)
         } else {
@@ -463,7 +585,15 @@ SELECT {}, arrayJoin([{roots}]), toUInt64(toUnixTimestamp64Milli(now64(3)))",
 
         let limit_plus = query.max_rows.saturating_add(1);
         let max_execution_time = query.execution_budget_secs.max(1).to_string();
-        let suffix_query_id = format!("{}-suffix", query.cancellation_token);
+        let suffix_query_id = format!(
+            "{}-{}",
+            query.cancellation_token,
+            if use_candidate_index {
+                "indexed-suffix"
+            } else {
+                "suffix"
+            }
+        );
         let params = [
             ("query_id", suffix_query_id.as_str()),
             ("max_execution_time", max_execution_time.as_str()),
@@ -471,20 +601,15 @@ SELECT {}, arrayJoin([{roots}]), toUInt64(toUnixTimestamp64Milli(now64(3)))",
         ];
 
         let normalized_tool_columns = if normalized_schema_available {
-            ", project_id, repo_rel_path, worktree_root"
-        } else {
-            ""
-        };
-        let normalized_event_columns = if normalized_schema_available {
-            ", any(project_id) AS project_id, any(worktree_root) AS worktree_root"
+            ", project_id, repo_rel_path, worktree_root, event_project_id, event_worktree_root"
         } else {
             ""
         };
 
         let sql = format!(
             "WITH {project_roots_with}matched AS (
-    SELECT session_id, event_uid, tool_call_id, harness, tool_name, tool_phase, input_json, input_preview, output_preview{normalized_tool_columns}
-    FROM {tool_io} FINAL
+    SELECT session_id, event_uid, tool_call_id, harness, tool_name, tool_phase, input_json, input_preview, output_preview, source_name, cwd{normalized_tool_columns}
+    FROM {tool_events}
     WHERE {match_predicate}
   )
   SELECT
@@ -492,7 +617,7 @@ SELECT {}, arrayJoin([{roots}]), toUInt64(toUnixTimestamp64Milli(now64(3)))",
     ti.event_uid AS event_uid,
     ti.tool_call_id AS tool_call_id,
     ti.harness AS harness,
-    ifNull(e.source_name, '') AS source_name,
+    ti.source_name AS source_name,
     ti.tool_name AS tool_name,
     ti.tool_phase AS tool_phase,
     {legacy_scalar_paths_expr} AS legacy_scalar_paths,
@@ -501,7 +626,7 @@ SELECT {}, arrayJoin([{roots}]), toUInt64(toUnixTimestamp64Milli(now64(3)))",
     {candidate_root_expr} AS legacy_candidate_root{verified_project_root_column},
     if(matched_path != '', 'path_suffix', 'shell_path') AS match_kind,
     {worktree_root_expr} AS worktree_root,
-    ifNull(e.cwd, '') AS cwd,
+    ti.cwd AS cwd,
     toInt64(toUnixTimestamp64Milli(tr.event_time)) AS event_unix_ms,
     toUInt64(ifNull(tr.event_order, toUInt64(0))) AS event_order,
     tr.turn_seq AS turn_seq,
@@ -509,16 +634,9 @@ SELECT {}, arrayJoin([{roots}]), toUInt64(toUnixTimestamp64Milli(now64(3)))",
     ti.output_preview AS output_preview
   FROM matched AS ti
   ANY LEFT JOIN (
-    SELECT session_id, event_uid, event_time, toUInt64(event_order) AS event_order, toUInt32(turn_seq) AS turn_seq
-    FROM {trace}
-    WHERE (session_id, event_uid) IN (SELECT session_id, event_uid FROM matched)
+    SELECT session_id, event_uid, event_time, event_order, turn_seq
+    FROM {attention_navigation}
   ) AS tr ON tr.session_id = ti.session_id AND tr.event_uid = ti.event_uid
-  ANY LEFT JOIN (
-    SELECT session_id, event_uid, any(cwd) AS cwd, any(source_name) AS source_name{normalized_event_columns}
-    FROM {events_source}
-    WHERE (session_id, event_uid) IN (SELECT session_id, event_uid FROM matched)
-    GROUP BY session_id, event_uid
-  ) AS e ON e.session_id = ti.session_id AND e.event_uid = ti.event_uid
   WHERE {outer_where}
   ORDER BY isNull(event_unix_ms) ASC, event_unix_ms DESC, event_order DESC, ti.event_uid DESC
   LIMIT {limit_plus}

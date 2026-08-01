@@ -10,7 +10,6 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::io::Write;
 
-mod mcp_open_projection;
 pub mod mcp_tool_names;
 
 const MAX_INSERT_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
@@ -657,23 +656,19 @@ impl ClickHouseClient {
             "raw_events",
             "events",
             "event_links",
-            "tool_io",
+            "mcp_session_directory",
             "ingest_errors",
             "ingest_checkpoints",
             "ingest_heartbeats",
-            "search_documents",
+            "mcp_event_locator",
+            "mcp_event_navigation",
             "search_postings",
-            "search_conversation_terms",
             "search_term_stats",
             "search_corpus_stats",
             "search_query_log",
             "search_hit_log",
             "search_interaction_log",
-            "mcp_open_sessions",
-            "mcp_open_turns",
-            "mcp_open_events",
-            "mcp_open_dirty_sessions",
-            "mcp_open_projection_state",
+            "file_attention_project_roots",
             "schema_migrations",
         ];
 
@@ -901,6 +896,11 @@ pub fn bundled_migrations() -> Vec<Migration> {
             version: "030",
             name: "030_refresh_omp_session_metadata.sql",
             sql: include_str!("../../../sql/030_refresh_omp_session_metadata.sql"),
+        },
+        Migration {
+            version: "031",
+            name: "031_events_content_authority.sql",
+            sql: include_str!("../../../sql/031_events_content_authority.sql"),
         },
     ]
 }

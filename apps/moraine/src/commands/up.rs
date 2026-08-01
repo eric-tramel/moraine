@@ -52,13 +52,6 @@ enum DatabaseActivity {
         name: &'static str,
         started: Instant,
     },
-    ReconciliationInspection {
-        started: Instant,
-    },
-    Reconciliation {
-        processed: usize,
-        started: Instant,
-    },
 }
 
 struct StartupProgress<W> {
@@ -191,7 +184,7 @@ impl<W: Write> StartupProgress<W> {
 
     fn database_event(&mut self, event: DatabaseProgress) {
         match event {
-            DatabaseProgress::Migration(MigrationProgress::Plan { applied, pending }) => {
+            MigrationProgress::Plan { applied, pending } => {
                 self.database_activity = None;
                 if pending == 0 {
                     self.success_step(
@@ -205,9 +198,9 @@ impl<W: Write> StartupProgress<W> {
                     );
                 }
             }
-            DatabaseProgress::Migration(MigrationProgress::Started {
+            MigrationProgress::Started {
                 index, total, name, ..
-            }) => {
+            } => {
                 self.database_activity = Some(DatabaseActivity::Migration {
                     index,
                     total,
@@ -216,9 +209,9 @@ impl<W: Write> StartupProgress<W> {
                 });
                 self.database_tick();
             }
-            DatabaseProgress::Migration(MigrationProgress::Applied {
+            MigrationProgress::Applied {
                 index, total, name, ..
-            }) => {
+            } => {
                 let elapsed = match self.database_activity.take() {
                     Some(DatabaseActivity::Migration { started, .. }) => started.elapsed(),
                     _ => Duration::ZERO,
@@ -227,49 +220,6 @@ impl<W: Write> StartupProgress<W> {
                     name,
                     Some(&format!(
                         "migration {index}/{total} applied · {:.1}s",
-                        elapsed.as_secs_f64()
-                    )),
-                );
-            }
-            DatabaseProgress::ReconciliationInspecting => {
-                self.database_activity = Some(DatabaseActivity::ReconciliationInspection {
-                    started: Instant::now(),
-                });
-                self.database_tick();
-            }
-            DatabaseProgress::ReconciliationStarted { historical } => {
-                self.tree.phase(
-                    "MCP read model",
-                    Some(if historical {
-                        "building from existing sessions"
-                    } else {
-                        "reconciling changed sessions"
-                    }),
-                );
-                self.database_activity = Some(DatabaseActivity::Reconciliation {
-                    processed: 0,
-                    started: Instant::now(),
-                });
-                self.database_tick();
-            }
-            DatabaseProgress::ReconciliationAdvanced { processed } => {
-                if let Some(DatabaseActivity::Reconciliation {
-                    processed: current, ..
-                }) = &mut self.database_activity
-                {
-                    *current = processed;
-                }
-                self.database_tick();
-            }
-            DatabaseProgress::ReconciliationFinished { processed } => {
-                let elapsed = match self.database_activity.take() {
-                    Some(DatabaseActivity::Reconciliation { started, .. }) => started.elapsed(),
-                    _ => Duration::ZERO,
-                };
-                self.success_step(
-                    "MCP read model ready",
-                    Some(&format!(
-                        "{processed} sessions processed · {:.1}s",
                         elapsed.as_secs_f64()
                     )),
                 );
@@ -292,14 +242,6 @@ impl<W: Write> StartupProgress<W> {
                 started,
             }) => format!(
                 "[{index}/{total}] {name} · {:.1}s",
-                started.elapsed().as_secs_f64()
-            ),
-            Some(DatabaseActivity::ReconciliationInspection { started }) => format!(
-                "Inspecting MCP read model · {:.1}s",
-                started.elapsed().as_secs_f64()
-            ),
-            Some(DatabaseActivity::Reconciliation { processed, started }) => format!(
-                "Reconciling sessions · {processed} processed · {:.1}s",
                 started.elapsed().as_secs_f64()
             ),
             None => return,
@@ -658,24 +600,24 @@ mod tests {
         let style = ProgressStyle::from_capabilities(&test_output(OutputMode::Plain, true), true);
         let mut progress = StartupProgress::new(ProgressTree::new(style, Vec::new()), false);
         progress.startup_plan(&[]);
-        progress.database_event(DatabaseProgress::Migration(MigrationProgress::Plan {
+        progress.database_event(MigrationProgress::Plan {
             applied: 29,
             pending: 1,
-        }));
-        progress.database_event(DatabaseProgress::Migration(MigrationProgress::Started {
+        });
+        progress.database_event(MigrationProgress::Started {
             index: 1,
             total: 1,
             version: "030",
             name: "030_refresh_omp_session_metadata.sql",
-        }));
+        });
         let before = String::from_utf8_lossy(progress.tree.bytes());
         assert!(!before.contains("migration 1/1 applied"));
-        progress.database_event(DatabaseProgress::Migration(MigrationProgress::Applied {
+        progress.database_event(MigrationProgress::Applied {
             index: 1,
             total: 1,
             version: "030",
             name: "030_refresh_omp_session_metadata.sql",
-        }));
+        });
         let rendered = String::from_utf8(progress.into_inner()).expect("progress utf8");
         assert!(rendered.contains("migration 1/1 applied"));
     }

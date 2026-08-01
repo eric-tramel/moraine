@@ -113,7 +113,7 @@ pub struct FileAttentionQuery {
 }
 
 /// One captured tool call that touched the queried file. Deserialized from a
-/// `tool_io` ⋈ `events` row; aggregation into summaries, roots, and per-session
+/// canonical `events` row; aggregation into summaries, roots, and per-session
 /// rollups happens in the MCP layer.
 #[derive(Debug, Clone, Deserialize)]
 pub struct FileAttentionTouch {

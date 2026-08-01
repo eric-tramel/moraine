@@ -61,6 +61,7 @@ fn sample_search_row(
 
 fn sample_mcp_search_row(event_uid: &str, raw_score: f64, event_unix_ms: i64) -> SearchMcpEventRow {
     SearchMcpEventRow {
+        event_version: 1,
         event_uid: event_uid.to_string(),
         session_id: "session-1".to_string(),
         source_name: "source".to_string(),
