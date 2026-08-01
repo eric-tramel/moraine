@@ -1,12 +1,25 @@
 //! SQLite polling engine for database-backed ingest sources (issue #361).
 //!
 //! The first consumer is the `cursor_sqlite` format, which polls Cursor's
-//! `state.vscdb` key/value stores. Cursor's `cursorDiskKV` table has no
-//! timestamp or rowid watermark (`key TEXT UNIQUE ON CONFLICT REPLACE`), so
-//! change detection is hash-based: the checkpoint's `cursor_json` payload
-//! carries one content hash per relevant key, and a poll emits synthetic
-//! records only for keys that are new or whose hash changed. Deleted keys are
-//! pruned after every full prefix scan.
+//! `state.vscdb` key/value stores. **Cursor has no row-level mutation
+//! watermark**: `cursorDiskKV` (`key TEXT UNIQUE ON CONFLICT REPLACE`) carries
+//! no timestamp or sequence, and `rowid` is reused after deletions, so it is a
+//! sound *positive* mutation hint and a usable recency ordering but never a
+//! skip criterion (issue #601 §0/§1.1). Change detection is therefore split:
+//!
+//! - A **census** — `(rowid, key)` over the covering `key` index, ~0.08 ms /
+//!   ~22 KB for the whole relevant keyspace on the reference host — runs on
+//!   every poll and detects inserts and deletions *exactly*, and
+//!   `INSERT OR REPLACE`d rows soundly (their rowid moved). Only those
+//!   candidates' values are read and hashed.
+//! - A plain `UPDATE` keeps its rowid and is **invisible to the census**; the
+//!   reconciliation sweep (§2.2) is the only mechanism that detects it, within
+//!   the published sweep interval. The fast path never claims otherwise.
+//!
+//! The checkpoint's `cursor_json` payload carries one `KvEntry { hash, rowid }`
+//! per relevant key; a poll emits synthetic records only for keys that are new
+//! or whose value hash changed. Deleted keys are pruned exactly when the
+//! census is complete.
 //!
 //! Synthetic records reuse the existing `cursor` harness normalization path
 //! (`sources/cursor.rs`) with stable logical identity: `source_line_no` /
@@ -71,17 +84,68 @@ const SCAN_PAGE_SIZE: usize = 512;
 /// early so the scan's working set stays bounded regardless of value sizes.
 pub(crate) const SCAN_PAGE_MAX_BYTES: usize = 32 * 1024 * 1024;
 
-const CURSOR_STATE_VERSION: u32 = 1;
+/// Bumped 1 → 2 by issue #601 WI-08: `kv_hashes: BTreeMap<String, String>`
+/// became `kv_entries: BTreeMap<String, KvEntry>` (hash **and** rowid), plus
+/// `active_composers` and `sweep_baseline`. A version-1 payload parses to
+/// `CursorState::fresh()` (the documented fallback for any unreadable cursor),
+/// which triggers the documented replay semantics **exactly once per source**:
+/// every censused key re-detects as never-read, is re-read (budgeted, so
+/// possibly across several polls under `pending_coverage`) and re-emitted at
+/// its stable logical coordinates, and the `ReplacingMergeTree` collapses the
+/// re-emission (§6). The first persisting poll writes a version-2 payload, so
+/// the fallback cannot re-trigger. On hosts with configured project
+/// exclusions the fresh state's zeroed exclusion hash additionally routes the
+/// re-ingest through the exclusions-changed generation replay — the
+/// pre-existing, #602-safe path for any cursor-format change.
+/// `a_v1_cursor_state_reingests_exactly_once_after_upgrade` pins both halves
+/// (§2.6: a `cursor_json` change must be deliberate, disclosed, and replay
+/// exactly once).
+const CURSOR_STATE_VERSION: u32 = 2;
+
+/// Cap on `CursorState::active_composers` (issue #601 §3.3 Change 3): the
+/// bounded set of composers that most recently produced a census-visible
+/// change. A *priority* mechanism only — it orders census supplements and
+/// candidate reads, and grants no skip rights — so the cap bounds state, not
+/// coverage. Kept as a constant rather than config: promoting it is cheap if
+/// an operator ever needs it, and every config key costs template/validation
+/// pinning (§7.1 D9's scope rule).
+const ACTIVE_COMPOSER_CAP: usize = 8;
+
+/// Rows per active composer's supplemental range census (§3.3 Change 3).
+/// Bounds the supplement at `ACTIVE_COMPOSER_CAP` bounded pages even when an
+/// active composer holds tens of thousands of bubbles; the remainder is
+/// already inside the truncation degradation the supplement exists to soften.
+///
+/// Deliberately **not** aliased to `SCAN_PAGE_SIZE`, though the values
+/// currently agree: the page size is a free paging knob (§7.2 F3 — it moves
+/// round trips and buffering, never results), while this bound is a safety
+/// value whose magnitude decides how much supplemental census work a
+/// truncated poll pays. A safety value must not move as a side effect of
+/// retuning a paging knob, so it is its own constant, pinned literally in
+/// both directions by `an_active_composer_supplement_stops_at_its_page_limit`
+/// (§7.1 D18).
+const ACTIVE_CENSUS_RANGE_LIMIT: usize = 512;
 
 /// Ceiling on the serialized Cursor cursor payload (issue #601 §2.3), the
 /// successor to `MAX_RELEVANT_KEYS`' hard latch. Enforced by **eviction** of
-/// the oldest kv hashes, never by failing the scan: an evicted key re-detects
+/// the oldest kv entries, never by failing the scan: an evicted key re-detects
 /// as never-read and is re-read (and re-emitted) by a later poll, which is
 /// safe because Cursor records are content-addressed at stable logical
 /// coordinates (§6). The bound matters beyond memory: `cursor_json` is
 /// persisted on every persisting poll and hashed into the #602 transition
 /// digest (§2.6), so without it the payload grows with the keyspace up to
 /// `fast_path_max_census_rows` entries — tens of MB at the 250 k default.
+///
+/// **Denomination.** One serialized `KvEntry` for a reference-shaped key
+/// (`bubbleId:<uuid>:<uuid>`, ~82 key bytes) costs ~128 bytes, so 8 MiB holds
+/// roughly **65 k reference entries** — ~220× the 292 relevant keys the
+/// 2026-07-31 reference-host re-measurement found, and comfortably above the
+/// ~10 k keys the pre-#601 latch declared fatal. Above ~65 k keys the ceiling
+/// degrades into the disclosed §7.1 D10 churn: each poll re-reads and
+/// re-emits up to one budget of evicted keys, bounded per poll and safe under
+/// §6 identity. `the_cursor_state_ceiling_is_denominated_in_reference_entries`
+/// pins the literal from both sides — halving the ceiling, doubling it, or
+/// bloating the entry serialization all move the entry count out of band.
 const MAX_CURSOR_CHECKPOINT_BYTES: usize = 8 * 1024 * 1024;
 
 const ERROR_KIND_OPEN: &str = "sqlite_open_error";
@@ -119,6 +183,24 @@ impl StatFingerprint {
     }
 }
 
+/// One relevant kv row's durable coverage record (issue #601 §3.3 Change 1):
+/// the content hash the last read observed, and the `rowid` the census saw
+/// when that read happened. The rowid is what makes the census a change
+/// detector without touching values — `rowid` moved ⇒ the row was
+/// `INSERT OR REPLACE`d and must be re-read; `rowid` unchanged is
+/// *inconclusive* (a plain `UPDATE` is invisible here) and is the sweep's
+/// job, stated rather than papered over. It is also the durable recency
+/// ordering `evict_to_fit` uses, retiring §7.1 D10's interim census-scoped
+/// view.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct KvEntry {
+    /// Content hash (hex u64 prefix of SHA-256) of the value bytes at the
+    /// last read.
+    hash: String,
+    /// The census-observed rowid at the last read/verification of this key.
+    rowid: i64,
+}
+
 /// Persisted poll cursor (the checkpoint's `cursor_json` payload).
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 struct CursorState {
@@ -126,9 +208,10 @@ struct CursorState {
     format: String,
     #[serde(default)]
     stat: StatFingerprint,
-    /// kv key → content-hash (hex u64). `BTreeMap` keeps serialization stable.
+    /// kv key → last-read coverage record. `BTreeMap` keeps serialization
+    /// stable (§2.6).
     #[serde(default)]
-    kv_hashes: BTreeMap<String, String>,
+    kv_entries: BTreeMap<String, KvEntry>,
     /// Hash of normalized project exclusion globs used for this scan.
     #[serde(default)]
     project_exclusions_hash: u64,
@@ -143,15 +226,38 @@ struct CursorState {
     #[serde(default, skip_serializing_if = "SweepState::is_default")]
     sweep: SweepState,
     /// True while some censused key has never been read in this generation
-    /// (a budget/census-cap remainder) — §2.3's persisted resume marker. The
-    /// cheap stat short-circuit must not fire while this is set, or a quiet
-    /// database's cold-ingest remainder is hidden forever: nothing will move
-    /// the stat, so nothing would ever scan again. Structural and
-    /// deterministic (a function of the committed census vs the committed
-    /// hash map), and skipped while false so `cursor_json` stays
-    /// byte-identical for fully-covered sources (§2.6).
+    /// (a budget/census-cap remainder) **or** carries an entry whose stored
+    /// rowid disagrees with the census (a replaced key whose re-read was
+    /// budget-deferred) — §2.3's persisted resume marker. The cheap stat
+    /// short-circuit must not fire while this is set, or a quiet database's
+    /// remainder is hidden forever: nothing will move the stat, so nothing
+    /// would ever scan again. Structural and deterministic (a function of the
+    /// committed census vs the committed entry map), and skipped while false
+    /// so `cursor_json` stays byte-identical for fully-covered sources
+    /// (§2.6).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pending_coverage: bool,
+    /// Bounded most-recent-first set of composers that last produced a
+    /// census-visible change — a new or rowid-moved key (issue #601 §3.3
+    /// Change 3). A *priority* mechanism only: their ranges are supplemented
+    /// into a truncated census and their candidates outrank same-class peers
+    /// in the budget order; it grants no skip rights over anything. Updated
+    /// only from committed census signals, so it is deterministic structural
+    /// state and rides the #602 digest safely (§2.6); every update coincides
+    /// with an entry-map or `pending_coverage` change, so it never causes a
+    /// checkpoint write of its own.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    active_composers: Vec<String>,
+    /// The stat fingerprint the in-progress (or last-started) sweep cycle
+    /// walked, §2.2/§7.1 D14's emitting-deferral fix mirrored from NAC: a
+    /// due reconcile poll proceeds past the cheap stat short-circuit while
+    /// the cycle is mid-keyspace or this baseline trails the current stat —
+    /// content changed since the last cycle began, so a rowid-silent plain
+    /// `UPDATE` in an otherwise-emitting write burst still gets its cycle.
+    /// Stamped only when a slice starts a fresh cycle, so a mid-cycle
+    /// re-stamp cannot erase an owed follow-up cycle.
+    #[serde(default, skip_serializing_if = "StatFingerprint::is_default")]
+    sweep_baseline: StatFingerprint,
 }
 
 impl CursorState {
@@ -182,23 +288,23 @@ impl CursorState {
         serde_json::to_string(self).unwrap_or_default()
     }
 
-    /// Evict the oldest kv hashes until the serialized payload fits
+    /// Evict the oldest kv entries until the serialized payload fits
     /// `max_bytes`, returning how many were dropped (issue #601 §2.3). The
     /// mirror of `NacState::evict_to_fit`: the ceiling degrades — an evicted
     /// key re-detects as never-read, so a later poll re-reads and re-emits it
     /// (safe under §6's content-addressed identity) — instead of latching the
     /// whole database the way `MAX_RELEVANT_KEYS` did.
     ///
-    /// "Oldest" is §2.3's adapter recency ordering, `rowid`, as this poll's
-    /// census saw it: entries the census did not cover evict first (their age
-    /// is unknowable here, and a truncated census's uncovered tail is where
-    /// carried-forward entries come from), then ascending `rowid`, then key
-    /// for determinism. The persisted state carries no rowid until WI-08's
-    /// `KvEntry { hash, rowid }`, which owns replacing this census-scoped
-    /// view with a durable one. Removal is in batches of one-eighth of the
-    /// map per round, so a pathological many-small-entries payload does not
-    /// re-serialize per entry.
-    fn evict_to_fit(&mut self, max_bytes: usize, census: &[CensusRow]) -> u64 {
+    /// "Oldest" is §2.3's adapter recency ordering: ascending **stored**
+    /// `rowid` — the durable per-entry recency `KvEntry` carries — with key
+    /// order as the deterministic tiebreak. This retires §7.1 D10's interim
+    /// census-scoped ordering (entries the census did not cover evicted
+    /// first): the persisted rowid outlives any one poll's census, so
+    /// eviction age no longer depends on what this poll happened to walk.
+    /// Removal is in batches of one-eighth of the map per round, so a
+    /// pathological many-small-entries payload does not re-serialize per
+    /// entry.
+    fn evict_to_fit(&mut self, max_bytes: usize) -> u64 {
         // As in `NacState::evict_to_fit`: measured through `serde_json`
         // directly, because `self.serialize()` on a `&mut self` receiver
         // resolves to serde's blanket `impl Serialize for &mut T` before the
@@ -212,24 +318,19 @@ impl CursorState {
         if raw_len(self) <= max_bytes {
             return evicted;
         }
-        let rowid_by_key: HashMap<&str, i64> = census
-            .iter()
-            .map(|row| (row.key.as_str(), row.rowid))
-            .collect();
         loop {
-            if raw_len(self) <= max_bytes || self.kv_hashes.is_empty() {
+            if raw_len(self) <= max_bytes || self.kv_entries.is_empty() {
                 return evicted;
             }
-            // `None` sorts before `Some`, so un-censused entries evict first.
-            let mut by_age: Vec<(Option<i64>, String)> = self
-                .kv_hashes
-                .keys()
-                .map(|key| (rowid_by_key.get(key.as_str()).copied(), key.clone()))
+            let mut by_age: Vec<(i64, String)> = self
+                .kv_entries
+                .iter()
+                .map(|(key, entry)| (entry.rowid, key.clone()))
                 .collect();
             by_age.sort();
-            let batch = (self.kv_hashes.len().div_ceil(8)).max(1);
+            let batch = (self.kv_entries.len().div_ceil(8)).max(1);
             for (_, key) in by_age.into_iter().take(batch) {
-                self.kv_hashes.remove(&key);
+                self.kv_entries.remove(&key);
                 evicted += 1;
             }
         }
@@ -1639,6 +1740,22 @@ pub(crate) async fn process_cursor_sqlite_db(
         begin_database_replay(&sink_tx, &checkpoint, scan_boundary, &policy_fingerprint).await?;
     }
 
+    // Sweep eligibility, conditions 1, 2 and 4 (issue #601 §2.2/§2.4): only a
+    // `Reconcile`-triggered poll — the provenance WI-03 established, including
+    // the owed-tick upgrades `arm_owed_reconcile` performs — of a database
+    // that is not replaying and whose per-database interval clock has expired
+    // requests a slice. Condition 3 (a quiet, cheap fast path) is decided
+    // inside the scan, where this poll's ledger exists. Computed before the
+    // cheap short-circuit because a due sweep can hold that short-circuit
+    // open (the D14 sweep-debt disjunct below).
+    let sweep_requested = work.trigger == WorkTrigger::Reconcile
+        && !replacement_replay
+        && poll_state.sweep_slice_due(
+            &cp_key,
+            checkpoint.source_generation,
+            Duration::from_secs(config.ingest.sqlite.sweep_slice_min_interval_seconds),
+        );
+
     // Cheap no-change short-circuit: nothing touched the database or its WAL
     // sidecars since the last successful poll.
     //
@@ -1674,7 +1791,25 @@ pub(crate) async fn process_cursor_sqlite_db(
     // and the flag clears durably with the covering scan's checkpoint
     // (`a_degraded_cold_ingest_completes_without_new_writes` fails if this
     // conjunct or the never-read-first ordering goes).
-    if state.stat == current_stat && state.last_error.is_empty() && !state.pending_coverage {
+    //
+    // The sweep-debt disjunct (§2.2/§7.1 D14, mirrored from NAC — the census
+    // fast path makes both of D14's holes reachable at Cursor): a durably
+    // covered stat proves nothing changed since the last persisting scan, but
+    // that scan's fast path cannot see a rowid-silent plain `UPDATE` — an
+    // in-place mutation in the same write burst as an emitting change, or a
+    // cycle still mid-keyspace. A due reconcile poll therefore proceeds while
+    // the cycle is in progress (`sweep.cursor` non-empty) or a new cycle is
+    // owed (`sweep_baseline` trails the current stat). Terminates: each due
+    // slice advances the cursor, the wrap empties it, the baseline catches up
+    // to the stat, and this disjunct then stands aside
+    // (`a_quiet_cursor_database_finishes_its_sweep_cycle_and_then_goes_idle`
+    // bounds both sides).
+    if state.stat == current_stat
+        && state.last_error.is_empty()
+        && !state.pending_coverage
+        && (!sweep_requested
+            || (state.sweep.cursor.is_empty() && state.sweep_baseline == current_stat))
+    {
         return Ok(());
     }
 
@@ -1685,22 +1820,21 @@ pub(crate) async fn process_cursor_sqlite_db(
     if !replacement_replay
         && poll_state.should_skip_poll(&cp_key, checkpoint.source_generation, &current_stat)
     {
-        return Ok(());
+        // A due sweep may override a *stat-covered or noop-throttled* skip —
+        // that cover is volatile bookkeeping over the fast path, and the fast
+        // path is exactly what a rowid-silent plain `UPDATE` evades (§0): a
+        // mutation noop-covered by a watcher poll would otherwise never be
+        // swept on a database that then goes quiet (G5d's fixture is exactly
+        // this shape). It must never override a failure or contention
+        // backoff, which is what the `failure_retry_due` conjunct preserves
+        // (`a_due_cursor_sweep_does_not_override_a_failure_backoff`; the
+        // override's lower bound is G5d, whose watcher poll noop-covers the
+        // mutation first).
+        if !(sweep_requested && poll_state.failure_retry_due(&cp_key, checkpoint.source_generation))
+        {
+            return Ok(());
+        }
     }
-
-    // Sweep eligibility, conditions 1, 2 and 4 (issue #601 §2.2/§2.4): only a
-    // `Reconcile`-triggered poll — the provenance WI-03 established, including
-    // the owed-tick upgrades `arm_owed_reconcile` performs — of a database
-    // that is not replaying and whose per-database interval clock has expired
-    // requests a slice. Condition 3 (a quiet, cheap fast path) is decided
-    // inside the scan, where this poll's ledger exists.
-    let sweep_requested = work.trigger == WorkTrigger::Reconcile
-        && !replacement_replay
-        && poll_state.sweep_slice_due(
-            &cp_key,
-            checkpoint.source_generation,
-            Duration::from_secs(config.ingest.sqlite.sweep_slice_min_interval_seconds),
-        );
     // A replacement replay is unbudgeted (see `CursorScanPlan::unbudgeted`):
     // its finalize publishes the generation whole, so degrading it would
     // publish a hole.
@@ -1733,6 +1867,16 @@ pub(crate) async fn process_cursor_sqlite_db(
         } => {
             new_state.stat = current_stat;
             new_state.last_error = String::new();
+            // A slice that started a fresh cycle stamps the content state
+            // that cycle is walking (§7.1 D14, mirrored from NAC); writes
+            // landing during the cycle move the stat past the baseline, so
+            // the wrap leaves a follow-up cycle owed — self-correcting. The
+            // cycle-start conjunct is load-bearing: a mid-cycle re-stamp
+            // would advance the baseline past a silent write behind the
+            // sweep cursor and erase that owed cycle.
+            if swept && state.sweep.cursor.is_empty() {
+                new_state.sweep_baseline = current_stat;
+            }
 
             // A no-op scan: only the stat fingerprint moved — no record was
             // emitted and nothing the durable checkpoint carries changed.
@@ -1741,6 +1885,14 @@ pub(crate) async fn process_cursor_sqlite_db(
             // record the covered stat in volatile state instead and send
             // nothing. The comparison is structural (stat normalized away)
             // so any future `CursorState` field is durable by default.
+            //
+            // §7.2 F1's census-count conjunct
+            // (`relevant_keys == checkpoint.last_line_no`) is deliberately
+            // **absent** — deleted, not guarded. Plan §7.1 D17 records the
+            // width-redundancy argument and the restoration condition (a
+            // future censused-key change that moves neither the entry map
+            // nor `pending_coverage` must restore the conjunct with its
+            // discriminating fixture).
             let prior_state_covered = {
                 let mut prior = state.clone();
                 prior.stat = new_state.stat;
@@ -1752,8 +1904,7 @@ pub(crate) async fn process_cursor_sqlite_db(
                 && records.is_empty()
                 && checkpoint.status == "active"
                 && *new_state == prior_state_covered
-                && schema_fingerprint == checkpoint.schema_fingerprint
-                && relevant_keys == checkpoint.last_line_no;
+                && schema_fingerprint == checkpoint.schema_fingerprint;
             if scan_is_noop {
                 poll_state.record_noop_scan(&cp_key, checkpoint.source_generation, new_state.stat);
                 return Ok(());
@@ -2095,8 +2246,24 @@ impl SweepPlan {
 }
 
 /// Blocking phase: open the database read-only, validate schema, census the
-/// relevant keyspace, and materialize candidate payloads newest-first under
-/// the fast-path budget.
+/// relevant keyspace, and materialize **only candidate** payloads — keys the
+/// census proves new, deleted, or `INSERT OR REPLACE`d — newest-first under
+/// the fast-path budget (issue #601 §3.3, the census fast path).
+///
+/// The census-vs-state classification, from one covering-index read and
+/// without touching a single value:
+///
+/// | Signal | Exactness | Action |
+/// |---|---|---|
+/// | key present now, absent before | exact | read (never-read class) |
+/// | key absent now, present before | exact | prune (complete census only) |
+/// | key present, `rowid` moved | sound positive | read (replaced class) |
+/// | key present, `rowid` unchanged | **inconclusive** | carry; the sweep's job |
+///
+/// The fourth row is the honest one: a plain `UPDATE` keeps its rowid and is
+/// invisible here, so the reconciliation sweep — not this fast path — owns
+/// its detection (G5d), within the published interval. Heuristics choose
+/// ORDER; the sweep guarantees COVERAGE (§0).
 ///
 /// The caller owns `ledger` so that every early return — including each
 /// failure arm — still reports the bytes this scan had already paid for.
@@ -2148,20 +2315,38 @@ fn scan_database(
     };
 
     // The census: `(rowid, key)` over both relevant ranges, covering-index
-    // backed (§1.1: ~0.1 ms / ~19 KB for the whole reference keyspace). It is
+    // backed (§1.1 re-measured 2026-07-31: ~0.07 ms / ~23 KB for the whole
+    // 292-key reference keyspace). It is
     // the exact change detector for inserts and deletes and the recency
     // ordering for the candidate read below.
-    let (census, truncation) = match census_relevant_keys(&connection, plan.max_census_rows, ledger)
-    {
-        Ok(result) => result,
-        Err(exc) => {
+    let (mut census, truncation) =
+        match census_relevant_keys(&connection, plan.max_census_rows, ledger) {
+            Ok(result) => result,
+            Err(exc) => {
+                return ScanOutcome::Failed {
+                    error_kind: ERROR_KIND_SCAN,
+                    error_text: format!("{exc:#}"),
+                }
+            }
+        };
+    if let Some(truncation_ref) = &truncation {
+        // §3.3 Change 3, census half: a truncated walk must not hide the
+        // sessions most recently seen changing, so the (persisted) active
+        // composers' ranges are censused supplementally, bounded per
+        // composer. Runs only on truncated censuses — an untruncated census
+        // already covered every active range.
+        if let Err(exc) = supplement_active_census(
+            &connection,
+            &prior.active_composers,
+            truncation_ref,
+            &mut census,
+            ledger,
+        ) {
             return ScanOutcome::Failed {
                 error_kind: ERROR_KIND_SCAN,
                 error_text: format!("{exc:#}"),
-            }
+            };
         }
-    };
-    if truncation.is_some() {
         // Best-effort size of the un-censused remainder, so the degradation
         // is quantified rather than merely flagged. The count is a covering
         // index aggregate (charged on neither axis per the ledger rules).
@@ -2185,56 +2370,128 @@ fn scan_database(
         format: SOURCE_FORMAT_CURSOR_SQLITE.to_string(),
         stat: StatFingerprint::default(),
         project_exclusions_hash: prior.project_exclusions_hash,
-        kv_hashes: BTreeMap::new(),
+        kv_entries: BTreeMap::new(),
         last_error: String::new(),
         sweep: prior.sweep.clone(),
         pending_coverage: false,
+        active_composers: prior.active_composers.clone(),
+        sweep_baseline: prior.sweep_baseline,
     };
     let mut records = Vec::<SyntheticRecord>::new();
     let mut workspace_cache = HashMap::<String, Option<String>>::new();
 
-    // Candidate read: never-read keys first, then `rowid DESC` within each
-    // class. `rowid DESC` is the §2.3 recency heuristic — it chooses ORDER
-    // only. Skipping is justified solely by the budget below, and every
-    // skipped key stays covered (prior hash carried) or re-detected (new key
-    // stays absent from the state) on later polls.
+    // Classification (§3.3 Change 1): the census against the prior entry map
+    // decides — without materializing a single value — which keys are
+    // candidates. A key whose stored rowid matches the census is *carried*,
+    // not read. Two mutation shapes evade this, and both are the sweep's
+    // declared job (G5d): a plain `UPDATE`, and an explicit DELETE of the
+    // max-rowid row followed by a re-INSERT of the same key — the fresh row
+    // reuses the vacated rowid (§1.1), so the census sees the same key at the
+    // same rowid in both shapes. Same sweep-covered class; the fast path
+    // never claims either.
+    let mut candidate_idx = Vec::<usize>::new();
+    let mut fresh_activity = HashMap::<String, i64>::new();
+    for (idx, row) in census.iter().enumerate() {
+        match prior.kv_entries.get(&row.key) {
+            Some(entry) if entry.rowid == row.rowid => {
+                new_state.kv_entries.insert(row.key.clone(), entry.clone());
+            }
+            _ => {
+                candidate_idx.push(idx);
+                if let Some(composer) = composer_of_key(&row.key) {
+                    let newest = fresh_activity
+                        .entry(composer.to_string())
+                        .or_insert(i64::MIN);
+                    *newest = (*newest).max(row.rowid);
+                }
+            }
+        }
+    }
+
+    // The bounded active set (§3.3 Change 3): composers of this census's
+    // new/replaced keys, newest census signal first, ahead of the carried
+    // set; capped. Updated from census *signals* — read or budget-deferred
+    // alike — so a deferred candidate's composer still gets priority on the
+    // next poll. Deterministic given census + prior state (§2.6).
+    let mut freshly_active: Vec<(i64, String)> = fresh_activity
+        .into_iter()
+        .map(|(composer, rowid)| (rowid, composer))
+        .collect();
+    freshly_active.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    let mut active: Vec<String> = freshly_active
+        .into_iter()
+        .map(|(_, composer)| composer)
+        .collect();
+    for carried in &prior.active_composers {
+        if !active.contains(carried) {
+            active.push(carried.clone());
+        }
+    }
+    active.truncate(ACTIVE_COMPOSER_CAP);
+    new_state.active_composers = active;
+
+    // Candidate read: never-read keys first, then active composers, then
+    // `rowid DESC`. The class order and the recency heuristic choose ORDER
+    // only — skipping is justified solely by the budget below, and every
+    // skipped key stays covered (prior entry carried) or re-detected (new
+    // key stays absent from the state) on later polls.
     //
     // Never-read-first is what makes a budget-degraded ingest *converge*: a
     // plain recency order re-reads the same newest slice on every poll, so a
     // database larger than one budget would keep its cold tail forever. With
     // unknown keys ahead of re-verification, each resumed poll retires at
     // least one budget's worth of never-read debt, and recency is undisturbed
-    // where it matters — a genuinely new key has no prior hash, so it is in
-    // the first class already, newest first.
-    let mut candidates = census;
-    candidates.sort_by(|a, b| {
-        let known_a = prior.kv_hashes.contains_key(&a.key);
-        let known_b = prior.kv_hashes.contains_key(&b.key);
-        known_a.cmp(&known_b).then_with(|| b.rowid.cmp(&a.rowid))
+    // where it matters — a genuinely new key has no prior entry, so it is in
+    // the first class already, newest first. Active-composer priority ranks
+    // *within* each class, so it can never displace the never-read class the
+    // convergence argument rests on.
+    // Ranked against the **persisted** active set — the committed knowledge
+    // of which sessions were recently live — not this census's fresh signals:
+    // ranking by fresh signals would collapse into plain rowid order (every
+    // fresh composer outranks the carried set by construction) and a burst in
+    // a cold composer could displace the active session's own deferred reads.
+    let active_rank = |key: &str| -> usize {
+        composer_of_key(key)
+            .and_then(|composer| {
+                prior
+                    .active_composers
+                    .iter()
+                    .position(|active| active == composer)
+            })
+            .unwrap_or(usize::MAX)
+    };
+    candidate_idx.sort_by_cached_key(|&idx| {
+        let row = &census[idx];
+        (
+            prior.kv_entries.contains_key(&row.key),
+            active_rank(&row.key),
+            std::cmp::Reverse(row.rowid),
+        )
     });
-    for idx in 0..candidates.len() {
+    for position in 0..candidate_idx.len() {
         if plan
             .fast_budget
             .is_exhausted_by(ledger.payload_rows, ledger.payload_bytes)
         {
             // Commit what was read (§2.1): the remainder keeps its prior
-            // hash — "unread this poll", never "deleted" — and new keys stay
+            // entry — "unread this poll", never "deleted" — and new keys stay
             // absent so the next poll re-detects them, newest-first again.
+            // A deferred *replaced* key keeps its stale rowid, so the census
+            // re-flags it and `pending_coverage` below carries the debt.
             // Skipped bytes are unknowable without decoding (§1.1 finding 2),
             // so rows are counted and bytes honestly under-reported as zero.
-            let remaining = &candidates[idx..];
+            let remaining = &candidate_idx[position..];
             ledger.mark_degraded(remaining.len() as u64, 0);
-            for skipped in remaining {
-                if let Some(hash) = prior.kv_hashes.get(&skipped.key) {
-                    new_state
-                        .kv_hashes
-                        .insert(skipped.key.clone(), hash.clone());
+            for &skipped in remaining {
+                let key = &census[skipped].key;
+                if let Some(entry) = prior.kv_entries.get(key) {
+                    new_state.kv_entries.insert(key.clone(), entry.clone());
                 }
             }
             break;
         }
-        let key = &candidates[idx].key;
-        let value = match read_value_for_key(&connection, key, ledger) {
+        let row = &census[candidate_idx[position]];
+        let value = match read_value_for_key(&connection, &row.key, ledger) {
             Ok(Some(value)) => value,
             // The row vanished between census and read: a mid-scan commit the
             // data_version bracket below will reject; nothing to record here.
@@ -2248,26 +2505,35 @@ fn scan_database(
         };
         let bytes = value.unwrap_or_default();
         let hash = format!("{:016x}", hash_bytes(&bytes));
-        let unchanged = prior.kv_hashes.get(key) == Some(&hash);
+        let unchanged = prior.kv_entries.get(&row.key).map(|entry| &entry.hash) == Some(&hash);
         if !unchanged && !bytes.is_empty() {
-            if let Some(mut record) = synthesize_cursor_sqlite_record(key, &bytes) {
+            if let Some(mut record) = synthesize_cursor_sqlite_record(&row.key, &bytes) {
                 stamp_bubble_workspace(&connection, &mut workspace_cache, &mut record, ledger);
                 records.push(record);
             }
         }
-        new_state.kv_hashes.insert(key.clone(), hash);
+        new_state.kv_entries.insert(
+            row.key.clone(),
+            KvEntry {
+                hash,
+                rowid: row.rowid,
+            },
+        );
     }
 
     if let Some(truncation) = &truncation {
         // Deletion pruning is exact only against a complete census. Carry
         // every prior entry beyond the truncation point so an un-censused key
-        // reads "unverified this poll", never silently "deleted".
-        for (key, hash) in &prior.kv_hashes {
+        // reads "unverified this poll", never silently "deleted". Supplement
+        // rows claim no pruning coverage (see `supplement_active_census`), so
+        // a supplement-censused key that was read keeps its fresh entry via
+        // `or_insert_with` and everything else in its range is carried.
+        for (key, entry) in &prior.kv_entries {
             if !census_covered(truncation, key) {
                 new_state
-                    .kv_hashes
+                    .kv_entries
                     .entry(key.clone())
-                    .or_insert_with(|| hash.clone());
+                    .or_insert_with(|| entry.clone());
             }
         }
     }
@@ -2306,7 +2572,7 @@ fn scan_database(
                     next_cursor_sweep_item(
                         &connection,
                         after,
-                        &mut new_state.kv_hashes,
+                        &mut new_state.kv_entries,
                         &mut records,
                         &mut workspace_cache,
                         slice,
@@ -2333,7 +2599,7 @@ fn scan_database(
     }
 
     // The checkpoint-state ceiling (issue #601 §2.3): evict the oldest kv
-    // hashes until the persisted payload fits — never fail the scan. This is
+    // entries until the persisted payload fits — never fail the scan. This is
     // `MAX_RELEVANT_KEYS`' replacement, and the bound that keeps
     // `cursor_json` (hashed into the #602 transition digest, §2.6) from
     // growing with the keyspace. It runs after the sweep slice so it bounds
@@ -2342,20 +2608,24 @@ fn scan_database(
     // censused-but-absent is exactly what the marker scans for. (An evicted
     // key the census did not cover only exists when the census truncated, and
     // `truncation.is_some()` already holds the marker open.)
-    let evicted = new_state.evict_to_fit(plan.max_checkpoint_bytes, &candidates);
+    let evicted = new_state.evict_to_fit(plan.max_checkpoint_bytes);
     ledger.mark_evicted(evicted);
 
     // §2.3's persisted resume marker, computed after the sweep slice so keys
     // the slice just read count as covered. A censused key absent from the
-    // hash map has never been read in this generation; a truncated census may
-    // hide more of them. Either keeps the cheap stat short-circuit open until
-    // a scan covers everything (see the conjunct in
-    // `process_cursor_sqlite_db`), at which point the flag clears with that
-    // scan's checkpoint.
+    // entry map has never been read in this generation; one whose stored
+    // rowid disagrees with the census is a replaced key whose re-read was
+    // deferred; a truncated census may hide more of either. Any of them
+    // keeps the cheap stat short-circuit open until a scan covers everything
+    // (see the conjunct in `process_cursor_sqlite_db`), at which point the
+    // flag clears with that scan's checkpoint.
     new_state.pending_coverage = truncation.is_some()
-        || candidates
+        || census
             .iter()
-            .any(|row| !new_state.kv_hashes.contains_key(&row.key));
+            .any(|row| match new_state.kv_entries.get(&row.key) {
+                None => true,
+                Some(entry) => entry.rowid != row.rowid,
+            });
 
     let data_version_after = match sqlite_data_version(&connection) {
         Ok(value) => value,
@@ -2383,34 +2653,32 @@ fn scan_database(
     // Composer (session_meta) records first, then bubbles in timestamp order:
     // downstream ordering is timestamp-driven, but deterministic emission
     // keeps raw-row insertion order reproducible for fixtures and debugging.
-    records.sort_by(|a, b| {
-        let rank = |r: &SyntheticRecord| {
-            let kind = r
-                .record
-                .get("type")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            let session = r
-                .record
-                .get("sessionId")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            let ts = r
-                .record
-                .get("timestamp")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            (
-                if kind == "cursor_composer" { 0u8 } else { 1u8 },
-                session,
-                ts,
-                r.source_offset,
-            )
-        };
-        rank(a).cmp(&rank(b))
+    // Sort keys are computed once per element (§3.3 Change 6) — the previous
+    // `sort_by` built three fresh `String`s per element per *comparison*.
+    records.sort_by_cached_key(|r| {
+        let kind = r.record.get("type").and_then(Value::as_str);
+        let session = r
+            .record
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let ts = r
+            .record
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        (
+            if kind == Some("cursor_composer") {
+                0u8
+            } else {
+                1u8
+            },
+            session,
+            ts,
+            r.source_offset,
+        )
     });
 
     ledger.rows_emitted = records.len() as u64;
@@ -2539,21 +2807,31 @@ fn validate_schema(
     Ok(hash_str(&schema_sql))
 }
 
-/// The two census statements, shared with the plan assertion in
+/// The census statements, shared with the plan assertion in
 /// `cursor_relevant_key_count_is_a_covering_index_scan` so the statements that
 /// test certifies are the statements this adapter actually runs. A copy in the
 /// test would let the two drift and the certification would mean nothing.
 ///
-/// Strictly greater, matching the census seed of the bare prefix — a key
-/// exactly equal to the prefix is never scanned and must not be counted. Both
-/// projections touch indexed columns only (`rowid` rides inside the unique
-/// `key` index): adding any reference to `value` costs the covering index and
-/// turns a 0.1 ms / 19 KB read into a 55 ms / 48 MB one (§1.1).
+/// The walk statement is strictly greater, matching the census seed of the
+/// bare prefix — a key exactly equal to the prefix is never scanned and must
+/// not be counted. Every projection touches indexed columns only (`rowid`
+/// rides inside the unique `key` index): adding any reference to `value`
+/// costs the covering index and turns a 0.07 ms / 23 KB read into a ~50 ms /
+/// 48 MB one (§1.1, re-measured 2026-07-31).
 const CURSOR_RELEVANT_KEY_COUNT_SQL: &str =
     "SELECT count(*) FROM cursorDiskKV WHERE key > ?1 AND key < ?2";
 
 const CURSOR_CENSUS_SQL: &str =
     "SELECT rowid, key FROM cursorDiskKV WHERE key > ?1 AND key < ?2 ORDER BY key LIMIT ?3";
+
+/// First page of an active composer's supplemental bubble-range census
+/// (§3.3 Change 3): inclusive lower bound, because the range's own lower
+/// bound (`bubbleId:<composer>:`) is a legal key.
+const CURSOR_CENSUS_FROM_SQL: &str =
+    "SELECT rowid, key FROM cursorDiskKV WHERE key >= ?1 AND key < ?2 ORDER BY key LIMIT ?3";
+
+/// Point census of one exact key (an active composer's `composerData:` row).
+const CURSOR_CENSUS_POINT_SQL: &str = "SELECT rowid, key FROM cursorDiskKV WHERE key = ?1";
 
 fn count_relevant_keys(connection: &Connection) -> Result<usize> {
     let mut total = 0usize;
@@ -2657,6 +2935,79 @@ fn census_relevant_keys(
     Ok((census, None))
 }
 
+/// The composer id embedded in a relevant key, when its family carries one:
+/// `bubbleId:<composer>:<bubble>` and `composerData:<composer>`.
+fn composer_of_key(key: &str) -> Option<&str> {
+    if let Some(rest) = key.strip_prefix("bubbleId:") {
+        return rest.split_once(':').map(|(composer, _)| composer);
+    }
+    key.strip_prefix("composerData:")
+}
+
+/// Issue #601 §3.3 Change 3, census half: when the census cap truncated the
+/// walk, the active composers' ranges are censused supplementally so the
+/// sessions most recently seen changing stay fast-path-visible however large
+/// the keyspace grows. Uses the *persisted* active set — this poll's fresh
+/// signals are not classifiable until the census exists.
+///
+/// Bounded: one point read plus one `LIMIT`ed page per active composer, all
+/// covering-index reads. Supplemental rows join the candidate census only —
+/// the deletion-pruning coverage claim stays with the walk-ordered census
+/// (`census_covered`), so a truncated poll never mistakes an un-walked key
+/// for a deleted one, at the disclosed cost that a deletion inside an active
+/// range is not pruned while the census stays truncated (the walk or a fresh
+/// generation eventually prunes it). Rows the walk already censused are
+/// dropped after materialization; each materialized row is charged to the
+/// census axis where it was read, kept or not.
+fn supplement_active_census(
+    connection: &Connection,
+    active_composers: &[String],
+    truncation: &CensusTruncation,
+    census: &mut Vec<CensusRow>,
+    ledger: &mut ScanLedger,
+) -> Result<()> {
+    for composer in active_composers {
+        let point_key = format!("composerData:{composer}");
+        {
+            let mut stmt = connection
+                .prepare_cached(CURSOR_CENSUS_POINT_SQL)
+                .context("failed to prepare supplemental point census")?;
+            let mut rows = stmt
+                .query(rusqlite::params![point_key])
+                .context("supplemental point census failed")?;
+            while let Some(row) = rows.next().context("supplemental point row failed")? {
+                let rowid: i64 = row.get(0).context("supplemental point rowid failed")?;
+                let key: String = row.get(1).context("supplemental point key failed")?;
+                ledger.charge_census_row(key.len());
+                if !census_covered(truncation, &key) {
+                    census.push(CensusRow { rowid, key });
+                }
+            }
+        }
+        let range_lo = format!("bubbleId:{composer}:");
+        let range_hi = format!("bubbleId:{composer};");
+        let mut stmt = connection
+            .prepare_cached(CURSOR_CENSUS_FROM_SQL)
+            .context("failed to prepare supplemental range census")?;
+        let mut rows = stmt
+            .query(rusqlite::params![
+                range_lo,
+                range_hi,
+                ACTIVE_CENSUS_RANGE_LIMIT as i64
+            ])
+            .context("supplemental range census failed")?;
+        while let Some(row) = rows.next().context("supplemental range row failed")? {
+            let rowid: i64 = row.get(0).context("supplemental range rowid failed")?;
+            let key: String = row.get(1).context("supplemental range key failed")?;
+            ledger.charge_census_row(key.len());
+            if !census_covered(truncation, &key) {
+                census.push(CensusRow { rowid, key });
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The candidate point read: one key's value, charged on the payload axis at
 /// the read site. `Ok(None)` means the row vanished between census and read —
 /// a mid-scan commit the data_version bracket rejects.
@@ -2689,15 +3040,22 @@ fn read_value_for_key(
 }
 
 /// The Cursor adapter's sweep reader: the first relevant key strictly after
-/// `after` in key order, read in full, verified against this poll's hash view,
-/// and re-emitted when it disagrees (§2.2). With today's exhaustive fast path
-/// the disagreement arm is reachable only through hashes carried forward by an
-/// earlier degraded poll; WI-08's census fast path makes it the sweep's whole
-/// job (G5d), and the driver contract here does not change when it does.
+/// `after` in key order, read in full, verified against this poll's entry
+/// view, and re-emitted when the *hash* disagrees (§2.2). Under the census
+/// fast path this is the sweep's whole job (G5d): a plain `UPDATE` keeps its
+/// rowid, so no census signal ever reaches it — only this re-hash does. The
+/// stored entry is refreshed on any disagreement (hash or rowid), so a
+/// hash-identical `INSERT OR REPLACE` the fast path deferred stops re-flagging
+/// once the sweep has verified it. ⊘ The rowid half of that refresh is
+/// deliberately not mutation-pinned (executed 2026-07-31, survives green): a
+/// hash-only refresh keeps the stale entry one extra poll, then the census
+/// re-flags the key and the fast path re-reads it, restoring the rowid —
+/// self-healing churn of one point read, behavior-neutral under §6 identity
+/// (plan §8, WI-08 table).
 fn next_cursor_sweep_item(
     connection: &Connection,
     after: &str,
-    hashes: &mut BTreeMap<String, String>,
+    entries: &mut BTreeMap<String, KvEntry>,
     records: &mut Vec<SyntheticRecord>,
     workspace_cache: &mut HashMap<String, Option<String>>,
     slice: &mut ScanLedger,
@@ -2711,32 +3069,40 @@ fn next_cursor_sweep_item(
         let read = {
             let mut stmt = connection
                 .prepare_cached(
-                    "SELECT key, value FROM cursorDiskKV \
+                    "SELECT rowid, key, value FROM cursorDiskKV \
                      WHERE key > ?1 AND key < ?2 ORDER BY key LIMIT 1",
                 )
                 .context("failed to prepare sweep read")?;
             stmt.query_row(rusqlite::params![start, range_end], |row| {
                 // This projection includes `value`, so the whole row is a
-                // payload read charged to the slice at the read site.
+                // payload read charged to the slice at the read site. The
+                // rowid is a fixed-width scalar, charged on neither axis.
                 slice.charge_payload_row();
-                let key = take_payload_required_string(slice, row, 0)?;
-                let value = take_payload_blob(slice, row, 1)?;
-                Ok((key, value))
+                let rowid: i64 = row.get(0)?;
+                let key = take_payload_required_string(slice, row, 1)?;
+                let value = take_payload_blob(slice, row, 2)?;
+                Ok((rowid, key, value))
             })
         };
         match read {
-            Ok((key, value)) => {
+            Ok((rowid, key, value)) => {
                 let bytes = value.unwrap_or_default();
                 let payload_bytes = bytes.len() as u64;
-                let hash = format!("{:016x}", hash_bytes(&bytes));
-                if hashes.get(&key) != Some(&hash) {
-                    if !bytes.is_empty() {
+                let observed = KvEntry {
+                    hash: format!("{:016x}", hash_bytes(&bytes)),
+                    rowid,
+                };
+                if entries.get(&key) != Some(&observed) {
+                    let hash_changed = entries
+                        .get(&key)
+                        .is_none_or(|entry| entry.hash != observed.hash);
+                    if hash_changed && !bytes.is_empty() {
                         if let Some(mut record) = synthesize_cursor_sqlite_record(&key, &bytes) {
                             stamp_bubble_workspace(connection, workspace_cache, &mut record, slice);
                             records.push(record);
                         }
                     }
-                    hashes.insert(key.clone(), hash);
+                    entries.insert(key.clone(), observed);
                 }
                 return Ok(Some(SweepItem {
                     position: key,
@@ -3518,6 +3884,12 @@ mod tests {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    fn census_rows(metrics: &Arc<Metrics>) -> u64 {
+        metrics
+            .sqlite_poll_census_rows_total
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     fn payload_bytes(metrics: &Arc<Metrics>) -> u64 {
         metrics
             .sqlite_poll_payload_bytes_total
@@ -4134,23 +4506,31 @@ mod tests {
         let db = seed_fixture_db(&path);
 
         for prefix in RELEVANT_PREFIXES {
-            for (statement, uses_limit) in [
-                (CURSOR_RELEVANT_KEY_COUNT_SQL, false),
-                // The row census projects `(rowid, key)`: rowid rides inside
-                // the unique key index, so it must stay covering too.
-                (CURSOR_CENSUS_SQL, true),
+            let range_params = || {
+                vec![
+                    rusqlite::types::Value::from((*prefix).to_string()),
+                    rusqlite::types::Value::from(prefix_range_end(prefix)),
+                ]
+            };
+            let mut limited = range_params();
+            limited.push(rusqlite::types::Value::from(SCAN_PAGE_SIZE as i64));
+            for (statement, params) in [
+                (CURSOR_RELEVANT_KEY_COUNT_SQL, range_params()),
+                // The row censuses project `(rowid, key)`: rowid rides inside
+                // the unique key index, so they must stay covering too.
+                (CURSOR_CENSUS_SQL, limited.clone()),
+                (CURSOR_CENSUS_FROM_SQL, limited.clone()),
+                (
+                    CURSOR_CENSUS_POINT_SQL,
+                    vec![rusqlite::types::Value::from(format!(
+                        "composerData:{COMPOSER_ID}"
+                    ))],
+                ),
             ] {
                 let plan: Vec<String> = {
                     let mut stmt = db
                         .prepare(&format!("EXPLAIN QUERY PLAN {statement}"))
                         .expect("prepare explain");
-                    let mut params: Vec<rusqlite::types::Value> = vec![
-                        rusqlite::types::Value::from((*prefix).to_string()),
-                        rusqlite::types::Value::from(prefix_range_end(prefix)),
-                    ];
-                    if uses_limit {
-                        params.push(rusqlite::types::Value::from(SCAN_PAGE_SIZE as i64));
-                    }
                     stmt.query_map(rusqlite::params_from_iter(params), |row| {
                         row.get::<_, String>(3)
                     })
@@ -4240,8 +4620,11 @@ mod tests {
             .and_then(|batch| batch.checkpoint.clone())
             .expect("final checkpoint");
         assert_eq!(checkpoint.last_offset, 1, "first poll sequence");
-        assert_eq!(checkpoint.last_line_no, 4, "relevant keys observed");
-        assert!(checkpoint.cursor_json.contains("kv_hashes"));
+        // `last_line_no` is denominated on **census rows** (§9.2): the count
+        // of relevant keys the covering-index census observed, which the fast
+        // path still walks on every scan — not on payloads read.
+        assert_eq!(checkpoint.last_line_no, 4, "censused relevant keys");
+        assert!(checkpoint.cursor_json.contains("kv_entries"));
         assert_ne!(checkpoint.schema_fingerprint, 0);
 
         cleanup(&path);
@@ -4700,6 +5083,7 @@ mod tests {
         // stat fingerprint moves but no relevant key changes.
         put(&db, "agentKv:blob:0000", &json!({"opaque": "blob"}));
 
+        let census_after_first = census_rows(&metrics);
         let second =
             run_poll_with_state_and_metrics(&work, &checkpoints, &poll_state, &metrics).await;
         assert!(
@@ -4707,16 +5091,25 @@ mod tests {
             "a no-op scan must send nothing durable; got {} batches",
             second.len()
         );
+        // Under the §3.3 census fast path a "scan" of irrelevant churn is a
+        // census that materializes no payloads: the census counter moves (the
+        // poll genuinely re-scanned — the test name's 'scans but persists no
+        // checkpoint' stays observable) while the payload counter must not
+        // (no relevant key changed, so no value may be read).
         let read_after_second = payload_rows(&metrics);
+        let census_after_second = census_rows(&metrics);
         assert!(
-            read_after_second > read_after_first,
-            "the stat moved, so this poll genuinely re-scanned — the test name's \
-             'scans but persists no checkpoint' has to be observable"
+            census_after_second > census_after_first,
+            "the stat moved, so this poll genuinely re-censused"
+        );
+        assert_eq!(
+            read_after_second, read_after_first,
+            "an irrelevant write must not materialize any payload (§3.3)"
         );
 
         // The same stat fingerprint is now covered by volatile state, so a
         // re-poll without further writes also sends nothing *and reads
-        // nothing*.
+        // nothing — not even the census*.
         let third =
             run_poll_with_state_and_metrics(&work, &checkpoints, &poll_state, &metrics).await;
         assert!(
@@ -4727,6 +5120,11 @@ mod tests {
             payload_rows(&metrics),
             read_after_second,
             "volatile coverage must skip the scan, not just its output"
+        );
+        assert_eq!(
+            census_rows(&metrics),
+            census_after_second,
+            "volatile coverage must skip the census too"
         );
 
         // A relevant write below the backoff threshold is picked up
@@ -4752,8 +5150,12 @@ mod tests {
 
         // The emitting scan cleared the volatile entry, so only the *durable*
         // stat short-circuit can suppress this last poll. It is the arm the
-        // volatile map cannot stand in for.
+        // volatile map cannot stand in for. Denominated on the census counter
+        // as well: under the §3.3 fast path an un-short-circuited poll of an
+        // unchanged database reads no payloads either way, so only the census
+        // axis can see the durable arm being deleted.
         let read_after_fourth = payload_rows(&metrics);
+        let census_after_fourth = census_rows(&metrics);
         let fifth =
             run_poll_with_state_and_metrics(&work, &checkpoints, &poll_state, &metrics).await;
         assert!(fifth.is_empty());
@@ -4762,6 +5164,11 @@ mod tests {
             read_after_fourth,
             "with no volatile entry left, the durable stat short-circuit is the \
              only thing that can stop the re-read"
+        );
+        assert_eq!(
+            census_rows(&metrics),
+            census_after_fourth,
+            "the durable stat short-circuit must stop the census as well"
         );
 
         cleanup(&path);
@@ -5411,8 +5818,11 @@ mod tests {
             "census bytes are the schema text plus the key bytes"
         );
 
-        // Nothing changed, so nothing is emitted — but every byte is still
-        // read. This is the assertion an emit-site ledger cannot survive.
+        // Nothing changed: the census sees every rowid where the entry map
+        // recorded it, so the fast path materializes **zero** payload bytes —
+        // this is the §3.3 cutover's signature, and the assertion a
+        // revert-to-exhaustive scan cannot survive. The census itself still
+        // runs in full.
         let mut second = ScanLedger::default();
         let ScanOutcome::Scanned { .. } =
             scan_database(&db_path, &new_state, &default_scan_plan(), &mut second)
@@ -5424,11 +5834,15 @@ mod tests {
             "an unchanged database emits nothing on the second poll"
         );
         assert_eq!(
-            second.payload_bytes, expected_bytes,
-            "an unchanged database is still fully re-read today, and the ledger \
-             must say so"
+            second.payload_bytes, 0,
+            "an unchanged database's values are never materialized (§3.3)"
         );
-        assert_eq!(second.payload_rows, 2);
+        assert_eq!(second.payload_rows, 0);
+        assert_eq!(
+            second.census_rows,
+            schema_census.census_rows + 2,
+            "the census still walks every relevant key"
+        );
 
         cleanup(&path);
     }
@@ -5973,13 +6387,16 @@ mod tests {
     /// degrades instead of failing, and every prior entry beyond the
     /// truncation point is carried — "un-censused" must never read "deleted".
     /// A complete census keeps exact deletion pruning (asserted here too, so
-    /// the carry cannot silently widen into never-pruning).
+    /// the carry cannot silently widen into never-pruning). The active set is
+    /// cleared before the capped scan so this test isolates the truncation
+    /// carry; `a_truncated_census_still_censuses_active_composers` owns the
+    /// supplement.
     #[test]
     fn a_census_past_its_cap_truncates_and_degrades_instead_of_failing() {
         let path = unique_db_path("census-cap");
         let keys = seed_junk_fixture(&path, 6, 64);
 
-        // Full scan first, so the prior state holds all six hashes.
+        // Full scan first, so the prior state holds all six entries.
         let full_plan = default_scan_plan();
         let mut full_ledger = ScanLedger::default();
         let ScanOutcome::Scanned {
@@ -5994,7 +6411,11 @@ mod tests {
         else {
             panic!("cold scan should succeed");
         };
-        assert_eq!(full_state.kv_hashes.len(), 6);
+        assert_eq!(full_state.kv_entries.len(), 6);
+        // Isolate the truncation carry from the active-composer supplement:
+        // a state whose active set has rotated away entirely.
+        let mut prior = (*full_state).clone();
+        prior.active_composers.clear();
 
         let mut config = moraine_config::AppConfig::default();
         config.ingest.sqlite.fast_path_max_census_rows = 3;
@@ -6004,12 +6425,7 @@ mod tests {
             new_state,
             relevant_keys,
             ..
-        } = scan_database(
-            &path.to_string_lossy(),
-            &full_state,
-            &capped_plan,
-            &mut ledger,
-        )
+        } = scan_database(&path.to_string_lossy(), &prior, &capped_plan, &mut ledger)
         else {
             panic!("a capped census must degrade, not fail");
         };
@@ -6020,7 +6436,7 @@ mod tests {
             "the un-censused remainder is counted"
         );
         assert_eq!(
-            new_state.kv_hashes.len(),
+            new_state.kv_entries.len(),
             6,
             "prior entries beyond the truncation are carried, not dropped"
         );
@@ -6046,46 +6462,76 @@ mod tests {
             panic!("post-delete scan should succeed");
         };
         assert!(
-            !pruned.kv_hashes.contains_key(&keys[0]),
+            !pruned.kv_entries.contains_key(&keys[0]),
             "a complete census must still detect the deletion exactly"
         );
-        assert_eq!(pruned.kv_hashes.len(), 5);
+        assert_eq!(pruned.kv_entries.len(), 5);
 
         cleanup(&path);
     }
 
     /// Issue #601 §2.3 / gate G4 (Cursor checkpoint-state ceiling): crossing
-    /// `max_checkpoint_bytes` evicts the **oldest** kv hashes until the
+    /// `max_checkpoint_bytes` evicts the **oldest** kv entries until the
     /// payload fits — never fails the scan — and reports the eviction as
     /// degraded coverage. This is `MAX_RELEVANT_KEYS`' replacement: the old
     /// bound latched the whole database dead; the ceiling degrades, and the
     /// evicted key re-detects as never-read on a later poll (§6's
     /// content-addressed identity makes the re-emission safe). `cursor_json`
     /// rides the #602 transition digest, so this ceiling is also what keeps
-    /// that digest's input bounded.
+    /// that digest's input bounded. "Oldest" is the **durable stored rowid**
+    /// each `KvEntry` carries — WI-08 retired §7.1 D10's interim
+    /// census-scoped ordering in favor of it. **[DIVERGENT FIXTURE]**: the
+    /// oldest *key* (`k000`) is re-replaced before the ceiling binds, so key
+    /// order and stored-rowid order genuinely disagree — an eviction sorted
+    /// by key (or by anything but the stored rowid) drops the wrong entry.
     ///
-    /// MUTATION (executed 2026-07-31): make `evict_to_fit` return 0 without
-    /// evicting — fails (the persisted payload exceeds its ceiling and
-    /// nothing is evicted). Reverse the age sort (evict newest-first) —
-    /// fails (the newest key's hash is dropped instead of the oldest's).
+    /// MUTATION (executed 2026-07-31, re-executed against the KvEntry
+    /// eviction): make `evict_to_fit` return 0 without evicting — fails (the
+    /// persisted payload exceeds its ceiling and nothing is evicted).
+    /// Reverse the age sort (evict newest-first) — fails. Sort by key
+    /// instead of stored rowid — fails (the re-replaced `k000` is evicted
+    /// despite being the newest row).
     #[test]
     fn a_cursor_state_over_its_ceiling_evicts_the_oldest_keys_instead_of_failing() {
         let path = unique_db_path("cursor-ceiling-upper");
         let keys = seed_junk_fixture(&path, 6, 64);
 
         let full_plan = default_scan_plan();
-        let mut full_ledger = ScanLedger::default();
+        let mut cold_ledger = ScanLedger::default();
+        let ScanOutcome::Scanned {
+            new_state: cold, ..
+        } = scan_database(
+            &path.to_string_lossy(),
+            &CursorState::fresh(),
+            &full_plan,
+            &mut cold_ledger,
+        )
+        else {
+            panic!("cold scan should succeed");
+        };
+
+        // Diverge key order from rowid order: replace the oldest *key* so it
+        // becomes the newest *row*, leaving the second key the oldest row.
+        {
+            let db = Connection::open(&path).expect("reopen fixture");
+            db.execute(
+                "INSERT INTO cursorDiskKV (key, value) VALUES (?1, 'junk-replaced')",
+                rusqlite::params![&keys[0]],
+            )
+            .expect("replace the oldest key");
+        }
+        let mut diverged_ledger = ScanLedger::default();
         let ScanOutcome::Scanned {
             new_state: full_state,
             ..
         } = scan_database(
             &path.to_string_lossy(),
-            &CursorState::fresh(),
+            &cold,
             &full_plan,
-            &mut full_ledger,
+            &mut diverged_ledger,
         )
         else {
-            panic!("cold scan should succeed");
+            panic!("divergence scan should succeed");
         };
         let full_len = (*full_state).serialize().len();
 
@@ -6103,12 +6549,16 @@ mod tests {
         assert_eq!(ledger.evicted_entries, 1, "one round of the oldest eighth");
         assert!(ledger.coverage_degraded);
         assert!(
-            !new_state.kv_hashes.contains_key(&keys[0]),
-            "eviction is oldest-first by census rowid"
+            !new_state.kv_entries.contains_key(&keys[1]),
+            "eviction is oldest-first by the durable stored rowid"
         );
         assert!(
-            new_state.kv_hashes.contains_key(&keys[5]),
-            "the newest key's hash survives"
+            new_state.kv_entries.contains_key(&keys[0]),
+            "the oldest *key* is the newest *row* — key order must not decide"
+        );
+        assert!(
+            new_state.kv_entries.contains_key(&keys[5]),
+            "the newest untouched key's entry survives"
         );
         assert!(
             (*new_state).serialize().len() <= ceiling,
@@ -6129,8 +6579,9 @@ mod tests {
     /// fully-covered sources). The upper test alone cannot see a ceiling that
     /// over-evicts by one boundary token; this one pins the boundary.
     ///
-    /// MUTATION (executed 2026-07-31): `<=` → `<` in `evict_to_fit`'s fit
-    /// checks — fails (a payload exactly at its ceiling is evicted).
+    /// MUTATION (executed 2026-07-31, re-executed against the KvEntry
+    /// eviction): `<=` → `<` in `evict_to_fit`'s fit checks — fails (a
+    /// payload exactly at its ceiling is evicted).
     #[test]
     fn a_cursor_state_at_its_ceiling_evicts_nothing() {
         let path = unique_db_path("cursor-ceiling-lower");
@@ -6162,7 +6613,7 @@ mod tests {
         };
         assert_eq!(ledger.evicted_entries, 0, "at the boundary nothing evicts");
         assert!(!ledger.coverage_degraded);
-        assert_eq!(new_state.kv_hashes.len(), 6);
+        assert_eq!(new_state.kv_entries.len(), 6);
         assert!(!new_state.pending_coverage);
         assert_eq!(
             (*new_state).serialize(),
@@ -6976,11 +7427,14 @@ mod tests {
     ///    carries neither `pending_coverage` nor `sweep`, byte-identical to a
     ///    source that never degraded.
     ///
-    /// MUTATION (executed 2026-07-31): drop the `!state.pending_coverage`
-    /// conjunct from the cheap short-circuit — fails at the poll-2 coverage
-    /// assertion (the unchanged stat ends every later poll). Drop the
-    /// never-read-first class from the candidate sort (plain `rowid DESC`) —
-    /// fails at the same assertion (polls re-read `k5,k4` forever). Each RED
+    /// MUTATION (executed 2026-07-31, re-executed against the census fast
+    /// path): drop the `!state.pending_coverage` conjunct from the cheap
+    /// short-circuit — fails at the poll-2 coverage assertion (the unchanged
+    /// stat ends every later poll). The never-read-first sort class is no
+    /// longer what this fixture converges on — stable keys stopped being
+    /// candidates, so unread keys are the only candidates here — and its pin
+    /// moved to `a_streaming_replace_does_not_starve_never_read_debt`, whose
+    /// fixture makes the class term the only ordering that can win. Each RED
     /// was confirmed in a filtered run, so suite-wide isolation is not
     /// claimed.
     #[tokio::test(flavor = "multi_thread")]
@@ -7005,7 +7459,11 @@ mod tests {
                 "the resume marker must be durable, not volatile"
             );
             let state = CursorState::parse(&checkpoint.cursor_json);
-            assert_eq!(state.kv_hashes.len(), 2, "the cold poll covered its budget");
+            assert_eq!(
+                state.kv_entries.len(),
+                2,
+                "the cold poll covered its budget"
+            );
         }
 
         // No touches: the stat never moves again. Two more polls must still
@@ -7016,7 +7474,7 @@ mod tests {
             let checkpoint = map.get(&cp_key).expect("resumed poll persists");
             let state = CursorState::parse(&checkpoint.cursor_json);
             assert_eq!(
-                state.kv_hashes.len(),
+                state.kv_entries.len(),
                 expected_covered,
                 "each resumed poll must retire one budget of never-read keys"
             );
@@ -7094,7 +7552,7 @@ mod tests {
         let checkpoint = map.get(&cp_key).expect("finalized replay checkpoint");
         let state = CursorState::parse(&checkpoint.cursor_json);
         assert_eq!(
-            state.kv_hashes.len(),
+            state.kv_entries.len(),
             7,
             "the replay must cover every key, budget notwithstanding"
         );
@@ -7150,15 +7608,22 @@ mod tests {
     /// Plan §7.2 F1, the `new_state == prior_state_covered` conjunct of
     /// `scan_is_noop` — the one whose failure mode is a durable-state change
     /// suppressed forever. A value mutation that synthesizes no record (junk
-    /// payloads) moves only the hash map: every other conjunct says "no-op",
+    /// payloads) moves only the entry map: every other conjunct says "no-op",
     /// and only the structural comparison notices. Suppress it and the
     /// mutation is re-discovered on every later poll and never durably
     /// recorded.
     ///
-    /// MUTATION (executed 2026-07-31): drop `new_state == prior_state_covered`
-    /// from `scan_is_noop` — this test fails (the persisted hash never
-    /// moves); RED was confirmed in a filtered run, so suite-wide isolation
-    /// is not claimed.
+    /// The mutation is written as Cursor writes it — a plain `INSERT` landing
+    /// on `ON CONFLICT REPLACE`, which moves the rowid — so the census fast
+    /// path sees it. The rowid-preserving plain-`UPDATE` shape is
+    /// deliberately *not* used here: the fast path cannot see it by design,
+    /// and G5d (`cursor_sweep_detects_a_plain_update_that_kept_its_rowid`)
+    /// owns that case through the sweep.
+    ///
+    /// MUTATION (executed 2026-07-31, re-executed against the census fast
+    /// path): drop `new_state == prior_state_covered` from `scan_is_noop` —
+    /// this test fails (the persisted hash never moves); RED was confirmed
+    /// in a filtered run, so suite-wide isolation is not claimed.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_changed_value_that_emits_no_records_still_persists_its_checkpoint() {
         let path = unique_db_path("noop-width-state");
@@ -7168,21 +7633,25 @@ mod tests {
         let cp_key = checkpoint_key(&work.source_name, &work.path);
 
         run_poll(&work, &checkpoints).await;
-        let hash_before = {
+        let entry_before = {
             let map = checkpoints.read().await;
             let state = CursorState::parse(&map.get(&cp_key).expect("cold checkpoint").cursor_json);
-            state.kv_hashes.get(&keys[0]).cloned().expect("covered key")
+            state
+                .kv_entries
+                .get(&keys[0])
+                .cloned()
+                .expect("covered key")
         };
 
-        // A plain UPDATE to another non-JSON payload: no record synthesizes,
-        // only the content hash moves.
+        // An INSERT-OR-REPLACE to another non-JSON payload: no record
+        // synthesizes, only the content hash (and rowid) moves.
         {
             let db = Connection::open(&path).expect("reopen fixture");
             db.execute(
-                "UPDATE cursorDiskKV SET value = 'junk-mutated' WHERE key = ?1",
+                "INSERT INTO cursorDiskKV (key, value) VALUES (?1, 'junk-mutated')",
                 rusqlite::params![&keys[0]],
             )
-            .expect("mutate value in place");
+            .expect("replace value in place");
         }
         let batches = run_poll(&work, &checkpoints).await;
         assert!(
@@ -7192,8 +7661,8 @@ mod tests {
         let map = checkpoints.read().await;
         let state = CursorState::parse(&map.get(&cp_key).expect("checkpoint").cursor_json);
         assert_ne!(
-            state.kv_hashes.get(&keys[0]),
-            Some(&hash_before),
+            state.kv_entries.get(&keys[0]).map(|entry| &entry.hash),
+            Some(&entry_before.hash),
             "the moved hash must be recorded durably, not re-discovered forever"
         );
 
@@ -7265,6 +7734,1531 @@ mod tests {
             record.record.get("text").and_then(Value::as_str),
             Some("hello from rich text")
         );
+    }
+
+    /// Pin the fixture to a rollback journal, making "quiet" mean an
+    /// unchanged stat. Under WAL, `-shm` churn from the scan's own read-only
+    /// open re-runs scans for the wrong reason, and every noop-cover /
+    /// baseline arm the sweep tests target is never reached — the WI-06/WI-07
+    /// mutation rounds proved exactly this shape green-under-mutation.
+    fn pin_delete_journal(path: &Path) {
+        let connection = Connection::open(path).expect("open fixture for journal pin");
+        connection
+            .query_row("PRAGMA journal_mode = DELETE", [], |_| Ok(()))
+            .expect("pin DELETE journal mode");
+    }
+
+    /// Gate G1a (§8): per-poll fast-path work is proportional to changed/new
+    /// rows, not to history. **[DIVERGENT FIXTURE]** 200 bubble rows of
+    /// ~256 KiB (~50 MB of history) against one new ~1 KiB key: if payload
+    /// and row budgets were interchangeable (uniform small rows) neither axis
+    /// would be tested, so the fixture makes the byte axis diverge by five
+    /// orders of magnitude. Census rows are asserted separately so the two
+    /// axes cannot be confused.
+    ///
+    /// Fails for: reverting the candidate read to hashing every value (the
+    /// pre-WI-08 exhaustive fast path reads ~50 MB here).
+    #[test]
+    fn cursor_fast_path_reads_only_changed_payloads() {
+        let path = unique_db_path("g1a-changed-only");
+        let db = create_kv_db(&path);
+        db.execute_batch("BEGIN").expect("begin fixture batch");
+        {
+            let mut insert = db
+                .prepare("INSERT INTO cursorDiskKV (key, value) VALUES (?1, ?2)")
+                .expect("prepare fixture insert");
+            for idx in 0..200 {
+                let bubble = json!({
+                    "_v": 3,
+                    "type": 1,
+                    "bubbleId": format!("{idx:08x}-1111-4111-8111-111111111111"),
+                    "createdAt": "2026-05-08T02:04:37.835Z",
+                    "text": "h".repeat(256 * 1024),
+                });
+                insert
+                    .execute(rusqlite::params![
+                        format!("bubbleId:{COMPOSER_ID}:h{idx:03}"),
+                        serde_json::to_string(&bubble).expect("serialize bubble"),
+                    ])
+                    .expect("insert history bubble");
+            }
+        }
+        db.execute_batch("COMMIT").expect("commit fixture batch");
+        let db_path = path.to_string_lossy().to_string();
+
+        // Prime unbudgeted (the history exceeds the default fast budget) so
+        // the second scan starts from full coverage.
+        let mut prime = ScanLedger::default();
+        let ScanOutcome::Scanned {
+            new_state: primed, ..
+        } = scan_database(
+            &db_path,
+            &CursorState::fresh(),
+            &CursorScanPlan::unbudgeted(),
+            &mut prime,
+        )
+        else {
+            panic!("priming scan should succeed");
+        };
+        assert_eq!(prime.payload_rows, 200, "the cold scan reads everything");
+
+        let new_bubble = json!({
+            "_v": 3,
+            "type": 1,
+            "bubbleId": "ffffffff-9999-4999-8999-999999999999",
+            "createdAt": "2026-05-08T02:09:00.000Z",
+            "text": "n".repeat(900),
+        });
+        put(&db, &format!("bubbleId:{COMPOSER_ID}:zz-new"), &new_bubble);
+        drop(db);
+
+        let mut ledger = ScanLedger::default();
+        let ScanOutcome::Scanned { records, .. } =
+            scan_database(&db_path, &primed, &default_scan_plan(), &mut ledger)
+        else {
+            panic!("changed-only scan should succeed");
+        };
+        assert_eq!(records.len(), 1, "only the new key synthesizes");
+        assert!(
+            ledger.payload_bytes < 512 * 1024,
+            "the fast path must not re-materialize 50 MB of unchanged history; \
+             read {} bytes",
+            ledger.payload_bytes
+        );
+        assert!(
+            (1..=2).contains(&ledger.payload_rows),
+            "the new key (plus at most its workspace lookup) is the only \
+             payload read; got {}",
+            ledger.payload_rows
+        );
+        let schema_census = {
+            let connection = open_read_only(&db_path).expect("reopen for schema census");
+            expected_schema_census(&connection, &["cursorDiskKV"])
+        };
+        assert_eq!(
+            ledger.census_rows,
+            schema_census.census_rows + 201,
+            "the census still walks all 201 relevant keys"
+        );
+
+        cleanup(&path);
+    }
+
+    /// Gate G2's ledger axis (§8): growing a source from E to 4E of cold
+    /// history must not change per-poll fast-path work. Two fixtures — 50 and
+    /// 200 keys of 64 KiB junk — each primed, appended one ~1 KiB key, and
+    /// re-polled; the appended poll's payload bytes must be flat (ratio
+    /// ≤ 1.25) and small in absolute terms. The census axis is asserted to
+    /// actually scale, so the fixture provably diverges. The latency axis and
+    /// the ≥30-sample p95 protocol are WI-11's `sqlite-delta-bench` sandbox
+    /// mode; this unit gate pins the read-cost half that a fast disk could
+    /// otherwise hide.
+    ///
+    /// Fails for: any per-poll cost that scales with total history.
+    #[test]
+    fn cursor_fast_path_work_is_flat_in_history() {
+        let mut results = Vec::new();
+        for count in [50usize, 200] {
+            let path = unique_db_path(&format!("g2-flat-{count}"));
+            seed_junk_fixture(&path, count, 64 * 1024);
+            let db_path = path.to_string_lossy().to_string();
+            let mut prime = ScanLedger::default();
+            let ScanOutcome::Scanned {
+                new_state: primed, ..
+            } = scan_database(
+                &db_path,
+                &CursorState::fresh(),
+                &default_scan_plan(),
+                &mut prime,
+            )
+            else {
+                panic!("priming scan should succeed");
+            };
+            let db = Connection::open(&path).expect("reopen fixture");
+            db.execute(
+                "INSERT INTO cursorDiskKV (key, value) VALUES (?1, ?2)",
+                rusqlite::params![
+                    format!("bubbleId:{COMPOSER_ID}:zz-appended"),
+                    format!("junk-appended-{}", "a".repeat(1000)),
+                ],
+            )
+            .expect("append one key");
+            drop(db);
+            let mut ledger = ScanLedger::default();
+            let ScanOutcome::Scanned { .. } =
+                scan_database(&db_path, &primed, &default_scan_plan(), &mut ledger)
+            else {
+                panic!("appended scan should succeed");
+            };
+            results.push((ledger.payload_bytes, ledger.census_rows));
+            cleanup(&path);
+        }
+        let (bytes_e, census_e) = results[0];
+        let (bytes_4e, census_4e) = results[1];
+        assert!(
+            census_4e > census_e,
+            "the fixture must genuinely grow, or flatness is vacuous"
+        );
+        assert!(
+            bytes_4e * 4 <= bytes_e * 5,
+            "append-poll payload bytes must be flat in history: E read \
+             {bytes_e}, 4E read {bytes_4e}"
+        );
+        assert!(
+            bytes_4e < 64 * 1024,
+            "the appended poll reads the appended key, not the history; \
+             read {bytes_4e} bytes"
+        );
+    }
+
+    /// Gate G5d (§8): the two mutation shapes genuinely diverge, and each is
+    /// caught by its own mechanism within its documented interval.
+    /// **[DIVERGENT FIXTURE]**
+    ///
+    /// - An `INSERT OR REPLACE` moves the rowid (asserted), so the census
+    ///   fast path catches it **within one poll**.
+    /// - A plain `UPDATE` keeps its rowid (asserted — writing this case as
+    ///   `INSERT OR REPLACE` would collapse the two and the sweep would never
+    ///   be exercised), so the fast path provably cannot see it (the watcher
+    ///   poll emits nothing and noop-covers the stat) and **only a sweep
+    ///   slice** re-emits it — through the volatile-skip override, since the
+    ///   noop cover would otherwise skip every later poll of the then-quiet
+    ///   database forever (§7.1 D14's noop-cover hole, now reachable at
+    ///   Cursor).
+    ///
+    /// Fails for: skipping values on any census signal weaker than a rowid
+    /// move, a sweep that does not re-hash, or dropping the noop-cover
+    /// override from `process_cursor_sqlite_db`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cursor_sweep_detects_a_plain_update_that_kept_its_rowid() {
+        let path = unique_db_path("g5d-plain-update");
+        let db = seed_fixture_db(&path);
+        pin_delete_journal(&path);
+        let work = sqlite_work(&path);
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let poll_state = VolatilePollMap::new();
+        let metrics = Arc::new(Metrics::default());
+        let mut config = moraine_config::AppConfig::default();
+        config.ingest.sqlite.sweep_slice_min_interval_seconds = 0;
+
+        let first = run_poll_with_config(&config, &work, &checkpoints, &poll_state, &metrics).await;
+        let first_rows = all_event_rows(&first);
+        let first_message_uids = event_uid_by_kind(&first_rows, "message");
+        assert_eq!(first_message_uids.len(), 1);
+
+        let tool_key = format!("bubbleId:{COMPOSER_ID}:{TOOL_BUBBLE_ID}");
+        let user_key = format!("bubbleId:{COMPOSER_ID}:{USER_BUBBLE_ID}");
+        let rowid_of = |key: &str| -> i64 {
+            db.query_row(
+                "SELECT rowid FROM cursorDiskKV WHERE key = ?1",
+                rusqlite::params![key],
+                |row| row.get(0),
+            )
+            .expect("fixture rowid")
+        };
+
+        // Case A: Cursor's native write shape — INSERT landing on ON CONFLICT
+        // REPLACE — moves the rowid, and the fast path catches it in one poll.
+        let tool_rowid_before = rowid_of(&tool_key);
+        put(&db, &tool_key, &tool_bubble_value("completed", true));
+        assert_ne!(
+            rowid_of(&tool_key),
+            tool_rowid_before,
+            "an INSERT OR REPLACE must move the rowid, or this fixture no \
+             longer distinguishes the two mutation shapes"
+        );
+        let second =
+            run_poll_with_config(&config, &work, &checkpoints, &poll_state, &metrics).await;
+        assert_eq!(
+            event_uid_by_kind(&all_event_rows(&second), "tool_result").len(),
+            1,
+            "a rowid-moving replace is fast-path-visible within one poll"
+        );
+
+        // Case B: a plain UPDATE keeps its rowid — invisible to the census.
+        let mut mutated = user_bubble_value();
+        mutated
+            .as_object_mut()
+            .expect("bubble object")
+            .insert("text".to_string(), json!("the silently rewritten prompt"));
+        let user_rowid_before = rowid_of(&user_key);
+        db.execute(
+            "UPDATE cursorDiskKV SET value = ?2 WHERE key = ?1",
+            rusqlite::params![
+                &user_key,
+                serde_json::to_string(&mutated).expect("serialize mutated bubble")
+            ],
+        )
+        .expect("plain UPDATE in place");
+        assert_eq!(
+            rowid_of(&user_key),
+            user_rowid_before,
+            "a plain UPDATE must keep its rowid, or this fixture exercises \
+             the fast path instead of the sweep"
+        );
+
+        // The watcher poll scans (the stat moved), sees no census signal,
+        // emits nothing, and noop-covers the new stat.
+        let third = run_poll_with_config(&config, &work, &checkpoints, &poll_state, &metrics).await;
+        assert!(
+            third.is_empty(),
+            "the fast path must not see a rowid-preserving UPDATE; got \
+             {} batches",
+            third.len()
+        );
+
+        // The due reconcile poll must override the noop cover (the database
+        // is now quiet — nothing else will ever move the stat) and the sweep
+        // slice re-hashes the key, re-emitting the same logical event.
+        let reconcile = reconcile_work(&path);
+        let fourth =
+            run_poll_with_config(&config, &reconcile, &checkpoints, &poll_state, &metrics).await;
+        let fourth_rows = all_event_rows(&fourth);
+        assert_eq!(
+            event_uid_by_kind(&fourth_rows, "message"),
+            first_message_uids,
+            "the sweep re-emits the mutated bubble at its stable logical UID"
+        );
+        assert!(
+            fourth_rows.iter().any(|row| {
+                row.get("text_content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| text.contains("silently rewritten"))
+            }),
+            "the re-emission must carry the mutated content"
+        );
+        assert!(
+            sweep_slices(&metrics) > 0,
+            "the detection must be attributable to a committed sweep slice"
+        );
+
+        cleanup(&path);
+    }
+
+    /// §2.6: the WI-08 `cursor_json` format change (version 1 → 2,
+    /// `kv_hashes` → `kv_entries`) is deliberate, and triggers the documented
+    /// replay semantics **exactly once per source**. A version-1 payload —
+    /// stat *matching* the file, so nothing but the version fallback can
+    /// explain a re-scan — parses to a fresh state; the next poll re-reads
+    /// and re-emits every record at its stable UID (the `ReplacingMergeTree`
+    /// collapse), persists a version-2 payload, and the poll after that is
+    /// fully idle.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_v1_cursor_state_reingests_exactly_once_after_upgrade() {
+        let path = unique_db_path("v1-upgrade-once");
+        let _db = seed_fixture_db(&path);
+        let work = sqlite_work(&path);
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let cp_key = checkpoint_key(&work.source_name, &work.path);
+
+        let first = run_poll(&work, &checkpoints).await;
+        let first_rows = all_event_rows(&first);
+        assert_eq!(
+            first_rows.len(),
+            4,
+            "meta + message + reasoning + tool_call"
+        );
+        let first_uids: Vec<String> = first_rows
+            .iter()
+            .filter_map(|row| row.get("event_uid").and_then(Value::as_str))
+            .map(str::to_string)
+            .collect();
+
+        // Rewrite the committed cursor to the pre-WI-08 shape, stat included.
+        {
+            let stat = stat_fingerprint(&work.path).expect("fixture stat");
+            let v1 = json!({
+                "version": 1,
+                "format": moraine_config::SOURCE_FORMAT_CURSOR_SQLITE,
+                "stat": serde_json::to_value(stat).expect("serialize stat"),
+                "kv_hashes": {
+                    format!("bubbleId:{COMPOSER_ID}:{USER_BUBBLE_ID}"): "0123456789abcdef"
+                },
+                "project_exclusions_hash": 0,
+                "last_error": "",
+            });
+            let mut map = checkpoints.write().await;
+            let checkpoint = map.get_mut(&cp_key).expect("committed checkpoint");
+            checkpoint.cursor_json = serde_json::to_string(&v1).expect("serialize v1 cursor");
+        }
+
+        let second = run_poll(&work, &checkpoints).await;
+        let second_rows = all_event_rows(&second);
+        let second_uids: Vec<String> = second_rows
+            .iter()
+            .filter_map(|row| row.get("event_uid").and_then(Value::as_str))
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            second_uids, first_uids,
+            "the upgrade re-emits every record at its stable UID"
+        );
+        {
+            let map = checkpoints.read().await;
+            let checkpoint = map.get(&cp_key).expect("upgraded checkpoint");
+            assert!(checkpoint.cursor_json.contains("kv_entries"));
+            assert_eq!(
+                CursorState::parse(&checkpoint.cursor_json).version,
+                CURSOR_STATE_VERSION,
+                "the first persisting poll writes the current version"
+            );
+        }
+
+        let third = run_poll(&work, &checkpoints).await;
+        assert!(
+            third.is_empty(),
+            "the replay happens exactly once — the upgraded cursor must not \
+             re-trigger"
+        );
+
+        cleanup(&path);
+    }
+
+    /// The §2.6 disclosure's second half: on a host with configured project
+    /// exclusions, the version fallback's zeroed exclusion hash routes the
+    /// same one-time re-ingest through the exclusions-changed **generation
+    /// replay** — the pre-existing, #602-safe path for a cursor-format
+    /// change. Still exactly once.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_v1_cursor_state_with_exclusions_replays_the_generation() {
+        let path = unique_db_path("v1-upgrade-replay");
+        let _db = seed_fixture_db(&path);
+        let work = sqlite_work(&path);
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let cp_key = checkpoint_key(&work.source_name, &work.path);
+        let poll_state = VolatilePollMap::new();
+        let metrics = Arc::new(Metrics::default());
+        let mut config = moraine_config::AppConfig::default();
+        // Excludes nothing the fixture emits; its hash is what matters.
+        config.ingest.exclude_project_dirs = vec!["/no/such/dir/**".to_string()];
+
+        let first = run_poll_with_config(&config, &work, &checkpoints, &poll_state, &metrics).await;
+        assert_eq!(all_event_rows(&first).len(), 4);
+        let exclusions_hash = {
+            let map = checkpoints.read().await;
+            let state = CursorState::parse(&map.get(&cp_key).expect("checkpoint").cursor_json);
+            assert_ne!(state.project_exclusions_hash, 0);
+            state.project_exclusions_hash
+        };
+
+        {
+            let stat = stat_fingerprint(&work.path).expect("fixture stat");
+            let v1 = json!({
+                "version": 1,
+                "format": moraine_config::SOURCE_FORMAT_CURSOR_SQLITE,
+                "stat": serde_json::to_value(stat).expect("serialize stat"),
+                "kv_hashes": {},
+                "project_exclusions_hash": exclusions_hash,
+            });
+            let mut map = checkpoints.write().await;
+            let checkpoint = map.get_mut(&cp_key).expect("committed checkpoint");
+            checkpoint.cursor_json = serde_json::to_string(&v1).expect("serialize v1 cursor");
+        }
+
+        let second =
+            run_poll_with_config(&config, &work, &checkpoints, &poll_state, &metrics).await;
+        assert_eq!(
+            all_event_rows(&second).len(),
+            4,
+            "the generation replay re-ingests everything"
+        );
+        {
+            let map = checkpoints.read().await;
+            let checkpoint = map.get(&cp_key).expect("replayed checkpoint");
+            assert_eq!(
+                checkpoint.source_generation, 2,
+                "an unreadable exclusion provenance replays the generation"
+            );
+            assert_eq!(checkpoint.status, "active");
+        }
+
+        let third = run_poll_with_config(&config, &work, &checkpoints, &poll_state, &metrics).await;
+        assert!(third.is_empty(), "exactly once");
+
+        cleanup(&path);
+    }
+
+    /// §7.2 F1's named case for the state conjunct, at the poll level: a key
+    /// deletion emits no record and moves nothing but the entry map, and the
+    /// checkpoint that records it durably must still persist — otherwise the
+    /// deletion is re-discovered on every later poll forever. Also pins that
+    /// deletion is **not** a rewind (§3.2/D16's Cursor analogue): no
+    /// generation bump, no replay barrier — the kv census detects deletions
+    /// exactly, and rowid reuse after them is why `rowid` is never treated as
+    /// a watermark in the first place (§1.1).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_deleted_key_is_dropped_from_the_cursor_durably() {
+        let path = unique_db_path("deletion-durable");
+        let keys = seed_junk_fixture(&path, 3, 64);
+        let work = sqlite_work(&path);
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let cp_key = checkpoint_key(&work.source_name, &work.path);
+
+        run_poll(&work, &checkpoints).await;
+        {
+            let db = Connection::open(&path).expect("reopen fixture");
+            db.execute(
+                "DELETE FROM cursorDiskKV WHERE key = ?1",
+                rusqlite::params![&keys[0]],
+            )
+            .expect("delete one key");
+        }
+
+        let second = run_poll(&work, &checkpoints).await;
+        assert!(
+            all_event_rows(&second).is_empty(),
+            "a deletion synthesizes nothing"
+        );
+        let generation = {
+            let map = checkpoints.read().await;
+            let checkpoint = map.get(&cp_key).expect("checkpoint");
+            let state = CursorState::parse(&checkpoint.cursor_json);
+            assert!(
+                !state.kv_entries.contains_key(&keys[0]),
+                "the deletion must be recorded durably"
+            );
+            assert_eq!(state.kv_entries.len(), 2);
+            assert_eq!(
+                checkpoint.last_line_no, 2,
+                "last_line_no is denominated on census rows"
+            );
+            checkpoint.source_generation
+        };
+        assert_eq!(generation, 1, "a deletion is not a rewind — no replay");
+
+        let third = run_poll(&work, &checkpoints).await;
+        assert!(
+            third.is_empty(),
+            "once recorded, the deletion must not re-scan"
+        );
+
+        cleanup(&path);
+    }
+
+    /// D6's never-read-first class, under the census fast path. Stable keys
+    /// are no longer candidates at all, so the class term's convergence case
+    /// moved: it is now what keeps a *continuously replaced* hot key (an
+    /// active session streaming `INSERT OR REPLACE`s) from starving
+    /// never-read debt under a bound budget. The fixture makes every rival
+    /// ordering lose: the hot key has the fresher rowid (recency order would
+    /// pick it) **and** the persisted active-composer rank (priority order
+    /// would pick it) — only the never-read class puts the cold new key
+    /// first.
+    ///
+    /// Fails for: dropping the class term from the candidate sort, or
+    /// ranking active-composer priority above it.
+    #[test]
+    fn a_streaming_replace_does_not_starve_never_read_debt() {
+        let path = unique_db_path("class-over-recency");
+        let db = create_kv_db(&path);
+        let hot_key = format!("bubbleId:{COMPOSER_ID}:hot");
+        db.execute(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?1, 'junk-hot-0')",
+            rusqlite::params![&hot_key],
+        )
+        .expect("insert hot key");
+        let db_path = path.to_string_lossy().to_string();
+        let mut prime = ScanLedger::default();
+        let ScanOutcome::Scanned {
+            new_state: primed, ..
+        } = scan_database(
+            &db_path,
+            &CursorState::fresh(),
+            &default_scan_plan(),
+            &mut prime,
+        )
+        else {
+            panic!("priming scan should succeed");
+        };
+        let stale_rowid = primed.kv_entries.get(&hot_key).expect("hot entry").rowid;
+        let mut prior = (*primed).clone();
+        prior.active_composers = vec![COMPOSER_ID.to_string()];
+
+        // The cold new key lands first (lower rowid), the hot replace last
+        // (fresher rowid, active composer).
+        let cold_composer = "99999999-8888-4888-8888-777777777777";
+        let cold_key = format!("bubbleId:{cold_composer}:new");
+        db.execute(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?1, 'junk-cold-new')",
+            rusqlite::params![&cold_key],
+        )
+        .expect("insert cold key");
+        db.execute(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?1, 'junk-hot-1')",
+            rusqlite::params![&hot_key],
+        )
+        .expect("replace hot key");
+        drop(db);
+
+        let mut config = moraine_config::AppConfig::default();
+        config.ingest.sqlite.fast_path_max_payload_rows = 1;
+        let plan = CursorScanPlan::from_config(&config, None);
+        let mut ledger = ScanLedger::default();
+        let ScanOutcome::Scanned { new_state, .. } =
+            scan_database(&db_path, &prior, &plan, &mut ledger)
+        else {
+            panic!("budgeted scan should succeed");
+        };
+        assert!(
+            new_state.kv_entries.contains_key(&cold_key),
+            "the never-read key wins the budget over recency and priority"
+        );
+        assert_eq!(
+            new_state
+                .kv_entries
+                .get(&hot_key)
+                .expect("hot carried")
+                .rowid,
+            stale_rowid,
+            "the hot replace defers, keeping its stale entry as the debt"
+        );
+        assert!(new_state.pending_coverage);
+
+        cleanup(&path);
+    }
+
+    /// The Cursor inheritance of WI-07's ⊘ cold-class hazard ("advance the
+    /// watermark from the never-read class"): Cursor's per-key entries are
+    /// exact, so the analogous defect is a bound poll that spends its budget
+    /// on never-read keys and then *retires the replaced-key debt anyway* —
+    /// marking a rowid-moved key covered without re-reading it. Both sides:
+    /// the debt is kept (the stale entry and `pending_coverage` survive the
+    /// bound poll), and the debt is paid (the very next poll re-reads and
+    /// emits the replaced key, without any new write).
+    ///
+    /// Fails for: carrying the census rowid (instead of the prior entry) for
+    /// budget-skipped candidates, or dropping the rowid-mismatch arm from the
+    /// `pending_coverage` marker.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_bound_poll_reading_only_new_keys_keeps_the_replaced_key_debt() {
+        let path = unique_db_path("cold-class-debt");
+        let db = create_kv_db(&path);
+        let user_key = format!("bubbleId:{COMPOSER_ID}:{USER_BUBBLE_ID}");
+        put(&db, &user_key, &user_bubble_value());
+        let work = sqlite_work(&path);
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let cp_key = checkpoint_key(&work.source_name, &work.path);
+        let mut config = moraine_config::AppConfig::default();
+        config.ingest.sqlite.fast_path_max_payload_rows = 2;
+        let poll_state = VolatilePollMap::new();
+        let metrics = Arc::new(Metrics::default());
+
+        let first = run_poll_with_config(&config, &work, &checkpoints, &poll_state, &metrics).await;
+        let first_uids = event_uid_by_kind(&all_event_rows(&first), "message");
+        assert_eq!(first_uids.len(), 1);
+        let stale_rowid = {
+            let map = checkpoints.read().await;
+            let state = CursorState::parse(&map.get(&cp_key).expect("checkpoint").cursor_json);
+            state.kv_entries.get(&user_key).expect("covered key").rowid
+        };
+
+        // The replaced key first (its rowid moves), then two junk keys under
+        // a different composer (never-read, newest rowids) that consume the
+        // whole 2-row budget.
+        let mut mutated = user_bubble_value();
+        mutated
+            .as_object_mut()
+            .expect("bubble object")
+            .insert("text".to_string(), json!("the replaced prompt"));
+        put(&db, &user_key, &mutated);
+        let cold_composer = "22222222-3333-4333-8333-444444444444";
+        for idx in 0..2 {
+            db.execute(
+                "INSERT INTO cursorDiskKV (key, value) VALUES (?1, ?2)",
+                rusqlite::params![format!("bubbleId:{cold_composer}:j{idx}"), "junk-cold"],
+            )
+            .expect("insert cold junk");
+        }
+
+        let second =
+            run_poll_with_config(&config, &work, &checkpoints, &poll_state, &metrics).await;
+        assert!(
+            all_event_rows(&second).is_empty(),
+            "the bound poll spends its budget on the never-read class"
+        );
+        {
+            let map = checkpoints.read().await;
+            let state = CursorState::parse(&map.get(&cp_key).expect("checkpoint").cursor_json);
+            assert_eq!(
+                state.kv_entries.get(&user_key).expect("carried key").rowid,
+                stale_rowid,
+                "the deferred replaced key keeps its stale entry — the debt"
+            );
+            assert!(
+                state.pending_coverage,
+                "a rowid-mismatched entry is a durable coverage debt"
+            );
+        }
+
+        // No further writes: the debt alone must drive the next poll.
+        let third = run_poll_with_config(&config, &work, &checkpoints, &poll_state, &metrics).await;
+        let third_rows = all_event_rows(&third);
+        assert_eq!(
+            event_uid_by_kind(&third_rows, "message"),
+            first_uids,
+            "the debt is paid: the replaced key re-emits at its stable UID"
+        );
+        {
+            let map = checkpoints.read().await;
+            let state = CursorState::parse(&map.get(&cp_key).expect("checkpoint").cursor_json);
+            assert_ne!(
+                state.kv_entries.get(&user_key).expect("covered key").rowid,
+                stale_rowid,
+                "the paid debt records the fresh rowid"
+            );
+            assert!(!state.pending_coverage);
+        }
+
+        cleanup(&path);
+    }
+
+    /// The `MAX_CURSOR_CHECKPOINT_BYTES` literal's two-sided pin, in the
+    /// denomination the `KvEntry` design makes real: how many
+    /// reference-shaped entries (an 82-byte `bubbleId:<uuid>:<uuid>` key, a
+    /// 16-hex-char hash, a six-digit rowid) the ceiling holds. Measured
+    /// ~128 B per serialized entry → ~65 k entries: ~220× the 292 relevant
+    /// keys of the 2026-07-31 reference-host re-measurement, and above the
+    /// 10 k keys the pre-#601 latch declared fatal. Halving the ceiling,
+    /// doubling it, or bloating the entry serialization each move the
+    /// capacity out of the pinned band — the WI-04 fixture-relative ceiling
+    /// tests scale with the constant and cannot see any of those.
+    #[test]
+    fn the_cursor_state_ceiling_is_denominated_in_reference_entries() {
+        let mut state = CursorState::fresh();
+        let empty_len = state.serialize().len();
+        let entries = 1000usize;
+        for idx in 0..entries {
+            state.kv_entries.insert(
+                format!("bubbleId:{COMPOSER_ID}:{idx:08x}-0000-4000-8000-000000000000"),
+                KvEntry {
+                    hash: format!("{idx:016x}"),
+                    rowid: 100_000 + idx as i64,
+                },
+            );
+        }
+        let per_entry = (state.serialize().len() - empty_len) as u64 / entries as u64;
+        let capacity = MAX_CURSOR_CHECKPOINT_BYTES as u64 / per_entry;
+        assert!(
+            (58_000..=72_000).contains(&capacity),
+            "the ceiling must hold ~65 k reference entries; at {per_entry} \
+             bytes/entry it holds {capacity}"
+        );
+    }
+
+    /// The Cursor mirror of the NAC sweep-termination bound, both sides at
+    /// once (the mid-cycle short-circuit bypass in
+    /// `process_cursor_sqlite_db`):
+    ///
+    /// - **starvation side**: with a 2-row slice budget the cycle spans
+    ///   several polls, and a durably covered stat must not strand the
+    ///   in-progress cycle — every due reconcile poll advances it until the
+    ///   wrap, with **no writes at all** between polls;
+    /// - **runaway side**: once the cycle wraps and the database stays
+    ///   quiet, reconcile polls go fully idle — no census, no slices — even
+    ///   with the interval at zero.
+    ///
+    /// Fails for: dropping the mid-cycle bypass conjunct (the cycle stalls
+    /// mid-keyspace forever), or widening it past `cursor.is_empty() &&
+    /// baseline == stat` (the database sweeps forever and never idles).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_quiet_cursor_database_finishes_its_sweep_cycle_and_then_goes_idle() {
+        let path = unique_db_path("sweep-quiet-idle");
+        seed_junk_fixture(&path, 4, 64);
+        pin_delete_journal(&path);
+        let work = reconcile_work(&path);
+        let cp_key = checkpoint_key(&work.source_name, &work.path);
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let poll_state = VolatilePollMap::new();
+        let metrics = Arc::new(Metrics::default());
+        let mut config = moraine_config::AppConfig::default();
+        config.ingest.sqlite.sweep_slice_min_interval_seconds = 0;
+        config.ingest.sqlite.sweep_slice_max_payload_rows = 2;
+
+        let mut polls = 0;
+        loop {
+            run_poll_with_config(&config, &work, &checkpoints, &poll_state, &metrics).await;
+            polls += 1;
+            let map = checkpoints.read().await;
+            let state = CursorState::parse(&map.get(&cp_key).expect("checkpoint").cursor_json);
+            if state.sweep.completed_cycles >= 1 && state.sweep.cursor.is_empty() {
+                break;
+            }
+            assert!(
+                polls <= 10,
+                "a 2-row slice against 4 keys must complete its cycle with no \
+                 writes; still mid-cycle after {polls} polls"
+            );
+        }
+
+        let slices_before = sweep_slices(&metrics);
+        let census_before = census_rows(&metrics);
+        for _ in 0..3 {
+            run_poll_with_config(&config, &work, &checkpoints, &poll_state, &metrics).await;
+        }
+        assert_eq!(
+            sweep_slices(&metrics),
+            slices_before,
+            "a completed cycle over a quiet database must not restart"
+        );
+        assert_eq!(
+            census_rows(&metrics),
+            census_before,
+            "idle means not even the census runs"
+        );
+
+        cleanup(&path);
+    }
+
+    /// The upper bound of the sweep's volatile-skip override, mirrored from
+    /// NAC: a due slice may ride over a *noop-covered stat* (G5d's fixture is
+    /// the lower bound), never over a **failure backoff** — a database whose
+    /// scan is failing is not scanned harder because a sweep is due.
+    ///
+    /// Fails for: an override that reads the noop cover only (dropping the
+    /// `failure_retry_due` conjunct), or one that bypasses `should_skip_poll`
+    /// wholesale.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_due_cursor_sweep_does_not_override_a_failure_backoff() {
+        let path = unique_db_path("sweep-failure-backoff");
+        {
+            // `cursorDiskKV` is missing: every scan fails schema validation.
+            let connection = Connection::open(&path).expect("create broken fixture");
+            connection
+                .execute_batch(
+                    "CREATE TABLE ItemTable (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB);",
+                )
+                .expect("create partial schema");
+        }
+        let work = reconcile_work(&path);
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let poll_state = VolatilePollMap::new();
+        let metrics = Arc::new(Metrics::default());
+        let mut config = moraine_config::AppConfig::default();
+        config.ingest.sqlite.sweep_slice_min_interval_seconds = 0;
+
+        run_poll_with_config(&config, &work, &checkpoints, &poll_state, &metrics).await;
+        assert_eq!(
+            scan_failures(&metrics),
+            1,
+            "the first poll must reach the failing scan"
+        );
+
+        // Far inside the 15 s failure window, a due sweep must not force a
+        // second scan of the failing database.
+        run_poll_with_config(&config, &work, &checkpoints, &poll_state, &metrics).await;
+        assert_eq!(
+            scan_failures(&metrics),
+            1,
+            "a due sweep must never override a failure backoff"
+        );
+
+        cleanup(&path);
+    }
+
+    /// §7.1 D14's emitting-deferral hole, now reachable at Cursor: one write
+    /// burst carries both a census-visible change (an INSERT, emitted by the
+    /// watcher poll — which persists the burst's stat durably) and a
+    /// rowid-silent plain UPDATE. The durable stat cover would end every
+    /// later poll of the then-quiet database, so `sweep_baseline` — stamped
+    /// at cycle start, trailing the burst — is what keeps a due reconcile
+    /// poll scanning until one full cycle re-covers the keyspace; the wrap
+    /// then stamps the baseline and the database goes fully idle.
+    ///
+    /// Fails for: dropping the `sweep_baseline == current_stat` disjunct
+    /// from the cheap short-circuit (the UPDATE is never swept — a §0
+    /// coverage loss), or stamping the baseline unconditionally (covered by
+    /// the idle half: the database would never idle).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_silent_update_beside_an_emitting_change_is_swept_within_one_cycle() {
+        let path = unique_db_path("baseline-owed-cycle");
+        let db = seed_fixture_db(&path);
+        pin_delete_journal(&path);
+        let work = sqlite_work(&path);
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let poll_state = VolatilePollMap::new();
+        let metrics = Arc::new(Metrics::default());
+        let mut config = moraine_config::AppConfig::default();
+        config.ingest.sqlite.sweep_slice_min_interval_seconds = 0;
+
+        let first = run_poll_with_config(&config, &work, &checkpoints, &poll_state, &metrics).await;
+        let first_message_uids = event_uid_by_kind(&all_event_rows(&first), "message");
+        assert_eq!(first_message_uids.len(), 1);
+
+        // The burst: a silent rewrite of the user bubble (rowid kept) plus a
+        // census-visible new bubble in one transaction.
+        let user_key = format!("bubbleId:{COMPOSER_ID}:{USER_BUBBLE_ID}");
+        let mut mutated = user_bubble_value();
+        mutated
+            .as_object_mut()
+            .expect("bubble object")
+            .insert("text".to_string(), json!("rewritten beside the burst"));
+        db.execute_batch("BEGIN").expect("begin burst");
+        db.execute(
+            "UPDATE cursorDiskKV SET value = ?2 WHERE key = ?1",
+            rusqlite::params![
+                &user_key,
+                serde_json::to_string(&mutated).expect("serialize mutated bubble")
+            ],
+        )
+        .expect("silent UPDATE");
+        put(
+            &db,
+            &format!("bubbleId:{COMPOSER_ID}:eeeeeeee-5555-4555-8555-555555555555"),
+            &json!({
+                "_v": 3,
+                "type": 1,
+                "bubbleId": "eeeeeeee-5555-4555-8555-555555555555",
+                "createdAt": "2026-05-08T02:10:00.000Z",
+                "text": "the visible half of the burst",
+            }),
+        );
+        db.execute_batch("COMMIT").expect("commit burst");
+
+        // The watcher poll emits the visible half and durably covers the
+        // burst's stat — the silent half is now invisible to every stat arm.
+        let second =
+            run_poll_with_config(&config, &work, &checkpoints, &poll_state, &metrics).await;
+        let second_rows = all_event_rows(&second);
+        assert!(second_rows
+            .iter()
+            .any(|row| row.get("text_content").and_then(Value::as_str)
+                == Some("the visible half of the burst")));
+        assert!(
+            !second_rows.iter().any(|row| {
+                row.get("text_content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| text.contains("rewritten beside"))
+            }),
+            "the fast path must not see the silent half"
+        );
+
+        // The due reconcile poll proceeds past the covered stat (the baseline
+        // trails it) and the cycle re-emits the silent half.
+        let reconcile = reconcile_work(&path);
+        let mut swept_rows = Vec::new();
+        let mut polls = 0;
+        while swept_rows.is_empty() {
+            let batches =
+                run_poll_with_config(&config, &reconcile, &checkpoints, &poll_state, &metrics)
+                    .await;
+            let rows = all_event_rows(&batches);
+            swept_rows = rows
+                .into_iter()
+                .filter(|row| {
+                    row.get("text_content")
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| text.contains("rewritten beside"))
+                })
+                .collect();
+            polls += 1;
+            assert!(
+                polls <= 5,
+                "one owed cycle must re-cover the keyspace; nothing after \
+                 {polls} reconcile polls"
+            );
+        }
+        assert!(sweep_slices(&metrics) > 0);
+
+        // Drive to the wrap, then the database must go fully idle.
+        let mut polls = 0;
+        loop {
+            let cp_key = checkpoint_key(&reconcile.source_name, &reconcile.path);
+            let done = {
+                let map = checkpoints.read().await;
+                let state = CursorState::parse(&map.get(&cp_key).expect("checkpoint").cursor_json);
+                state.sweep.cursor.is_empty() && state.sweep.completed_cycles >= 1
+            };
+            if done {
+                break;
+            }
+            run_poll_with_config(&config, &reconcile, &checkpoints, &poll_state, &metrics).await;
+            polls += 1;
+            assert!(polls <= 10, "the owed cycle must wrap");
+        }
+        let census_before = census_rows(&metrics);
+        run_poll_with_config(&config, &reconcile, &checkpoints, &poll_state, &metrics).await;
+        assert_eq!(
+            census_rows(&metrics),
+            census_before,
+            "with the baseline caught up, a due reconcile poll is fully idle"
+        );
+
+        cleanup(&path);
+    }
+
+    /// `sweep_baseline`'s cycle-start conjunct at the Cursor stamp site
+    /// (§2.2/D14, the mirror of NAC's
+    /// `a_silent_write_behind_the_sweep_cursor_owes_a_follow_up_cycle`): only
+    /// a slice that *starts* a cycle stamps the baseline. A mid-cycle slice
+    /// that re-stamped it would advance the baseline past a rowid-silent
+    /// plain `UPDATE` that landed **behind** the sweep cursor during the
+    /// cycle, erasing the owed follow-up cycle — on a database that then goes
+    /// quiet, the mutation is never swept (a §0 coverage loss).
+    ///
+    /// The fixture: a 1-row slice budget spans the cycle across polls; after
+    /// the first slice commits (cursor at the user bubble, the first key in
+    /// sweep order), the bubble is silently rewritten in place — behind the
+    /// cursor, rowid untouched — and the database goes quiet. The wrapping
+    /// cycle cannot see the write; the owed follow-up cycle must re-emit it,
+    /// and the database must then idle.
+    ///
+    /// Fails for: dropping the `state.sweep.cursor.is_empty()` conjunct from
+    /// the baseline stamp in `process_cursor_sqlite_db` (`if swept && …` →
+    /// `if swept`).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_silent_update_behind_the_sweep_cursor_owes_a_follow_up_cycle() {
+        let path = unique_db_path("baseline-behind-cursor");
+        let db = create_kv_db(&path);
+        let user_key = format!("bubbleId:{COMPOSER_ID}:{USER_BUBBLE_ID}");
+        put(&db, &user_key, &user_bubble_value());
+        for idx in 0..2 {
+            db.execute(
+                "INSERT INTO cursorDiskKV (key, value) VALUES (?1, ?2)",
+                rusqlite::params![format!("bubbleId:{COMPOSER_ID}:zz-j{idx}"), "junk-tail"],
+            )
+            .expect("insert tail junk");
+        }
+        put(
+            &db,
+            &format!("composerData:{COMPOSER_ID}"),
+            &composer_value("Baseline fixture", 1),
+        );
+        pin_delete_journal(&path);
+        let reconcile = reconcile_work(&path);
+        let cp_key = checkpoint_key(&reconcile.source_name, &reconcile.path);
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let poll_state = VolatilePollMap::new();
+        let metrics = Arc::new(Metrics::default());
+        let mut config = moraine_config::AppConfig::default();
+        config.ingest.sqlite.sweep_slice_min_interval_seconds = 0;
+        config.ingest.sqlite.sweep_slice_max_payload_rows = 1;
+
+        // Drive to the mid-cycle point: the first 1-row slice has committed
+        // and the cursor sits at the user bubble, the first key in sweep
+        // (key) order.
+        let mut polls = 0;
+        loop {
+            run_poll_with_config(&config, &reconcile, &checkpoints, &poll_state, &metrics).await;
+            polls += 1;
+            let map = checkpoints.read().await;
+            let state = CursorState::parse(&map.get(&cp_key).expect("checkpoint").cursor_json);
+            if state.sweep.cursor == user_key {
+                break;
+            }
+            assert!(
+                polls <= 5,
+                "the first 1-row slice must commit within a few polls;                  cursor still elsewhere after {polls}"
+            );
+        }
+
+        // The silent write, behind the cursor: content changes, the rowid
+        // does not, and the in-progress cycle has already passed this key.
+        let mut mutated = user_bubble_value();
+        mutated.as_object_mut().expect("bubble object").insert(
+            "text".to_string(),
+            json!("rewritten behind the sweep cursor"),
+        );
+        db.execute(
+            "UPDATE cursorDiskKV SET value = ?2 WHERE key = ?1",
+            rusqlite::params![
+                &user_key,
+                serde_json::to_string(&mutated).expect("serialize mutated bubble")
+            ],
+        )
+        .expect("silent UPDATE behind the cursor");
+
+        // Quiet from here on. The wrapping cycle cannot see the write; the
+        // owed follow-up cycle must.
+        let mut polls = 0;
+        let mut found = false;
+        while !found {
+            let batches =
+                run_poll_with_config(&config, &reconcile, &checkpoints, &poll_state, &metrics)
+                    .await;
+            found = all_event_rows(&batches).iter().any(|row| {
+                row.get("text_content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| text.contains("rewritten behind"))
+            });
+            polls += 1;
+            assert!(
+                polls <= 12,
+                "the owed follow-up cycle must re-emit the silent rewrite;                  nothing after {polls} reconcile polls"
+            );
+        }
+
+        cleanup(&path);
+    }
+
+    /// §3.3 Change 3's census half: when the census cap truncates the walk,
+    /// the persisted active composers' ranges are censused supplementally, so
+    /// a change in the active session is fast-path-visible even though the
+    /// walk never reached its keys — while a change in a cold composer's
+    /// un-walked range stays deferred (the divergence that proves the
+    /// supplement is scoped, not a cap bypass). Deletion-pruning coverage
+    /// stays with the walk: everything beyond it is carried.
+    ///
+    /// Fails for: deleting the `supplement_active_census` call, or widening
+    /// the truncation-carry into the supplemented ranges.
+    ///
+    /// MUTATION (executed 2026-07-31): delete the truncation-carry — fails
+    /// (the deleted key's entry vanishes instead of being carried). Make the
+    /// carry `insert` instead of `or_insert_with` — fails at the replaced-key
+    /// rowid assertion (the stale prior clobbers the supplement-read fresh
+    /// entry). Record the truncation point one key too far — fails at the
+    /// exact-membership count (the first un-walked entry is silently
+    /// pruned). Drop the truncation disjunct from the `pending_coverage`
+    /// marker — fails. Each RED was confirmed in a filtered run, so
+    /// suite-wide isolation is not claimed.
+    #[test]
+    fn a_truncated_census_still_censuses_active_composers() {
+        let path = unique_db_path("census-supplement");
+        let db = create_kv_db(&path);
+        // The cold composer's keys sort first, so the capped walk never gets
+        // past them.
+        let cold_composer = "00000000-aaaa-4aaa-8aaa-000000000000";
+        for idx in 0..4 {
+            db.execute(
+                "INSERT INTO cursorDiskKV (key, value) VALUES (?1, ?2)",
+                rusqlite::params![format!("bubbleId:{cold_composer}:k{idx:03}"), "junk-cold"],
+            )
+            .expect("insert cold junk");
+        }
+        put(
+            &db,
+            &format!("composerData:{COMPOSER_ID}"),
+            &composer_value("Active session", 1),
+        );
+        put(
+            &db,
+            &format!("bubbleId:{COMPOSER_ID}:{USER_BUBBLE_ID}"),
+            &user_bubble_value(),
+        );
+        put(
+            &db,
+            &format!("bubbleId:{COMPOSER_ID}:{TOOL_BUBBLE_ID}"),
+            &tool_bubble_value("pending", false),
+        );
+        let db_path = path.to_string_lossy().to_string();
+
+        let mut prime = ScanLedger::default();
+        let ScanOutcome::Scanned {
+            new_state: primed, ..
+        } = scan_database(
+            &db_path,
+            &CursorState::fresh(),
+            &default_scan_plan(),
+            &mut prime,
+        )
+        else {
+            panic!("priming scan should succeed");
+        };
+        let mut prior = (*primed).clone();
+        prior.active_composers = vec![COMPOSER_ID.to_string()];
+
+        // One new bubble in the active session, one replaced bubble there
+        // (rowid moves — read fresh through the supplement), one new cold
+        // bubble — all beyond the capped walk — plus a deletion *inside* the
+        // active range.
+        put(
+            &db,
+            &format!("bubbleId:{COMPOSER_ID}:{THINKING_BUBBLE_ID}"),
+            &thinking_bubble_value(),
+        );
+        let replaced_active_key = format!("bubbleId:{COMPOSER_ID}:{TOOL_BUBBLE_ID}");
+        let stale_tool_rowid = prior
+            .kv_entries
+            .get(&replaced_active_key)
+            .expect("primed tool entry")
+            .rowid;
+        put(
+            &db,
+            &replaced_active_key,
+            &tool_bubble_value("completed", true),
+        );
+        let deleted_active_key = format!("bubbleId:{COMPOSER_ID}:{USER_BUBBLE_ID}");
+        db.execute(
+            "DELETE FROM cursorDiskKV WHERE key = ?1",
+            rusqlite::params![&deleted_active_key],
+        )
+        .expect("delete inside the active range");
+        let cold_new_key = format!("bubbleId:{cold_composer}:k009");
+        db.execute(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?1, ?2)",
+            rusqlite::params![&cold_new_key, "junk-cold-new"],
+        )
+        .expect("insert new cold junk");
+        drop(db);
+
+        let mut config = moraine_config::AppConfig::default();
+        config.ingest.sqlite.fast_path_max_census_rows = 3;
+        let plan = CursorScanPlan::from_config(&config, None);
+        let mut ledger = ScanLedger::default();
+        let ScanOutcome::Scanned {
+            records, new_state, ..
+        } = scan_database(&db_path, &prior, &plan, &mut ledger)
+        else {
+            panic!("capped scan should succeed");
+        };
+        assert!(
+            records.iter().any(|record| {
+                record.record.get("type").and_then(Value::as_str) == Some("cursor_bubble")
+            }),
+            "the active session's new bubble must be censused and read \
+             despite the truncation"
+        );
+        assert!(
+            !new_state.kv_entries.contains_key(&cold_new_key),
+            "the cold composer's new key stays deferred — the supplement is \
+             a priority, not a cap bypass"
+        );
+        assert!(ledger.coverage_degraded);
+        assert!(new_state.pending_coverage);
+        // Everything the walk covered or the supplement read is present;
+        // everything else is carried from the prior state.
+        assert!(new_state
+            .kv_entries
+            .contains_key(&format!("bubbleId:{COMPOSER_ID}:{THINKING_BUBBLE_ID}")));
+        // Deletion-pruning coverage stays with the walk: the supplement's
+        // one-page range census cannot prove absence, so a key deleted inside
+        // the active range is *carried*, never silently pruned, while the
+        // census stays truncated (disclosed in `supplement_active_census`).
+        assert!(
+            new_state.kv_entries.contains_key(&deleted_active_key),
+            "the supplement claims no pruning coverage"
+        );
+        // The truncation-carry must not overwrite a supplement-read fresh
+        // entry with its stale prior (`or_insert_with`, never `insert`): a
+        // replaced key read through the supplement keeps the fresh rowid.
+        assert_ne!(
+            new_state
+                .kv_entries
+                .get(&replaced_active_key)
+                .expect("replaced key entry")
+                .rowid,
+            stale_tool_rowid,
+            "a supplement-read replaced key keeps its fresh entry — the \
+             carry must not clobber it with the stale prior"
+        );
+        // Exact membership: 3 walked cold keys + carried k003 + carried
+        // composerData + carried (deleted) user bubble + fresh thinking +
+        // fresh tool. A truncation point recorded one key too far would
+        // silently drop the first un-walked entry from this count.
+        assert_eq!(new_state.kv_entries.len(), 8);
+
+        cleanup(&path);
+    }
+
+    /// The supplement's own bound (§3.3 Change 3): one `LIMIT`ed page per
+    /// active composer. `fast_path_max_census_rows` caps the walk against
+    /// pathological keyspaces; an unLIMITed supplement would hand that
+    /// hazard straight back — a single active composer holding more bubbles
+    /// than the cap would be walked whole on every truncated poll.
+    ///
+    /// The fixture size (520) and the expectation (3 + 1 + 512) are
+    /// **hardcoded**, the way
+    /// `the_cursor_state_ceiling_is_denominated_in_reference_entries` pins
+    /// its band: an expectation written in terms of
+    /// `ACTIVE_CENSUS_RANGE_LIMIT` scales with the constant it exists to pin
+    /// and stays green in both directions. The equality pins both sides: the
+    /// bound binds (not the fixture's larger size), and the supplement
+    /// genuinely reaches it.
+    ///
+    /// MUTATION (executed 2026-07-31): halve `ACTIVE_CENSUS_RANGE_LIMIT`
+    /// (512 → 256) — fails (3 + 1 + 256 censused). Raise it past the fixture
+    /// (512 → 1024) — fails (the whole 520-row range is censused; an
+    /// unLIMITed supplement fails identically, since the bound stops
+    /// binding either way). Drop the point-census contribution — fails
+    /// (3 + 0 + 512). Each RED was confirmed in a filtered run, so
+    /// suite-wide isolation is not claimed.
+    #[test]
+    fn an_active_composer_supplement_stops_at_its_page_limit() {
+        let path = unique_db_path("supplement-page-limit");
+        let db = create_kv_db(&path);
+        // The cold composer's keys sort first, so the capped walk truncates
+        // inside its range and the active composer is supplement-only.
+        let cold_composer = "00000000-aaaa-4aaa-8aaa-000000000000";
+        for idx in 0..4 {
+            db.execute(
+                "INSERT INTO cursorDiskKV (key, value) VALUES (?1, ?2)",
+                rusqlite::params![format!("bubbleId:{cold_composer}:k{idx:03}"), "junk-cold"],
+            )
+            .expect("insert cold junk");
+        }
+        put(
+            &db,
+            &format!("composerData:{COMPOSER_ID}"),
+            &composer_value("Oversized active session", 1),
+        );
+        // 520 bubbles: strictly more than the 512-row supplement page, by a
+        // margin no plausible page-size retune lands on.
+        for idx in 0..520 {
+            db.execute(
+                "INSERT INTO cursorDiskKV (key, value) VALUES (?1, ?2)",
+                rusqlite::params![format!("bubbleId:{COMPOSER_ID}:b{idx:06}"), "junk-active"],
+            )
+            .expect("insert active bubble");
+        }
+        drop(db);
+        let db_path = path.to_string_lossy().to_string();
+
+        let mut prior = CursorState::fresh();
+        prior.active_composers = vec![COMPOSER_ID.to_string()];
+
+        let mut config = moraine_config::AppConfig::default();
+        config.ingest.sqlite.fast_path_max_census_rows = 3;
+        let plan = CursorScanPlan::from_config(&config, None);
+        let mut ledger = ScanLedger::default();
+        let ScanOutcome::Scanned { relevant_keys, .. } =
+            scan_database(&db_path, &prior, &plan, &mut ledger)
+        else {
+            panic!("capped scan should succeed");
+        };
+        assert_eq!(
+            relevant_keys,
+            3 + 1 + 512,
+            "the supplement is one point row plus exactly one 512-row range \
+             page per active composer — never the whole range, and never a \
+             scaled page"
+        );
+        assert!(ledger.coverage_degraded);
+
+        cleanup(&path);
+    }
+
+    /// The supplement's `census_covered` dedup filter, at both of its call
+    /// sites (§3.3 Change 3). The other two supplement fixtures place the
+    /// active composer's keys wholly **beyond** the truncation point, so
+    /// dropping the filter is green there — no walked row is ever
+    /// re-materialized. Here the active composer's bubble range *and* its
+    /// `composerData:` row sit inside the walked region (the truncation
+    /// lands past them, in the cold composer's `composerData:` row), so each
+    /// supplement read returns rows the walk already censused: without the
+    /// filter the census holds duplicate rows and each duplicate is a
+    /// duplicate candidate — the same key read and charged twice.
+    ///
+    /// MUTATION (executed 2026-07-31): drop the `!census_covered` filter from
+    /// the supplemental **range** census — fails (4 census rows, 4 payload
+    /// reads: the walked bubble is re-read). Drop it from the **point**
+    /// census — fails the same way at the `composerData:` row. Each RED was
+    /// confirmed in a filtered run, so suite-wide isolation is not claimed.
+    #[test]
+    fn a_supplement_overlapping_the_walked_census_adds_no_duplicates() {
+        let path = unique_db_path("supplement-dedup");
+        let db = create_kv_db(&path);
+        // The active composer sorts first: its bubble and composerData rows
+        // are walked before the cap lands in the cold composer's range.
+        let cold_composer = "zzzzzzzz-9999-4999-8999-999999999999";
+        for composer in [COMPOSER_ID, cold_composer] {
+            db.execute(
+                "INSERT INTO cursorDiskKV (key, value) VALUES (?1, ?2)",
+                rusqlite::params![format!("bubbleId:{composer}:k0"), "junk-bubble"],
+            )
+            .expect("insert bubble junk");
+            db.execute(
+                "INSERT INTO cursorDiskKV (key, value) VALUES (?1, ?2)",
+                rusqlite::params![format!("composerData:{composer}"), "junk-composer"],
+            )
+            .expect("insert composer junk");
+        }
+        drop(db);
+        let db_path = path.to_string_lossy().to_string();
+
+        let mut prior = CursorState::fresh();
+        prior.active_composers = vec![COMPOSER_ID.to_string()];
+
+        // Cap 3: the walk censuses both bubbles and the active composer's
+        // composerData row, then truncates exactly there — the supplement's
+        // point read and range page both land inside the walked region.
+        let mut config = moraine_config::AppConfig::default();
+        config.ingest.sqlite.fast_path_max_census_rows = 3;
+        let plan = CursorScanPlan::from_config(&config, None);
+        let mut ledger = ScanLedger::default();
+        let ScanOutcome::Scanned {
+            relevant_keys,
+            new_state,
+            ..
+        } = scan_database(&db_path, &prior, &plan, &mut ledger)
+        else {
+            panic!("capped scan should succeed");
+        };
+        assert_eq!(
+            relevant_keys, 3,
+            "the supplement must not duplicate census rows the walk covered"
+        );
+        assert_eq!(
+            ledger.payload_rows, 3,
+            "each candidate is read and charged exactly once"
+        );
+        assert_eq!(new_state.kv_entries.len(), 3);
+        assert!(ledger.coverage_degraded);
+        assert!(new_state.pending_coverage);
+
+        cleanup(&path);
+    }
+
+    /// §3.3 Change 3's budget half: within the replaced class, an active
+    /// composer's candidates outrank a fresher rowid from an inactive one.
+    ///
+    /// Fails for: dropping the active-rank term from the candidate sort.
+    #[test]
+    fn active_composers_get_budget_priority_within_their_class() {
+        let path = unique_db_path("active-priority");
+        let db = create_kv_db(&path);
+        let composer_a = "aaaaaaa1-1111-4111-8111-111111111111";
+        let composer_b = "bbbbbbb2-2222-4222-8222-222222222222";
+        let key_a = format!("bubbleId:{composer_a}:k0");
+        let key_b = format!("bubbleId:{composer_b}:k0");
+        for (key, value) in [(&key_a, "junk-a0"), (&key_b, "junk-b0")] {
+            db.execute(
+                "INSERT INTO cursorDiskKV (key, value) VALUES (?1, ?2)",
+                rusqlite::params![key, value],
+            )
+            .expect("insert junk");
+        }
+        let db_path = path.to_string_lossy().to_string();
+        let mut prime = ScanLedger::default();
+        let ScanOutcome::Scanned {
+            new_state: primed, ..
+        } = scan_database(
+            &db_path,
+            &CursorState::fresh(),
+            &default_scan_plan(),
+            &mut prime,
+        )
+        else {
+            panic!("priming scan should succeed");
+        };
+        let mut prior = (*primed).clone();
+        prior.active_composers = vec![composer_b.to_string()];
+
+        // Replace both; the inactive composer's key gets the fresher rowid,
+        // so a plain rowid-DESC order would read it first.
+        for (key, value) in [(&key_b, "junk-b1"), (&key_a, "junk-a1")] {
+            db.execute(
+                "INSERT INTO cursorDiskKV (key, value) VALUES (?1, ?2)",
+                rusqlite::params![key, value],
+            )
+            .expect("replace junk");
+        }
+        drop(db);
+
+        let mut config = moraine_config::AppConfig::default();
+        config.ingest.sqlite.fast_path_max_payload_rows = 1;
+        let plan = CursorScanPlan::from_config(&config, None);
+        let mut ledger = ScanLedger::default();
+        let ScanOutcome::Scanned { new_state, .. } =
+            scan_database(&db_path, &prior, &plan, &mut ledger)
+        else {
+            panic!("budgeted scan should succeed");
+        };
+        let prior_b_rowid = prior.kv_entries.get(&key_b).expect("prior b").rowid;
+        let prior_a_rowid = prior.kv_entries.get(&key_a).expect("prior a").rowid;
+        assert_ne!(
+            new_state.kv_entries.get(&key_b).expect("entry b").rowid,
+            prior_b_rowid,
+            "the active composer's candidate wins the 1-row budget"
+        );
+        assert_eq!(
+            new_state.kv_entries.get(&key_a).expect("entry a").rowid,
+            prior_a_rowid,
+            "the inactive composer's fresher rowid defers"
+        );
+        assert!(new_state.pending_coverage);
+
+        cleanup(&path);
+    }
+
+    /// The active set is a bounded LRU (§3.3 Change 3): fresh census signals
+    /// rank by newest rowid ahead of the carried set, membership is capped at
+    /// `ACTIVE_COMPOSER_CAP`, and re-activity moves a composer to the front
+    /// instead of duplicating it. The cold-census expectation is written
+    /// against literal member lists, so scaling the cap in either direction
+    /// fails here — the cap is a pinned constant, not config (§7.1 D18).
+    ///
+    /// MUTATION (executed 2026-07-31): drop the `truncate` — fails. Rank
+    /// fresh signals oldest-first — fails. Halve or double
+    /// `ACTIVE_COMPOSER_CAP` — fails. Drop the carried-membership dedup —
+    /// fails at the in-set re-activity step (the composer(0) step alone
+    /// cannot see it: that composer had already rotated out). Each RED was
+    /// confirmed in a filtered run, so suite-wide isolation is not claimed.
+    #[test]
+    fn the_active_composer_set_is_bounded_and_lru() {
+        let path = unique_db_path("active-lru");
+        let db = create_kv_db(&path);
+        let composer = |idx: usize| format!("cccccc{idx:02}-0000-4000-8000-000000000000");
+        for idx in 0..10 {
+            db.execute(
+                "INSERT INTO cursorDiskKV (key, value) VALUES (?1, ?2)",
+                rusqlite::params![format!("bubbleId:{}:k0", composer(idx)), "junk"],
+            )
+            .expect("insert junk");
+        }
+        let db_path = path.to_string_lossy().to_string();
+        let mut prime = ScanLedger::default();
+        let ScanOutcome::Scanned {
+            new_state: primed, ..
+        } = scan_database(
+            &db_path,
+            &CursorState::fresh(),
+            &default_scan_plan(),
+            &mut prime,
+        )
+        else {
+            panic!("priming scan should succeed");
+        };
+        let expected: Vec<String> = (2..10).rev().map(composer).collect();
+        assert_eq!(
+            primed.active_composers, expected,
+            "a cold census ranks by newest rowid and caps at {ACTIVE_COMPOSER_CAP}"
+        );
+
+        // Re-activity in the oldest composer moves it to the front and drops
+        // the least-recent member.
+        db.execute(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?1, ?2)",
+            rusqlite::params![format!("bubbleId:{}:k0", composer(0)), "junk-replaced"],
+        )
+        .expect("replace junk");
+        let mut ledger = ScanLedger::default();
+        let ScanOutcome::Scanned { new_state, .. } =
+            scan_database(&db_path, &primed, &default_scan_plan(), &mut ledger)
+        else {
+            panic!("second scan should succeed");
+        };
+        let mut expected: Vec<String> = vec![composer(0)];
+        expected.extend((3..10).rev().map(composer));
+        assert_eq!(new_state.active_composers, expected);
+        assert_eq!(new_state.active_composers.len(), ACTIVE_COMPOSER_CAP);
+
+        // Re-activity in a composer already *in* the set moves it to the
+        // front without duplicating it — the composer(0) step above cannot
+        // see this (composer(0) had already been rotated out), so a carried
+        // set that skips the membership dedup was green until here.
+        db.execute(
+            "INSERT INTO cursorDiskKV (key, value) VALUES (?1, ?2)",
+            rusqlite::params![format!("bubbleId:{}:k0", composer(5)), "junk-replaced-2"],
+        )
+        .expect("replace mid-set junk");
+        drop(db);
+        let mut ledger = ScanLedger::default();
+        let ScanOutcome::Scanned {
+            new_state: reordered,
+            ..
+        } = scan_database(&db_path, &new_state, &default_scan_plan(), &mut ledger)
+        else {
+            panic!("third scan should succeed");
+        };
+        let mut expected: Vec<String> = vec![composer(5), composer(0)];
+        expected.extend((6..10).rev().map(composer));
+        expected.extend([composer(4), composer(3)]);
+        assert_eq!(
+            reordered.active_composers, expected,
+            "an in-set composer moves to the front, unduplicated, and no \
+             member is displaced by the move"
+        );
+
+        cleanup(&path);
     }
 
     #[test]
