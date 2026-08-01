@@ -10,6 +10,8 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 
+pub const BUILD_VERSION: &str = env!("MORAINE_BUILD_VERSION");
+
 pub const KNOWN_INGEST_HARNESSES: &[&str] = &[
     "codex",
     "claude-code",

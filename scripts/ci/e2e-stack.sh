@@ -1576,7 +1576,6 @@ EOF
   assert_clickhouse_count "$clickhouse_url" "Qwen both rewind branches preserved" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'qwen-code' AND (position(text_content, 'Qwen abandoned branch ${run_stamp}') > 0 OR position(text_content, 'Qwen replacement branch answer ${run_stamp}') > 0)" "2"
   assert_clickhouse_count "$clickhouse_url" "Qwen compression is bounded" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'qwen-code' AND item_id = 'qwen-compression-${run_stamp}' AND event_kind = 'summary' AND text_content = '' AND position(payload_json, 'compressedHistory') = 0" "1"
   assert_clickhouse_count "$clickhouse_url" "Qwen malformed timestamp neighbor retained" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'qwen-code' AND item_id = 'qwen-bad-ts-${run_stamp}'" "1"
-  assert_clickhouse_count "$clickhouse_url" "Qwen qualified Moraine mode" "SELECT count() FROM ${clickhouse_database}.mcp_session_directory FINAL WHERE session_id = '${qwen_session_id}' AND mode_hint = 2" "1"
   assert_clickhouse_count "$clickhouse_url" "kiro unique raw rows" "SELECT uniqExact(raw_json_hash) FROM ${clickhouse_database}.raw_events WHERE source_name = 'ci-kiro'" "6"
   assert_clickhouse_count "$clickhouse_url" "kiro event rows" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-kiro'" "8"
   assert_clickhouse_count "$clickhouse_url" "kiro link rows" "SELECT count() FROM ${clickhouse_database}.event_links FINAL WHERE source_name = 'ci-kiro'" "0"

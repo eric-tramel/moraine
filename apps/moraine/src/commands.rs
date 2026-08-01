@@ -21,13 +21,19 @@ use crate::managed_clickhouse::{
     cmd_clickhouse_install, cmd_clickhouse_status, cmd_clickhouse_uninstall,
     run_foreground_clickhouse, run_supervised_clickhouse,
 };
-use crate::paths::{load_cfg, runtime_paths};
-use crate::process::{require_service_binary, service_args_with_defaults};
+use crate::paths::{load_cfg, runtime_paths, RuntimePaths};
+use crate::process::{
+    require_service_binary, service_args_with_defaults, service_running_read_only,
+};
 use crate::render::{
     render_clickhouse_status, render_db_doctor, render_db_migrate, render_logs, state_label,
     CliOutput, MigrationOutcome,
 };
 use crate::service::Service;
+
+pub(super) const CONTENT_AUTHORITY_MIGRATION: &str = "042";
+pub(super) const CONTENT_AUTHORITY_WRITER_SERVICES: [Service; 2] =
+    [Service::Backend, Service::Ingest];
 
 pub(crate) async fn dispatch(cli: Cli, output: CliOutput) -> Result<ExitCode> {
     match cli.command {
@@ -75,7 +81,7 @@ pub(crate) async fn dispatch(cli: Cli, output: CliOutput) -> Result<ExitCode> {
             let (_, cfg) = load_cfg(cli.config.clone())?;
             match args.command {
                 DbCommand::Migrate => {
-                    let outcome = cmd_db_migrate(&cfg).await?;
+                    let outcome = cmd_db_migrate(&cfg, &runtime_paths(&cfg)).await?;
                     render_db_migrate(&output, &outcome)?;
                     Ok(ExitCode::SUCCESS)
                 }
@@ -213,14 +219,46 @@ fn conversation_repository(cfg: &AppConfig) -> Result<ClickHouseConversationRepo
 // while `export` owns a versioned row contract and schema-skew gate. Those paths keep
 // direct ClickHouse access; operational status reads go through ConversationRepository.
 
-pub(super) type DatabaseProgress = MigrationProgress;
+pub(super) fn content_authority_writer_barrier_required(missing_migrations: &[String]) -> bool {
+    missing_migrations
+        .iter()
+        .any(|version| version == CONTENT_AUTHORITY_MIGRATION)
+}
+
+fn ensure_standalone_migration_quiescent_with<F>(
+    missing_migrations: &[String],
+    mut running_pid: F,
+) -> Result<()>
+where
+    F: FnMut(Service) -> Option<u32>,
+{
+    if !content_authority_writer_barrier_required(missing_migrations) {
+        return Ok(());
+    }
+
+    let active = CONTENT_AUTHORITY_WRITER_SERVICES
+        .into_iter()
+        .filter_map(|service| {
+            running_pid(service).map(|pid| format!("{} (pid {pid})", service.name()))
+        })
+        .collect::<Vec<_>>();
+    if !active.is_empty() {
+        bail!(
+            "cannot apply migration 042 while tracked Moraine services are running: {}; \
+             run `moraine down` first so the content cutover snapshot is quiescent",
+            active.join(", ")
+        );
+    }
+
+    Ok(())
+}
 
 async fn migrate_database_with_progress<F>(
     cfg: &AppConfig,
     mut on_progress: F,
 ) -> Result<MigrationOutcome>
 where
-    F: FnMut(DatabaseProgress),
+    F: FnMut(MigrationProgress),
 {
     let ch = ClickHouseClient::new(cfg.clickhouse.clone())?;
     let applied = ch
@@ -236,13 +274,19 @@ pub(super) async fn migrate_database_for_up<F>(
     on_progress: F,
 ) -> Result<MigrationOutcome>
 where
-    F: FnMut(DatabaseProgress),
+    F: FnMut(MigrationProgress),
 {
     migrate_database_with_progress(cfg, on_progress).await
 }
 
-async fn cmd_db_migrate(cfg: &AppConfig) -> Result<MigrationOutcome> {
-    migrate_database_with_progress(cfg, |_| {}).await
+async fn cmd_db_migrate(cfg: &AppConfig, paths: &RuntimePaths) -> Result<MigrationOutcome> {
+    let ch = ClickHouseClient::new(cfg.clickhouse.clone())?;
+    let schema_skew = ch.schema_skew().await?;
+    ensure_standalone_migration_quiescent_with(&schema_skew.missing_on_server, |service| {
+        service_running_read_only(paths, service)
+    })?;
+    let applied = ch.run_migrations().await?;
+    Ok(MigrationOutcome { applied })
 }
 
 async fn cmd_db_doctor(cfg: &AppConfig) -> Result<DoctorReport> {
@@ -387,6 +431,33 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("unsupported config key"));
         assert!(!message.contains(TOKEN_SENTINEL));
+    }
+
+    #[test]
+    fn standalone_migration_requires_quiescence_only_while_042_is_pending() {
+        ensure_standalone_migration_quiescent_with(&["043".to_string()], |_| {
+            panic!("current 042 must not inspect service PIDs")
+        })
+        .expect("043 alone needs no writer barrier");
+
+        let mut inspected = Vec::new();
+        let error = ensure_standalone_migration_quiescent_with(
+            &["042".to_string(), "043".to_string()],
+            |service| {
+                inspected.push(service);
+                match service {
+                    Service::Backend => Some(41),
+                    Service::Ingest => Some(42),
+                    Service::ClickHouse | Service::Mcp => None,
+                }
+            },
+        )
+        .expect_err("live tracked services must block standalone 042");
+
+        assert_eq!(inspected, vec![Service::Backend, Service::Ingest]);
+        assert!(error.to_string().contains("backend (pid 41)"));
+        assert!(error.to_string().contains("ingest (pid 42)"));
+        assert!(error.to_string().contains("moraine down"));
     }
 
     #[tokio::test(flavor = "multi_thread")]

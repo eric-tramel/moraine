@@ -127,7 +127,7 @@ fn backend_router(
 ) -> Result<Arc<BackendRepositoryRouter>> {
     let user_agent = format!(
         "{role}/{} (pid={})",
-        env!("CARGO_PKG_VERSION"),
+        moraine_config::BUILD_VERSION,
         std::process::id()
     );
     Ok(Arc::new(BackendRepositoryRouter::new(

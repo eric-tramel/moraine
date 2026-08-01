@@ -58,18 +58,20 @@ def fixture_database_evidence(recipe: Mapping[str, Any]) -> dict[str, Any]:
         "event_sessions": 17,
         "event_min_uid": "perf-event-00000000",
         "event_max_uid": f"perf-event-{documents - 1:08d}",
-        "documents_count": documents,
-        "documents_fixture_count": documents,
-        "documents_unique_ids": documents,
-        "document_min_uid": "perf-event-00000000",
-        "document_max_uid": f"perf-event-{documents - 1:08d}",
         "posting_documents": documents,
-        "corpus_documents": documents,
-        "projected_sessions": 17,
-        "projected_session_events": documents,
-        "projected_events": documents,
-        "dirty_session_count": 0,
-        "projection_ready_rows": 1,
+        "posting_fixture_documents": documents,
+        "locator_events": documents,
+        "locator_fixture_events": documents,
+        "locator_unique_ids": documents,
+        "locator_sessions": 17,
+        "locator_min_uid": "perf-event-00000000",
+        "locator_max_uid": f"perf-event-{documents - 1:08d}",
+        "navigation_events": documents,
+        "navigation_fixture_events": documents,
+        "navigation_unique_ids": documents,
+        "navigation_sessions": 17,
+        "navigation_min_uid": "perf-event-00000000",
+        "navigation_max_uid": f"perf-event-{documents - 1:08d}",
         "pass": True,
     }
 
@@ -690,18 +692,20 @@ class NativeBurstTests(unittest.TestCase):
                     "event_sessions",
                     "event_min_uid",
                     "event_max_uid",
-                    "documents_count",
-                    "documents_fixture_count",
-                    "documents_unique_ids",
-                    "document_min_uid",
-                    "document_max_uid",
                     "posting_documents",
-                    "corpus_documents",
-                    "projected_sessions",
-                    "projected_session_events",
-                    "projected_events",
-                    "dirty_session_count",
-                    "projection_ready_rows",
+                    "posting_fixture_documents",
+                    "locator_events",
+                    "locator_fixture_events",
+                    "locator_unique_ids",
+                    "locator_sessions",
+                    "locator_min_uid",
+                    "locator_max_uid",
+                    "navigation_events",
+                    "navigation_fixture_events",
+                    "navigation_unique_ids",
+                    "navigation_sessions",
+                    "navigation_min_uid",
+                    "navigation_max_uid",
                 }
             }
             with mock.patch.object(
@@ -712,13 +716,12 @@ class NativeBurstTests(unittest.TestCase):
                 evidence = burst._fixture_database_evidence(selection, recipe)
             self.assertTrue(evidence["pass"])
             fixture_sql = query.call_args_list[-1].args[1]
-            self.assertIn("mcp_open_projection_state", fixture_sql)
-            self.assertIn("mcp_open_dirty_sessions", fixture_sql)
-            self.assertIn("INNER JOIN `moraine_native_test`.mcp_open_sessions", fixture_sql)
-            self.assertNotIn(
-                "ANY INNER JOIN `moraine_native_test`.mcp_open_sessions",
-                fixture_sql,
-            )
+            self.assertIn("`moraine_native_test`.events FINAL", fixture_sql)
+            self.assertIn("`moraine_native_test`.search_postings FINAL", fixture_sql)
+            self.assertIn("`moraine_native_test`.mcp_event_locator FINAL", fixture_sql)
+            self.assertIn("`moraine_native_test`.mcp_event_navigation FINAL", fixture_sql)
+            self.assertNotIn("search_documents", fixture_sql)
+            self.assertNotIn("mcp_open_", fixture_sql)
 
             route.joinpath(".moraine.toml").write_text(
                 'backend = "team"\n', encoding="utf-8"
@@ -726,7 +729,7 @@ class NativeBurstTests(unittest.TestCase):
             with self.assertRaisesRegex(burst.NativeBurstFailure, "non-default backend"):
                 burst._resolve_backend_selection(config, route)
 
-            row["projected_events"] -= 1
+            row["navigation_events"] -= 1
             with mock.patch.object(
                 burst,
                 "_clickhouse_query",

@@ -885,7 +885,7 @@ async fn emit_heartbeat(clickhouse: &ClickHouseClient, metrics: &Arc<Metrics>, r
 
     let mut heartbeat = json!({
         "host": host_name(),
-        "service_version": env!("CARGO_PKG_VERSION"),
+        "service_version": moraine_config::BUILD_VERSION,
         "queue_depth": metrics.queue_depth.load(Ordering::Relaxed),
         "files_active": files_active,
         "files_watched": files_watched,
@@ -939,7 +939,6 @@ async fn flush_pending(
     raw_rows: &mut Vec<Value>,
     event_rows: &mut Vec<Value>,
     link_rows: &mut Vec<Value>,
-    _tool_rows: &mut Vec<Value>,
     error_rows: &mut Vec<Value>,
     checkpoint_updates: &mut HashMap<String, Checkpoint>,
     checkpoint_cursor_columns: bool,
@@ -1692,7 +1691,6 @@ mod tests {
         })];
         let mut event_rows = vec![json!({"event_uid": "evt-1"})];
         let mut link_rows = Vec::<Value>::new();
-        let mut tool_rows = Vec::<Value>::new();
         let mut error_rows = Vec::<Value>::new();
         let mut checkpoint_updates = HashMap::new();
         let checkpoint = sample_checkpoint();
@@ -1708,7 +1706,6 @@ mod tests {
             &mut raw_rows,
             &mut event_rows,
             &mut link_rows,
-            &mut tool_rows,
             &mut error_rows,
             &mut checkpoint_updates,
             true,
@@ -1739,7 +1736,6 @@ mod tests {
             &mut raw_rows,
             &mut event_rows,
             &mut link_rows,
-            &mut tool_rows,
             &mut error_rows,
             &mut checkpoint_updates,
             true,
@@ -1800,7 +1796,6 @@ mod tests {
         })];
         let mut event_rows = vec![json!({"event_uid": "evt-fallback"})];
         let mut link_rows = Vec::<Value>::new();
-        let mut tool_rows = Vec::<Value>::new();
         let mut error_rows = Vec::<Value>::new();
 
         assert!(
@@ -1811,7 +1806,6 @@ mod tests {
                 &mut raw_rows,
                 &mut event_rows,
                 &mut link_rows,
-                &mut tool_rows,
                 &mut error_rows,
                 &mut checkpoint_updates,
                 true,
@@ -1912,7 +1906,6 @@ mod tests {
         })];
         let mut event_rows = vec![json!({"event_uid": "evt-error-record-fails"})];
         let mut link_rows = Vec::<Value>::new();
-        let mut tool_rows = Vec::<Value>::new();
         let mut error_rows = Vec::<Value>::new();
 
         assert!(
@@ -1923,7 +1916,6 @@ mod tests {
                 &mut raw_rows,
                 &mut event_rows,
                 &mut link_rows,
-                &mut tool_rows,
                 &mut error_rows,
                 &mut checkpoint_updates,
                 true,
@@ -1977,7 +1969,6 @@ mod tests {
             "source_offset": 4096u64,
         })];
         let mut link_rows = Vec::<Value>::new();
-        let mut tool_rows = Vec::<Value>::new();
         let mut error_rows = Vec::<Value>::new();
 
         assert!(
@@ -1988,7 +1979,6 @@ mod tests {
                 &mut raw_rows,
                 &mut event_rows,
                 &mut link_rows,
-                &mut tool_rows,
                 &mut error_rows,
                 &mut checkpoint_updates,
                 true,
@@ -2066,7 +2056,6 @@ mod tests {
         ];
         let mut event_rows = Vec::<Value>::new();
         let mut link_rows = Vec::<Value>::new();
-        let mut tool_rows = Vec::<Value>::new();
         let mut error_rows = Vec::<Value>::new();
 
         assert!(
@@ -2077,7 +2066,6 @@ mod tests {
                 &mut raw_rows,
                 &mut event_rows,
                 &mut link_rows,
-                &mut tool_rows,
                 &mut error_rows,
                 &mut checkpoint_updates,
                 true,
@@ -2137,7 +2125,6 @@ mod tests {
         })];
         let mut event_rows = vec![json!({"event_uid": "evt-retry"})];
         let mut link_rows = Vec::<Value>::new();
-        let mut tool_rows = Vec::<Value>::new();
         let mut error_rows = Vec::<Value>::new();
 
         assert!(
@@ -2148,7 +2135,6 @@ mod tests {
                 &mut raw_rows,
                 &mut event_rows,
                 &mut link_rows,
-                &mut tool_rows,
                 &mut error_rows,
                 &mut checkpoint_updates,
                 true,
@@ -2200,7 +2186,6 @@ mod tests {
         })];
         let mut event_rows = Vec::<Value>::new();
         let mut link_rows = Vec::<Value>::new();
-        let mut tool_rows = Vec::<Value>::new();
         let mut error_rows = Vec::<Value>::new();
 
         assert!(
@@ -2211,7 +2196,6 @@ mod tests {
                 &mut raw_rows,
                 &mut event_rows,
                 &mut link_rows,
-                &mut tool_rows,
                 &mut error_rows,
                 &mut checkpoint_updates,
                 true,
@@ -2369,7 +2353,6 @@ mod tests {
         let mut raw_rows = Vec::<Value>::new();
         let mut event_rows = Vec::<Value>::new();
         let mut link_rows = Vec::<Value>::new();
-        let mut tool_rows = Vec::<Value>::new();
         let mut error_rows = Vec::<Value>::new();
 
         let ahead = sample_checkpoint(); // offset 100
@@ -2388,7 +2371,6 @@ mod tests {
                     &mut raw_rows,
                     &mut event_rows,
                     &mut link_rows,
-                    &mut tool_rows,
                     &mut error_rows,
                     &mut checkpoint_updates,
                     true,

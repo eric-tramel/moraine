@@ -111,7 +111,7 @@ impl ClickHouseClient {
     pub fn new(cfg: ClickHouseConfig) -> Result<Self> {
         let user_agent = format!(
             "{DEFAULT_USER_AGENT_ROLE}/{} (pid={})",
-            env!("CARGO_PKG_VERSION"),
+            moraine_config::BUILD_VERSION,
             std::process::id()
         );
         Self::new_with_user_agent(cfg, user_agent)
@@ -656,7 +656,6 @@ impl ClickHouseClient {
             "raw_events",
             "events",
             "event_links",
-            "mcp_session_directory",
             "ingest_errors",
             "ingest_checkpoints",
             "ingest_heartbeats",
@@ -898,11 +897,26 @@ pub fn bundled_migrations() -> Vec<Migration> {
             sql: include_str!("../../../sql/030_refresh_omp_session_metadata.sql"),
         },
         Migration {
-            version: "031",
-            name: "031_events_content_authority.sql",
-            sql: include_str!("../../../sql/031_events_content_authority.sql"),
+            version: "042",
+            name: "042_events_content_authority.sql",
+            sql: include_str!("../../../sql/042_events_content_authority.sql"),
+        },
+        Migration {
+            version: "043",
+            name: "043_drop_frozen_tool_io.sql",
+            sql: include_str!("../../../sql/043_drop_frozen_tool_io.sql"),
         },
     ]
+}
+
+// Development briefly shipped 031 for the migration now bundled as 042.
+// Ignore only that exact ledger collision, and only when its replacement is known.
+const SUPERSEDED_DEVELOPMENT_MIGRATIONS: &[(&str, &str)] = &[("031", "042")];
+
+fn is_compatible_superseded_version(version: &str, bundled: &BTreeSet<&str>) -> bool {
+    SUPERSEDED_DEVELOPMENT_MIGRATIONS
+        .iter()
+        .any(|(superseded, replacement)| version == *superseded && bundled.contains(replacement))
 }
 
 /// Pure comparison of two migration-version lists; the basis of
@@ -921,6 +935,7 @@ pub fn compute_schema_skew<B: AsRef<str>, S: AsRef<str>>(
             .collect(),
         unknown_on_server: server
             .difference(&bundled)
+            .filter(|version| !is_compatible_superseded_version(version, &bundled))
             .map(|v| (*v).to_string())
             .collect(),
     }
@@ -1606,6 +1621,118 @@ mod tests {
     }
 
     #[test]
+    fn migration_042_freezes_and_replays_the_legacy_tool_source_safely() {
+        let migration = bundled_migrations()
+            .into_iter()
+            .find(|migration| migration.version == "042")
+            .expect("migration 042 must be registered");
+        let sql = materialize_migration_sql(migration.sql, "other_db")
+            .expect("materialize migration 042");
+        let statements = split_sql_statements(&sql);
+        let position = |needle: &str| {
+            statements
+                .iter()
+                .position(|statement| statement.contains(needle))
+                .unwrap_or_else(|| panic!("migration 042 must contain {needle}"))
+        };
+
+        let frozen = position(
+            "CREATE TABLE IF NOT EXISTS other_db.tool_io_events_content_authority_042_frozen",
+        );
+        let staging = position(
+            "CREATE TABLE IF NOT EXISTS other_db.tool_io\nAS other_db.tool_io_events_content_authority_042_frozen",
+        );
+        let exchange = position(
+            "EXCHANGE TABLES other_db.tool_io\nAND other_db.tool_io_events_content_authority_042_frozen",
+        );
+        let fold =
+            position("SELECT * FROM other_db.tool_io_events_content_authority_042_frozen FINAL");
+        let drop_staging = position("DROP TABLE IF EXISTS other_db.tool_io");
+        let truncate = position(
+            "TRUNCATE TABLE IF EXISTS other_db.tool_io_events_content_authority_042_frozen",
+        );
+
+        assert!(
+            frozen < staging
+                && staging < exchange
+                && exchange < fold
+                && fold < drop_staging
+                && drop_staging < truncate
+        );
+        assert!(sql.contains("UNION ALL\n    SELECT * FROM other_db.tool_io FINAL"));
+        assert!(sql.contains("WHERE NOT JSONHas(e.payload_json, 'moraine_tool_io')"));
+        assert!(!sql.contains("RENAME TABLE IF EXISTS"));
+        assert!(!sql
+            .contains("DROP TABLE IF EXISTS other_db.tool_io_events_content_authority_042_frozen"));
+        assert!(sql.contains("DROP TABLE IF EXISTS other_db.mcp_session_directory"));
+        assert!(!sql.contains("CREATE TABLE IF NOT EXISTS other_db.mcp_session_directory"));
+        assert!(!sql.contains("INSERT INTO other_db.mcp_session_directory"));
+        assert!(!sql
+            .contains("CREATE MATERIALIZED VIEW IF NOT EXISTS other_db.mv_mcp_session_directory"));
+        assert!(!sql.contains("AggregatingMergeTree"));
+    }
+
+    #[test]
+    fn migration_042_uses_the_same_narrow_path_projection_for_live_and_backfill() {
+        let migration = bundled_migrations()
+            .into_iter()
+            .find(|migration| migration.version == "042")
+            .expect("migration 042 must be registered");
+        let sql = materialize_migration_sql(migration.sql, "other_db")
+            .expect("materialize migration 042");
+        let statements = split_sql_statements(&sql);
+        let live = statements
+            .iter()
+            .find(|statement| {
+                statement.contains("CREATE MATERIALIZED VIEW IF NOT EXISTS other_db.mv_mcp_event_locator_from_events")
+            })
+            .expect("live locator projection");
+        let backfill = statements
+            .iter()
+            .find(|statement| statement.starts_with("INSERT INTO other_db.mcp_event_locator"))
+            .expect("locator backfill");
+        fn path_expression(statement: &str) -> &str {
+            let start = statement
+                .find("arrayFilter(path ->")
+                .expect("path expression start");
+            let remainder = &statement[start..];
+            let end = remainder.find("\n  toUInt8(").expect("path expression end");
+            let expression = remainder[..end].trim_end_matches(',');
+            expression
+                .strip_suffix(" AS path_tokens")
+                .unwrap_or(expression)
+        }
+
+        let live_path_expression = path_expression(live);
+        let backfill_path_expression = path_expression(backfill);
+        assert_eq!(live_path_expression, backfill_path_expression);
+        assert!(live_path_expression.contains("file_path|notebook_path|path|target_file"));
+        assert!(live_path_expression.contains("JSONExtractString(tool_input, 'command')"));
+        assert!(live_path_expression.contains("JSONExtractString(tool_input, 'cmd')"));
+        assert_eq!(live_path_expression.matches("extractAll(").count(), 2);
+        assert!(!live_path_expression.contains("[A-Za-z0-9_./-]+"));
+        assert!(!live_path_expression.contains("\n      '\"((?:[^\""));
+    }
+
+    #[test]
+    fn migration_043_only_drops_the_empty_frozen_tool_source() {
+        let migration = bundled_migrations()
+            .into_iter()
+            .find(|migration| migration.version == "043")
+            .expect("migration 043 must be registered");
+        let sql = materialize_migration_sql(migration.sql, "other_db")
+            .expect("materialize migration 043");
+
+        assert_eq!(
+            split_sql_statements(&sql),
+            vec![
+                "DROP TABLE IF EXISTS other_db.tool_io_events_content_authority_042_frozen"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
     fn migration_020_purges_every_session_keyed_table() {
         let migration = bundled_migrations()
             .into_iter()
@@ -1776,6 +1903,73 @@ mod tests {
     }
 
     #[test]
+    fn schema_skew_accepts_superseded_031_with_current_bundle() {
+        let bundled: Vec<&str> = bundled_migrations()
+            .iter()
+            .map(|migration| migration.version)
+            .collect();
+        let mut server: Vec<String> = bundled
+            .iter()
+            .map(|version| (*version).to_string())
+            .collect();
+        server.push("031".to_string());
+
+        let skew = compute_schema_skew(&bundled, &server);
+
+        assert_eq!(skew, SchemaSkew::default());
+        assert!(enforce_remote_schema_policy("team-ch", &skew, false).is_ok());
+    }
+
+    #[test]
+    fn schema_skew_does_not_ignore_031_without_its_bundled_replacement() {
+        let skew = compute_schema_skew(&["001"], &["001".to_string(), "031".to_string()]);
+
+        assert!(skew.missing_on_server.is_empty());
+        assert_eq!(skew.unknown_on_server, vec!["031"]);
+    }
+
+    #[test]
+    fn schema_skew_rejects_unrelated_unknown_version_with_current_bundle() {
+        let bundled: Vec<&str> = bundled_migrations()
+            .iter()
+            .map(|migration| migration.version)
+            .collect();
+        let mut server: Vec<String> = bundled
+            .iter()
+            .map(|version| (*version).to_string())
+            .collect();
+        server.extend(["031".to_string(), "999".to_string()]);
+
+        let skew = compute_schema_skew(&bundled, &server);
+
+        assert!(skew.missing_on_server.is_empty());
+        assert_eq!(skew.unknown_on_server, vec!["999"]);
+        assert!(enforce_remote_schema_policy("team-ch", &skew, false).is_err());
+    }
+
+    #[test]
+    fn schema_skew_reports_missing_current_versions_despite_superseded_031() {
+        let bundled: Vec<&str> = bundled_migrations()
+            .iter()
+            .map(|migration| migration.version)
+            .collect();
+        let mut server: Vec<String> = bundled
+            .iter()
+            .filter(|version| !matches!(**version, "042" | "043"))
+            .map(|version| (*version).to_string())
+            .collect();
+        server.push("031".to_string());
+
+        let skew = compute_schema_skew(&bundled, &server);
+
+        assert_eq!(skew.missing_on_server, vec!["042", "043"]);
+        assert!(skew.unknown_on_server.is_empty());
+        let error = enforce_remote_schema_policy("team-ch", &skew, false)
+            .expect_err("missing current migrations must remain behind");
+        assert!(error.to_string().contains("042, 043"));
+    }
+
+    #[test]
     fn schema_skew_reports_divergence_in_both_directions() {
         let skew = compute_schema_skew(
             &["001", "002"],
@@ -1896,7 +2090,7 @@ mod tests {
 
         let expected = format!(
             "{DEFAULT_USER_AGENT_ROLE}/{} (pid={})",
-            env!("CARGO_PKG_VERSION"),
+            moraine_config::BUILD_VERSION,
             std::process::id()
         );
         assert_eq!(
@@ -2213,13 +2407,26 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn migration_progress_applies_latest_after_ledger_write() {
+    async fn migration_progress_applies_042_and_043_after_superseded_031() {
         let bundled = bundled_migrations();
-        let latest = bundled.last().expect("latest migration").clone();
-        let applied = bundled[..bundled.len() - 1]
+        let pending = bundled
             .iter()
+            .filter(|migration| matches!(migration.version, "042" | "043"))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pending
+                .iter()
+                .map(|migration| migration.version)
+                .collect::<Vec<_>>(),
+            vec!["042", "043"]
+        );
+        let mut applied = bundled
+            .iter()
+            .filter(|migration| !matches!(migration.version, "042" | "043"))
             .map(|migration| migration.version.to_string())
             .collect::<Vec<_>>();
+        applied.push("031".to_string());
         let queries = Arc::new(Mutex::new(Vec::new()));
         let base_url = spawn_migration_mock_server(MigrationMockState {
             applied: Arc::new(applied),
@@ -2233,38 +2440,53 @@ mod tests {
         let executed = client
             .run_migrations_with_progress(|event| events.push(event))
             .await
-            .expect("apply latest migration");
+            .expect("apply migrations 042 and 043");
 
-        assert_eq!(executed, vec![latest.version.to_string()]);
+        assert_eq!(executed, vec!["042", "043"]);
         assert_eq!(
             events,
             vec![
                 MigrationProgress::Plan {
-                    applied: bundled.len() - 1,
-                    pending: 1,
+                    applied: bundled.len() - 2,
+                    pending: 2,
                 },
                 MigrationProgress::Started {
                     index: 1,
-                    total: 1,
-                    version: latest.version,
-                    name: latest.name,
+                    total: 2,
+                    version: pending[0].version,
+                    name: pending[0].name,
                 },
                 MigrationProgress::Applied {
                     index: 1,
-                    total: 1,
-                    version: latest.version,
-                    name: latest.name,
+                    total: 2,
+                    version: pending[0].version,
+                    name: pending[0].name,
+                },
+                MigrationProgress::Started {
+                    index: 2,
+                    total: 2,
+                    version: pending[1].version,
+                    name: pending[1].name,
+                },
+                MigrationProgress::Applied {
+                    index: 2,
+                    total: 2,
+                    version: pending[1].version,
+                    name: pending[1].name,
                 },
             ]
         );
         let queries = queries.lock().expect("migration query mutex poisoned");
-        let ledger_index = queries
+        let ledger_indices = queries
             .iter()
-            .position(|query| {
-                query.starts_with("INSERT INTO") && query.contains("schema_migrations")
+            .enumerate()
+            .filter_map(|(index, query)| {
+                (query.starts_with("INSERT INTO") && query.contains("schema_migrations"))
+                    .then_some(index)
             })
-            .expect("ledger insert query");
-        assert_eq!(ledger_index, queries.len() - 1);
+            .collect::<Vec<_>>();
+        assert_eq!(ledger_indices.len(), 2);
+        assert_eq!(ledger_indices.last().copied(), Some(queries.len() - 1));
     }
 
     #[tokio::test(flavor = "multi_thread")]

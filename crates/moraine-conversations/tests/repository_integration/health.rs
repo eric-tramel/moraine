@@ -148,7 +148,6 @@ async fn diagnostics_maps_doctor_partial_report_and_ping_short_circuit() {
     assert_eq!(
         diagnostics.missing_tables,
         vec![
-            "mcp_session_directory",
             "ingest_errors",
             "mcp_event_locator",
             "mcp_event_navigation",

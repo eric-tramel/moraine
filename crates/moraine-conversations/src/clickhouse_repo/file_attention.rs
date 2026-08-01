@@ -277,7 +277,11 @@ WHERE (session_id, event_uid) IN (
       e.cwd AS cwd
     FROM (
       SELECT * FROM {events} FINAL
-      WHERE (session_id, event_uid) IN (SELECT session_id, event_uid FROM matched_ids)
+      WHERE (session_id, event_uid) IN (
+        SELECT session_id, event_uid
+        FROM {locator} FINAL
+        WHERE {exact_candidate_predicate}
+      )
     ) AS e
     ANY INNER JOIN matched_ids AS mi
       ON mi.session_id = e.session_id AND mi.event_uid = e.event_uid

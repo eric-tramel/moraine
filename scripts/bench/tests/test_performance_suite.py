@@ -298,6 +298,31 @@ class EvidenceTests(unittest.TestCase):
 
 
 class LifecycleTests(unittest.TestCase):
+    def test_seed_proves_post_cutover_index_cardinality(self) -> None:
+        recipe = build_recipe("smoke")
+        expected = str(recipe["corpus"]["document_count"])
+        sandbox = mock.Mock(clickhouse_port=48123, sandbox_id="sb-123456")
+        with mock.patch.object(
+            suite,
+            "_clickhouse_query",
+            side_effect=["0", "0", "0", "0", "", expected, expected, expected, expected],
+        ) as query:
+            suite._seed_owned_sandbox(sandbox, recipe)
+
+        sql = [call.args[1] for call in query.call_args_list]
+        self.assertIn("moraine.events FINAL", sql[0])
+        self.assertIn("moraine.search_postings FINAL", sql[1])
+        self.assertIn("moraine.mcp_event_locator FINAL", sql[2])
+        self.assertIn("moraine.mcp_event_navigation FINAL", sql[3])
+        self.assertTrue(sql[4].startswith("INSERT INTO moraine.events"))
+        self.assertIn("moraine.events FINAL", sql[5])
+        self.assertIn("moraine.search_postings FINAL", sql[6])
+        self.assertIn("moraine.mcp_event_locator FINAL", sql[7])
+        self.assertIn("moraine.mcp_event_navigation FINAL", sql[8])
+        self.assertNotIn("search_documents", "\n".join(sql))
+        self.assertNotIn("mcp_open_", "\n".join(sql))
+        sandbox.checkpoint.assert_called_once_with("seeded")
+
     def test_setup_failure_reports_each_owned_cleanup_failure(self) -> None:
         envelope = mock.Mock()
         envelope.owned_id = "perf-0123456789abcdef"

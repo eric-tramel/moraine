@@ -1,10 +1,5 @@
 use super::*;
 
-pub(super) const CONVERSATION_CANDIDATE_MIN: usize = 512;
-pub(super) const CONVERSATION_CANDIDATE_MULTIPLIER: usize = 80;
-pub(super) const CONVERSATION_CANDIDATE_MAX: usize = 20_000;
-pub(super) const CONVERSATION_RECENT_WINDOW_MS: i64 = 45_000;
-pub(super) const CONVERSATION_RECENT_CANDIDATE_LIMIT: usize = 1024;
 pub(super) const MCP_SEARCH_MAX_CANDIDATE_PAGES: u16 = 16;
 pub(super) const CODEX_FINAL_ANSWER_MIRROR_MAX_TIMESTAMP_DELTA_MS: u64 = 10;
 
@@ -252,7 +247,6 @@ FORMAT JSONEachRow",
         include_tool_events: bool,
         event_kinds: Option<&[SearchEventKind]>,
         exclude_codex_mcp: bool,
-        _locator_has_codex_flag: bool,
         session_id: Option<&str>,
         session_ids: Option<&[String]>,
         min_should_match: u16,
@@ -697,7 +691,6 @@ FORMAT JSONEachRow"
     pub(super) fn build_search_events_hydrate_sql(
         &self,
         event_uids: &[String],
-        _locator_has_codex_flag: bool,
     ) -> RepoResult<String> {
         if event_uids.is_empty() {
             return Err(RepoError::invalid_argument(
@@ -725,7 +718,6 @@ FORMAT JSONEachRow"
     argMax(e.tool_name, e.event_version) AS name,
     argMax(if(notEmpty(e.tool_phase), e.tool_phase, e.op_status), e.event_version) AS phase,
     argMax(e.source_ref, e.event_version) AS source_ref,
-    argMax(toUInt32(length(extractAll(lowerUTF8(concat(e.text_content, ' ', e.payload_json)), '[a-z0-9_]+'))), e.event_version) AS doc_len,
     argMax(leftUTF8(e.text_content, {preview}), e.event_version) AS text_preview,
     argMax(leftUTF8(e.text_content, {text_limit}), e.event_version) AS text_content,
     argMax(leftUTF8(e.payload_json, {payload_limit}), e.event_version) AS payload_json
@@ -736,16 +728,12 @@ FORMAT JSONEachRow"
 SELECT
   h.event_uid, h.session_id, h.event_time, h.source_name, h.harness,
   h.inference_provider, h.event_class, h.payload_type, h.actor_role, h.name,
-  h.phase, h.source_ref, h.doc_len, h.text_preview, h.text_content,
+  h.phase, h.source_ref, toUInt32(l.doc_len) AS doc_len, h.text_preview, h.text_content,
   h.payload_json, toUInt8(l.has_codex_mcp) AS has_codex_mcp
 FROM hydrated AS h
 ANY INNER JOIN {locator} AS l FINAL ON l.event_uid = h.event_uid
 FORMAT JSONEachRow"
         ))
-    }
-
-    pub(super) async fn locator_has_codex_flag(&self) -> RepoResult<bool> {
-        Ok(true)
     }
 
     pub(super) fn passes_search_doc_filters(
@@ -1028,7 +1016,6 @@ FORMAT JSONEachRow",
     pub(super) async fn load_search_doc_extras(
         &self,
         event_uids: &[String],
-        locator_has_codex_flag: bool,
     ) -> RepoResult<HashMap<String, SearchDocExtraCacheEntry>> {
         let now = Instant::now();
         let mut by_uid = HashMap::<String, SearchDocExtraCacheEntry>::new();
@@ -1048,8 +1035,7 @@ FORMAT JSONEachRow",
         }
 
         if !missing_uids.is_empty() {
-            let query =
-                self.build_search_events_hydrate_sql(&missing_uids, locator_has_codex_flag)?;
+            let query = self.build_search_events_hydrate_sql(&missing_uids)?;
             let fetched_rows: Vec<SearchDocExtraRow> =
                 self.map_backend(self.query_rows(&query, None).await)?;
 
@@ -1168,7 +1154,6 @@ FORMAT JSONEachRow",
             idf_by_term.insert(term.clone(), Self::bm25_idf(docs, df));
         }
 
-        let locator_has_codex_flag = self.locator_has_codex_flag().await?;
         let fallback_sql = self.build_search_events_sql(
             terms,
             &idf_by_term,
@@ -1176,7 +1161,6 @@ FORMAT JSONEachRow",
             include_tool_events,
             event_kinds,
             exclude_codex_mcp,
-            locator_has_codex_flag,
             session_id,
             session_ids,
             min_should_match,
@@ -1599,7 +1583,6 @@ FORMAT JSONEachRow",
         }
 
         let postings_by_term = self.load_term_postings_for_terms(terms).await?;
-        let locator_has_codex_flag = self.locator_has_codex_flag().await?;
         let k1 = self.cfg.bm25_k1.max(0.01);
         let b = self.cfg.bm25_b.clamp(0.0, 1.0);
         let mut idf_by_term = HashMap::<&str, f64>::new();
@@ -1675,9 +1658,7 @@ FORMAT JSONEachRow",
                 .iter()
                 .map(|row| row.row.event_uid.clone())
                 .collect();
-            let doc_extras = self
-                .load_search_doc_extras(&event_uids, locator_has_codex_flag)
-                .await?;
+            let doc_extras = self.load_search_doc_extras(&event_uids).await?;
 
             for row in &fast_candidates[offset..end] {
                 let Some(extra) = doc_extras.get(row.row.event_uid.as_str()) else {
@@ -1725,19 +1706,6 @@ FORMAT JSONEachRow",
         Ok((fast_rows, candidate_count))
     }
 
-    pub(super) fn conversation_candidate_limit(limit: u16) -> usize {
-        (limit as usize)
-            .saturating_mul(CONVERSATION_CANDIDATE_MULTIPLIER)
-            .clamp(CONVERSATION_CANDIDATE_MIN, CONVERSATION_CANDIDATE_MAX)
-    }
-
-    pub(super) fn now_unix_ms() -> i64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or_default()
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub(super) fn build_conversation_postings_filter_sql(
         &self,
@@ -1746,8 +1714,6 @@ FORMAT JSONEachRow",
         exclude_codex_mcp: bool,
         from_unix_ms: Option<i64>,
         to_unix_ms: Option<i64>,
-        recent_from_unix_ms: Option<i64>,
-        candidate_session_ids: Option<&[String]>,
     ) -> (String, String, String) {
         let terms_array_sql = sql_array_strings(terms);
         let mut postings_filters = vec![format!("p.term IN {}", terms_array_sql)];
@@ -1761,11 +1727,6 @@ FORMAT JSONEachRow",
         if let Some(to_unix_ms) = to_unix_ms {
             document_filters.push(format!(
                 "toUnixTimestamp64Milli(d.ingested_at) < {to_unix_ms}"
-            ));
-        }
-        if let Some(recent_from_unix_ms) = recent_from_unix_ms {
-            document_filters.push(format!(
-                "toUnixTimestamp64Milli(d.ingested_at) >= {recent_from_unix_ms}"
             ));
         }
 
@@ -1788,15 +1749,6 @@ FORMAT JSONEachRow",
             ));
         }
 
-        if let Some(candidate_session_ids) = candidate_session_ids {
-            if !candidate_session_ids.is_empty() {
-                postings_filters.push(format!(
-                    "p.session_id IN {}",
-                    sql_array_strings(candidate_session_ids)
-                ));
-            }
-        }
-
         let prewhere_sql = postings_filters.join("\n      AND ");
         let where_sql = if document_filters.is_empty() {
             String::new()
@@ -1813,280 +1765,6 @@ FORMAT JSONEachRow",
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn build_search_conversation_candidates_sql(
-        &self,
-        terms: &[String],
-        idf_by_term: &HashMap<String, f64>,
-        include_tool_events: bool,
-        exclude_codex_mcp: bool,
-        min_should_match: u16,
-        limit: usize,
-        from_unix_ms: Option<i64>,
-        to_unix_ms: Option<i64>,
-        mode: Option<ConversationMode>,
-    ) -> RepoResult<String> {
-        if terms.is_empty() {
-            return Err(RepoError::invalid_argument(
-                "cannot build candidate query with empty terms",
-            ));
-        }
-
-        let postings_table = self.table_ref("search_postings");
-        let conversation_terms_table = self.table_ref("search_conversation_terms");
-        let terms_array_sql = sql_array_strings(terms);
-        let idf_vals: Vec<f64> = terms
-            .iter()
-            .map(|t| *idf_by_term.get(t).unwrap_or(&0.0))
-            .collect();
-        let idf_array_sql = sql_array_f64(&idf_vals);
-        let (docs_join_sql, prewhere_sql, where_sql) = self.build_conversation_postings_filter_sql(
-            terms,
-            include_tool_events,
-            exclude_codex_mcp,
-            from_unix_ms,
-            to_unix_ms,
-            None,
-            None,
-        );
-
-        let (mode_join_sql, mode_filter_sql) = if let Some(selected_mode) = mode {
-            let mode_subquery = self.mode_subquery();
-            let mode_filter_sql = Self::mode_filter_clause(Some(selected_mode))
-                .map(|clause| format!("AND {clause}"))
-                .unwrap_or_default();
-            (
-                format!("ANY LEFT JOIN ({mode_subquery}) AS m ON m.session_id = c.session_id"),
-                mode_filter_sql,
-            )
-        } else {
-            (String::new(), String::new())
-        };
-
-        Ok(format!(
-            "WITH
-  {terms_array_sql} AS q_terms,
-  {idf_array_sql} AS q_idf
-SELECT
-  c.session_id AS session_id,
-  c.score AS score,
-  toUInt16(c.matched_terms) AS matched_terms
-FROM (
-  SELECT
-    ct.session_id,
-    sum(transform(ct.term, q_terms, q_idf, 0.0) * log1p(toFloat64(ct.tf_sum))) AS score,
-    toUInt16(countDistinct(ct.term)) AS matched_terms
-  FROM {conversation_terms_table} AS ct
-  ANY INNER JOIN (
-    SELECT DISTINCT p.session_id
-    FROM {postings_table} AS p
-    {docs_join_sql}
-    PREWHERE {prewhere_sql}
-    {where_sql}
-  ) AS eligible ON eligible.session_id = ct.session_id
-  WHERE ct.term IN {terms_array_sql}
-  GROUP BY ct.session_id
-) AS c
-{mode_join_sql}
-WHERE c.matched_terms >= {min_should_match}
-  {mode_filter_sql}
-ORDER BY c.score DESC, c.session_id ASC
-LIMIT {limit}
-FORMAT JSONEachRow",
-            conversation_terms_table = conversation_terms_table,
-            postings_table = postings_table,
-            docs_join_sql = docs_join_sql,
-            prewhere_sql = prewhere_sql,
-            where_sql = where_sql,
-            mode_join_sql = mode_join_sql,
-            mode_filter_sql = mode_filter_sql,
-            min_should_match = min_should_match,
-            limit = limit,
-        ))
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn build_search_conversation_recent_candidates_sql(
-        &self,
-        terms: &[String],
-        idf_by_term: &HashMap<String, f64>,
-        include_tool_events: bool,
-        exclude_codex_mcp: bool,
-        min_should_match: u16,
-        limit: usize,
-        from_unix_ms: Option<i64>,
-        to_unix_ms: Option<i64>,
-        mode: Option<ConversationMode>,
-    ) -> RepoResult<String> {
-        if terms.is_empty() {
-            return Err(RepoError::invalid_argument(
-                "cannot build recent candidate query with empty terms",
-            ));
-        }
-
-        let postings_table = self.table_ref("search_postings");
-        let terms_array_sql = sql_array_strings(terms);
-        let idf_vals: Vec<f64> = terms
-            .iter()
-            .map(|t| *idf_by_term.get(t).unwrap_or(&0.0))
-            .collect();
-        let idf_array_sql = sql_array_f64(&idf_vals);
-        let now_unix_ms = Self::now_unix_ms();
-        let recent_floor = now_unix_ms.saturating_sub(CONVERSATION_RECENT_WINDOW_MS);
-        let recent_from_unix_ms = match from_unix_ms {
-            Some(from) => from.max(recent_floor),
-            None => recent_floor,
-        };
-        let (docs_join_sql, prewhere_sql, where_sql) = self.build_conversation_postings_filter_sql(
-            terms,
-            include_tool_events,
-            exclude_codex_mcp,
-            from_unix_ms,
-            to_unix_ms,
-            Some(recent_from_unix_ms),
-            None,
-        );
-
-        let (mode_join_sql, mode_filter_sql) = if let Some(selected_mode) = mode {
-            let mode_subquery = self.mode_subquery();
-            let mode_filter_sql = Self::mode_filter_clause(Some(selected_mode))
-                .map(|clause| format!("AND {clause}"))
-                .unwrap_or_default();
-            (
-                format!("ANY LEFT JOIN ({mode_subquery}) AS m ON m.session_id = c.session_id"),
-                mode_filter_sql,
-            )
-        } else {
-            (String::new(), String::new())
-        };
-
-        Ok(format!(
-            "WITH
-  {terms_array_sql} AS q_terms,
-  {idf_array_sql} AS q_idf
-SELECT
-  c.session_id AS session_id,
-  c.score AS score,
-  toUInt16(c.matched_terms) AS matched_terms
-FROM (
-  SELECT
-    p.session_id AS session_id,
-    sum(transform(toString(p.term), q_terms, q_idf, 0.0) * log1p(toFloat64(p.tf))) AS score,
-    toUInt16(countDistinct(p.term)) AS matched_terms
-  FROM {postings_table} AS p
-  {docs_join_sql}
-  PREWHERE {prewhere_sql}
-  {where_sql}
-  GROUP BY p.session_id
-) AS c
-{mode_join_sql}
-WHERE c.matched_terms >= {min_should_match}
-  {mode_filter_sql}
-ORDER BY c.score DESC, c.session_id ASC
-LIMIT {limit}
-FORMAT JSONEachRow",
-            postings_table = postings_table,
-            docs_join_sql = docs_join_sql,
-            prewhere_sql = prewhere_sql,
-            where_sql = where_sql,
-            mode_join_sql = mode_join_sql,
-            mode_filter_sql = mode_filter_sql,
-            min_should_match = min_should_match,
-            limit = limit,
-        ))
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(super) async fn fetch_conversation_candidates(
-        &self,
-        terms: &[String],
-        idf_by_term: &HashMap<String, f64>,
-        include_tool_events: bool,
-        exclude_codex_mcp: bool,
-        min_should_match: u16,
-        limit: u16,
-        from_unix_ms: Option<i64>,
-        to_unix_ms: Option<i64>,
-        mode: Option<ConversationMode>,
-    ) -> RepoResult<ConversationCandidateSet> {
-        let candidate_limit = Self::conversation_candidate_limit(limit);
-        let persistent_sql = self.build_search_conversation_candidates_sql(
-            terms,
-            idf_by_term,
-            include_tool_events,
-            exclude_codex_mcp,
-            min_should_match,
-            candidate_limit,
-            from_unix_ms,
-            to_unix_ms,
-            mode,
-        )?;
-        let mut persistent_rows: Vec<ConversationCandidateRow> =
-            self.map_backend(self.query_rows(&persistent_sql, None).await)?;
-        let truncated = persistent_rows.len() >= candidate_limit;
-        if truncated {
-            return Ok(ConversationCandidateSet {
-                rows: persistent_rows,
-                truncated: true,
-            });
-        }
-
-        let recent_sql = self.build_search_conversation_recent_candidates_sql(
-            terms,
-            idf_by_term,
-            include_tool_events,
-            exclude_codex_mcp,
-            min_should_match,
-            CONVERSATION_RECENT_CANDIDATE_LIMIT,
-            from_unix_ms,
-            to_unix_ms,
-            mode,
-        )?;
-        let recent_rows: Vec<ConversationCandidateRow> =
-            self.map_backend(self.query_rows(&recent_sql, None).await)?;
-
-        let mut by_session = HashMap::<String, (f64, u16)>::new();
-        for row in persistent_rows.drain(..) {
-            by_session.insert(row.session_id, (row.score, row.matched_terms));
-        }
-        for row in recent_rows {
-            let entry = by_session
-                .entry(row.session_id)
-                .or_insert((row.score, row.matched_terms));
-            if row.score > entry.0 {
-                entry.0 = row.score;
-            }
-            if row.matched_terms > entry.1 {
-                entry.1 = row.matched_terms;
-            }
-        }
-
-        let mut rows = by_session
-            .into_iter()
-            .map(
-                |(session_id, (score, matched_terms))| ConversationCandidateRow {
-                    session_id,
-                    score,
-                    matched_terms,
-                },
-            )
-            .collect::<Vec<_>>();
-        rows.sort_by(|a, b| {
-            b.score
-                .total_cmp(&a.score)
-                .then_with(|| a.session_id.cmp(&b.session_id))
-        });
-        let max_rows = candidate_limit.saturating_add(CONVERSATION_RECENT_CANDIDATE_LIMIT);
-        if rows.len() > max_rows {
-            rows.truncate(max_rows);
-        }
-
-        Ok(ConversationCandidateSet {
-            rows,
-            truncated: false,
-        })
-    }
-
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn build_search_conversations_sql(
         &self,
         terms: &[String],
@@ -2100,7 +1778,6 @@ FORMAT JSONEachRow",
         from_unix_ms: Option<i64>,
         to_unix_ms: Option<i64>,
         mode: Option<ConversationMode>,
-        candidate_session_ids: Option<&[String]>,
     ) -> RepoResult<String> {
         if terms.is_empty() {
             return Err(RepoError::invalid_argument(
@@ -2122,8 +1799,6 @@ FORMAT JSONEachRow",
             exclude_codex_mcp,
             from_unix_ms,
             to_unix_ms,
-            None,
-            candidate_session_ids,
         );
         let (mode_join_sql, mode_filter_sql) = if let Some(selected_mode) = mode {
             let mode_subquery = self.mode_subquery();
@@ -2211,7 +1886,7 @@ FROM (
           (toFloat64(p.tf) + k1 * (1.0 - b + b * (toFloat64(p.doc_len) / avgdl)))
         )
       ) AS event_score
-    FROM {postings_table} AS p
+    FROM {postings_table} AS p FINAL
     {docs_join_sql}
     PREWHERE {prewhere_sql}
     {where_sql}
@@ -3033,42 +2708,6 @@ FORMAT JSONEachRow",
             idf_by_term.insert(term.clone(), idf.max(0.0));
         }
 
-        let candidate_set = match self
-            .fetch_conversation_candidates(
-                &terms,
-                &idf_by_term,
-                include_tool_events,
-                exclude_codex_mcp,
-                min_should_match,
-                limit,
-                query.from_unix_ms,
-                query.to_unix_ms,
-                query.mode,
-            )
-            .await
-        {
-            Ok(set) => set,
-            Err(err) => {
-                warn!("search_conversations candidate stage failed; falling back to exact path: {err}");
-                ConversationCandidateSet::default()
-            }
-        };
-        let candidate_limit = Self::conversation_candidate_limit(limit);
-        let candidate_session_ids = if candidate_set.truncated
-            || candidate_set.rows.is_empty()
-            || candidate_set.rows.len() >= candidate_limit
-        {
-            None
-        } else {
-            Some(
-                candidate_set
-                    .rows
-                    .into_iter()
-                    .map(|row| row.session_id)
-                    .collect::<Vec<_>>(),
-            )
-        };
-
         let sql = self.build_search_conversations_sql(
             &terms,
             &idf_by_term,
@@ -3081,7 +2720,6 @@ FORMAT JSONEachRow",
             query.from_unix_ms,
             query.to_unix_ms,
             query.mode,
-            candidate_session_ids.as_deref(),
         )?;
 
         let rows: Vec<ConversationSearchRow> =

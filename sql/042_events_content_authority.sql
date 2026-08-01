@@ -8,10 +8,53 @@ DROP VIEW IF EXISTS moraine.mv_search_postings;
 DROP VIEW IF EXISTS moraine.mv_search_documents_from_events;
 DROP VIEW IF EXISTS moraine.mv_search_conversation_terms;
 DROP VIEW IF EXISTS moraine.mv_mcp_open_dirty_sessions_from_events;
+DROP VIEW IF EXISTS moraine.mv_mcp_session_directory_from_events;
 DROP VIEW IF EXISTS moraine.mv_file_attention_project_roots_from_tool_io;
 DROP VIEW IF EXISTS moraine.mv_file_attention_project_roots_from_events;
 
 DROP TABLE IF EXISTS moraine.search_conversation_terms;
+
+-- Create both names before the atomic exchange. Exactly one contains legacy
+-- rows on every replay: the original source on first execution, or whichever
+-- side retained the frozen rows after an interrupted execution.
+CREATE TABLE IF NOT EXISTS moraine.tool_io_events_content_authority_042_frozen (
+  ingested_at DateTime64(3) DEFAULT now64(3),
+  event_uid String,
+  session_id String,
+  harness LowCardinality(String),
+  inference_provider LowCardinality(String) DEFAULT '',
+  source_name LowCardinality(String),
+  tool_call_id String,
+  parent_tool_call_id String,
+  tool_name LowCardinality(String),
+  tool_phase LowCardinality(String),
+  tool_error UInt8,
+  input_json String,
+  output_json String,
+  output_text String,
+  input_bytes UInt32,
+  output_bytes UInt32,
+  input_preview String,
+  output_preview String,
+  io_hash UInt64,
+  project_id LowCardinality(String) DEFAULT '',
+  repo_rel_path String DEFAULT '',
+  worktree_root String DEFAULT '',
+  source_ref String,
+  event_version UInt64
+)
+ENGINE = ReplacingMergeTree(event_version)
+PARTITION BY toYYYYMM(ingested_at)
+ORDER BY (session_id, tool_call_id, event_uid);
+
+CREATE TABLE IF NOT EXISTS moraine.tool_io
+AS moraine.tool_io_events_content_authority_042_frozen;
+
+-- Supported migration commands quiesce tracked writers before this point;
+-- EXCHANGE only swaps names atomically and does not close either name to writes.
+-- The fold reads both sides so replay is correct whichever side retained rows.
+EXCHANGE TABLES moraine.tool_io
+AND moraine.tool_io_events_content_authority_042_frozen;
 
 -- Preserve tool detail on its canonical event before dropping the side table.
 INSERT INTO moraine.events
@@ -52,25 +95,16 @@ ALL INNER JOIN
       ),
       tuple(event_version, tool_call_id)
     ) AS tool_json
-  FROM moraine.tool_io FINAL
+  FROM
+  (
+    SELECT * FROM moraine.tool_io_events_content_authority_042_frozen FINAL
+    UNION ALL
+    SELECT * FROM moraine.tool_io FINAL
+  ) AS tool_source
   GROUP BY event_uid
 ) AS t ON t.event_uid = e.event_uid
 WHERE NOT JSONHas(e.payload_json, 'moraine_tool_io');
 
-CREATE TABLE IF NOT EXISTS moraine.mcp_session_directory (
-  session_id String,
-  source_name LowCardinality(String),
-  source_file String,
-  source_generation UInt32,
-  harness LowCardinality(String),
-  mode_hint SimpleAggregateFunction(max, UInt8),
-  min_observed_event_time SimpleAggregateFunction(min, DateTime64(3)),
-  max_observed_event_time SimpleAggregateFunction(max, DateTime64(3)),
-  observed_events SimpleAggregateFunction(sum, UInt64),
-  origin_cwd_state AggregateFunction(argMinIf, String, Tuple(DateTime64(3), String), UInt8)
-)
-ENGINE = AggregatingMergeTree
-ORDER BY (session_id, source_name, source_file, source_generation, harness);
 
 CREATE TABLE IF NOT EXISTS moraine.mcp_event_locator (
   event_uid String,
@@ -126,27 +160,6 @@ ENGINE = ReplacingMergeTree(event_version)
 PARTITION BY cityHash64(session_id) % 64
 ORDER BY (session_id, event_uid);
 
-CREATE MATERIALIZED VIEW IF NOT EXISTS moraine.mv_mcp_session_directory_from_events
-TO moraine.mcp_session_directory AS
-SELECT
-  session_id,
-  source_name,
-  source_file,
-  source_generation,
-  harness,
-  max(multiIf(
-    payload_type IN ('web_search_call', 'search_results_received') OR (payload_type = 'tool_use' AND tool_name IN ('WebSearch', 'WebFetch')), 3,
-    source_name = 'codex-mcp' OR match(lowerUTF8(trimBoth(tool_name)), '^(search|search_sessions|open|list_sessions|file_attention|mcp__moraine__(search|search_sessions|open|list_sessions|file_attention))$'), 2,
-    event_kind IN ('tool_call', 'tool_result') OR payload_type = 'tool_use', 1,
-    0
-  )) AS mode_hint,
-  min(ifNull(parseDateTime64BestEffortOrNull(record_ts), ingested_at)) AS min_observed_event_time,
-  max(ifNull(parseDateTime64BestEffortOrNull(record_ts), ingested_at)) AS max_observed_event_time,
-  count() AS observed_events,
-  argMinIfState(cwd, tuple(event_ts, event_uid), cwd != '') AS origin_cwd_state
-FROM moraine.events
-WHERE notEmpty(session_id)
-GROUP BY session_id, source_name, source_file, source_generation, harness;
 
 CREATE MATERIALIZED VIEW IF NOT EXISTS moraine.mv_mcp_event_locator_from_events
 TO moraine.mcp_event_locator AS
@@ -169,8 +182,16 @@ SELECT
   JSONExtractString(payload_json, 'moraine_tool_io', 'repo_rel_path') AS repo_rel_path,
   JSONExtractString(payload_json, 'moraine_tool_io', 'worktree_root') AS worktree_root,
   arrayFilter(path -> path != '', arrayDistinct(arrayConcat(
-    extractAll(tool_input, '[A-Za-z0-9_./-]+'),
-    extractAll(tool_input, '"((?:[^"\\\\]|\\\\.)*)"'),
+    extractAll(
+      tool_input,
+      '"(?:file_path|notebook_path|path|target_file|relativeWorkspacePath|relative_workspace_path|filepath|file|filename)"[[:space:]]*:[[:space:]]*"((?:[^"\\\\]|\\\\.)*)"'
+    ),
+    extractAll(
+      if(JSONExtractString(tool_input, 'command') != '',
+         JSONExtractString(tool_input, 'command'),
+         JSONExtractString(tool_input, 'cmd')),
+      '(?:^|[[:space:]''"`=(])((?:/|\\./|\\.\\./)?[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+|[A-Za-z0-9_-]+\\.[A-Za-z0-9_.-]+)(?:[[:space:]''"`,;|&<>)]|$)'
+    ),
     [
       JSONExtractString(tool_input, 'file_path'),
       JSONExtractString(tool_input, 'notebook_path'),
@@ -306,21 +327,6 @@ WHERE startsWith(JSONExtractString(payload_json, 'moraine_tool_io', 'project_id'
   AND JSONExtractString(payload_json, 'moraine_tool_io', 'worktree_root') != '';
 
 -- Backfill the newly installed indexes before any legacy relation is retired.
-INSERT INTO moraine.mcp_session_directory
-SELECT
-  session_id, source_name, source_file, source_generation, harness,
-  max(multiIf(
-    payload_type IN ('web_search_call', 'search_results_received') OR (payload_type = 'tool_use' AND tool_name IN ('WebSearch', 'WebFetch')), 3,
-    source_name = 'codex-mcp' OR match(lowerUTF8(trimBoth(tool_name)), '^(search|search_sessions|open|list_sessions|file_attention|mcp__moraine__(search|search_sessions|open|list_sessions|file_attention))$'), 2,
-    event_kind IN ('tool_call', 'tool_result') OR payload_type = 'tool_use', 1, 0
-  )) AS mode_hint,
-  min(ifNull(parseDateTime64BestEffortOrNull(record_ts), ingested_at)),
-  max(ifNull(parseDateTime64BestEffortOrNull(record_ts), ingested_at)),
-  count(),
-  argMinIfState(cwd, tuple(event_ts, event_uid), cwd != '')
-FROM moraine.events FINAL
-WHERE notEmpty(session_id)
-GROUP BY session_id, source_name, source_file, source_generation, harness;
 
 INSERT INTO moraine.mcp_event_locator
 WITH JSONExtractString(payload_json, 'moraine_tool_io', 'input_json') AS tool_input
@@ -333,8 +339,16 @@ SELECT event_uid, event_version, ingested_at, session_id, source_name, source_fi
   JSONExtractString(payload_json, 'moraine_tool_io', 'repo_rel_path'),
   JSONExtractString(payload_json, 'moraine_tool_io', 'worktree_root'),
   arrayFilter(path -> path != '', arrayDistinct(arrayConcat(
-    extractAll(tool_input, '[A-Za-z0-9_./-]+'),
-    extractAll(tool_input, '"((?:[^"\\\\]|\\\\.)*)"'),
+    extractAll(
+      tool_input,
+      '"(?:file_path|notebook_path|path|target_file|relativeWorkspacePath|relative_workspace_path|filepath|file|filename)"[[:space:]]*:[[:space:]]*"((?:[^"\\\\]|\\\\.)*)"'
+    ),
+    extractAll(
+      if(JSONExtractString(tool_input, 'command') != '',
+         JSONExtractString(tool_input, 'command'),
+         JSONExtractString(tool_input, 'cmd')),
+      '(?:^|[[:space:]''"`=(])((?:/|\\./|\\.\\./)?[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+|[A-Za-z0-9_-]+\\.[A-Za-z0-9_.-]+)(?:[[:space:]''"`,;|&<>)]|$)'
+    ),
     [
       JSONExtractString(tool_input, 'file_path'),
       JSONExtractString(tool_input, 'notebook_path'),
@@ -397,8 +411,10 @@ FROM
 WHERE startsWith(project_id, 'git:') AND worktree_root != ''
 GROUP BY project_id, worktree_root;
 
--- Nothing below is a runtime content authority after this point.
+-- Nothing below is a runtime content authority after this point. The frozen
+-- source is emptied here but retained until this migration's ledger write.
 DROP TABLE IF EXISTS moraine.search_documents;
+DROP TABLE IF EXISTS moraine.mcp_session_directory;
 DROP TABLE IF EXISTS moraine.tool_io;
 DROP TABLE IF EXISTS moraine.mcp_open_events;
 DROP TABLE IF EXISTS moraine.mcp_open_turns;
@@ -408,3 +424,4 @@ DROP TABLE IF EXISTS moraine.mcp_open_generation_readiness;
 DROP TABLE IF EXISTS moraine.mcp_open_dirty_sessions;
 DROP TABLE IF EXISTS moraine.mcp_open_backfill_plans;
 DROP TABLE IF EXISTS moraine.mcp_open_projection_state;
+TRUNCATE TABLE IF EXISTS moraine.tool_io_events_content_authority_042_frozen;

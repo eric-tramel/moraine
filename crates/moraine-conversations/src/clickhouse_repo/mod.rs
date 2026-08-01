@@ -4,7 +4,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc, OnceLock,
 };
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use ahash::AHashMap as HashMap;
 use anyhow::Result as AnyResult;

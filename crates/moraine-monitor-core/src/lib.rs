@@ -346,7 +346,7 @@ async fn api_capabilities(State(state): State<Arc<AppState>>) -> Response {
     json_response(
         json!({
             "ok": true,
-            "server_version": env!("CARGO_PKG_VERSION"),
+            "server_version": moraine_config::BUILD_VERSION,
             "schema_migration_level": schema_migration_level,
             "features": {
                 "analytics": true,
@@ -1499,7 +1499,7 @@ mod tests {
             response_json(response).await,
             json!({
                 "ok": true,
-                "server_version": env!("CARGO_PKG_VERSION"),
+                "server_version": moraine_config::BUILD_VERSION,
                 "schema_migration_level": "025",
                 "features": {
                     "analytics": true,
@@ -1895,7 +1895,10 @@ mod tests {
 
         let (status, capabilities) = router_json(&app, "/api/v1/capabilities").await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(capabilities["server_version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            capabilities["server_version"],
+            moraine_config::BUILD_VERSION
+        );
         assert_eq!(capabilities["schema_migration_level"], json!("025"));
         assert_eq!(
             capabilities["features"],

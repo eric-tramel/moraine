@@ -94,6 +94,11 @@ async fn file_attention_merges_normalized_exact_lookup_with_suffix_fallback() {
         exact_query.contains("position(ti.worktree_root, ';') = 0"),
         "normalized roots must still satisfy the one-path invariant: {exact_query}"
     );
+    assert!(
+        !exact_query
+            .contains("(session_id, event_uid) IN (SELECT session_id, event_uid FROM matched_ids)"),
+        "exact lookup must not use a correlated CTE in a tuple IN predicate: {exact_query}"
+    );
     for fragment in ["char(0)", "char(10)", "char(13)", "'`'"] {
         assert!(
             exact_query.contains(fragment),

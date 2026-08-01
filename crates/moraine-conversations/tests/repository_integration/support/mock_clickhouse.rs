@@ -1202,7 +1202,9 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
             );
         }
 
-        if query.contains("FROM `moraine`.`search_conversation_terms` AS ct") {
+        if query.contains("GROUP BY p.session_id, p.term")
+            && query.contains("FROM `moraine`.`search_postings` AS p FINAL")
+        {
             return (
                 StatusCode::OK,
                 json_each_row(json!([

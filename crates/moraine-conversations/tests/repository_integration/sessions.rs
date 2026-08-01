@@ -608,7 +608,7 @@ async fn get_mcp_session_includes_turn_summaries_and_latest_completion() {
             "tool_call",
             "tool_response",
             "assistant_response",
-            "system",
+            "runtime",
         ]
     );
     assert_eq!(

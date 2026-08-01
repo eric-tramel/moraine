@@ -534,10 +534,13 @@ fn update_turn(turn: &mut TurnAccum, row: &NavRow, position: DerivedPosition, se
         turn.first_event = Some(event_ref.clone());
     }
     turn.last_event = Some(event_ref);
-    if is_message(row) && row.actor_kind.eq_ignore_ascii_case("user") && turn.user_input.is_none() {
+    if ClickHouseConversationRepository::is_mcp_message_event(&row.event_kind, &row.payload_type)
+        && row.actor_kind.eq_ignore_ascii_case("user")
+        && turn.user_input.is_none()
+    {
         turn.user_input = Some((row.clone(), position));
     }
-    if is_message(row)
+    if ClickHouseConversationRepository::is_mcp_message_event(&row.event_kind, &row.payload_type)
         && row.actor_kind.eq_ignore_ascii_case("assistant")
         && !row.phase.eq_ignore_ascii_case("commentary")
     {
@@ -806,78 +809,13 @@ fn compact_source(source: &str, is_payload: bool, preview_chars: u16) -> Option<
 }
 
 fn normalized_event_type(row: &NavRow) -> String {
-    let actor = row.actor_kind.to_ascii_lowercase();
-    if actor == "user" && is_message(row) {
-        "user_input"
-    } else if actor == "assistant" && is_message(row) {
-        "assistant_response"
-    } else if actor != "system"
-        && (row.event_kind == "reasoning"
-            || matches!(
-                row.payload_type.as_str(),
-                "agent_reasoning" | "reasoning" | "thinking"
-            ))
-    {
-        "reasoning"
-    } else if actor != "system"
-        && (row.event_kind == "tool_call"
-            || matches!(
-                row.payload_type.as_str(),
-                "tool_use" | "function_call" | "custom_tool_call" | "web_search_call"
-            ))
-    {
-        "tool_call"
-    } else if actor != "system"
-        && (row.event_kind == "tool_result"
-            || matches!(
-                row.payload_type.as_str(),
-                "tool_result"
-                    | "function_call_output"
-                    | "custom_tool_call_output"
-                    | "search_results_received"
-            ))
-    {
-        "tool_response"
-    } else if actor != "system"
-        && (matches!(
-            row.event_kind.as_str(),
-            "summary" | "compacted_raw" | "queue_operation"
-        ) || matches!(
-            row.payload_type.as_str(),
-            "summary"
-                | "compacted"
-                | "task_started"
-                | "task_complete"
-                | "turn_aborted"
-                | "item_completed"
-                | "queue-operation"
-        ))
-    {
-        "runtime"
-    } else if actor == "system"
-        || matches!(
-            row.event_kind.as_str(),
-            "system" | "progress" | "file_history_snapshot"
-        )
-        || matches!(
-            row.payload_type.as_str(),
-            "system" | "progress" | "file-history-snapshot" | "file_history_snapshot"
-        )
-    {
-        "system"
-    } else {
-        "unknown"
-    }
+    ClickHouseConversationRepository::mcp_event_type_for(
+        &row.event_kind,
+        &row.payload_type,
+        &row.actor_kind,
+    )
+    .as_str()
     .to_string()
-}
-
-fn is_message(row: &NavRow) -> bool {
-    row.event_kind == "message"
-        || (row.event_kind == "event_msg"
-            && matches!(
-                row.payload_type.as_str(),
-                "user_message" | "agent_message" | "message" | "text" | "event_msg"
-            ))
 }
 
 fn is_terminal(row: &NavRow) -> bool {

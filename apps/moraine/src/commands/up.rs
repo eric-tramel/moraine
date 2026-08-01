@@ -1,6 +1,6 @@
 use anyhow::Result;
 use dialoguer::console::Style;
-use moraine_clickhouse::MigrationProgress;
+use moraine_clickhouse::{ClickHouseClient, MigrationProgress};
 use moraine_config::{AppConfig, LoadedConfigPath};
 use std::future::Future;
 use std::io::Write;
@@ -13,7 +13,8 @@ use crate::cli::UpArgs;
 use crate::managed_clickhouse::{start_clickhouse_with_progress, ClickHouseStartupProgress};
 use crate::paths::{ensure_runtime_dirs, runtime_paths, RuntimePaths};
 use crate::process::{
-    preflight_required_service_binaries, start_background_service, StartOutcome, StartState,
+    preflight_required_service_binaries, start_background_service, stop_service, StartOutcome,
+    StartState,
 };
 #[cfg(test)]
 use crate::progress::ProgressStyle;
@@ -22,8 +23,8 @@ use crate::render::{render_up, CliOutput, MigrationOutcome, StatusSnapshot, UpSn
 use crate::service::Service;
 
 use super::{
-    conversation_repository, doctor_is_healthy, migrate_database_for_up, status::cmd_status,
-    DatabaseProgress,
+    content_authority_writer_barrier_required, conversation_repository, doctor_is_healthy,
+    migrate_database_for_up, status::cmd_status, CONTENT_AUTHORITY_WRITER_SERVICES,
 };
 
 const PROGRESS_REFRESH: Duration = Duration::from_millis(250);
@@ -182,7 +183,7 @@ impl<W: Write> StartupProgress<W> {
         self.database_tick();
     }
 
-    fn database_event(&mut self, event: DatabaseProgress) {
+    fn database_event(&mut self, event: MigrationProgress) {
         match event {
             MigrationProgress::Plan { applied, pending } => {
                 self.database_activity = None;
@@ -439,6 +440,21 @@ async fn start_selected_services<W: Write>(
     .await?;
     progress.clickhouse_outcome(&clickhouse);
 
+    let schema_skew = ClickHouseClient::new(cfg.clickhouse.clone())?
+        .schema_skew()
+        .await?;
+    if content_authority_writer_barrier_required(&schema_skew.missing_on_server) {
+        progress.phase(
+            "Content cutover",
+            "stopping tracked backend and ingest before snapshotting legacy tool rows",
+        );
+        stop_content_authority_writers_with(|service| stop_service(paths, service))?;
+        progress.success_step(
+            "Tracked cutover services stopped",
+            Some("backend and ingest are quiescent"),
+        );
+    }
+
     progress.database_start();
     let migrations = drive_database_progress(cfg, progress).await?;
 
@@ -472,6 +488,16 @@ async fn start_selected_services<W: Write>(
     })
 }
 
+fn stop_content_authority_writers_with<F>(mut stop: F) -> Result<()>
+where
+    F: FnMut(Service) -> Result<bool>,
+{
+    for service in CONTENT_AUTHORITY_WRITER_SERVICES {
+        stop(service)?;
+    }
+    Ok(())
+}
+
 async fn drive_database_progress<W: Write>(
     cfg: &AppConfig,
     progress: &mut StartupProgress<W>,
@@ -499,7 +525,7 @@ async fn drive_database_progress<W: Write>(
 }
 
 fn drain_database_events<W: Write>(
-    receiver: &Receiver<DatabaseProgress>,
+    receiver: &Receiver<MigrationProgress>,
     progress: &mut StartupProgress<W>,
 ) {
     while let Ok(event) = receiver.try_recv() {
@@ -704,5 +730,44 @@ mod tests {
                 "backend={backend} monitor={monitor} mcp={mcp}"
             );
         }
+    }
+
+    #[test]
+    fn content_cutover_stops_every_tracked_writer_before_migration() {
+        let mut attempted = Vec::new();
+
+        stop_content_authority_writers_with(|service| {
+            attempted.push(service);
+            Ok(false)
+        })
+        .expect("writer barrier");
+
+        assert_eq!(attempted, vec![Service::Backend, Service::Ingest]);
+    }
+
+    #[test]
+    fn content_cutover_barrier_runs_only_while_042_is_pending() {
+        assert!(content_authority_writer_barrier_required(&[
+            "030".to_string(),
+            "042".to_string(),
+            "043".to_string(),
+        ]));
+        assert!(!content_authority_writer_barrier_required(&[
+            "043".to_string()
+        ]));
+    }
+
+    #[test]
+    fn content_cutover_stop_failure_is_fail_closed() {
+        let mut attempted = Vec::new();
+
+        let error = stop_content_authority_writers_with(|service| {
+            attempted.push(service);
+            anyhow::bail!("stop failed")
+        })
+        .expect_err("a stop failure must abort the cutover");
+
+        assert_eq!(attempted, vec![Service::Backend]);
+        assert!(error.to_string().contains("stop failed"));
     }
 }

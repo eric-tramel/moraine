@@ -198,14 +198,27 @@ async fn search_conversations_returns_ranked_session_hits_and_expected_sql_shape
     assert!(!result.stats.limit_capped);
 
     let queries = state.queries.lock().expect("queries lock").clone();
-    let agg_query = queries
+    assert!(
+        queries
+            .iter()
+            .all(|query| !query.contains("search_conversation_terms")),
+        "conversation search must not query the retired aggregate table: {queries:?}"
+    );
+    let ranking_queries = queries
         .iter()
-        .find(|q| q.contains("GROUP BY e.session_id"))
-        .expect("aggregated conversation query should be captured");
-
+        .filter(|query| query.contains("FROM `moraine`.`search_postings` AS p FINAL"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        ranking_queries.len(),
+        1,
+        "conversation search must rank canonical postings once: {queries:?}"
+    );
+    let agg_query = ranking_queries[0];
+    assert!(agg_query.contains("GROUP BY e.session_id"));
     assert!(agg_query.contains("argMax(e.event_uid, e.event_score)"));
     assert!(agg_query.contains("ANY LEFT JOIN `moraine`.`v_session_summary` AS s"));
-    assert!(agg_query.contains("p.session_id IN ['sess_c','sess_a']"));
+    assert!(!agg_query.contains("GROUP BY p.session_id, p.term"));
+    assert!(!agg_query.contains("p.session_id IN"));
     assert!(agg_query.contains("ifNull(m.mode, 'chat') = 'chat'"));
     assert!(agg_query.contains("toUnixTimestamp64Milli(d.ingested_at) >= 1767261600000"));
     assert!(agg_query.contains("toUnixTimestamp64Milli(d.ingested_at) < 1767500000000"));

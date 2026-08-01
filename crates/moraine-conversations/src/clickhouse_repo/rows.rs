@@ -395,19 +395,6 @@ pub(super) struct SessionTimeBoundsRow {
     pub(super) last_event_time: String,
 }
 
-#[derive(Debug, Deserialize)]
-pub(super) struct ConversationCandidateRow {
-    pub(super) session_id: String,
-    pub(super) score: f64,
-    pub(super) matched_terms: u16,
-}
-
-#[derive(Debug, Default)]
-pub(super) struct ConversationCandidateSet {
-    pub(super) rows: Vec<ConversationCandidateRow>,
-    pub(super) truncated: bool,
-}
-
 #[derive(Debug, Clone, Default)]
 pub(super) struct SessionTimeBounds {
     pub(super) first_event_time: String,
