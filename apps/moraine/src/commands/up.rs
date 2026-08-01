@@ -22,8 +22,8 @@ use crate::render::{render_up, CliOutput, MigrationOutcome, StatusSnapshot, UpSn
 use crate::service::Service;
 
 use super::{
-    conversation_repository, doctor_is_healthy, format_dirty_session_count,
-    migrate_database_for_up, status::cmd_status, DatabaseProgress,
+    conversation_repository, doctor_is_healthy, migrate_database_for_up, status::cmd_status,
+    DatabaseProgress,
 };
 
 const PROGRESS_REFRESH: Duration = Duration::from_millis(250);
@@ -50,13 +50,6 @@ enum DatabaseActivity {
         index: usize,
         total: usize,
         name: &'static str,
-        started: Instant,
-    },
-    ReconciliationInspection {
-        started: Instant,
-    },
-    Reconciliation {
-        processed: usize,
         started: Instant,
     },
 }
@@ -236,61 +229,24 @@ impl<W: Write> StartupProgress<W> {
                     )),
                 );
             }
-            DatabaseProgress::ReconciliationInspecting => {
-                self.database_activity = Some(DatabaseActivity::ReconciliationInspection {
-                    started: Instant::now(),
-                });
-                self.database_tick();
+            // Issue #603 WI-10: the retirement migration's preflight note
+            // (reclaimed bytes) and its deferral (precondition unmet, with
+            // the named recovery reason) both reach the operator's terminal.
+            DatabaseProgress::Migration(MigrationProgress::Preflight { version, note }) => {
+                self.info_step(&format!("Migration {version} preflight"), Some(&note));
             }
-            DatabaseProgress::ReconciliationStarted { historical } => {
-                self.tree.phase(
-                    "MCP read model",
-                    Some(if historical {
-                        "building from existing sessions"
-                    } else {
-                        "reconciling changed sessions"
-                    }),
-                );
-                self.database_activity = Some(DatabaseActivity::Reconciliation {
-                    processed: 0,
-                    started: Instant::now(),
-                });
-                self.database_tick();
-            }
-            DatabaseProgress::ReconciliationAdvanced { processed } => {
-                if let Some(DatabaseActivity::Reconciliation {
-                    processed: current, ..
-                }) = &mut self.database_activity
-                {
-                    *current = processed;
-                }
-                self.database_tick();
-            }
-            DatabaseProgress::ReconciliationFinished { processed } => {
-                let elapsed = match self.database_activity.take() {
-                    Some(DatabaseActivity::Reconciliation { started, .. }) => started.elapsed(),
-                    _ => Duration::ZERO,
-                };
-                self.success_step(
-                    "MCP read model ready",
-                    Some(&format!(
-                        "{processed} sessions processed · {:.1}s",
-                        elapsed.as_secs_f64()
-                    )),
-                );
-            }
-            DatabaseProgress::ReconciliationFailed {
-                dirty_sessions,
-                error,
-            } => {
+            DatabaseProgress::Migration(MigrationProgress::Deferred {
+                version,
+                name,
+                reason,
+            }) => {
                 self.database_activity = None;
                 self.tree.clear_active();
-                self.warning_step("MCP read model (v1) backfill failed", Some(&error));
+                self.warning_step(&format!("{name} deferred"), Some(&reason));
                 self.info_step(
-                    "Continuing startup degraded",
+                    "Continuing startup",
                     Some(&format!(
-                        "still dirty: {}; canonical read-index sweep proceeds",
-                        format_dirty_session_count(dirty_sessions)
+                        "migration {version} retries after the canonical sweep publishes"
                     )),
                 );
             }
@@ -360,14 +316,6 @@ impl<W: Write> StartupProgress<W> {
                 started,
             }) => format!(
                 "[{index}/{total}] {name} · {:.1}s",
-                started.elapsed().as_secs_f64()
-            ),
-            Some(DatabaseActivity::ReconciliationInspection { started }) => format!(
-                "Inspecting MCP read model · {:.1}s",
-                started.elapsed().as_secs_f64()
-            ),
-            Some(DatabaseActivity::Reconciliation { processed, started }) => format!(
-                "Reconciling sessions · {processed} processed · {:.1}s",
                 started.elapsed().as_secs_f64()
             ),
             None => return,
@@ -748,23 +696,39 @@ mod tests {
         assert!(rendered.contains("migration 1/1 applied"));
     }
 
-    /// The degraded v1-backfill event must reach the operator's terminal:
-    /// the warning step carries the server error verbatim, and the follow-up
-    /// step names the dirty count and says the canonical sweep proceeds.
+    /// A deferred retirement migration (issue #603 WI-10) must reach the
+    /// operator's terminal: the warning step carries the named actionable
+    /// reason verbatim, and the follow-up step says the pass retries after
+    /// the canonical sweep. The preflight note (reclaimed bytes) renders too.
+    ///
+    /// The note here is a RENDERER fixture, not a measurement, but it is built
+    /// from `RETIREMENT_PROCEED_NOTE_PREFIX` and spelled the way the runner
+    /// spells it. It said "20.71 GiB on disk" through review round 6 — a column
+    /// `retired_family_footprint_sql` does not sum, and one this PR's own
+    /// `sql/041` header goes out of its way to rule out — which is exactly the
+    /// wording a reader would copy out of a test.
     #[test]
-    fn a_degraded_v1_backfill_renders_an_operator_visible_warning() {
+    fn a_deferred_retirement_migration_renders_an_operator_visible_warning() {
         let style = ProgressStyle::from_capabilities(&test_output(OutputMode::Plain, true), true);
         let mut progress = StartupProgress::new(ProgressTree::new(style, Vec::new()), false);
         progress.startup_plan(&[]);
-        progress.database_event(DatabaseProgress::ReconciliationFailed {
-            dirty_sessions: Some(1),
-            error: "clickhouse returned 500: MEMORY_LIMIT_EXCEEDED".to_string(),
-        });
+        progress.database_event(DatabaseProgress::Migration(MigrationProgress::Deferred {
+            version: "041",
+            name: "041_retire_mcp_open_projection.sql",
+            reason: "this store has not cut over to the canonical read indexes".to_string(),
+        }));
+        progress.database_event(DatabaseProgress::Migration(MigrationProgress::Preflight {
+            version: "041",
+            note: format!(
+                "{}20.71 GiB of compressed column data",
+                moraine_clickhouse::RETIREMENT_PROCEED_NOTE_PREFIX
+            ),
+        }));
         let rendered = String::from_utf8(progress.into_inner()).expect("progress utf8");
-        assert!(rendered.contains("MCP read model (v1) backfill failed"));
-        assert!(rendered.contains("MEMORY_LIMIT_EXCEEDED"));
-        assert!(rendered.contains("still dirty: 1 session"));
-        assert!(rendered.contains("canonical read-index sweep proceeds"));
+        assert!(rendered.contains("041_retire_mcp_open_projection.sql deferred"));
+        assert!(rendered.contains("has not cut over"));
+        assert!(rendered.contains("retries after the canonical sweep"));
+        assert!(rendered.contains("20.71 GiB"));
     }
 
     #[test]

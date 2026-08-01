@@ -1,37 +1,46 @@
 //! Shared canonical derivation SQL fragments.
 //!
-//! Every interactive read of a Moraine session — the legacy `mcp_open_*`
-//! projector, the migration-036 materialized views, and the issue-598 v2
-//! canonical reader — must agree on how a session's public ordering, turns,
-//! summaries, mode, and session metadata are derived from canonical `events`
-//! rows. This module is the single authority for those derivation expressions
-//! so the three consumers cannot drift.
+//! Every interactive read of a Moraine session — the migration-036
+//! materialized views and the issue-598 canonical reader (and, until issue
+//! #603 WI-10 retired it, the legacy `mcp_open_*` projector) — must agree on
+//! how a session's public ordering, turns, summaries, mode, and session
+//! metadata are derived from canonical `events` rows. This module is the
+//! single authority for those derivation expressions so the consumers cannot
+//! drift.
 //!
 //! ## Column naming
 //!
-//! The projector aliases the physical `events` columns inside its `canonical`
-//! CTE (`event_kind AS event_class`, `actor_kind AS actor_role`,
-//! `tool_name AS name`, `tool_call_id AS call_id`), so its derivation SQL reads
+//! The retired projector aliased the physical `events` columns inside its
+//! `canonical` CTE (`event_kind AS event_class`, `actor_kind AS actor_role`,
+//! `tool_name AS name`, `tool_call_id AS call_id`), so its derivation SQL read
 //! the aliased names. Migration 036 MV bodies and the v2 reader read the
-//! physical `events` columns directly (see `sql/001_schema.sql:42-43`). Every
-//! fragment is therefore a pure function of a [`DerivationColumns`] set: pass
-//! [`DerivationColumns::PROJECTOR`] to reproduce the projector's byte-identical
-//! SQL, or [`DerivationColumns::EVENTS`] for the raw `events` column names.
+//! physical `events` columns directly (see `sql/001_schema.sql:42-43`), and
+//! since issue #603 WI-10 they are the only readers. Every fragment stayed a
+//! pure function of a [`DerivationColumns`] set: pass
+//! [`DerivationColumns::EVENTS`] for the physical names, or
+//! [`DerivationColumns::PROJECTOR`] for the aliases — which is now a
+//! test-only set, and deliberately still exercised (see its own docs).
 //!
 //! ## Whitespace
 //!
-//! The projector builds its SQL with `\n\` string continuations, which Rust
-//! strips to a left-aligned, newline-delimited statement. Fragments here return
-//! left-aligned, `\n`-joined text so they slot into the projector's generated
-//! SQL with zero byte diff (pinned by the byte-identity snapshot test in
-//! `mcp_open_projection`). ClickHouse ignores this whitespace, so MV/reader
-//! consumers may embed the same fragments wherever convenient.
+//! Fragments here return left-aligned, `\n`-joined text. The shape is
+//! historical: the retired v1 projector built its SQL with `\n\` string
+//! continuations, which Rust strips to a left-aligned, newline-delimited
+//! statement, and these fragments had to slot into it with zero byte diff.
+//! A byte-identity snapshot test pinned that; both the projector and the test
+//! went with issue #603 WI-10. The convention is kept because the
+//! migration-036 MVs and the canonical reader embed the same fragments and
+//! their goldens are written left-aligned. ClickHouse ignores the whitespace
+//! either way.
 
 use crate::mcp_tool_names;
 
-/// SQL-side cap on a projected/hydrated `text_content` summary
-/// (`projection.rs` historical value). Shared so the v2 reader's wide-column
-/// hydration matches the projector's preview contract.
+/// SQL-side cap on a hydrated `text_content` summary.
+///
+/// Inherited from the retired v1 projector so the v2 reader's wide-column
+/// hydration truncates where v1 truncated: the surviving record of that value
+/// is `leftUTF8(text_content, 65536)` in the frozen golden
+/// `testdata/projector_golden/projected_publication_header.sql:45`.
 pub const MAX_PROJECTED_TEXT_SUMMARY_CHARS: usize = 65_536;
 
 /// SQL-side cap on a projected/hydrated `payload_json` summary.
@@ -39,8 +48,8 @@ pub const MAX_PROJECTED_PAYLOAD_SUMMARY_CHARS: usize = 131_071;
 
 /// The `events`-derived column names a derivation fragment reads.
 ///
-/// See the module docs: the projector reads aliased names, the 036 MVs and v2
-/// reader read the physical `events` names.
+/// See the module docs: the 036 MVs and the v2 reader read the physical
+/// `events` names; the retired projector read aliased ones.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DerivationColumns {
     /// Actor kind column (`actor_role` aliased / `actor_kind` physical).
@@ -54,8 +63,17 @@ pub struct DerivationColumns {
 }
 
 impl DerivationColumns {
-    /// The projector's aliased column names. Fragments built with this set are
-    /// byte-identical to the current `mcp_open_*` projection SQL.
+    /// The retired projector's aliased column names.
+    ///
+    /// **No production consumer speaks these aliases any more** — issue #603
+    /// WI-10 deleted the projector, and [`Self::EVENTS`] is the only set a live
+    /// caller passes. It is kept as a TEST set, because with one set in the
+    /// tree the parameterization would be unfalsifiable: every fragment would
+    /// look parameterized and behave like a constant, and a fragment that
+    /// hardcoded `actor_kind` instead of reading its [`DerivationColumns`]
+    /// argument would pass every test in this module. The test
+    /// `every_column_taking_fragment_actually_reads_its_argument` is what turns
+    /// that from an argument into a check.
     pub const PROJECTOR: Self = Self {
         actor: "actor_role",
         event_kind: "event_class",
@@ -88,7 +106,8 @@ pub const DISPLAY_TIME_EXPR: &str =
 /// key and ReplacingMergeTree collapses it — no ghost rows. Diverges from
 /// [`DISPLAY_TIME_EXPR`] only for rows whose `record_ts` fails BestEffort parse
 /// (they sort at the session start instead of their v1 insert-arrival slot).
-/// Not consumed by the projector; the 036 navigation index and v2 reader use it.
+/// The retired projector never consumed it; the 036 navigation index and the
+/// v2 reader do.
 pub const SORT_TIME_EXPR: &str =
     "ifNull(parseDateTime64BestEffortOrNull(record_ts), toDateTime64('1970-01-01 00:00:00', 3))";
 
@@ -256,8 +275,9 @@ pub fn mode_rank_expr(cols: DerivationColumns) -> String {
 // --- Turn aggregate folds & neighbors -------------------------------------
 
 /// The shared turn-row aggregate fold columns, from `turn_seq` through
-/// `event_summaries_json`, that both the single-session and batch projector
-/// turn INSERTs group by `(session_id, turn_seq)`.
+/// `event_summaries_json`, which both the single-session and batch projector
+/// turn INSERTs grouped by `(session_id, turn_seq)` and the canonical reader
+/// folds over its derived turn rows.
 ///
 /// argMin/argMaxIf folds key on `tuple(event_order, event_uid)`; summary
 /// selection uses the [`TurnSummaryPredicates`]; per-class counts use the
@@ -306,8 +326,8 @@ toJSONString(arrayMap(x -> x.2, arraySort(groupArray(tuple(event_order, event_su
 }
 
 /// The `turn_neighbors` CTE: prev/next turn refs ordered by `turn_seq` **value**
-/// (R1's turn-neighbor semantics), shared by both projector turn INSERTs. Column
-/// independent (operates on already-derived turn rows).
+/// (R1's turn-neighbor semantics), shared by both projector turn INSERTs while
+/// they existed. Column independent (operates on already-derived turn rows).
 pub fn turn_neighbors_cte() -> String {
     "turn_neighbors AS (\n\
 SELECT *,\n\
@@ -331,7 +351,8 @@ WINDOW turn_window AS (PARTITION BY session_id ORDER BY turn_seq ROWS BETWEEN UN
 /// metadata iff it is a `session_meta` event or an omp title/title_change
 /// payload. Consumed by the 036 navigation MV's `is_metadata_bearing` flag and
 /// the v2 reader's bounded metadata fetch. The projector's `latest_metadata_*`
-/// argMaxIf conditions embed the same logic (see [`session_header_rollup_columns`]).
+/// argMaxIf conditions embedded the same logic (see
+/// [`session_header_rollup_columns`]).
 pub fn is_metadata_bearing_predicate(cols: DerivationColumns) -> String {
     format!(
         "{ek} = 'session_meta' OR (source_name = 'omp' AND JSONExtractString(payload_json, 'type') IN ('title', 'title_change'))",
@@ -353,11 +374,12 @@ fn metadata_bearing_predicate_projector_form(cols: DerivationColumns) -> String 
 
 /// The session-header scalar rollup columns, from `min(event_time) AS
 /// first_event_time` through `... AS origin_cwd`, in the exact order the
-/// projector's `mcp_open_publication_headers` header CTE selects them.
+/// retired projector's `mcp_open_publication_headers` header CTE selected
+/// them.
 ///
 /// Composes: session counts, the [`mode_aggregate_expr`], the first/last/
 /// last_actor precedence key `tuple(event_time, event_order, event_uid)`
-/// (R1(a): equivalent to the projector's third key because `event_order` is
+/// (R1(a): equivalent to the projector's third key, because `event_order` is
 /// monotone in the ordering tuple), and the OPEN+LIST metadata-precedence
 /// columns (latest_metadata_*, latest_session_meta_*, omp dispatch title,
 /// source/harness/inference, session_slug, origin_cwd argMinIf).
@@ -403,20 +425,20 @@ ifNull(argMinIf(cwd, tuple(event_ts, event_uid), cwd != ''), '') AS origin_cwd"
 /// The session completed/terminal selection columns (R1(b)):
 /// `argMax(completed, turn_seq)` and `argMax(terminal_event_uid, turn_seq)` —
 /// the terminal semantics of the max-`turn_seq` turn. Consumers MUST restrict to
-/// real turns (`turn_seq > 0`) before aggregating; the projector applies that
-/// filter in its `terminal` CTE's `WHERE`, and the v2 reader applies it over its
-/// derived turn rows.
+/// real turns (`turn_seq > 0`) before aggregating; the projector applied that
+/// filter in its `terminal` CTE's `WHERE`, and the v2 reader applies it over
+/// its derived turn rows.
 pub fn session_terminal_selection_columns() -> &'static str {
     "argMax(completed, turn_seq) AS completed, argMax(terminal_event_uid, turn_seq) AS terminal_event_uid"
 }
 
-// --- v2-reader-only derivations (not consumed by the projector) ----------
+// --- v2-reader-only derivations (the projector never consumed these) -----
 
 /// The v2 reader's deterministic `turn_id` rule (R1(d)): a turn's id is the
 /// `toString(turn_index)` of the member row selected by the minimum
 /// `(event_order, event_uid)`. Deterministic even when a turn mixes
 /// `turn_index` values, unlike v1's `anyIf(turn_id, turn_id != '')`
-/// (nondeterministic within the turn's value set). Not used by the projector.
+/// (nondeterministic within the turn's value set). The projector never used it.
 pub fn deterministic_turn_id_expr() -> String {
     "argMin(toString(turn_index), tuple(event_order, event_uid))".to_string()
 }
@@ -432,7 +454,7 @@ pub fn deterministic_turn_id_expr() -> String {
 /// `maxO >= U`); the reader computes the counter contribution as
 /// `max(1, U at the last turn_index=0 row)` via one extra tiny aggregate so a
 /// trailing overridden user message cannot inflate the count. Documented here as
-/// the shared authority; the projector uses `toUInt32(max(turn_seq))` directly.
+/// the shared authority; the projector used `toUInt32(max(turn_seq))` directly.
 pub fn total_turns_identity_expr(max_override_expr: &str, user_message_count_expr: &str) -> String {
     format!(
         "greatest({max_override_expr}, if(count() > 0, greatest(toUInt32(1), {user_message_count_expr}), toUInt32(0)))"
@@ -442,6 +464,194 @@ pub fn total_turns_identity_expr(max_override_expr: &str, user_message_count_exp
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every fragment that takes a [`DerivationColumns`] must actually read it.
+    ///
+    /// With the projector deleted, [`DerivationColumns::EVENTS`] is the only
+    /// set production passes, so nothing else in this module would notice a
+    /// fragment that hardcoded a physical column name and ignored its
+    /// argument — it would keep returning exactly the right SQL for the only
+    /// caller, and the parameterization would be decoration. This walks both
+    /// sets over all THIRTEEN functions in this module that take a
+    /// `DerivationColumns` — nine public (eight free `pub fn` plus
+    /// `TurnSummaryPredicates::new`) and four private — and requires the
+    /// output to move with the set. Three of the private four are the
+    /// `mode_*` predicates, reached transitively through `mode_aggregate_expr`
+    /// and `mode_rank_expr`; the fourth,
+    /// `metadata_bearing_predicate_projector_form`, is not a mode predicate
+    /// and is composed by `session_header_rollup_columns`. All four are listed
+    /// anyway so the denominator is the module's, not a subset's.
+    ///
+    /// Bounded from both sides per fragment: under `PROJECTOR` the alias name
+    /// must appear and the physical name must not, and under `EVENTS` the
+    /// reverse — so neither a fragment that emits both nor one that emits
+    /// neither passes. The fragment count is asserted, so a fragment dropped
+    /// from the list cannot quietly leave the walk.
+    ///
+    /// MUTATION (executed 2026-08-01): hardcode `"actor_kind"`/`"event_kind"`
+    /// in [`user_message_count_predicate`] so it ignores its argument —
+    /// correct output for the only set production passes => FAILS here.
+    /// Nothing else in this module notices.
+    #[test]
+    fn every_column_taking_fragment_actually_reads_its_argument() {
+        let predicates =
+            |cols: DerivationColumns| TurnSummaryPredicates::new(cols).user_input.clone();
+        type Fragment = Box<dyn Fn(DerivationColumns) -> String>;
+        let fragments: Vec<(&str, Fragment)> = vec![
+            (
+                "user_message_count_predicate",
+                Box::new(user_message_count_predicate),
+            ),
+            (
+                "turn_seq_windowed_expr",
+                Box::new(|cols| turn_seq_windowed_expr(cols, "canonical_rows")),
+            ),
+            ("TurnSummaryPredicates::new", Box::new(predicates)),
+            ("event_type_expr", Box::new(event_type_expr)),
+            ("mode_aggregate_expr", Box::new(mode_aggregate_expr)),
+            ("mode_rank_expr", Box::new(mode_rank_expr)),
+            (
+                "turn_fold_columns",
+                Box::new(|cols| turn_fold_columns(cols, &TurnSummaryPredicates::new(cols))),
+            ),
+            (
+                "is_metadata_bearing_predicate",
+                Box::new(is_metadata_bearing_predicate),
+            ),
+            (
+                "metadata_bearing_predicate_projector_form",
+                Box::new(metadata_bearing_predicate_projector_form),
+            ),
+            (
+                "session_header_rollup_columns",
+                Box::new(session_header_rollup_columns),
+            ),
+            (
+                "mode_web_search_predicate",
+                Box::new(mode_web_search_predicate),
+            ),
+            (
+                "mode_mcp_internal_predicate",
+                Box::new(mode_mcp_internal_predicate),
+            ),
+            (
+                "mode_tool_calling_predicate",
+                Box::new(mode_tool_calling_predicate),
+            ),
+        ];
+        assert_eq!(
+            fragments.len(),
+            13,
+            "the walk is denominated: a fragment added to this module must be added here or \
+             the count moves"
+        );
+        // The denominator is the module's, derived rather than asserted from
+        // memory: every `fn …(cols: DerivationColumns)` in this file, public
+        // or private, must be in the list above.
+        let module = include_str!("canonical_derivations.rs");
+        let declared: Vec<&str> = module
+            .lines()
+            .filter_map(|line| {
+                let rest = line.strip_prefix("pub fn ").or(line.strip_prefix("fn "))?;
+                let (name, params) = rest.split_once('(')?;
+                params
+                    .starts_with("cols: DerivationColumns")
+                    .then_some(name)
+            })
+            .collect();
+        for name in &declared {
+            assert!(
+                fragments.iter().any(|(listed, _)| listed == name),
+                "`{name}` takes a DerivationColumns but is not in the walk; declared: \
+                 {declared:?}"
+            );
+        }
+        assert_eq!(
+            declared.len(),
+            fragments.len() - 1,
+            "every listed fragment but `TurnSummaryPredicates::new` (an inherent method, not \
+             a free fn) must be a declared free function: {declared:?}"
+        );
+
+        // A column mention is an IDENTIFIER, so quoted SQL literals are erased
+        // first — `JSONExtractString(payload_json, 'name')` is not a read of
+        // the aliased `name` column.
+        fn without_literals(sql: &str) -> String {
+            let mut out = String::with_capacity(sql.len());
+            let mut inside = false;
+            for ch in sql.chars() {
+                if ch == '\'' {
+                    inside = !inside;
+                    out.push(' ');
+                } else {
+                    out.push(if inside { ' ' } else { ch });
+                }
+            }
+            assert!(!inside, "unbalanced quote while scanning a fragment");
+            out
+        }
+
+        // Identifier-boundary containment: `tool_name` must not read as a
+        // mention of the alias `name`, nor `tool_call_id` of `call_id`.
+        fn mentions(sql: &str, token: &str) -> bool {
+            let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+            sql.match_indices(token).any(|(at, _)| {
+                let before_ok = at == 0 || !sql[..at].chars().next_back().is_some_and(ident);
+                let after = at + token.len();
+                let after_ok =
+                    after == sql.len() || !sql[after..].chars().next().is_some_and(ident);
+                before_ok && after_ok
+            })
+        }
+
+        let pairs = |cols: DerivationColumns| {
+            [
+                cols.actor,
+                cols.event_kind,
+                cols.tool_name,
+                cols.tool_call_id,
+            ]
+        };
+        let aliases = pairs(DerivationColumns::PROJECTOR);
+        let physicals = pairs(DerivationColumns::EVENTS);
+
+        for (name, build) in &fragments {
+            let aliased_raw = build(DerivationColumns::PROJECTOR);
+            let physical_raw = build(DerivationColumns::EVENTS);
+            assert_ne!(
+                aliased_raw, physical_raw,
+                "`{name}` returns the same SQL for both column sets, so it ignores its \
+                 DerivationColumns argument"
+            );
+            let aliased = without_literals(&aliased_raw);
+            let physical = without_literals(&physical_raw);
+            let mut exercised = 0usize;
+            for (alias, real) in aliases.iter().zip(physicals.iter()) {
+                if mentions(&aliased, alias) {
+                    exercised += 1;
+                    assert!(
+                        mentions(&physical, real),
+                        "`{name}` reads `{alias}` under PROJECTOR but not `{real}` under \
+                         EVENTS:\n{physical}"
+                    );
+                }
+                assert!(
+                    !mentions(&aliased, real),
+                    "`{name}` leaks the physical name `{real}` into its PROJECTOR \
+                     form:\n{aliased}"
+                );
+                assert!(
+                    !mentions(&physical, alias),
+                    "`{name}` leaks the alias `{alias}` into its EVENTS form:\n{physical}"
+                );
+            }
+            assert!(
+                exercised > 0,
+                "`{name}` differs between the two sets without reading any of the four \
+                 aliased columns, so this walk did not test what it claims"
+            );
+        }
+    }
 
     #[test]
     fn projector_and_events_column_sets_differ_only_in_aliases() {

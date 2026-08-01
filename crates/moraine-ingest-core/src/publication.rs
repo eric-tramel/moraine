@@ -1,8 +1,6 @@
 use crate::model::{Checkpoint, CheckpointLifecycle};
 use anyhow::{anyhow, bail, Context, Result};
-use moraine_clickhouse::{
-    ClickHouseClient, McpOpenHostRevision, McpOpenPublicationRequest, QueryEnvelope,
-};
+use moraine_clickhouse::{ClickHouseClient, QueryEnvelope};
 use moraine_config::ValidatedQueryBudgets;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -167,10 +165,17 @@ impl CheckpointTransition {
         Ok(())
     }
 
+    /// `compatibility_prepared` is named for the v1 `mcp_open_*` bridge it was
+    /// introduced for (migration 033). Since issue #603 WI-10 there is no
+    /// compatibility publication to prepare: the column survives as the
+    /// persisted finalization marker on the readiness rows (`sql/031`), which
+    /// is a never-delete control relation, so the NAME is stuck but the meaning
+    /// is not. The refusal below reaches an operator, so it says what is
+    /// actually missing rather than naming a projection this build cannot have.
     pub(crate) fn validate_final(&self) -> Result<()> {
         self.validate_final_source()?;
         if !self.checkpoint.compatibility_prepared {
-            bail!("compatibility projection is not prepared");
+            bail!("publication finalization marker (compatibility_prepared) is not set");
         }
         Ok(())
     }
@@ -884,10 +889,13 @@ pub(crate) struct PublicationActor {
 const PUBLICATION_STATEMENT_OVERHEAD: u32 = 64;
 
 /// Per-candidate statement allowance for batch-shaped publication operations
-/// (amendment A7): a head commit/repair runs ~4 activate/persist statements
-/// per candidate plus compatibility preparation for the sessions of that
-/// source, so the term is deliberately generous. The configured
-/// `[query_budgets.background].statement_cap` stays as the floor.
+/// (amendment A7): a head commit/repair runs ~4 activate/persist statements per
+/// candidate. The term was sized when each candidate ALSO drove compatibility
+/// preparation for every session of that source (issue #603 WI-10 removed
+/// that), so it is now generous by a wide margin — deliberately kept, because
+/// shrinking a statement cap is how a legitimate batch starts failing at the
+/// envelope. The configured `[query_budgets.background].statement_cap` stays as
+/// the floor.
 const PUBLICATION_STATEMENTS_PER_CANDIDATE: u32 = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -904,42 +912,22 @@ impl SourcePublicationKind {
         }
     }
 
-    fn persists_readiness_after_direct_repair_activation(self) -> bool {
-        matches!(self, Self::Replacement)
-    }
-
     fn messages(self) -> HeadPublicationMessages {
         match self {
             Self::Initial => HeadPublicationMessages {
-                repair_not_authorized:
-                    "initial MCP compatibility repair did not authorize the published generation",
                 insert_context: "failed to publish initial source generation",
                 missing_after_insert:
                     "initial source head is not observable after acknowledged insert",
                 conflict_detail: "another publisher won initial source-head verification",
                 conflict_error:
-                    "conflicting publisher changed the initial source head during activation",
-                activate_context: "failed to activate initial MCP compatibility publication",
-                reprepare_context:
-                    "failed to reprepare initial MCP compatibility after concurrent head change",
-                reactivate_context: "failed to reactivate initial MCP compatibility publication",
-                activation_not_current:
-                    "initial MCP compatibility activation did not become current",
+                    "conflicting publisher changed the initial source head during publication",
             },
             Self::Replacement => HeadPublicationMessages {
-                repair_not_authorized:
-                    "MCP compatibility repair did not authorize the published generation",
                 insert_context: "failed to publish source generation",
                 missing_after_insert:
                     "published source head is not observable after acknowledged insert",
                 conflict_detail: "another publisher won source-head verification",
-                conflict_error: "conflicting publisher changed the source head during activation",
-                activate_context: "failed to activate MCP compatibility publication",
-                reprepare_context:
-                    "failed to reprepare MCP compatibility after concurrent head change",
-                reactivate_context: "failed to reactivate MCP compatibility publication",
-                activation_not_current:
-                    "MCP compatibility activation did not become current after source publication",
+                conflict_error: "conflicting publisher changed the source head during publication",
             },
         }
     }
@@ -958,15 +946,10 @@ enum HeadPublicationAction {
 }
 
 struct HeadPublicationMessages {
-    repair_not_authorized: &'static str,
     insert_context: &'static str,
     missing_after_insert: &'static str,
     conflict_detail: &'static str,
     conflict_error: &'static str,
-    activate_context: &'static str,
-    reprepare_context: &'static str,
-    reactivate_context: &'static str,
-    activation_not_current: &'static str,
 }
 
 impl PublicationActor {
@@ -1047,8 +1030,9 @@ impl PublicationActor {
     }
 
     /// Persist the ordered mirror catch-up gate. Final scans supersede their
-    /// staged `backend_caught_up = 0` readiness immediately; compatibility
-    /// publication records the final prepared row in the next actor step.
+    /// staged `backend_caught_up = 0` readiness immediately; the finalization
+    /// marker (`compatibility_prepared`, named for the retired v1 bridge) is
+    /// recorded on the readiness row in the next actor step.
     pub(crate) async fn persist_mirror_caught_up(
         &self,
         transition: &mut CheckpointTransition,
@@ -1372,13 +1356,23 @@ impl PublicationActor {
         })
     }
 
-    /// Commit a new source head or repair the compatibility activation for a
-    /// head that was already durable when its acknowledgement was lost.
+    /// Commit a new source head, or repair the persisted finalization state
+    /// for a head that was already durable when its acknowledgement was lost.
     ///
     /// Callers retain generation-specific eligibility and stale-head policy.
     /// This primitive owns the shared causal sequence while the actor gate is
-    /// held: candidate preparation, checkpoint/readiness persistence, head
-    /// insert and verification, activation, and one reprepare/reactivate.
+    /// held: checkpoint/readiness persistence, head insert, and verification.
+    ///
+    /// Until issue #603 WI-10 this sequence also prepared and activated the v1
+    /// `mcp_open_*` compatibility publication around the head insert
+    /// (migration 033's bridge). The projection is retired — migration 041
+    /// drops its tables and no reader consults its activation — so the barrier
+    /// a reader observes is the head insert into
+    /// `published_source_generations` alone, exactly as the canonical (#602)
+    /// protocol defines it. `compatibility_prepared` survives as the persisted
+    /// finalization marker in the readiness rows (the 1/1/1 gate the live
+    /// suite asserts), because erasing a column of a never-delete control
+    /// relation is not this change's to make.
     async fn commit_or_repair_head_locked(
         &self,
         transition: &mut CheckpointTransition,
@@ -1389,7 +1383,7 @@ impl PublicationActor {
         match action {
             HeadPublicationAction::Repair {
                 publication_revision,
-                previous_source_generation,
+                ..
             } => {
                 if transition.checkpoint.checkpoint_revision == 0 {
                     if let Some(revision) = self
@@ -1399,37 +1393,10 @@ impl PublicationActor {
                         transition.checkpoint.checkpoint_revision = revision;
                     }
                 }
-                let candidate_id = candidate_publication_id(transition);
-                let mut activated = self
-                    .clickhouse
-                    .activate_mcp_open_publication(&candidate_id)
-                    .await?;
-                if !activated {
-                    self.prepare_compatibility_locked(
-                        transition,
-                        previous_source_generation,
-                        publication_revision,
-                    )
-                    .await?;
-                    transition.set_compatibility_prepared(true);
-                    kind.validate_prepared(transition)?;
-                    self.persist_transition_locked(transition).await?;
-                    self.record_readiness_locked(transition, true).await?;
-                    activated = self
-                        .clickhouse
-                        .activate_mcp_open_publication(&candidate_id)
-                        .await?;
-                }
-                if !activated {
-                    bail!(messages.repair_not_authorized);
-                }
-                if kind.persists_readiness_after_direct_repair_activation()
-                    && !transition.checkpoint.compatibility_prepared
-                {
-                    // A replacement activation may repair a head committed by
-                    // the prior process without entering the reprepare branch.
-                    // Persist the final 1/1/1 gate so an older repair-failure
-                    // diagnostic cannot remain current after success.
+                if !transition.checkpoint.compatibility_prepared {
+                    // The head is already durable; persist the final 1/1/1
+                    // gate so an older repair-failure diagnostic cannot remain
+                    // current after success. Idempotent by `operation_id`.
                     transition.set_compatibility_prepared(true);
                     kind.validate_prepared(transition)?;
                     self.persist_transition_locked(transition).await?;
@@ -1443,15 +1410,8 @@ impl PublicationActor {
             }
             HeadPublicationAction::Commit {
                 publication_revision,
-                previous_source_generation,
+                ..
             } => {
-                let candidate_id = self
-                    .prepare_compatibility_locked(
-                        transition,
-                        previous_source_generation,
-                        publication_revision,
-                    )
-                    .await?;
                 transition.set_compatibility_prepared(true);
                 kind.validate_prepared(transition)?;
                 let checkpoint = self.persist_transition_locked(transition).await?;
@@ -1487,28 +1447,6 @@ impl PublicationActor {
                 }
                 self.record_writer_conflict(&transition.source, false, "")
                     .await?;
-                let mut activated = self
-                    .clickhouse
-                    .activate_mcp_open_publication(&candidate_id)
-                    .await
-                    .context(messages.activate_context)?;
-                if !activated {
-                    self.prepare_compatibility_locked(
-                        transition,
-                        previous_source_generation,
-                        publication_revision,
-                    )
-                    .await
-                    .context(messages.reprepare_context)?;
-                    activated = self
-                        .clickhouse
-                        .activate_mcp_open_publication(&candidate_id)
-                        .await
-                        .context(messages.reactivate_context)?;
-                }
-                if !activated {
-                    bail!(messages.activation_not_current);
-                }
                 Ok(PublicationAck {
                     checkpoint_revision: checkpoint.checkpoint_revision,
                     publication_revision,
@@ -1604,18 +1542,17 @@ impl PublicationActor {
         let _guard = self.gate.lock().await;
         transition.canonicalize_source(&self.source_host);
         if let Some(head) = self.current_head(&transition.source).await? {
-            // A delayed generation-1 repair must not rebuild or activate its
-            // compatibility candidate after a replacement generation has
-            // already become authoritative.
+            // A delayed generation-1 repair must not re-publish after a
+            // replacement generation has already become authoritative.
             if !is_current_initial_head(&head) {
                 return Ok(None);
             }
             // A generation-1 source remains published while its inode grows.
             // Later ordinary checkpoints have their own operation identity;
-            // persist that causal cursor without reactivating (or rebuilding)
-            // the source-wide candidate prepared by the initial publication.
-            // Only the original operation can represent a crash after the
-            // source head became durable but before compatibility activation.
+            // persist that causal cursor without re-running the initial
+            // publication's head sequence. Only the original operation can
+            // represent a crash after the source head became durable but
+            // before its finalization marker was recorded.
             if !is_original_initial_publication(&head, &transition.checkpoint.operation_id) {
                 let checkpoint = self.persist_transition_locked(transition).await?;
                 return Ok(Some(PublicationAck {
@@ -2083,50 +2020,6 @@ impl PublicationActor {
             .context("failed to persist source-generation publication readiness")
     }
 
-    async fn prepare_compatibility_locked(
-        &self,
-        transition: &CheckpointTransition,
-        previous_source_generation: Option<u32>,
-        publication_revision: u64,
-    ) -> Result<String> {
-        let captured_host_revisions = self.current_host_revisions().await?;
-        let candidate_publication_id = candidate_publication_id(transition);
-        let readiness = self
-            .clickhouse
-            .prepare_mcp_open_publication(&McpOpenPublicationRequest {
-                candidate_publication_id: candidate_publication_id.clone(),
-                operation_id: transition.checkpoint.operation_id.clone(),
-                publisher_id: self.publisher_id.clone(),
-                source_host: transition.source.source_host.clone(),
-                source_name: transition.source.source_name.clone(),
-                source_file: transition.source.source_file.clone(),
-                previous_source_generation,
-                source_generation: transition.checkpoint.source_generation,
-                publication_revision,
-                captured_host_revisions,
-            })
-            .await
-            .context("failed to prepare MCP compatibility publication")?;
-        if readiness.prepared_session_count != readiness.affected_session_count {
-            bail!(
-                "MCP compatibility preparation incomplete: prepared {} of {} affected sessions",
-                readiness.prepared_session_count,
-                readiness.affected_session_count
-            );
-        }
-        Ok(candidate_publication_id)
-    }
-
-    async fn current_host_revisions(&self) -> Result<Vec<McpOpenHostRevision>> {
-        let query = format!(
-            "SELECT source_host, toUInt64(max(publication_revision)) AS publication_revision \
-             FROM {}.v_current_published_source_generations \
-             GROUP BY source_host ORDER BY source_host",
-            quote_ident(&self.clickhouse.config().database),
-        );
-        self.clickhouse.query_rows(&query, None).await
-    }
-
     async fn next_revision(&self, query: &str, kind: &str) -> Result<u64> {
         let rows: Vec<RevisionRow> = self.clickhouse.query_rows(query, None).await?;
         rows.first()
@@ -2236,20 +2129,6 @@ fn sql_string_list(values: &BTreeSet<String>) -> String {
         .join(",")
 }
 
-fn candidate_publication_id(transition: &CheckpointTransition) -> String {
-    let mut hasher = Sha256::new();
-    for value in [
-        transition.source.source_host.as_str(),
-        transition.source.source_name.as_str(),
-        transition.source.source_file.as_str(),
-    ] {
-        hasher.update((value.len() as u64).to_le_bytes());
-        hasher.update(value.as_bytes());
-    }
-    hasher.update(transition.checkpoint.source_generation.to_le_bytes());
-    format!("source-publication-{:x}", hasher.finalize())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2310,7 +2189,6 @@ mod tests {
         inserts: Arc<StdMutex<BTreeMap<String, usize>>>,
         current_head: Arc<StdMutex<Option<Value>>>,
         transition_revisions: Arc<StdMutex<BTreeMap<String, u64>>>,
-        mcp_generation_ready: Arc<StdMutex<bool>>,
     }
 
     impl HeadPublicationMock {
@@ -2353,13 +2231,6 @@ mod tests {
                 .expect("head mock transition revisions mutex poisoned")
                 .insert(operation_id.to_string(), revision);
         }
-
-        fn set_mcp_generation_ready(&self, ready: bool) {
-            *self
-                .mcp_generation_ready
-                .lock()
-                .expect("head mock MCP readiness mutex poisoned") = ready;
-        }
     }
 
     fn head_mock_response(params: &BTreeMap<String, String>, rows: &[Value]) -> String {
@@ -2382,7 +2253,6 @@ mod tests {
             "source_generation_publication_readiness",
             "published_source_generations",
             "publication_diagnostic_events",
-            "mcp_open_generation_readiness",
         ]
         .into_iter()
         .find(|table| query.contains(table))
@@ -2479,16 +2349,6 @@ mod tests {
                 .collect::<Vec<_>>();
             return (StatusCode::OK, head_mock_response(&params, &rows));
         }
-        if query.contains("v_current_mcp_open_generation_readiness") {
-            let ready = *state
-                .mcp_generation_ready
-                .lock()
-                .expect("head mock MCP readiness mutex poisoned");
-            return (
-                StatusCode::OK,
-                head_mock_response(&params, &[json!({ "ready": u8::from(ready) })]),
-            );
-        }
         if query.contains("SELECT") && !query.contains("INSERT INTO") {
             return (StatusCode::OK, head_mock_response(&params, &[]));
         }
@@ -2506,9 +2366,6 @@ mod tests {
             .entry(table.to_string())
             .or_insert(0) += 1;
 
-        if table == "mcp_open_generation_readiness" {
-            state.set_mcp_generation_ready(true);
-        }
         for row in body
             .lines()
             .filter_map(|line| serde_json::from_str::<Value>(line).ok())
@@ -2564,23 +2421,26 @@ mod tests {
         publication_readiness: usize,
         source_heads: usize,
         writer_diagnostics: usize,
-        mcp_readiness: usize,
-        mcp_candidate_reads: usize,
-        mcp_activation_reads: usize,
-        mcp_preparations: usize,
+        /// Statements naming the retired v1 projection (issue #603 WI-10).
+        /// Must be zero on every path: migration 041 dropped the family, so
+        /// one of these reaching a live server is an error, not a stage.
+        retired_projection_statements: usize,
     }
 
     fn head_publication_trace(state: &HeadPublicationMock) -> HeadPublicationTrace {
-        HeadPublicationTrace {
+        let trace = HeadPublicationTrace {
             checkpoint_transitions: state.insert_count("ingest_checkpoint_transitions"),
             publication_readiness: state.insert_count("source_generation_publication_readiness"),
             source_heads: state.insert_count("published_source_generations"),
             writer_diagnostics: state.insert_count("publication_diagnostic_events"),
-            mcp_readiness: state.insert_count("mcp_open_generation_readiness"),
-            mcp_candidate_reads: state.query_count("mcp_open_publication_headers FINAL"),
-            mcp_activation_reads: state.query_count("v_current_mcp_open_generation_readiness"),
-            mcp_preparations: state.query_count("SELECT DISTINCT session_id"),
-        }
+            retired_projection_statements: state.query_count("mcp_open")
+                + state.insert_count("mcp_open_generation_readiness"),
+        };
+        assert_eq!(
+            trace.retired_projection_statements, 0,
+            "publication issued a statement naming the retired mcp_open_* projection"
+        );
+        trace
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2625,7 +2485,7 @@ mod tests {
     async fn repair_after_lost_head_ack(
         generation: u32,
         kind: SourcePublicationKind,
-        initially_ready: bool,
+        already_finalized: bool,
     ) -> (PublicationAck, HeadPublicationMock, CheckpointTransition) {
         let (actor, state) = spawn_head_publication_actor().await;
         let mut transition = if kind == SourcePublicationKind::Initial {
@@ -2638,9 +2498,13 @@ mod tests {
             transition.set_backend_caught_up(true);
             transition
         };
+        if already_finalized {
+            // The prior process persisted the final 1/1/1 gate before its
+            // acknowledgement was lost: nothing is left to repair but the ack.
+            transition.set_compatibility_prepared(true);
+        }
         state.set_current_head(&transition, 7);
         state.seed_transition_revision(&transition.checkpoint.operation_id, 5);
-        state.set_mcp_generation_ready(initially_ready);
 
         let ack = if kind == SourcePublicationKind::Initial {
             actor
@@ -2675,7 +2539,7 @@ mod tests {
         assert_eq!(
             head_publication_trace(&initial_state),
             head_publication_trace(&replacement_state),
-            "both response-loss paths must prepare, persist readiness, and reactivate identically"
+            "both response-loss paths must persist the finalization gate identically"
         );
         assert_eq!(
             initial_state.insert_count("published_source_generations"),
@@ -2687,33 +2551,32 @@ mod tests {
         );
     }
 
+    /// A repair whose finalization gate is already persisted re-persists
+    /// nothing: the ack is re-issued from durable state alone. (Until issue
+    /// #603 WI-10 this state was detected by probing the v1 projection's
+    /// activation; the flag on the transition is the durable remainder of
+    /// that protocol.)
     #[tokio::test(flavor = "multi_thread")]
-    async fn direct_response_loss_activation_keeps_replacement_readiness_repair() {
+    async fn an_already_finalized_repair_persists_nothing_for_either_kind() {
         let (initial_ack, initial_state, initial) =
             repair_after_lost_head_ack(1, SourcePublicationKind::Initial, true).await;
         let (replacement_ack, replacement_state, replacement) =
             repair_after_lost_head_ack(2, SourcePublicationKind::Replacement, true).await;
 
+        assert!(initial_ack.already_published);
+        assert!(replacement_ack.already_published);
         assert_eq!(initial_ack.checkpoint_revision, 5);
-        assert_eq!(replacement_ack.checkpoint_revision, 6);
-        assert!(!initial.checkpoint.compatibility_prepared);
+        assert_eq!(replacement_ack.checkpoint_revision, 5);
+        assert!(initial.checkpoint.compatibility_prepared);
         assert!(replacement.checkpoint.compatibility_prepared);
-        assert_eq!(
-            initial_state.insert_count("ingest_checkpoint_transitions"),
-            0
-        );
-        assert_eq!(
-            initial_state.insert_count("source_generation_publication_readiness"),
-            0
-        );
-        assert_eq!(
-            replacement_state.insert_count("ingest_checkpoint_transitions"),
-            1
-        );
-        assert_eq!(
-            replacement_state.insert_count("source_generation_publication_readiness"),
-            1
-        );
+        for state in [&initial_state, &replacement_state] {
+            assert_eq!(state.insert_count("ingest_checkpoint_transitions"), 0);
+            assert_eq!(
+                state.insert_count("source_generation_publication_readiness"),
+                0
+            );
+            assert_eq!(state.insert_count("published_source_generations"), 0);
+        }
     }
 
     #[test]

@@ -13,7 +13,6 @@ use std::io::Write;
 pub mod canonical_derivations;
 mod canonical_indexes;
 pub mod envelope;
-mod mcp_open_projection;
 pub use canonical_indexes::{
     CoreIndexAuditOutcome, CoreIndexBackfillOutcome, CoreIndexBackfillProgress, CoreIndexCursor,
     OpenV2PromotionOutcome, ReadIndexState, BACKFILL_PAGE_SIZE, OPEN_V2_PROVENANCE_AUTO_LOCAL,
@@ -25,9 +24,6 @@ pub use envelope::{
     record_budget_rejection, record_budget_request, unenveloped_statement_count, AllowanceResource,
     BudgetTelemetrySnapshot, EnvelopeError, EnvelopeStatsSnapshot, QueryClass, QueryEnvelope,
 };
-pub use mcp_open_projection::{
-    McpOpenGenerationReadiness, McpOpenHostRevision, McpOpenPublicationRequest, McpOpenSourceHead,
-};
 pub mod mcp_tool_names;
 /// Issue #603 WI-04/WI-05. Ledger, planner, authority types, and the §3.2
 /// claim/re-drive/settle driver.
@@ -36,9 +32,6 @@ pub mod reclaim;
 /// the delete predicates it authorizes — the one scope that deletes user
 /// history, unreachable without both `[retention]` keys.
 mod reclaim_canonical;
-/// Issue #603 WI-05. The two `mcp_open_*` candidate probes and the delete
-/// predicates they authorize.
-mod reclaim_mcp_open;
 /// Issue #603 WI-07. The canonical read-index candidate probe and the delete
 /// predicates it authorizes.
 mod reclaim_read_index;
@@ -370,7 +363,7 @@ pub struct Migration {
     pub sql: &'static str,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MigrationProgress {
     Plan {
         applied: usize,
@@ -388,6 +381,177 @@ pub enum MigrationProgress {
         version: &'static str,
         name: &'static str,
     },
+    /// A pending migration whose precondition is not yet met was deferred —
+    /// together with everything after it, so the applied prefix stays ordered.
+    /// The run itself still succeeds: the caller is expected to re-run the
+    /// migration pass once the precondition can be satisfied (the `migrate`/
+    /// `up` sequence retries after the canonical sweep publishes readiness).
+    /// `reason` is operator-facing and actionable.
+    Deferred {
+        version: &'static str,
+        name: &'static str,
+        reason: String,
+    },
+    /// A preflight note emitted immediately before a gated migration applies —
+    /// the retirement migration reports the compressed column bytes the drop
+    /// returns.
+    Preflight {
+        version: &'static str,
+        note: String,
+    },
+}
+
+/// Migration 041, the issue #603 WI-10 retirement of the legacy `mcp_open_*`
+/// projection. The only bundled migration with a runner precondition — see
+/// [`ClickHouseClient::retirement_gate`].
+pub const RETIREMENT_MIGRATION_VERSION: &str = "041";
+
+/// The exact opening of the [`MigrationProgress::Preflight`] note
+/// [`ClickHouseClient::retirement_gate`] emits on a cut-over host, before the
+/// measured size, row count and table count.
+///
+/// It is a constant so that the one operator-facing sentence this migration is
+/// documented by has a single source. `sql/041`'s header quotes it verbatim
+/// and `storage_class::tests::the_migration_header_quotes_the_note_the_runner_emits`
+/// pins that quotation; the runner formats the note FROM this constant, and
+/// `commands::tests::a_cut_over_host_retires_the_projection_in_the_first_pass`
+/// asserts the rendered note in full, beginning with it. A migration is
+/// immutable once released, so an operator who greps their log for the wording
+/// in that header has to find the line moraine actually printed.
+pub const RETIREMENT_PROCEED_NOTE_PREFIX: &str =
+    "retiring the legacy mcp_open_* projection: dropping the family returns ";
+
+/// How the no-projected-content preflight note names the seeds that leave the
+/// family's marker table non-empty on a store that projected nothing.
+///
+/// A constant because the count and the version list are DERIVED, not
+/// remembered: `storage_class::tests::the_bookkeeping_table_is_the_one_the_
+/// migrations_seed_without_reading_data` walks the bundled migrations for
+/// data-independent seeds and refuses to let this sentence name a different
+/// set, or a different number of them, than the walk finds. Review round 6
+/// printed "migrations 027 and 029" here — two of the five — while that same
+/// derivation was asserting all seven `INSERT`s and `sql/041`'s immutable
+/// header was already spelling the list correctly. The only string an operator
+/// ever saw was the wrong one, and nothing could see it.
+/// The operator-facing clause naming the migrations that put rows in
+/// `mcp_open_projection_state` on every store that ran them.
+///
+/// "Without reading any corpus", not "unconditionally": one of the seven seeds
+/// IS conditional — 027's `INSERT` carries a `WHERE NOT EXISTS` against the
+/// marker table itself — and the distinction that makes the gate correct is
+/// corpus-independence, not the absence of a `WHERE`. A statement whose row
+/// source never touches projected data writes its row on a brand-new store, so
+/// the marker cannot separate a store that projected something from one that
+/// never did, which is why the emptiness test sums the other seven tables.
+/// `storage_class::tests::the_bookkeeping_table_is_the_one_the_migrations_seed_without_reading_data`
+/// derives that set from the migrations and checks this sentence against it
+/// both ways, including the count word.
+pub const BOOKKEEPING_SEED_CLAUSE: &str =
+    "that migrations 027, 029, 033, 034 and 035 seed without reading any corpus (seven \
+     INSERTs, none of which reads one; 027's is guarded, but only against the marker table \
+     itself)";
+
+/// A pending migration's precondition verdict (see
+/// [`ClickHouseClient::migration_gate`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MigrationGate {
+    /// Apply now. `notes` are surfaced as [`MigrationProgress::Preflight`]
+    /// immediately before the migration's first statement.
+    Proceed { notes: Vec<String> },
+    /// Do not apply this migration (or anything ordered after it) in this
+    /// pass. The run still succeeds; the caller re-runs the pass once the
+    /// precondition can be met.
+    Defer { reason: String },
+}
+
+/// Compact byte rendering for operator-facing migration notes.
+/// The footprint statement [`ClickHouseClient::retired_family_footprint`]
+/// issues, as text.
+///
+/// A free function rather than an inline `format!` because the column it sums
+/// is quoted by an IMMUTABLE file: `sql/041`'s header carries a measured
+/// `28.36 GiB` and names `data_compressed_bytes` as where that came from. The
+/// two figures a store can offer here differ — on the reference host, read
+/// SELECT-only at 2026-08-01 09:15:47 local, `sum(data_compressed_bytes)` was
+/// 30 451 044 275 and `sum(bytes_on_disk)` was
+/// 30 459 477 709, which render as `28.36 GiB` and `28.37 GiB` — so "the bytes
+/// on disk" is not a specification. Both are AS-OF figures: background merges
+/// move them by a few thousand bytes an hour without changing what the family
+/// holds, so it is the GAP that is the point here, not the digits. (Earlier in
+/// the same day they were 30 451 052 638 and 30 459 493 288 — a different pair
+/// of numbers, the same two renderings, the same 25,114,507 rows.)
+/// `storage_class::tests::
+/// the_header_footprint_figure_is_what_the_runner_would_print` reads this
+/// statement and the header and refuses to let them name different columns.
+///
+/// Four figures, because the gate and the note ask different questions. The
+/// note reports what the drop RETURNS, which is the whole family. The gate
+/// asks whether anything would be LOST, which is the family's projected
+/// content only: `mcp_open_projection_state` is a bookkeeping marker seeded
+/// without reading a corpus by five of the migrations that build the family, so its
+/// rows are present on every store that ran them and cannot distinguish a
+/// store that projected something from one that never did. Summing it into the
+/// emptiness test is what made the fresh-install arm unreachable — measured
+/// against a real ClickHouse 25.12.5.44 server, a database with bundled
+/// migrations 001–040 applied and nothing else held 2 rows / 392 B, all of it
+/// that marker (the count is merge state; it is never zero).
+fn retired_family_footprint_sql(database: &str) -> String {
+    let literals = |tables: &mut dyn Iterator<Item = &'static storage_class::RetiredTable>| {
+        tables
+            .map(|table| escape_literal(table.name))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let names = literals(&mut storage_class::RETIRED_TABLES.iter());
+    let content = literals(&mut storage_class::retired_content_tables());
+    // The aliases deliberately do NOT reuse the source column names. ClickHouse
+    // resolves a SELECT-list alias inside a later SELECT-list expression, so
+    // `sum(rows) AS rows` followed by `sumIf(rows, …)` nests one aggregate
+    // inside another and the statement fails outright with `Code: 184 …
+    // ILLEGAL_AGGREGATION` (executed against 25.12.5.44). Same resolution rule
+    // sql/041's header documents for the ledger settle statement's constants.
+    format!(
+        "SELECT toUInt64(sum(rows)) AS family_rows, \
+                toUInt64(sum(data_compressed_bytes)) AS family_bytes, \
+                toUInt64(sumIf(rows, table IN ({content}))) AS content_rows, \
+                toUInt64(sumIf(data_compressed_bytes, table IN ({content}))) AS content_bytes \
+         FROM system.parts \
+         WHERE database = {} AND active AND table IN ({names}) \
+         FORMAT JSONEachRow",
+        escape_literal(database),
+    )
+}
+
+/// What the retired `mcp_open_*` family holds right now, as
+/// [`retired_family_footprint_sql`] reports it.
+///
+/// `family_*` is what the drop returns (all eight tables); `content_*` is what
+/// the drop would LOSE (the seven that hold projected content). They differ by
+/// `mcp_open_projection_state`, which five of the family's own migrations seed
+/// without reading a corpus across seven `INSERT`s — see
+/// [`storage_class::RetiredTable::holds_projected_content`] and
+/// [`BOOKKEEPING_SEED_CLAUSE`].
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+struct RetiredFamilyFootprint {
+    family_rows: u64,
+    family_bytes: u64,
+    content_rows: u64,
+    content_bytes: u64,
+}
+
+fn format_binary_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.2} {}", UNITS[unit])
+    }
 }
 
 /// Result of comparing the server's `schema_migrations` ledger against this
@@ -998,8 +1162,10 @@ impl ClickHouseClient {
     }
 
     /// Insert rows synchronously even when the client is configured for
-    /// ClickHouse async inserts. Projection maintenance uses this boundary so
-    /// canonical events are visible before it rebuilds their session.
+    /// ClickHouse async inserts. Publication uses this boundary: a head, a
+    /// checkpoint, or a readiness row must be durable and readable before the
+    /// next causal step reads it back, and an async insert can still be
+    /// buffered when the caller's next statement runs.
     pub async fn insert_json_rows_sync(&self, table: &str, rows: &[Value]) -> Result<()> {
         self.insert_json_rows_with_mode(table, rows, false).await
     }
@@ -1095,7 +1261,9 @@ impl ClickHouseClient {
 
     /// Migration-class envelope for schema/read-model work driven by this
     /// client (the migration runner itself, and the `migrate`/`up` command
-    /// path around `backfill_mcp_open_read_model*` / projection reclaim).
+    /// path around the canonical read-index sweep and storage reclamation —
+    /// until issue #603 WI-10 also the `mcp_open` backfill and reclaim, both
+    /// deleted).
     /// The absolute deadline honors `max(configured migration budget,
     /// operator client timeout, 300s)` per amendment A5, so an envelope can
     /// never be tighter than the client bound migrations honored before
@@ -1184,6 +1352,37 @@ impl ClickHouseClient {
         let mut executed = Vec::with_capacity(total);
         for (offset, migration) in pending.into_iter().enumerate() {
             let index = offset + 1;
+
+            // Precondition gate (issue #603 WI-10). A deferred migration stops
+            // the pass HERE — before `Started`, and before anything ordered
+            // after it — so the applied prefix in `schema_migrations` stays a
+            // prefix of `bundled_migrations()`. The pass itself still returns
+            // Ok: the migrate/`up` sequence re-runs it after the canonical
+            // sweep, which is what satisfies the retirement precondition on a
+            // host that has not yet cut over.
+            match self
+                .migration_envelope(migration_budget)
+                .scope(self.migration_gate(migration.version))
+                .await?
+            {
+                MigrationGate::Proceed { notes } => {
+                    for note in notes {
+                        on_progress(MigrationProgress::Preflight {
+                            version: migration.version,
+                            note,
+                        });
+                    }
+                }
+                MigrationGate::Defer { reason } => {
+                    on_progress(MigrationProgress::Deferred {
+                        version: migration.version,
+                        name: migration.name,
+                        reason,
+                    });
+                    break;
+                }
+            }
+
             on_progress(MigrationProgress::Started {
                 index,
                 total,
@@ -1242,6 +1441,132 @@ impl ClickHouseClient {
         }
 
         Ok(executed)
+    }
+
+    /// The precondition verdict for one pending migration. Every migration
+    /// except [`RETIREMENT_MIGRATION_VERSION`] proceeds unconditionally and
+    /// without issuing a statement.
+    async fn migration_gate(&self, version: &str) -> Result<MigrationGate> {
+        if version != RETIREMENT_MIGRATION_VERSION {
+            return Ok(MigrationGate::Proceed { notes: Vec::new() });
+        }
+        self.retirement_gate().await
+    }
+
+    /// The issue #603 WI-10 retirement precondition: migration 041 drops the
+    /// legacy `mcp_open_*` projection, and this build carries no v1 reader, so
+    /// the drop may only run once nothing can still need the projection.
+    ///
+    /// Three host shapes, decided from two probes (`open_v2` readiness and the
+    /// family's `system.parts` footprint):
+    ///
+    /// * **Cut over** (`open_v2.ready = 1` — the same durable authority the
+    ///   reader dispatch consults): proceed, reporting the compressed column
+    ///   bytes the drop returns. Readiness is published only after the sweep
+    ///   completes AND the persisted overlap audit passes, so this is the
+    ///   "sweep + audit ran first" gate in its durable form.
+    /// * **Never cut over, projection populated**: defer with a named,
+    ///   actionable reason. The migrate/`up` sequence runs the canonical
+    ///   sweep + audit right after the migration pass and then re-runs the
+    ///   pass, so a healthy host retires in the same startup; a host whose
+    ///   audit fails keeps its projection bytes untouched and the reason names
+    ///   the recovery recipe.
+    /// * **No projected content** (fresh install, or a store that never
+    ///   projected anything): proceed — the drop cannot lose data that does
+    ///   not exist, and readiness for the empty corpus publishes when the
+    ///   sweep runs moments later.
+    ///
+    /// The third arm measures the family's projected CONTENT, not its row
+    /// count. `mcp_open_projection_state` is a bookkeeping marker that
+    /// five of the family's own migrations seed without reading a corpus, so on a real
+    /// fresh install — executed against ClickHouse 25.12.5.44, migrations
+    /// 001–040 applied to an empty database — the family held 2 rows / 392 B
+    /// of marker and nothing else. Gating on the total made this arm
+    /// unreachable and printed
+    /// the deferral's "has not cut over … run `moraine db core-index rebuild`"
+    /// on every brand-new store's first startup.
+    async fn retirement_gate(&self) -> Result<MigrationGate> {
+        let ready = self.open_v2_reader_ready().await?;
+        let RetiredFamilyFootprint {
+            family_rows: rows,
+            family_bytes: bytes,
+            content_rows,
+            content_bytes,
+        } = self.retired_family_footprint().await?;
+        if ready {
+            return Ok(MigrationGate::Proceed {
+                notes: vec![format!(
+                    "{RETIREMENT_PROCEED_NOTE_PREFIX}\
+                     {} of compressed column data ({rows} rows across {} tables; \
+                     sum(data_compressed_bytes) over active system.parts, measured \
+                     immediately before the drop — DROP TABLE ... SYNC deletes the parts \
+                     before returning, so unlike a reclaim DELETE none of it is merge-deferred)",
+                    format_binary_bytes(bytes),
+                    storage_class::RETIRED_TABLES.len(),
+                )],
+            });
+        }
+        if content_rows == 0 {
+            let held = if rows == 0 {
+                "the family holds no rows at all".to_string()
+            } else {
+                format!(
+                    "the family holds no projected rows — only the {rows}-row ({}) \
+                     mcp_open_projection_state marker {BOOKKEEPING_SEED_CLAUSE}",
+                    format_binary_bytes(bytes),
+                )
+            };
+            return Ok(MigrationGate::Proceed {
+                notes: vec![format!(
+                    "retiring the legacy mcp_open_* projection: {held}, so the drop loses \
+                     nothing (canonical read-index readiness publishes when the sweep next \
+                     runs)"
+                )],
+            });
+        }
+        Ok(MigrationGate::Defer {
+            reason: format!(
+                "migration 041 retires the legacy mcp_open_* projection, but this store has \
+                 not cut over to the canonical read indexes (open_v2 is unpublished) and the \
+                 projection still holds {content_rows} projected rows ({}). The canonical \
+                 sweep + audit must succeed first: `moraine db migrate` (and `moraine up`) \
+                 runs the sweep right after this pass and then retries the migration in the \
+                 same startup. If it keeps deferring, run `moraine db core-index rebuild`, \
+                 confirm `moraine db core-index status` reports open_v2 published, then \
+                 re-run `moraine db migrate`.",
+                format_binary_bytes(content_bytes),
+            ),
+        })
+    }
+
+    /// Rows and compressed bytes currently held by the retired `mcp_open_*`
+    /// family, from active parts, split into the whole family and the seven
+    /// tables that hold projected content. Zero everywhere once migration 041
+    /// has run; `content_*` alone is zero on a store that never projected
+    /// anything, because five of the family's own migrations seed its
+    /// bookkeeping marker without reading a corpus.
+    ///
+    /// The statement is built by [`retired_family_footprint_sql`] so the column
+    /// it sums is a thing a test can read; `sql/041`'s header quotes a measured
+    /// figure from that same column and cannot be corrected in place.
+    /// An absent row is an ERROR, not an empty family. The statement is an
+    /// aggregate with no `GROUP BY`, so ClickHouse answers it with exactly one
+    /// row even when nothing matches (executed against 25.12.5.44: a family
+    /// list naming only absent tables still returns
+    /// `{"family_rows":0,…,"content_bytes":0}`). Defaulting an empty answer to
+    /// zeros would therefore never help a real store, and would silently turn
+    /// "the backend did not answer this shape" into "proceed with the drop".
+    async fn retired_family_footprint(&self) -> Result<RetiredFamilyFootprint> {
+        let query = retired_family_footprint_sql(&self.cfg.database);
+        let rows: Vec<RetiredFamilyFootprint> = self
+            .query_json_each_row(&query, Some("system"))
+            .await
+            .context("failed to measure the legacy mcp_open_* projection footprint")?;
+        rows.into_iter().next().context(
+            "the legacy mcp_open_* projection footprint probe returned no row; the statement \
+             is an aggregate without GROUP BY, so a conforming backend answers it with one \
+             row even when no part matches — an empty answer means the backend did not run it",
+        )
     }
 
     pub async fn pending_migration_versions(&self) -> Result<Vec<String>> {
@@ -1477,6 +1802,12 @@ impl ClickHouseClient {
 /// against `system.tables` (materialized views appear there too). New
 /// migrations that add a durable table or MV register it here so a partially
 /// applied schema is reported as missing rather than silently tolerated.
+///
+/// The legacy `mcp_open_*` projection family is deliberately absent: migration
+/// 041 (issue #603 WI-10) drops it, so requiring it would fail the handshake
+/// on every migrated store. The retired names are recorded in
+/// [`storage_class::RETIRED_TABLES`] so the migration gate still recognizes
+/// them in historical migrations.
 pub const REQUIRED_SCHEMA_OBJECTS: &[&str] = &[
     "raw_events",
     "events",
@@ -1493,14 +1824,6 @@ pub const REQUIRED_SCHEMA_OBJECTS: &[&str] = &[
     "search_query_log",
     "search_hit_log",
     "search_interaction_log",
-    "mcp_open_sessions",
-    "mcp_open_turns",
-    "mcp_open_events",
-    "mcp_open_dirty_sessions",
-    "mcp_open_projection_state",
-    "mcp_open_publication_headers",
-    "mcp_open_generation_readiness",
-    "mcp_open_backfill_plans",
     "published_source_generations",
     "ingest_checkpoint_transitions",
     "source_generation_publication_readiness",
@@ -1524,8 +1847,6 @@ pub const REQUIRED_SCHEMA_OBJECTS: &[&str] = &[
     "v_live_tool_io",
     "v_live_search_documents",
     "v_live_search_postings",
-    "v_mcp_open_publication_headers",
-    "v_current_mcp_open_generation_readiness",
     "v_publication_diagnostics",
     // issue-603 WI-04 storage reclaim ledger (migration 038).
     "storage_reclaim_ledger",
@@ -1733,6 +2054,11 @@ pub fn bundled_migrations() -> Vec<Migration> {
             version: "040",
             name: "040_decommission_conversation_terms_mv.sql",
             sql: include_str!("../../../sql/040_decommission_conversation_terms_mv.sql"),
+        },
+        Migration {
+            version: RETIREMENT_MIGRATION_VERSION,
+            name: "041_retire_mcp_open_projection.sql",
+            sql: include_str!("../../../sql/041_retire_mcp_open_projection.sql"),
         },
     ]
 }
@@ -2034,6 +2360,11 @@ mod tests {
         queries: Arc<Mutex<Vec<String>>>,
         params: Arc<Mutex<Vec<HashMap<String, String>>>>,
         fail_ledger_insert: bool,
+        /// Answer the retirement gate's `system.parts` footprint probe with an
+        /// empty body — a backend that accepted the statement and returned no
+        /// row. Only [`a_footprint_probe_that_answers_nothing_is_an_error`]
+        /// sets it.
+        blind_footprint_probe: bool,
     }
 
     impl MigrationMockState {
@@ -2043,6 +2374,7 @@ mod tests {
                 queries,
                 params: Arc::new(Mutex::new(Vec::new())),
                 fail_ledger_insert: false,
+                blind_footprint_probe: false,
             }
         }
     }
@@ -2071,6 +2403,29 @@ mod tests {
                     .map(|version| json!({ "version": version }))
                     .collect::<Vec<_>>();
                 return (StatusCode::OK, json!({ "data": data }).to_string());
+            }
+            if query.contains("system.parts") && query.contains("mcp_open_") {
+                if state.blind_footprint_probe {
+                    return (StatusCode::OK, String::new());
+                }
+                // The retirement gate's footprint probe. Answered with what a
+                // real ClickHouse 25.12.5.44 reports for a store that ran
+                // migrations 027–035 and projected nothing into the family:
+                // 2 rows / 392 B, every byte of it the
+                // `mcp_open_projection_state` marker that 027, 029, 033, 034
+                // and 035 seed without reading a corpus across seven `INSERT`s.
+                // Leaving it unanswered is now an error, not
+                // an empty family — see `retired_family_footprint`.
+                return (
+                    StatusCode::OK,
+                    json!({
+                        "family_rows": 2,
+                        "family_bytes": 392,
+                        "content_rows": 0,
+                        "content_bytes": 0,
+                    })
+                    .to_string(),
+                );
             }
             if state.fail_ledger_insert
                 && query.starts_with("INSERT INTO")
@@ -2571,6 +2926,44 @@ mod tests {
                 m.name
             );
         }
+    }
+
+    /// The deferral in `migrate_database_with_progress` `break`s rather than
+    /// `continue`s, so the applied set in `schema_migrations` stays a **prefix**
+    /// of [`bundled_migrations`]. Today that choice is unobservable:
+    /// [`RETIREMENT_MIGRATION_VERSION`] is the only deferrable migration and it
+    /// sorts last, so `break` and `continue` do the same thing and no test can
+    /// tell them apart.
+    ///
+    /// This pin exists to make the day that stops being true loud. When a
+    /// migration sorts after 041, `continue` would apply it over a deferred
+    /// 041 — a non-prefix applied set, on a store the operator believes is
+    /// mid-upgrade — with nothing else red. Keep the `break`, and replace this
+    /// pin with a walk that asserts the later migration stays unapplied through
+    /// a deferral (extend
+    /// `commands::tests::a_host_whose_audit_never_passes_keeps_its_projection_bytes`,
+    /// which already drives the deferring shape).
+    #[test]
+    fn nothing_is_bundled_after_the_deferrable_migration() {
+        let later: Vec<&str> = bundled_migrations()
+            .iter()
+            .map(|migration| migration.version)
+            .filter(|version| *version > RETIREMENT_MIGRATION_VERSION)
+            .collect();
+        assert!(
+            later.is_empty(),
+            "migrations {later:?} sort after the deferrable {RETIREMENT_MIGRATION_VERSION}, so \
+             the `break` on MigrationGate::Defer in migrate_database_with_progress is now \
+             observable and needs its own test — see this test's docstring"
+        );
+        // …and the deferrable version is really bundled, so the check above is
+        // not passing against an empty comparison.
+        assert!(
+            bundled_migrations()
+                .iter()
+                .any(|migration| migration.version == RETIREMENT_MIGRATION_VERSION),
+            "the deferrable migration must be bundled"
+        );
     }
 
     #[test]
@@ -3257,7 +3650,7 @@ mod tests {
 
     /// Issue #597 §2.3 / correction C1. The v1 dedup digest was
     /// `hex(SHA256(mcp_open_events.text_content))` over the FULL projected text
-    /// (the projector copies `events.text_content` verbatim), so 037's digest
+    /// (the projector copied `events.text_content` verbatim), so 037's digest
     /// must be taken over the full `text_content` too. Narrowing it to
     /// `substring(text_content, 1, 65536)` would newly collapse two events that
     /// differ only past 64 KiB — a silent #539/#565 equivalence change.
@@ -3776,6 +4169,59 @@ mod tests {
         assert!(msg.contains("'team-ch'"));
         assert!(msg.contains("015, 016"));
         assert!(msg.contains("never migrates"));
+    }
+
+    /// **The new terminal path issue #603 WI-10 creates, pinned deliberately.**
+    ///
+    /// Before this work every bundled migration applied unconditionally, so a
+    /// server moraine had migrated was never legitimately behind and
+    /// `missing_on_server` meant "someone forgot". [`RETIREMENT_MIGRATION_VERSION`]
+    /// is the first migration a healthy server can sit behind on purpose: a
+    /// shared/team ClickHouse whose 041 defers (never cut over, projection
+    /// populated) reports exactly `["041"]` to every NON-default backend, and
+    /// this policy hard-errors — disabling that backend's ingest sink
+    /// (`BackendSinkStatus::DisabledSkew`, terminal until restart) and failing
+    /// repository construction in `backend_router`.
+    ///
+    /// That is the deliberate choice and this test is what makes it deliberate:
+    /// the failure is loud and named rather than silent, moraine still never
+    /// migrates a non-default backend, and 041's own deferral reason already
+    /// names the recovery. Softening it — special-casing the deferrable version
+    /// into a warning — would have to delete this test, which is the point.
+    #[test]
+    fn a_deferred_retirement_makes_a_non_default_backend_legitimately_behind_and_it_still_errors() {
+        // The set of versions a migrated server can legitimately be missing is
+        // exactly the deferrable one. Asserted from the gate's own rule, so a
+        // second deferrable migration cannot slip in behind this reasoning.
+        let deferrable: Vec<&str> = bundled_migrations()
+            .iter()
+            .map(|migration| migration.version)
+            .filter(|version| *version == RETIREMENT_MIGRATION_VERSION)
+            .collect();
+        assert_eq!(
+            deferrable,
+            vec![RETIREMENT_MIGRATION_VERSION],
+            "`migration_gate` defers exactly one bundled migration; if that changed, this \
+             walk has to grow with it"
+        );
+
+        let skew = SchemaSkew {
+            missing_on_server: vec![RETIREMENT_MIGRATION_VERSION.to_string()],
+            unknown_on_server: Vec::new(),
+        };
+        let err = enforce_remote_schema_policy("team-ch", &skew, false)
+            .expect_err("a deferred 041 leaves a non-default backend behind, and behind errors");
+        let msg = err.to_string();
+        assert!(msg.contains("'team-ch'"), "{msg}");
+        assert!(msg.contains(RETIREMENT_MIGRATION_VERSION), "{msg}");
+        assert!(msg.contains("never migrates"), "{msg}");
+
+        // `allow_newer_server` is about a server AHEAD of this build. It must
+        // not become an accidental escape hatch for the deferral.
+        assert!(
+            enforce_remote_schema_policy("team-ch", &skew, true).is_err(),
+            "allow_newer_server must not excuse a deferred retirement"
+        );
     }
 
     #[test]
@@ -4495,26 +4941,48 @@ mod tests {
             .expect("apply latest migration");
 
         assert_eq!(executed, vec![latest.version.to_string()]);
+        // The latest migration is the gated retirement (041); against the
+        // mock — no readiness row, and a family holding nothing but the
+        // bookkeeping seed — the gate takes the no-projected-content arm and
+        // emits its preflight note before `Started`. See the three
+        // `a_*_host_*` retirement walks in apps/moraine for the full
+        // three-shape walk.
+        assert_eq!(events.len(), 4, "{events:#?}");
         assert_eq!(
-            events,
-            vec![
-                MigrationProgress::Plan {
-                    applied: bundled.len() - 1,
-                    pending: 1,
-                },
-                MigrationProgress::Started {
-                    index: 1,
-                    total: 1,
-                    version: latest.version,
-                    name: latest.name,
-                },
-                MigrationProgress::Applied {
-                    index: 1,
-                    total: 1,
-                    version: latest.version,
-                    name: latest.name,
-                },
-            ]
+            events[0],
+            MigrationProgress::Plan {
+                applied: bundled.len() - 1,
+                pending: 1,
+            }
+        );
+        match &events[1] {
+            MigrationProgress::Preflight { version, note } => {
+                assert_eq!(*version, latest.version);
+                assert!(
+                    note.contains("holds no projected rows")
+                        && note.contains("2-row (392 B) mcp_open_projection_state marker"),
+                    "{note}"
+                );
+            }
+            other => panic!("expected the retirement preflight note, got {other:?}"),
+        }
+        assert_eq!(
+            events[2],
+            MigrationProgress::Started {
+                index: 1,
+                total: 1,
+                version: latest.version,
+                name: latest.name,
+            }
+        );
+        assert_eq!(
+            events[3],
+            MigrationProgress::Applied {
+                index: 1,
+                total: 1,
+                version: latest.version,
+                name: latest.name,
+            }
         );
         let queries = queries.lock().expect("migration query mutex poisoned");
         let ledger_index = queries
@@ -4524,6 +4992,65 @@ mod tests {
             })
             .expect("ledger insert query");
         assert_eq!(ledger_index, queries.len() - 1);
+    }
+
+    /// A footprint probe that answers nothing is an ERROR, not an empty
+    /// family.
+    ///
+    /// The statement is an aggregate without `GROUP BY`, so a conforming
+    /// backend returns exactly one row even when no part matches — verified
+    /// against ClickHouse 25.12.5.44, where a family list naming only absent
+    /// tables still answers `{"family_rows":0,…,"content_bytes":0}`. Nothing
+    /// real therefore reaches a zero-row answer, and treating one as "the
+    /// family is empty, proceed with the drop" is how review round 4's
+    /// fresh-install walk came to assert a stand-in's default instead of a
+    /// schema property: its mock answered every unmatched `SELECT` with no
+    /// rows, `unwrap_or((0, 0))` turned that into an empty family, and the arm
+    /// the walk claimed to cover was unreachable against a real server.
+    ///
+    /// MUTATION (executed 2026-08-01): restore the
+    /// `.unwrap_or_default()` fallback in `retired_family_footprint` => FAILS
+    /// here (041 applies against a backend that measured nothing). Nothing
+    /// else in the tree notices, because every other stand-in now answers the
+    /// probe.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_footprint_probe_that_answers_nothing_is_an_error() {
+        let bundled = bundled_migrations();
+        let applied = bundled[..bundled.len() - 1]
+            .iter()
+            .map(|migration| migration.version.to_string())
+            .collect::<Vec<_>>();
+        let base_url = spawn_migration_mock_server(MigrationMockState {
+            blind_footprint_probe: true,
+            ..MigrationMockState::new(applied, Arc::new(Mutex::new(Vec::new())))
+        })
+        .await;
+        let client = ClickHouseClient::new(test_clickhouse_config(base_url)).expect("new client");
+
+        let mut events = Vec::new();
+        let error = client
+            .run_migrations_with_progress(|event| events.push(event))
+            .await
+            .expect_err("an unmeasurable family must not read as an empty one");
+        let chain = format!("{error:#}");
+        assert!(
+            chain.contains("footprint probe returned no row"),
+            "the abort must name what went unanswered, got: {chain}"
+        );
+        // Bounded from the other side too: the run stopped before the drop,
+        // and before claiming anything about the family.
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, MigrationProgress::Applied { version: "041", .. })),
+            "041 must not apply on an unmeasured family: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, MigrationProgress::Preflight { .. })),
+            "no preflight note may claim a footprint that was never read: {events:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

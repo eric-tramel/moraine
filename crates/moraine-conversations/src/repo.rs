@@ -1,18 +1,17 @@
 use async_trait::async_trait;
 
 use crate::domain::{
-    AnalyticsRange, AnalyticsSnapshot, IngestHeartbeatRead, SessionAnalytics,
-    SessionAnalyticsQuery, StoreDiagnostics, StoreHealth, TablePreview, TablePreviewQuery,
-    TableSummaries, WebSearchEvent,
+    AnalyticsRange, AnalyticsSnapshot, IngestHeartbeatRead, StoreDiagnostics, StoreHealth,
+    TablePreview, TablePreviewQuery, TableSummaries, WebSearchEvent,
 };
 use crate::domain::{
     CanonicalContinuation, CanonicalReadOutcome, CanonicalSessionPage, CanonicalTurnPage,
     Conversation, ConversationDetailOptions, ConversationListFilter, ConversationSearchQuery,
     ConversationSearchResults, FileAttentionQuery, FileAttentionTouch, McpEventOpen,
-    McpSessionListFilter, McpSessionListItem, McpSessionOpen, McpTurnOpen, OpenContext,
-    OpenEventRequest, Page, PageRequest, RepoConfig, SearchEventsQuery, SearchEventsResult,
-    SearchMcpEventsQuery, SearchMcpEventsResult, SessionEventsQuery, SessionMetadata,
-    SessionSearchQuery, SessionSearchResults, TraceEvent, Turn, TurnListFilter, TurnSummary,
+    McpSessionListFilter, McpSessionListItem, OpenContext, OpenEventRequest, Page, PageRequest,
+    RepoConfig, SearchEventsQuery, SearchEventsResult, SearchMcpEventsQuery, SearchMcpEventsResult,
+    SessionEventsQuery, SessionMetadata, SessionSearchQuery, SessionSearchResults, TraceEvent,
+    Turn, TurnListFilter, TurnSummary,
 };
 use crate::error::{RepoError, RepoResult};
 
@@ -21,25 +20,6 @@ pub trait ConversationRepository: Send + Sync {
     fn config(&self) -> &RepoConfig;
 
     async fn prewarm_mcp_search_state(&self) -> RepoResult<()>;
-
-    /// The projector-backed dashboard read. It has had no interactive caller
-    /// since issue-599 WI-04 moved the monitor session feed onto
-    /// [`Self::list_mcp_sessions`]; only live-fixture and repository tests
-    /// still reach it.
-    ///
-    /// Its implementation walks `v_session_summary` / `v_conversation_trace`
-    /// and returns full transcripts, which is exactly the corpus-shaped read
-    /// #599 removed from the interactive path. Deleting it belongs to the
-    /// projector-retirement PR, which also retires the views it reads and the
-    /// `mode_subquery_for_sessions` helper it shares with `list_conversations`
-    /// and `get_conversation`.
-    #[deprecated(
-        note = "no interactive caller since issue-599 WI-04; removal belongs to the projector-retirement PR"
-    )]
-    async fn list_session_analytics(
-        &self,
-        query: SessionAnalyticsQuery,
-    ) -> RepoResult<Vec<SessionAnalytics>>;
 
     async fn analytics_series(&self, range: AnalyticsRange) -> RepoResult<AnalyticsSnapshot>;
 
@@ -69,12 +49,11 @@ pub trait ConversationRepository: Send + Sync {
 
     async fn get_session_metadata(&self, session_id: &str) -> RepoResult<Option<SessionMetadata>>;
 
-    async fn get_mcp_session(&self, session_id: &str) -> RepoResult<Option<McpSessionOpen>>;
-
     /// Session DISCOVERY, and the single shared operation MCP `list_sessions`
     /// and the monitor session feed both page through (issue-599 WI-04 moved
-    /// the feed here from [`Self::list_session_analytics`]). The `mcp_` prefix
-    /// is historical; renaming it is recorded as a post-epic cleanup.
+    /// the feed here from the former `list_session_analytics`, which issue
+    /// #603 WI-10 deleted once its helpers stopped being shared). The `mcp_`
+    /// prefix is historical; renaming it is recorded as a post-epic cleanup.
     ///
     /// Whether more results exist is `Page::next_cursor.is_some()` — there is
     /// deliberately no `total`, because a corpus-wide count is exactly the
@@ -97,7 +76,7 @@ pub trait ConversationRepository: Send + Sync {
     ///
     /// Candidate selection is issue #597's bounded postings ranking; every step
     /// after it is shared with [`Self::list_mcp_sessions`] — the same read
-    /// model, chosen by the same readiness latch, then the same hydration and
+    /// model, gated by the same readiness latch, then the same hydration and
     /// the same visibility rules — so the two discovery surfaces cannot
     /// disagree about what a session is, what it is called, whether the caller
     /// may see it, or which harness it ran under.
@@ -131,23 +110,7 @@ pub trait ConversationRepository: Send + Sync {
 
     async fn get_turn(&self, session_id: &str, turn_seq: u32) -> RepoResult<Option<Turn>>;
 
-    async fn get_mcp_turn(
-        &self,
-        session_id: &str,
-        turn_seq: u32,
-    ) -> RepoResult<Option<McpTurnOpen>>;
-
-    async fn get_mcp_turn_summary(
-        &self,
-        session_id: &str,
-        turn_seq: u32,
-    ) -> RepoResult<Option<McpTurnOpen>> {
-        self.get_mcp_turn(session_id, turn_seq).await
-    }
-
     async fn open_event(&self, req: OpenEventRequest) -> RepoResult<OpenContext>;
-
-    async fn get_mcp_event(&self, event_uid: &str) -> RepoResult<Option<McpEventOpen>>;
 
     async fn list_session_events(
         &self,

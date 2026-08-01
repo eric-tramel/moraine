@@ -11,9 +11,8 @@
 //! ## Envelope discipline (BINDING D5)
 //!
 //! Each page runs under its OWN Migration-class batch [`QueryEnvelope`]
-//! (`new_batch` with a derived statement cap), sequenced AFTER and OUTSIDE the
-//! existing v1 `mcp_open` backfill envelope in `commands.rs` — never nested
-//! inside it. The migration runner's per-statement doctrine (a single envelope
+//! (`new_batch` with a derived statement cap) — never nested inside another
+//! envelope. The migration runner's per-statement doctrine (a single envelope
 //! spanning a run would cap the SUM of statement times, a regression amendment
 //! A5 forbids) applies here too: one envelope per page, so a budget-exceeded
 //! page fails typed and retryable while the durable per-page cursor makes rerun
@@ -380,8 +379,8 @@ impl ClickHouseClient {
     ///
     /// Every phase runs inside its own Migration-class envelope built from
     /// `migration_budget` / `admin_budget`; the per-page envelope uses
-    /// [`PAGE_STATEMENT_CAP`]. This call MUST be sequenced after and OUTSIDE the
-    /// v1 `mcp_open` backfill envelope.
+    /// [`PAGE_STATEMENT_CAP`]. This call must never run nested inside another
+    /// envelope.
     pub async fn backfill_canonical_read_indexes<F>(
         &self,
         publication_mode_is_local: bool,
@@ -1367,14 +1366,15 @@ mod tests {
     ///
     /// §4 S3 says every `DELETE` is constructed by one function that re-derives
     /// the table's class. That is not yet true of the tree: this module's
-    /// `reset_canonical_read_indexes` (via `truncate_index_table`) and
-    /// `mcp_open_projection::reclaim_orphan_delete_statements` both emit
-    /// row-removing SQL directly, and both predate #603. Their safety rests
-    /// entirely on the tables they name being bucket 3 — a property nothing
-    /// asserted, so reclassifying one of these three to `RawAudit` (an
-    /// argument someone could make for a read index that is expensive to
-    /// rebuild) would leave an unguarded `TRUNCATE` pointed at protected data
-    /// with the suite green.
+    /// `reset_canonical_read_indexes` (via `truncate_index_table`) emits
+    /// row-removing SQL directly, and it predates #603. (The second such
+    /// emitter, the retired projector's `reclaim_orphan_delete_statements`,
+    /// went with the projection in issue #603 WI-10 — leaving this one.) Its
+    /// safety rests entirely on the tables it names being bucket 3 — a
+    /// property nothing asserted, so reclassifying one of these three to
+    /// `RawAudit` (an argument someone could make for a read index that is
+    /// expensive to rebuild) would leave an unguarded `TRUNCATE` pointed at
+    /// protected data with the suite green.
     ///
     /// MUTATION (executed 2026-07-27), each run separately: reclassify
     /// `mcp_session_directory` to `RawAudit`; reclassify `mcp_event_locator`

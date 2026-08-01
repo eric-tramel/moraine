@@ -150,12 +150,18 @@ fn backend_clickhouse_config(cfg: &AppConfig, backend_name: &str) -> ClickHouseC
 /// Read the `open_v2` reader readiness once at backend construction (issue #598
 /// WI-08, BINDING D6). This is the sole DB read that seeds the one-way `open`
 /// cutover for the served process: the MCP dispatch caches the result for the
-/// process lifetime, so a not-ready backend stays on v1 and a ready one never
-/// falls back (a config `v1` override still wins regardless).
+/// process lifetime, so a ready backend never un-readies mid-process.
+///
+/// Since issue #603 WI-10 this is a readiness gate, not an engine choice.
+/// `false` means `open` refuses with a typed error naming the canonical sweep,
+/// because there is no v1 reader left to serve it — and a configured
+/// `open_reader = "v1"` does not change that in either direction
+/// (`OpenReaderMode::resolve` cannot yield an effective `v1` for any input; it
+/// records the request and serves v2 with the retirement note).
 ///
 /// Best-effort by design: an unreachable or un-migrated backend yields `false`
-/// (stay on v1) rather than failing startup — matching the `auto` contract that
-/// v2 activates only once its indexes are published.
+/// rather than failing startup — matching the `auto` contract that v2 serves
+/// only once its indexes are published.
 async fn read_open_v2_ready(cfg: &AppConfig, backend_name: &str) -> bool {
     let clickhouse = backend_clickhouse_config(cfg, backend_name);
     let budgets = backend_query_budgets(cfg);
@@ -247,11 +253,9 @@ async fn run_stdio_entry(cfg: AppConfig, session_scope: Option<SessionOriginScop
         .await
         .context("failed to construct embedded conversation repository")?;
     let repository = backend.repository().clone();
-    // Resolve the open-reader inputs once for the routed backend (issue #598
-    // WI-08): whether it is the default single-owner Local backend, and its
-    // published `open_v2` readiness. Only Local backends auto-select v2.
+    // Resolve the routed backend's published `open_v2` readiness once (issue
+    // #598 WI-08) — the single reader gate since issue #603 WI-10.
     let backend_name = backend.backend_name().to_string();
-    let publication_mode_is_local = backend_name == DEFAULT_BACKEND_NAME;
     let open_v2_ready = read_open_v2_ready(&cfg, &backend_name).await;
     drop(backend);
     drop(router);
@@ -259,7 +263,6 @@ async fn run_stdio_entry(cfg: AppConfig, session_scope: Option<SessionOriginScop
         Arc::unwrap_or_clone(cfg),
         repository,
         open_v2_ready,
-        publication_mode_is_local,
     )
     .await
 }

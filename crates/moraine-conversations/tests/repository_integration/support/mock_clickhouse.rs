@@ -13,9 +13,6 @@ use moraine_conversations::{ClickHouseConversationRepository, RepoConfig, Sessio
 use serde_json::json;
 use tokio::sync::Notify;
 
-use super::mcp_open_fixtures::{
-    event_lookup, event_ref_rows, full_event_row, session_row, turn_rows,
-};
 use super::responses::{json_each_row, trace_event_row, turn_summary_row};
 
 #[derive(Clone)]
@@ -91,9 +88,7 @@ pub(crate) const MOCK_SATURATED_CANDIDATE_WINDOW: u32 = 9;
 #[derive(Clone, Default)]
 pub(crate) struct MockOptions {
     pub(crate) omit_second_snippet_row: bool,
-    pub(crate) dirty_projection_on_first_candidate: bool,
     pub(crate) omit_first_mcp_detail_row: bool,
-    pub(crate) repeated_corpus_stats_barrier: Option<ScriptedBarrier>,
     /// Return a candidate window of exactly `candidate_fetch_size` rows that
     /// all collapse into one another under the #539/#565 dedup rule — the
     /// input the retired 16-page refill loop turned into
@@ -279,8 +274,8 @@ pub(crate) const SHARED_EVENT_UID: &str = "evt-shared";
 
 // Issue #597 §2.6 / correction C2 — ONE BM25 document population.
 //
-// `docs` / `avgdl` come from `search_corpus_stats` for every search path, v1
-// and v2 alike: `count()` / `sum(doc_len)` over `v_live_search_documents`,
+// `docs` / `avgdl` come from `search_corpus_stats` for every search path this
+// build serves: `count()` / `sum(doc_len)` over `v_live_search_documents`,
 // i.e. published-generation-authorized document revisions with `doc_len > 0`.
 // The design decided against additionally semi-joining `mcp_event_locator`
 // there (an O(D)x O(E) scan for two scalars, on the interactive path), so
@@ -307,12 +302,15 @@ fn v2_requested_events(query: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-/// The one MCP-search event fixture BOTH engines describe.
+/// The one MCP-search event fixture.
 ///
-/// v1 serves it out of the projected detail statement; v2 assembles the same
-/// hit from the ranking pass, the content-free derivation, the dedup-key read
-/// and the winner hydration. Keeping ONE fixture is what makes the `SearchPath`
-/// matrix a comparison rather than two unrelated stories.
+/// The canonical engine assembles a hit from the ranking pass, the
+/// content-free derivation, the dedup-key read and the winner hydration; every
+/// one of those shapes reads its values here. It was shared with the retired
+/// v1 detail statement so the two engines described one corpus, and it stays
+/// single-sourced for the same reason within the one engine that survives:
+/// four statements agreeing about a hit is only meaningful if they cannot be
+/// given four different hits.
 pub(crate) fn mcp_search_detail_row(event_uid: &str) -> serde_json::Value {
     let (session_id, event_time, event_unix_ms, event_order, turn_seq) = match event_uid {
         "evt-a-11" => (
@@ -558,7 +556,9 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
         // repository before the first session-list page. It is repository
         // infrastructure like the publication snapshot above, so a mock that
         // declares a verdict answers it out of band and keeps the per-test
-        // query scripts focused on the operation under test.
+        // query scripts focused on the operation under test; an undeclared
+        // verdict lets the probe flow to the scripts, for the health tests
+        // that steer the probe itself.
         if let Some(ready) = state.options.open_v2_reader_ready {
             if query.contains("mcp_read_index_state") {
                 state
@@ -646,89 +646,6 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
                 barrier.release.notified().await;
             }
             return (response.status, response.body);
-        }
-
-        if query.contains("mcp_open_projection_state")
-            && query.contains("WHERE state_key = 'global'")
-            && !query.contains("toUInt8(0) AS row_kind")
-        {
-            return (StatusCode::OK, json_each_row(json!([{ "ready": 1_u8 }])));
-        }
-
-        // `load_projected_session`, identified by its own alias rather than by
-        // the table name alone: since #603 the candidate-lookup query names
-        // `mcp_open_publication_headers` too (in a subquery that bounds its
-        // `LIMIT 64` window), so a bare table-name match routed it here and
-        // answered a candidate lookup with a session row.
-        if query.contains("FROM `moraine`.`mcp_open_publication_headers`")
-            && query.contains("FINAL")
-            && query.contains("s.session_id = '")
-            && !query.contains("toUInt8(0) AS row_kind")
-            && !query.contains("candidate_heads AS")
-            && !query.contains("current_headers AS")
-        {
-            let session_id = query
-                .split("s.session_id = '")
-                .nth(1)
-                .and_then(|rest| rest.split('\'').next())
-                .unwrap_or("");
-            let rows = session_row(session_id).into_iter().collect::<Vec<_>>();
-            return (StatusCode::OK, json_each_row(json!(rows)));
-        }
-
-        if query.contains("FROM `moraine`.`mcp_open_turns`")
-            && query.contains("FINAL")
-            && !query.contains("toUInt8(0) AS row_kind")
-        {
-            let session_id = query
-                .split("session_id = '")
-                .nth(1)
-                .and_then(|rest| rest.split('\'').next())
-                .unwrap_or("");
-            let turn_seq = query
-                .split(" AND turn_seq = ")
-                .nth(1)
-                .and_then(|rest| rest.split_whitespace().next())
-                .and_then(|value| value.parse::<u32>().ok());
-            let mut rows = turn_rows(session_id, turn_seq);
-            if query.contains("'[]' AS event_summaries_json") {
-                for row in &mut rows {
-                    row["event_summaries_json"] = json!("[]");
-                }
-            }
-            return (StatusCode::OK, json_each_row(json!(rows)));
-        }
-
-        if query.contains("FROM `moraine`.`mcp_open_events` FINAL")
-            && query.contains("SELECT\n  source_host,\n  event_uid,\n  session_id,")
-        {
-            let event_uid = query
-                .split("WHERE event_uid = '")
-                .nth(1)
-                .and_then(|rest| rest.split('\'').next())
-                .unwrap_or("");
-            let rows = event_lookup(event_uid).into_iter().collect::<Vec<_>>();
-            return (StatusCode::OK, json_each_row(json!(rows)));
-        }
-
-        if query.contains("FROM `moraine`.`mcp_open_events`")
-            && query.contains("FINAL")
-            && query.contains("previous_event_uid")
-        {
-            let event_uid = query
-                .split("event_uid = '")
-                .nth(1)
-                .and_then(|rest| rest.split('\'').next())
-                .unwrap_or("");
-            let rows = full_event_row(event_uid).into_iter().collect::<Vec<_>>();
-            return (StatusCode::OK, json_each_row(json!(rows)));
-        }
-
-        if query.contains("FROM `moraine`.`mcp_open_events` FINAL")
-            && query.contains("event_order IN")
-            && !query.contains("toUInt8(0) AS row_kind")
-        {
-            return (StatusCode::OK, json_each_row(json!(event_ref_rows())));
         }
 
         if query.starts_with("INSERT INTO `moraine`.`file_attention_project_roots`") {
@@ -914,14 +831,15 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
         }
 
         // ------------------------------------------------------------------
-        // Issue #597 v2: the bounded canonical MCP search engine. Seven shapes,
-        // none of which names an `mcp_open_*` relation — that absence is what
-        // `search_mcp_events_v2_never_touches_the_projection` asserts against
-        // the statements this handler actually recorded.
+        // Issue #597 v2: the bounded canonical MCP search engine. Seven
+        // shapes, none of which names an `mcp_open_*` relation — that absence
+        // is asserted directly against the emitted statements by
+        // `search_canonical::tests::every_v2_search_builder_is_free_of_the_
+        // projection`, not here.
         //
         // Every shape below reads its values out of `mcp_search_detail_row`,
-        // the SAME fixture the v1 detail statement serves, so a `SearchPath`
-        // matrix assertion compares two engines describing one corpus.
+        // so the four statements that make up one hit cannot disagree about
+        // what that hit is.
         // ------------------------------------------------------------------
 
         // Phase 0: session-scope existence as a directory point read.
@@ -1261,9 +1179,12 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
         // wide column, and the one that retires the uid-only `models` CTE.
         if query.contains("e.model AS model") && query.contains("AS text_preview") {
             // As with the derivation, a uid-only filter gets every session that
-            // carries the uid.
+            // carries the uid. `omit_first_mcp_detail_row` starves the first
+            // requested winner of its wide row, modelling a hydration window
+            // that moved between ranking and the wide read.
             let rows = v2_requested_events(&query)
                 .into_iter()
+                .skip(usize::from(state.options.omit_first_mcp_detail_row))
                 .map(|(key, uid)| {
                     let detail = mcp_search_detail_row(&key);
                     json!({
@@ -1402,104 +1323,6 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
             return (
                 StatusCode::OK,
                 json_each_row(json!(rows_for_requested_sessions(&query, &terminal))),
-            );
-        }
-
-        if query.contains("FROM `moraine`.`mcp_open_publication_headers` AS h FINAL")
-            && query.contains("current_headers AS")
-            && query.contains("toUInt8(s.completed) AS completed")
-        {
-            if query.contains("s.session_id < 'sess_b'") {
-                return (
-                    StatusCode::OK,
-                    json_each_row(json!([
-                                    {
-                                        "session_id": "sess_a",
-                                        "first_event_time": "2026-01-01 10:00:00",
-                                        "first_event_unix_ms": 1767261600000_i64,
-                                        "last_event_time": "2026-01-01 10:10:00",
-                                        "last_event_unix_ms": 1767262200000_i64,
-                                        "total_turns": 2,
-                                        "total_events": 20,
-                                        "mode": "web_search",
-                                        "completed": 0_u8,
-                                        "title": "",
-                                        "origin_cwd": "/repo",
-                    "source": "codex",
-                                        "harness": "codex",
-                                        "inference_provider": "openai",
-                                        "tool_calls": 2,
-                                        "session_slug": "",
-                                        "session_summary": ""
-                                    }
-                                ])),
-                );
-            }
-
-            return (
-                StatusCode::OK,
-                json_each_row(json!([
-                            {
-                                "session_id": "sess_c",
-                                "first_event_time": "2026-01-03 10:00:00",
-                                "first_event_unix_ms": 1767434400000_i64,
-                                "last_event_time": "2026-01-03 10:10:00",
-                                "last_event_unix_ms": 1767435000000_i64,
-                                "total_turns": 3,
-                                "total_events": 30,
-                                "mode": "web_search",
-                                "completed": 1_u8,
-                                "title": "Session C title",
-                                "origin_cwd": "/repo",
-                "source": "codex",
-                                "harness": "codex",
-                                "inference_provider": "openai",
-                                "tool_calls": 6,
-                                "originator": "Codex Desktop",
-                                "origin_cwd": "/work/acme-secret-merger",
-                                "project": "acme-secret-merger",
-                                "session_slug": "project-c",
-                                "session_summary": "Session C summary"
-                            },
-                            {
-                                "session_id": "sess_b",
-                                "first_event_time": "2026-01-02 10:00:00",
-                                "first_event_unix_ms": 1767348000000_i64,
-                                "last_event_time": "2026-01-02 10:10:00",
-                                "last_event_unix_ms": 1767348600000_i64,
-                                "total_turns": 2,
-                                "total_events": 22,
-                                "mode": "web_search",
-                                "completed": 1_u8,
-                                "title": "Session B title",
-                                "origin_cwd": "/repo",
-                "source": "codex",
-                                "harness": "codex",
-                                "inference_provider": "openai",
-                                "tool_calls": 4,
-                                "session_slug": "project-b",
-                                "session_summary": "Session B summary"
-                            },
-                            {
-                                "session_id": "sess_a",
-                                "first_event_time": "2026-01-01 10:00:00",
-                                "first_event_unix_ms": 1767261600000_i64,
-                                "last_event_time": "2026-01-01 10:10:00",
-                                "last_event_unix_ms": 1767262200000_i64,
-                                "total_turns": 2,
-                                "total_events": 20,
-                                "mode": "web_search",
-                                "completed": 0_u8,
-                                "title": "",
-                                "origin_cwd": "/repo",
-                "source": "codex",
-                                "harness": "codex",
-                                "inference_provider": "openai",
-                                "tool_calls": 2,
-                                "session_slug": "",
-                                "session_summary": ""
-                            }
-                        ])),
             );
         }
 
@@ -1836,205 +1659,6 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
                     { "term": "world", "df": 10_u64 }
                 ])),
             );
-        }
-
-        if query.contains("toUInt8(0) AS row_kind") && query.contains("term_postings AS (") {
-            let candidate_query_count = state
-                .queries
-                .lock()
-                .expect("query lock")
-                .iter()
-                .filter(|candidate_query| {
-                    candidate_query.contains("toUInt8(0) AS row_kind")
-                        && candidate_query.contains("term_postings AS (")
-                })
-                .count();
-            if candidate_query_count == 2 && query.contains("search_corpus_stats") {
-                if let Some(barrier) = state.options.repeated_corpus_stats_barrier.clone() {
-                    barrier.reached.notify_one();
-                    barrier.release.notified().await;
-                }
-            }
-            let projection_clean = u8::from(
-                !state.options.dirty_projection_on_first_candidate || candidate_query_count != 1,
-            );
-            let candidate = |event_uid: &str,
-                             raw_score: f64,
-                             matched_terms: u64,
-                             event_unix_ms: i64| {
-                json!({
-                    "row_kind": 0_u8,
-                    "event_uid": event_uid,
-                    "session_id": if event_uid.starts_with("evt-a") { "sess_a" } else if event_uid.starts_with("evt-b") { "sess_b" } else { "sess_c" },
-                    "slot": 0_u8,
-                    "generation": 1_u64,
-                    "raw_score": raw_score,
-                    "matched_terms": matched_terms,
-                    "event_unix_ms": event_unix_ms,
-                    "docs": 100_u64,
-                    "total_doc_len": 5000_u64,
-                    "scope_exists": 1_u8,
-                    "projection_ready": 1_u8,
-                    "projection_clean": projection_clean
-                })
-            };
-            // Scope existence, the v1 way: `scope_state_sql` is inlined into
-            // the candidate statement as a scalar. The verdict has to match the
-            // v2 point read's, or the `SearchPath` matrix compares two
-            // different corpora.
-            let scope_session = query
-                .split("WHERE scope_s.session_id = '")
-                .nth(1)
-                .and_then(|rest| rest.split('\'').next())
-                .unwrap_or_default()
-                .to_string();
-            let scope_turn = query
-                .split("AND scope_t.turn_seq = ")
-                .nth(1)
-                .and_then(|rest| rest.split(['\n', ' ', ')']).next())
-                .and_then(|value| value.parse::<u32>().ok());
-            let scope_exists = u8::from(match (scope_session.as_str(), scope_turn) {
-                ("", _) => true,
-                ("sess_missing", _) => false,
-                (session_id, Some(turn_seq)) => [
-                    "evt-c-tool-call",
-                    "evt-c-tool",
-                    "evt-c-user",
-                    "evt-c-42",
-                    "evt-c-duplicate",
-                    "evt-a-11",
-                    "evt-b-9",
-                ]
-                .into_iter()
-                .any(|uid| {
-                    let row = mcp_search_detail_row(uid);
-                    row["session_id"] == session_id
-                        && row["turn_seq"].as_u64() == Some(u64::from(turn_seq))
-                }),
-                _ => true,
-            });
-            let metadata = json!({
-                "row_kind": 1_u8,
-                "event_uid": "",
-                "session_id": "",
-                "slot": 0_u8,
-                "generation": 0_u64,
-                "raw_score": 0.0,
-                "matched_terms": 0_u64,
-                "event_unix_ms": 0_i64,
-                "docs": 100_u64,
-                "total_doc_len": 5000_u64,
-                "scope_exists": scope_exists,
-                "projection_ready": 1_u8,
-                "projection_clean": projection_clean
-            });
-            let filter_clause = query
-                .split_once("WHERE ")
-                .and_then(|(_, tail)| tail.split_once("GROUP BY p.doc_id"))
-                .map(|(filter, _)| filter)
-                .unwrap_or(query.as_str());
-            let includes_user = filter_clause.contains("lowerUTF8(p.actor_role) = 'user'");
-            let includes_assistant =
-                filter_clause.contains("lowerUTF8(p.actor_role) = 'assistant'");
-            let includes_tool_call = filter_clause.contains("p.event_class = 'tool_call'");
-            let includes_tool_response = filter_clause.contains("p.event_class = 'tool_result'");
-            let mut rows = if query.contains("e.session_id = 'sess_c' AND e.turn_seq = 2") {
-                vec![candidate("evt-c-tool", 13.0, 2, 1_767_434_430_000)]
-            } else if query.contains("p.session_id = 'sess_a'") {
-                vec![candidate("evt-a-11", 7.0, 1, 1_767_261_720_000)]
-            } else if includes_user
-                && !includes_assistant
-                && !includes_tool_call
-                && !includes_tool_response
-            {
-                vec![candidate("evt-c-user", 11.0, 2, 1_767_434_460_000)]
-            } else if includes_assistant
-                && !includes_user
-                && !includes_tool_call
-                && !includes_tool_response
-            {
-                vec![candidate("evt-c-42", 12.5, 2, 1_767_434_520_000)]
-            } else if includes_tool_call
-                && !includes_user
-                && !includes_assistant
-                && !includes_tool_response
-            {
-                vec![candidate("evt-c-tool-call", 13.5, 2, 1_767_434_400_000)]
-            } else if includes_tool_response
-                && !includes_user
-                && !includes_assistant
-                && !includes_tool_call
-            {
-                vec![candidate("evt-c-tool", 13.0, 2, 1_767_434_430_000)]
-            } else if includes_user
-                && includes_tool_call
-                && !includes_assistant
-                && !includes_tool_response
-            {
-                vec![
-                    candidate("evt-c-tool-call", 13.5, 2, 1_767_434_400_000),
-                    candidate("evt-c-user", 11.0, 2, 1_767_434_460_000),
-                ]
-            } else if state.options.saturate_candidate_window {
-                // A SATURATED window (exactly `candidate_fetch_size` rows) whose
-                // members all collapse into one another. The retired code looped
-                // 16 times over this and then failed with
-                // `backend("duplicate scan budget exhausted")`; the bounded pass
-                // returns the surviving hit plus the incompleteness marker.
-                (0..MOCK_SATURATED_CANDIDATE_WINDOW)
-                    .map(|idx| Box::leak(format!("evt-sat-{idx}").into_boxed_str()) as &str)
-                    .map(|uid| candidate(uid, 12.0, 2, 1_767_434_520_000))
-                    .collect()
-            } else if query.contains("LIMIT 9") {
-                // n_hits = 2 -> unique_fetch_limit = 3 -> one window of 9.
-                // Four rows, one of them the #539 duplicate: dedup leaves three
-                // unique hits, which is more than the two requested, so the page
-                // reports `truncated` WITHOUT a second ranking pass.
-                vec![
-                    candidate("evt-c-42", 12.5, 2, 1_767_434_520_000),
-                    candidate("evt-c-duplicate", 12.0, 2, 1_767_434_520_003),
-                    candidate("evt-a-11", 7.0, 1, 1_767_261_720_000),
-                    candidate("evt-b-9", 6.0, 1, 1_767_348_120_000),
-                ]
-            } else {
-                vec![
-                    candidate("evt-c-42", 12.5, 2, 1_767_434_520_000),
-                    candidate("evt-a-11", 7.0, 1, 1_767_261_720_000),
-                ]
-            };
-            rows.push(metadata);
-            return (StatusCode::OK, json_each_row(json!(rows)));
-        }
-
-        if query.contains("documents AS (")
-            && query.contains("AS session_started_at_unix_ms")
-            && query.contains("FROM documents")
-            && query.contains("mcp_open_events")
-        {
-            let detail = mcp_search_detail_row;
-            // `evt-sat-N` are the saturated-window uids. They take `detail`'s
-            // fallback shape, so they share session, turn, event type, digest
-            // and timestamp — i.e. they are #539-equivalent and collapse to one.
-            let saturation_uids = (0..MOCK_SATURATED_CANDIDATE_WINDOW)
-                .map(|idx| format!("evt-sat-{idx}"))
-                .collect::<Vec<_>>();
-            let event_uids = [
-                "evt-c-tool-call",
-                "evt-c-tool",
-                "evt-c-user",
-                "evt-c-42",
-                "evt-c-duplicate",
-                "evt-a-11",
-                "evt-b-9",
-            ]
-            .into_iter()
-            .map(str::to_string)
-            .chain(saturation_uids)
-            .filter(|event_uid| query.contains(&format!("'{event_uid}'")))
-            .skip(usize::from(state.options.omit_first_mcp_detail_row))
-            .map(|event_uid| detail(event_uid.as_str()))
-            .collect::<Vec<_>>();
-            return (StatusCode::OK, json_each_row(json!(event_uids)));
         }
 
         if query.contains("AS mcp_event_type")
@@ -3192,9 +2816,11 @@ pub(crate) async fn build_repo_with_max_results(
     build_repo_with_options(
         max_results,
         MockOptions {
-            // Not-ready store: session listing stays on the projected-header
-            // path, which is what the pre-#599 fixtures below describe.
-            open_v2_reader_ready: Some(false),
+            // Ready store: the canonical read model is the only one since
+            // issue #603 WI-10 retired the projection, so the stock repo is a
+            // cut-over one. Tests that need the unready refusal declare
+            // `open_v2_reader_ready: Some(false)` explicitly.
+            open_v2_reader_ready: Some(true),
             ..MockOptions::default()
         },
     )
@@ -3266,9 +2892,10 @@ pub(crate) async fn build_scripted_repo_with_retention(
 /// consuming the script's first response.
 ///
 /// Search fixtures need this: every `search_mcp_events` request asks the latch
-/// which engine to run. Without a declared verdict the probe eats a scripted
-/// reply and every later assertion is silently off by one. `false` selects the
-/// legacy projected-header engine, which is what the pre-#597 scripts describe.
+/// whether the canonical read indexes are published. Without a declared verdict
+/// the probe eats a scripted reply and every later assertion is silently off by
+/// one. Since issue #603 WI-10 `false` is not a second engine but a typed
+/// refusal, so a scripted search fixture wants `true`.
 pub(crate) async fn build_scripted_repo_with_readiness(
     scripted_responses: Vec<ScriptedResponse>,
     open_v2_reader_ready: bool,
@@ -3291,7 +2918,7 @@ pub(crate) async fn build_repo() -> (ClickHouseConversationRepository, Arc<MockS
 pub(crate) async fn build_scoped_repo(
     roots: &[&str],
 ) -> (ClickHouseConversationRepository, Arc<MockState>) {
-    build_scoped_repo_with_readiness(roots, Some(false)).await
+    build_scoped_repo_with_readiness(roots, Some(true)).await
 }
 
 /// Repository whose backend reports the issue-598 `open_v2` key ready, so
@@ -3348,22 +2975,6 @@ pub(crate) async fn build_scripted_directory_repo(
         MockOptions {
             scripted_responses,
             open_v2_reader_ready: Some(true),
-            ..MockOptions::default()
-        },
-    )
-    .await
-}
-
-/// [`build_scripted_repo`] against a backend whose `open_v2` reader is not
-/// published, so scripts describe the projected-header path.
-pub(crate) async fn build_scripted_header_repo(
-    scripted_responses: Vec<ScriptedResponse>,
-) -> (ClickHouseConversationRepository, Arc<MockState>) {
-    build_repo_with_options(
-        100,
-        MockOptions {
-            scripted_responses,
-            open_v2_reader_ready: Some(false),
             ..MockOptions::default()
         },
     )

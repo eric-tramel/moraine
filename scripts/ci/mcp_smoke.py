@@ -639,6 +639,7 @@ def run_smoke(
     expect_event_count: Optional[int] = None,
     expect_updated_at: Optional[str] = None,
     expect_mode: Optional[str] = None,
+    expect_title: Optional[str] = None,
     expect_matching_search_hits: Optional[int] = None,
     require_embedded_fallback: bool = False,
     tools_snapshot: Optional[str] = None,
@@ -885,6 +886,11 @@ def run_smoke(
                     "list_sessions mode parity failed: "
                     f"got {session_metadata.get('mode')!r}, wanted {expect_mode!r}"
                 )
+            if expect_title is not None and session_metadata.get("title") != expect_title:
+                raise AssertionError(
+                    "list_sessions title parity failed: "
+                    f"got {session_metadata.get('title')!r}, wanted {expect_title!r}"
+                )
             listed_source = nested_string(selected_session, "session", "source")
             if listed_source is None:
                 raise AssertionError(
@@ -1048,6 +1054,10 @@ def main() -> int:
         help="expected canonical mode for the selected list_sessions fixture",
     )
     parser.add_argument(
+        "--expect-title",
+        help="expected canonical title for the selected list_sessions fixture",
+    )
+    parser.add_argument(
         "--require-embedded-fallback",
         action="store_true",
         help=(
@@ -1083,6 +1093,7 @@ def main() -> int:
         expect_event_count=args.expect_event_count,
         expect_updated_at=args.expect_updated_at,
         expect_mode=args.expect_mode,
+        expect_title=args.expect_title,
         expect_matching_search_hits=args.expect_matching_search_hits,
         require_embedded_fallback=args.require_embedded_fallback,
         tools_snapshot=args.write_tools_snapshot,

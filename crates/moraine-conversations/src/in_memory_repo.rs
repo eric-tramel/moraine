@@ -5,19 +5,17 @@ use async_trait::async_trait;
 
 use crate::domain::{
     AnalyticsRange, AnalyticsSnapshot, AnalyticsWindow, CanonicalContinuation,
-    CanonicalReadOutcome, CanonicalSessionPage, IngestHeartbeatRead, SessionAnalytics,
-    SessionAnalyticsQuery, StoreDiagnostics, StoreHealth, TablePreview, TablePreviewQuery,
-    TableSummaries, WebSearchEvent,
+    CanonicalReadOutcome, CanonicalSessionPage, IngestHeartbeatRead, StoreDiagnostics, StoreHealth,
+    TablePreview, TablePreviewQuery, TableSummaries, WebSearchEvent,
 };
 use crate::domain::{
     Conversation, ConversationDetailOptions, ConversationListFilter, ConversationMode,
     ConversationSearchQuery, ConversationSearchResults, ConversationSearchStats,
-    ConversationSummary, FileAttentionQuery, FileAttentionTouch, McpEventOpen, McpEventType,
-    McpSessionListFilter, McpSessionListItem, McpSessionOpen, McpTurnOpen, OpenContext,
-    OpenEventRequest, Page, PageRequest, RepoConfig, SearchEventsQuery, SearchEventsResult,
-    SearchEventsStats, SearchMcpEventsQuery, SearchMcpEventsResult, SearchMcpEventsStats,
-    SessionEventsQuery, SessionMetadata, SessionSearchQuery, SessionSearchResults, TraceEvent,
-    Turn, TurnListFilter, TurnSummary,
+    ConversationSummary, FileAttentionQuery, FileAttentionTouch, McpEventType,
+    McpSessionListFilter, McpSessionListItem, OpenContext, OpenEventRequest, Page, PageRequest,
+    RepoConfig, SearchEventsQuery, SearchEventsResult, SearchEventsStats, SearchMcpEventsQuery,
+    SearchMcpEventsResult, SearchMcpEventsStats, SessionEventsQuery, SessionMetadata,
+    SessionSearchQuery, SessionSearchResults, TraceEvent, Turn, TurnListFilter, TurnSummary,
 };
 use crate::error::{RepoError, RepoResult};
 use crate::repo::ConversationRepository;
@@ -36,7 +34,6 @@ pub struct InMemoryConversationResponses {
     pub list_conversations: Option<RepoResult<Page<ConversationSummary>>>,
     pub get_conversation: Option<RepoResult<Option<Conversation>>>,
     pub get_session_metadata: Option<RepoResult<Option<SessionMetadata>>>,
-    pub get_mcp_session: Option<RepoResult<Option<McpSessionOpen>>>,
     pub list_mcp_sessions: Option<RepoResult<Page<McpSessionListItem>>>,
     /// A static keyset corpus: the page served for a given continuation token,
     /// with `""` keying the uncursored first page. Takes precedence over
@@ -57,9 +54,7 @@ pub struct InMemoryConversationResponses {
     pub canonical_reader_ready: Option<bool>,
     pub list_turns: Option<RepoResult<Page<TurnSummary>>>,
     pub get_turn: Option<RepoResult<Option<Turn>>>,
-    pub get_mcp_turn: Option<RepoResult<Option<McpTurnOpen>>>,
     pub open_event: Option<RepoResult<OpenContext>>,
-    pub get_mcp_event: Option<RepoResult<Option<McpEventOpen>>>,
     pub list_session_events: Option<RepoResult<Page<TraceEvent>>>,
     pub search_events: Option<RepoResult<SearchEventsResult>>,
     pub search_mcp_events: Option<RepoResult<SearchMcpEventsResult>>,
@@ -67,7 +62,6 @@ pub struct InMemoryConversationResponses {
     pub file_attention: Option<RepoResult<Vec<FileAttentionTouch>>>,
     pub prewarm_mcp_search_state: Option<RepoResult<()>>,
     pub cancel_query: Option<RepoResult<()>>,
-    pub list_session_analytics: Option<RepoResult<Vec<SessionAnalytics>>>,
     pub analytics_series: Option<RepoResult<AnalyticsSnapshot>>,
     pub list_web_searches: Option<RepoResult<Vec<WebSearchEvent>>>,
     pub latest_ingest_heartbeat: Option<RepoResult<IngestHeartbeatRead>>,
@@ -83,15 +77,12 @@ pub struct InMemoryConversationCalls {
     pub list_conversations: Vec<(ConversationListFilter, PageRequest)>,
     pub get_conversation: Vec<(String, ConversationDetailOptions)>,
     pub get_session_metadata: Vec<String>,
-    pub get_mcp_session: Vec<String>,
     pub list_mcp_sessions: Vec<(McpSessionListFilter, PageRequest)>,
     pub search_session_summaries: Vec<SessionSearchQuery>,
     pub canonical_open_session_page: Vec<(String, u16, Option<CanonicalContinuation>)>,
     pub list_turns: Vec<(String, TurnListFilter, PageRequest)>,
     pub get_turn: Vec<(String, u32)>,
-    pub get_mcp_turn: Vec<(String, u32)>,
     pub open_event: Vec<OpenEventRequest>,
-    pub get_mcp_event: Vec<String>,
     pub list_session_events: Vec<(SessionEventsQuery, PageRequest)>,
     pub search_events: Vec<SearchEventsQuery>,
     pub search_mcp_events: Vec<SearchMcpEventsQuery>,
@@ -99,7 +90,6 @@ pub struct InMemoryConversationCalls {
     pub file_attention: Vec<FileAttentionQuery>,
     pub prewarm_mcp_search_state: usize,
     pub cancel_query: Vec<String>,
-    pub list_session_analytics: Vec<SessionAnalyticsQuery>,
     pub analytics_series: Vec<AnalyticsRange>,
     pub list_web_searches: Vec<u16>,
     pub latest_ingest_heartbeat: usize,
@@ -246,14 +236,6 @@ impl ConversationRepository for InMemoryConversationRepository {
         self.record(|calls| calls.prewarm_mcp_search_state += 1);
         response_or!(self, prewarm_mcp_search_state, ())
     }
-    async fn list_session_analytics(
-        &self,
-        query: SessionAnalyticsQuery,
-    ) -> RepoResult<Vec<SessionAnalytics>> {
-        self.record(|calls| calls.list_session_analytics.push(query));
-        response_or!(self, list_session_analytics, Vec::new())
-    }
-
     async fn analytics_series(&self, range: AnalyticsRange) -> RepoResult<AnalyticsSnapshot> {
         self.record(|calls| calls.analytics_series.push(range));
         response_or!(
@@ -346,11 +328,6 @@ impl ConversationRepository for InMemoryConversationRepository {
     async fn get_session_metadata(&self, session_id: &str) -> RepoResult<Option<SessionMetadata>> {
         self.record(|calls| calls.get_session_metadata.push(session_id.to_string()));
         response_or!(self, get_session_metadata, None)
-    }
-
-    async fn get_mcp_session(&self, session_id: &str) -> RepoResult<Option<McpSessionOpen>> {
-        self.record(|calls| calls.get_mcp_session.push(session_id.to_string()));
-        response_or!(self, get_mcp_session, None)
     }
 
     async fn list_mcp_sessions(
@@ -447,15 +424,6 @@ impl ConversationRepository for InMemoryConversationRepository {
         response_or!(self, get_turn, None)
     }
 
-    async fn get_mcp_turn(
-        &self,
-        session_id: &str,
-        turn_seq: u32,
-    ) -> RepoResult<Option<McpTurnOpen>> {
-        self.record(|calls| calls.get_mcp_turn.push((session_id.to_string(), turn_seq)));
-        response_or!(self, get_mcp_turn, None)
-    }
-
     async fn open_event(&self, req: OpenEventRequest) -> RepoResult<OpenContext> {
         self.record(|calls| calls.open_event.push(req.clone()));
         response_or!(
@@ -472,11 +440,6 @@ impl ConversationRepository for InMemoryConversationRepository {
                 events: Vec::new(),
             }
         )
-    }
-
-    async fn get_mcp_event(&self, event_uid: &str) -> RepoResult<Option<McpEventOpen>> {
-        self.record(|calls| calls.get_mcp_event.push(event_uid.to_string()));
-        response_or!(self, get_mcp_event, None)
     }
 
     async fn list_session_events(
@@ -604,10 +567,9 @@ mod tests {
     use std::sync::Arc;
 
     use crate::domain::{
-        AnalyticsRange, AnalyticsSnapshot, AnalyticsWindow, ConversationMode, ConversationSummary,
-        CoreIndexHealth, IngestHeartbeatRead, PublicationDiagnostics, SessionAnalytics,
-        SessionAnalyticsQuery, SessionLookback, StoreConnectionMetrics, StoreDiagnostics,
-        StoreHealth, StoreProbe, TablePreview, TablePreviewQuery, TableSummaries, WebSearchEvent,
+        AnalyticsRange, AnalyticsSnapshot, AnalyticsWindow, CoreIndexHealth, IngestHeartbeatRead,
+        PublicationDiagnostics, StoreConnectionMetrics, StoreDiagnostics, StoreHealth, StoreProbe,
+        TablePreview, TablePreviewQuery, TableSummaries, WebSearchEvent,
     };
     use crate::error::RepoError;
 
@@ -684,26 +646,14 @@ mod tests {
     }
 
     #[tokio::test]
-    // `list_session_analytics` is deprecated pending projector retirement;
-    // these suites are the callers that keep it covered until it is deleted.
-    #[allow(deprecated)]
     async fn analytics_contract_defaults_and_calls_work_through_trait_object() {
         let fake = Arc::new(InMemoryConversationRepository::default());
         let repo: Arc<dyn ConversationRepository> = fake.clone();
-        let session_query = SessionAnalyticsQuery {
-            lookback: SessionLookback::SevenDays,
-            limit: 0,
-        };
         let preview_query = TablePreviewQuery {
             table: "events".to_string(),
             limit: 0,
         };
 
-        assert!(repo
-            .list_session_analytics(session_query.clone())
-            .await
-            .expect("default session analytics")
-            .is_empty());
         let snapshot = repo
             .analytics_series(AnalyticsRange::ThirtyDays)
             .await
@@ -753,7 +703,6 @@ mod tests {
         );
 
         let calls = fake.calls();
-        assert_eq!(calls.list_session_analytics, vec![session_query]);
         assert_eq!(calls.analytics_series, vec![AnalyticsRange::ThirtyDays]);
         assert_eq!(calls.list_web_searches, vec![0]);
         assert_eq!(calls.latest_ingest_heartbeat, 1);
@@ -764,34 +713,7 @@ mod tests {
     }
 
     #[tokio::test]
-    // `list_session_analytics` is deprecated pending projector retirement;
-    // these suites are the callers that keep it covered until it is deleted.
-    #[allow(deprecated)]
     async fn analytics_contract_returns_configured_successes_and_accumulates_calls() {
-        let session = SessionAnalytics {
-            summary: ConversationSummary {
-                session_id: "session".to_string(),
-                first_event_time: "2026-01-01 00:00:00".to_string(),
-                first_event_unix_ms: 1,
-                last_event_time: "2026-01-01 00:00:01".to_string(),
-                last_event_unix_ms: 2,
-                total_turns: 1,
-                total_events: 2,
-                user_messages: 1,
-                assistant_messages: 1,
-                tool_calls: 0,
-                tool_results: 0,
-                mode: ConversationMode::Chat,
-                session_slug: None,
-                session_summary: None,
-            },
-            harness: "codex".to_string(),
-            source_name: "codex-jsonl".to_string(),
-            models: vec!["gpt-5".to_string()],
-            trace_id: "trace".to_string(),
-            first_user_text: "hello".to_string(),
-            turns: Vec::new(),
-        };
         let analytics = AnalyticsSnapshot {
             window: AnalyticsWindow {
                 range: AnalyticsRange::OneHour,
@@ -852,7 +774,6 @@ mod tests {
             ..StoreDiagnostics::default()
         };
         let responses = InMemoryConversationResponses {
-            list_session_analytics: Some(Ok(vec![session])),
             analytics_series: Some(Ok(analytics.clone())),
             list_web_searches: Some(Ok(vec![web_search.clone()])),
             latest_ingest_heartbeat: Some(Ok(heartbeat.clone())),
@@ -867,21 +788,12 @@ mod tests {
             responses,
         ));
         let repo: Arc<dyn ConversationRepository> = fake.clone();
-        let session_query = SessionAnalyticsQuery {
-            lookback: SessionLookback::OneHour,
-            limit: 7,
-        };
         let preview_query = TablePreviewQuery {
             table: "events".to_string(),
             limit: 7,
         };
 
         for _ in 0..2 {
-            let sessions = repo
-                .list_session_analytics(session_query.clone())
-                .await
-                .expect("configured sessions");
-            assert_eq!(sessions[0].summary.session_id, "session");
             assert_eq!(
                 repo.analytics_series(AnalyticsRange::OneHour)
                     .await
@@ -926,10 +838,6 @@ mod tests {
 
         let calls = fake.calls();
         assert_eq!(
-            calls.list_session_analytics,
-            vec![session_query.clone(), session_query]
-        );
-        assert_eq!(
             calls.analytics_series,
             vec![AnalyticsRange::OneHour, AnalyticsRange::OneHour]
         );
@@ -945,12 +853,8 @@ mod tests {
     }
 
     #[tokio::test]
-    // `list_session_analytics` is deprecated pending projector retirement;
-    // these suites are the callers that keep it covered until it is deleted.
-    #[allow(deprecated)]
     async fn analytics_contract_returns_each_configured_error_through_trait_object() {
         let responses = InMemoryConversationResponses {
-            list_session_analytics: Some(Err(RepoError::backend("sessions"))),
             analytics_series: Some(Err(RepoError::backend("analytics"))),
             list_web_searches: Some(Err(RepoError::backend("web"))),
             latest_ingest_heartbeat: Some(Err(RepoError::backend("heartbeat"))),
@@ -964,11 +868,6 @@ mod tests {
             InMemoryConversationRepository::with_responses(Default::default(), responses),
         );
 
-        assert!(matches!(
-            repo.list_session_analytics(SessionAnalyticsQuery::default())
-                .await,
-            Err(RepoError::Backend(message)) if message == "sessions"
-        ));
         assert!(matches!(
             repo.analytics_series(AnalyticsRange::default()).await,
             Err(RepoError::Backend(message)) if message == "analytics"

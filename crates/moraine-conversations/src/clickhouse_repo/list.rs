@@ -8,7 +8,6 @@ use super::search::McpEventRankingOptions;
 use super::*;
 use crate::cursor::{
     ACCEPTED_MCP_SESSION_LIST_CURSOR_VERSIONS, MCP_SESSION_LIST_CURSOR_VERSION_DIRECTORY,
-    MCP_SESSION_LIST_CURSOR_VERSION_HEADERS,
 };
 
 /// Sessions returned by a content search when the caller names no `limit`.
@@ -266,33 +265,22 @@ FORMAT JSONEachRow",
         let limit = page.normalized_limit(self.cfg.max_results);
         let filter_sig = self.mcp_session_list_filter_sig(&filter);
         let sort = filter.sort;
-        // Canonical-first when the issue-598 backfill has published coverage;
-        // otherwise the projected-header path still serves the page. The
-        // fallback is short-lived by design — it is deleted once the live
-        // gates are green (issue-599 open question 4).
-        //
-        // The token is decoded against the SERVING path's version, so a
-        // readiness flip mid-pagination surfaces as a cursor mismatch rather
-        // than a silent gap.
-        if self.canonical_list_path_ready().await {
-            let cursor = Self::decode_session_list_cursor(
-                page.cursor.as_deref(),
-                &filter_sig,
-                sort,
-                MCP_SESSION_LIST_CURSOR_VERSION_DIRECTORY,
-            )?;
-            self.list_mcp_sessions_directory(&filter, filter_sig, sort, limit, cursor)
-                .await
-        } else {
-            let cursor = Self::decode_session_list_cursor(
-                page.cursor.as_deref(),
-                &filter_sig,
-                sort,
-                MCP_SESSION_LIST_CURSOR_VERSION_HEADERS,
-            )?;
-            self.list_mcp_sessions_headers(&filter, filter_sig, sort, limit, cursor)
-                .await
+        // Canonical-only since issue #603 WI-10 retired the projected-header
+        // fallback with the projection (the deletion issue-599 open question 4
+        // promised). While the issue-598 canonical read indexes are
+        // unpublished the page is a typed refusal, not a confident empty
+        // answer — reachable only before a fresh store's first sweep.
+        if !self.canonical_list_path_ready().await? {
+            return Err(Self::canonical_read_path_unready_error());
         }
+        let cursor = Self::decode_session_list_cursor(
+            page.cursor.as_deref(),
+            &filter_sig,
+            sort,
+            MCP_SESSION_LIST_CURSOR_VERSION_DIRECTORY,
+        )?;
+        self.list_mcp_sessions_directory(&filter, filter_sig, sort, limit, cursor)
+            .await
     }
 
     /// Decode and validate a `list_sessions` continuation token.
@@ -583,35 +571,31 @@ FORMAT JSONEachRow",
     /// through the SAME repository entry point MCP `search_sessions` uses, so
     /// there is one ranking, one corpus-stats cache and one candidate-budget
     /// contract rather than a monitor-only copy. Everything after ranking is
-    /// [`Self::list_mcp_sessions_impl`]'s hydration and visibility rules, on
-    /// whichever read model that operation is currently serving — so the two
-    /// discovery surfaces cannot disagree about who may be served, what a
-    /// session is called, or which harness it ran under.
+    /// [`Self::list_mcp_sessions_impl`]'s hydration and visibility rules — so
+    /// the two discovery surfaces cannot disagree about who may be served, what
+    /// a session is called, or which harness it ran under.
     ///
-    /// **Readiness is branched on exactly like the sibling list path.** While
-    /// the issue-598 canonical read indexes are unpublished, `mcp_event_navigation`
-    /// is empty and hydrating from it would answer every query with "nothing in
-    /// the corpus matched" — a confident falsehood, served with `ok: true`,
-    /// while `/api/v1/sessions` was still serving the same sessions from the
-    /// projected headers. The not-ready arm hydrates from
-    /// `mcp_open_publication_headers` instead, which is what
-    /// [`Self::list_mcp_sessions_headers`] reads, so session summaries stay
-    /// available throughout the cutover (docs/monitor-http-api.md).
+    /// **Readiness is refused on, exactly like the sibling list path.** While
+    /// the issue-598 canonical read indexes are unpublished,
+    /// `mcp_event_navigation` is empty and hydrating from it would answer every
+    /// query with "nothing in the corpus matched" — a confident falsehood
+    /// served with `ok: true`. Issue #603 WI-10 retired the projected-header
+    /// arm that used to answer here along with the projection it read, so this
+    /// path returns [`Self::canonical_read_path_unready_error`] instead, which
+    /// the monitor renders as a plain `503` with the recovery in its message
+    /// (docs/monitor-http-api.md). Reachable only before a store's first
+    /// canonical sweep, or while its overlap audit is failing.
     ///
-    /// **Readiness is resolved ONCE, at the top, and threaded into both
-    /// stages.** Ranking branches on the latch to pick its engine and hydration
-    /// branches on it to pick its read model. Probing twice costs a second
-    /// `mcp_read_index_state` point read on every pre-cutover search, and — the
-    /// reason that matters — the latch flips when a backfill publishes, so two
-    /// probes in one request can disagree and produce an answer ranked over the
-    /// `mcp_open_*` projection and then hydrated from the canonical navigation
-    /// index. `list_mcp_sessions_impl` branches once and cannot straddle the
-    /// flip; this must not be weaker.
+    /// **Readiness is resolved ONCE, at the top.** The remaining reason to care
+    /// is cost and coherence, not engine choice: the latch flips when a
+    /// backfill publishes, so a second probe inside the same request could
+    /// disagree with the first and serve half a refusal. One probe cannot
+    /// straddle the flip.
     ///
     /// Statement budget: 1 readiness point read (skipped once the latch is
     /// positive for the process), ranking at most 9 (issue #597 §1), then the
-    /// directory keyset batch + hydration — 4 (directory) or 1 (headers) — so
-    /// at most 14, bounded well inside the Interactive `statement_cap` even at
+    /// directory keyset batch + hydration, 4 — so at most 14, bounded well
+    /// inside the Interactive `statement_cap` even at
     /// `SESSION_SEARCH_MAX_LIMIT`.
     ///
     /// Ranking hydrates message text to build snippets. **None of it survives
@@ -621,7 +605,12 @@ FORMAT JSONEachRow",
         &self,
         query: SessionSearchQuery,
     ) -> RepoResult<SessionSearchResults> {
-        let canonical_ready = self.canonical_list_path_ready().await;
+        // Canonical-only since issue #603 WI-10: the ranking's legacy engine
+        // and the projected-header hydration arm retired with the projection,
+        // so an unpublished read index is a typed refusal up front.
+        if !self.canonical_list_path_ready().await? {
+            return Err(Self::canonical_read_path_unready_error());
+        }
         let max_results = self.cfg.max_results.max(1);
         // Two clamps: the operation's own documented bound, then the backend's
         // `max_results`. The first is what makes `limit` — and therefore every
@@ -660,7 +649,7 @@ FORMAT JSONEachRow",
                 },
                 McpEventRankingOptions {
                     hit_cap: hit_budget,
-                    canonical_ready: Some(canonical_ready),
+                    canonical_ready: Some(true),
                 },
             )
             .await?;
@@ -689,11 +678,11 @@ FORMAT JSONEachRow",
         // (LIST needs the loop because its Phase A over-fetches a whole
         // multi-chunk candidate budget; a ranking hands back at most `limit`.)
         //
-        // Ranked order is the response order in BOTH arms, so each folds over
-        // the ranked id sequence and not over the (unordered) hydration map.
+        // Ranked order is the response order, so this folds over the ranked id
+        // sequence and not over the (unordered) hydration map.
         //
         // The SAME verdict the ranking used, never a fresh probe.
-        let sessions = if canonical_ready {
+        let sessions = {
             // The directory value FIRST, for the same reason the time-ordered
             // page derives it first: it is this operation's `updated_at`, and
             // an id with no row here has no live published generation — the
@@ -723,18 +712,6 @@ FORMAT JSONEachRow",
                     )
                 })
                 .collect::<Vec<_>>()
-        } else {
-            let mut headers = self
-                .hydrate_session_headers(
-                    &ranked_session_ids,
-                    query.harness.as_deref(),
-                    query.source_name.as_deref(),
-                )
-                .await?;
-            ranked_session_ids
-                .iter()
-                .filter_map(|session_id| headers.remove(session_id.as_str()))
-                .collect::<Vec<_>>()
         };
 
         let bounds = SessionSearchBounds::derive(
@@ -755,44 +732,6 @@ FORMAT JSONEachRow",
             incomplete: ranked.incomplete_due_to_candidate_budget,
             dropped: bounds.dropped,
         })
-    }
-
-    /// Hydrate a bounded set of session ids from the PROJECTED HEADERS, keyed
-    /// by session id.
-    ///
-    /// The not-ready counterpart to [`Self::hydrate_session_list_chunk`]. One
-    /// statement, and its visibility predicates come from
-    /// [`Self::header_visibility_clauses`] — the same builder
-    /// [`Self::list_mcp_sessions_headers`] uses — so a session the feed would
-    /// serve and a session a search may disclose are decided by one rule set.
-    ///
-    /// An id with no row in the answer was dropped (tombstoned, out of scope,
-    /// wrong harness/source, unpublished); the caller reports that rather than
-    /// silently returning a shorter page.
-    async fn hydrate_session_headers(
-        &self,
-        session_ids: &[String],
-        harness: Option<&str>,
-        source_name: Option<&str>,
-    ) -> RepoResult<HashMap<String, McpSessionListItem>> {
-        if session_ids.is_empty() {
-            return Ok(HashMap::default());
-        }
-        let mut clauses = self.header_visibility_clauses(harness, source_name);
-        clauses.push(format!(
-            "s.session_id IN {}",
-            sql_array_strings(session_ids)
-        ));
-        let sql = self.build_session_headers_sql(
-            &clauses.join("\n  AND "),
-            "s.session_id ASC",
-            session_ids.len(),
-        );
-        let rows: Vec<McpSessionListRow> = self.map_backend(self.query_rows(&sql, None).await)?;
-        Ok(rows
-            .into_iter()
-            .map(|row| (row.session_id.clone(), Self::map_mcp_session_list_row(row)))
-            .collect())
     }
 
     /// One hydrated session folded into the summary both discovery paths serve,
@@ -948,211 +887,6 @@ FORMAT JSONEachRow",
             return None;
         }
         Some(item)
-    }
-
-    /// The projected-header VISIBILITY rules, in one place.
-    ///
-    /// This is the header read model's counterpart to
-    /// [`Self::hydrated_session_summary`]. On the headers these values are
-    /// materialized and exact — `origin_cwd`, `harness` and `source` are
-    /// columns, not recall hints — so the rules are enforced in SQL rather than
-    /// re-checked in Rust, which is what the pre-#599 list path has always
-    /// done. Both discovery surfaces build their header predicate from here, so
-    /// one rule set decides who may be served on this read model too.
-    fn header_visibility_clauses(
-        &self,
-        harness: Option<&str>,
-        source_name: Option<&str>,
-    ) -> Vec<String> {
-        let mut clauses = vec![
-            // A blank session_id is never a real session (e.g. the orphan
-            // Workflow-journal events ingested before #386's exclusion). Drop
-            // them here so they never consume a LIMIT slot or anchor the keyset
-            // cursor. `notEmpty(trimBoth(...))` mirrors the MCP contract's
-            // `trim().is_empty()` rejection so the repo filter and the mcp-core
-            // skip agree on what counts as blank.
-            "s.tombstone = 0".to_string(),
-            "notEmpty(trimBoth(s.session_id))".to_string(),
-        ];
-        if let Some(scope) = self.cfg.session_scope.as_ref() {
-            let roots = scope
-                .roots
-                .iter()
-                .map(|root| {
-                    format!(
-                        "s.origin_cwd = {root} OR startsWith(s.origin_cwd, {prefix})",
-                        root = sql_quote(root),
-                        prefix = sql_quote(&format!("{root}/")),
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(" OR ");
-            clauses.push(format!("({roots})"));
-        }
-        if let Some(harness) = harness {
-            clauses.push(format!("s.harness = {}", sql_quote(harness)));
-        }
-        if let Some(source_name) = source_name {
-            clauses.push(format!("s.source = {}", sql_quote(source_name)));
-        }
-        clauses
-    }
-
-    /// The projected-header projection, shared by the time-ordered feed and the
-    /// ranked search.
-    ///
-    /// Callers differ only in `where_sql`, `order_sql` and `limit`. Everything
-    /// that decides which header REVISION is current and whether it may be
-    /// served at all — publication source-head authorization, dirty-revision
-    /// fencing, the `LIMIT 1 BY session_id` collapse — is single-sourced here.
-    ///
-    /// Listing is a moving-feed read over the already materialized session
-    /// headers. Source-head authorization pins each candidate to this
-    /// operation's publication snapshot, while the dirty revision prevents a
-    /// header from being served after its canonical session changes. This
-    /// avoids rebuilding all list metadata from the canonical event corpus on
-    /// every page.
-    fn build_session_headers_sql(&self, where_sql: &str, order_sql: &str, limit: usize) -> String {
-        let snapshot = require_active_publication_snapshot("projected MCP session list reads");
-        let headers = self.table_ref("mcp_open_publication_headers");
-        let history = self.table_ref("v_published_source_generation_history");
-        let dirty_sessions = self.table_ref("mcp_open_dirty_sessions");
-        let captured_heads = snapshot.captured_source_heads_sql(&history);
-
-        format!(
-            "WITH
-  {captured_heads} AS captured_heads,
-current_dirty AS (
-  SELECT
-    session_id,
-    toUInt64(dirty_revision) AS dirty_revision
-  FROM {dirty_sessions} FINAL
-  WHERE notEmpty(session_id)
-),
-authorized_headers AS (
-  SELECT
-    h.*
-  FROM {headers} AS h FINAL
-  ANY LEFT JOIN current_dirty AS d ON d.session_id = h.session_id
-  WHERE length(h.required_source_heads) > 0
-    AND arrayAll(
-      required_head -> has(captured_heads, required_head),
-      h.required_source_heads
-    )
-    AND h.dirty_revision = ifNull(d.dirty_revision, toUInt64(0))
-),
-current_headers AS (
-  SELECT *
-  FROM authorized_headers
-  ORDER BY session_id ASC, header_revision DESC
-  LIMIT 1 BY session_id
-)
-SELECT
-  s.session_id AS session_id,
-  toString(s.first_event_time) AS first_event_time,
-  toInt64(toUnixTimestamp64Milli(s.first_event_time)) AS first_event_unix_ms,
-  toString(s.last_event_time) AS last_event_time,
-  toInt64(toUnixTimestamp64Milli(s.last_event_time)) AS last_event_unix_ms,
-  toUInt32(s.total_turns) AS total_turns,
-  toUInt64(s.total_events) AS total_events,
-  s.mode AS mode,
-  toUInt8(s.completed) AS completed,
-  toUInt64(s.tool_calls) AS tool_calls,
-  s.list_title AS title,
-  s.source AS source,
-  s.harness AS harness,
-  s.inference_provider AS inference_provider,
-  s.session_slug AS session_slug,
-  s.list_session_summary AS session_summary
-FROM current_headers AS s
-WHERE {where_sql}
-ORDER BY {order_sql}
-LIMIT {limit}
-FORMAT JSONEachRow",
-        )
-    }
-
-    /// The pre-#599 projected-header discovery page, kept behind the
-    /// canonical read-index readiness gate for stores whose issue-598 backfill
-    /// has not published coverage yet.
-    async fn list_mcp_sessions_headers(
-        &self,
-        filter: &McpSessionListFilter,
-        filter_sig: String,
-        sort: ConversationListSort,
-        limit: u16,
-        cursor: Option<McpSessionListCursor>,
-    ) -> RepoResult<Page<McpSessionListItem>> {
-        let mut where_clauses = self
-            .header_visibility_clauses(filter.harness.as_deref(), filter.source_name.as_deref());
-        where_clauses.push(format!(
-            "toUnixTimestamp64Milli(s.last_event_time) >= {}",
-            filter.start_unix_ms
-        ));
-        where_clauses.push(format!(
-            "toUnixTimestamp64Milli(s.first_event_time) < {}",
-            filter.end_unix_ms
-        ));
-        if let Some(mode) = filter.mode {
-            where_clauses.push(format!("s.mode = {}", sql_quote(mode.as_str())));
-        }
-
-        if let Some(cursor) = &cursor {
-            let (time_cmp, session_cmp) = match sort {
-                ConversationListSort::Desc => ("<", "<"),
-                ConversationListSort::Asc => (">", ">"),
-            };
-            where_clauses.push(format!(
-                "(toUnixTimestamp64Milli(s.last_event_time) {time_cmp} {} OR (toUnixTimestamp64Milli(s.last_event_time) = {} AND s.session_id {session_cmp} {}))",
-                cursor.last_event_unix_ms,
-                cursor.last_event_unix_ms,
-                sql_quote(&cursor.session_id)
-            ));
-        }
-
-        let where_sql = where_clauses.join("\n  AND ");
-        let order_dir = match sort {
-            ConversationListSort::Desc => "DESC",
-            ConversationListSort::Asc => "ASC",
-        };
-        let limit_plus = (limit as usize) + 1;
-
-        let query = self.build_session_headers_sql(
-            &where_sql,
-            &format!("s.last_event_time {order_dir}, s.session_id {order_dir}"),
-            limit_plus,
-        );
-
-        let rows: Vec<McpSessionListRow> = self.map_backend(self.query_rows(&query, None).await)?;
-
-        let mut items: Vec<McpSessionListItem> = rows
-            .iter()
-            .take(limit as usize)
-            .cloned()
-            .map(Self::map_mcp_session_list_row)
-            .collect();
-
-        let next_cursor = if rows.len() > limit as usize {
-            items
-                .last()
-                .map(|last| {
-                    Self::mint_session_list_cursor(
-                        last.last_event_unix_ms,
-                        &last.session_id,
-                        filter_sig,
-                        sort,
-                        MCP_SESSION_LIST_CURSOR_VERSION_HEADERS,
-                    )
-                })
-                .transpose()?
-        } else {
-            None
-        };
-
-        Ok(Page {
-            items: std::mem::take(&mut items),
-            next_cursor,
-        })
     }
 
     pub(super) async fn list_turns_impl(
@@ -1405,10 +1139,10 @@ struct SessionSearchBounds {
     hits_truncated: bool,
     /// The exact post-ranking re-check shortened the answer, unrefilled.
     ///
-    /// Never a project-scope removal: both ranking arms apply scope while they
-    /// choose candidates, so an out-of-scope session is not in `considered` to
-    /// begin with. See [`crate::domain::SessionSearchResults::dropped`] for why
-    /// that distinction is a disclosure property and not a detail.
+    /// Never a project-scope removal: ranking applies scope while it chooses
+    /// candidates, so an out-of-scope session is not in `considered` to begin
+    /// with. See [`crate::domain::SessionSearchResults::dropped`] for why that
+    /// distinction is a disclosure property and not a detail.
     dropped: bool,
 }
 

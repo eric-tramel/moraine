@@ -142,7 +142,12 @@ async fn bootstrap_schema_through_030(
                  ('033', 'fixture-hold-033'), \
                  ('034', 'fixture-hold-034'), \
                  ('035', 'fixture-hold-035'), \
-                 ('036', 'fixture-hold-036')"
+                 ('036', 'fixture-hold-036'), \
+                 ('037', 'fixture-hold-037'), \
+                 ('038', 'fixture-hold-038'), \
+                 ('039', 'fixture-hold-039'), \
+                 ('040', 'fixture-hold-040'), \
+                 ('041', 'fixture-hold-041')"
             ),
             None,
             Some("system"),
@@ -1026,6 +1031,101 @@ pub(super) async fn run(clickhouse: &ClickHouseClient, database: &OwnedDatabaseN
             "shared_hostless_live_events": 0,
             "mcp_projection_generation": projection.generation,
             "mcp_projection_ready": projection.ready,
+        })
+    );
+
+    // ---- issue #603 WI-10: the retirement walk on the legacy fixture ------
+    //
+    // This store is the never-cut-over shape: the projection carries the
+    // legacy rows seeded above and `open_v2` is unpublished. Releasing the
+    // held tail (037..041) must apply everything EXCEPT the retirement, which
+    // defers with the named reason; the canonical sweep then publishes
+    // readiness, and the retry applies 041 and the family is gone.
+    remove_migration_ledger_rows(
+        clickhouse,
+        database.as_str(),
+        &["037", "038", "039", "040", "041"],
+    )
+    .await?;
+    let mut deferred_reasons: Vec<String> = Vec::new();
+    let mut preflight_notes: Vec<String> = Vec::new();
+    let applied_tail = clickhouse
+        .run_migrations_with_progress(|event| match event {
+            moraine_clickhouse::MigrationProgress::Deferred {
+                version, reason, ..
+            } => {
+                deferred_reasons.push(format!("{version}: {reason}"));
+            }
+            moraine_clickhouse::MigrationProgress::Preflight { version, note } => {
+                preflight_notes.push(format!("{version}: {note}"));
+            }
+            _ => {}
+        })
+        .await
+        .context("failed to apply the held post-036 migrations")?;
+    if applied_tail != ["037", "038", "039", "040"] {
+        bail!("the un-cut-over store must apply 037..040 and defer 041, applied {applied_tail:?}");
+    }
+    if deferred_reasons.len() != 1
+        || !deferred_reasons[0].contains("has not cut over")
+        || !deferred_reasons[0].contains("core-index rebuild")
+    {
+        bail!("the retirement deferral must name the recovery recipe: {deferred_reasons:?}");
+    }
+    let family_before = scalar(
+        clickhouse,
+        "SELECT toUInt64(count()) AS value FROM system.tables \
+         WHERE database = currentDatabase() AND name LIKE 'mcp_open%' \
+         FORMAT JSONEachRow",
+    )
+    .await?;
+    if family_before != 8 {
+        bail!("the deferred retirement must leave all eight family tables: {family_before}");
+    }
+
+    clickhouse
+        .backfill_canonical_read_indexes(
+            true,
+            &super::live_fixture_budget(),
+            &super::default_interactive_budget(),
+            |_| {},
+        )
+        .await
+        .context("failed to sweep the legacy fixture into the canonical read indexes")?;
+
+    let retried = clickhouse
+        .run_migrations_with_progress(|event| {
+            if let moraine_clickhouse::MigrationProgress::Preflight { version, note } = event {
+                preflight_notes.push(format!("{version}: {note}"));
+            }
+        })
+        .await
+        .context("failed to retry the retirement after the sweep")?;
+    if retried != ["041"] {
+        bail!("the post-sweep retry must apply exactly the retirement, applied {retried:?}");
+    }
+    if !preflight_notes
+        .iter()
+        .any(|note| note.starts_with("041:") && note.contains("mcp_open_*"))
+    {
+        bail!("the retirement preflight must report the reclaimed family: {preflight_notes:?}");
+    }
+    let family_after = scalar(
+        clickhouse,
+        "SELECT toUInt64(count()) AS value FROM system.tables \
+         WHERE database = currentDatabase() AND name LIKE 'mcp_open%' \
+         FORMAT JSONEachRow",
+    )
+    .await?;
+    if family_after != 0 {
+        bail!("migration 041 must drop the whole family: {family_after} tables remain");
+    }
+    eprintln!(
+        "{}",
+        json!({
+            "kind": "source_publication_retirement_walk_evidence",
+            "deferred_reasons": deferred_reasons,
+            "preflight_notes": preflight_notes,
         })
     );
     Ok(())

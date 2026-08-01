@@ -11,7 +11,6 @@ use futures_util::stream;
 use moraine_clickhouse::ClickHouseClient;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::env;
 use std::fs;
@@ -36,14 +35,7 @@ const INGEST_BINARY_ROOT: &str = "/opt/moraine/bin";
 const PROCESS_SOURCE: &str = "source-publication-process";
 const PROCESS_SESSION: &str = "source-publication-process-session";
 const FIXTURE_LINES: u64 = 4;
-const FIXTURE_EVENTS: u64 = 5;
 const PROCESS_WAIT: Duration = Duration::from_secs(120);
-const LEGACY_SESSION_PUBLICATION_COLUMNS: &str = "session_id, slot, generation, source_revision, \
-    dirty_revision, first_event_time, last_event_time, total_turns, total_events, user_messages, \
-    assistant_messages, tool_calls, tool_results, mode, first_event_uid, last_event_uid, \
-    last_actor_role, title, source, harness, inference_provider, session_slug, session_summary, \
-    completed, terminal_event_uid, origin_cwd";
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum FaultTarget {
     ReplayingCheckpoint {
@@ -66,25 +58,21 @@ enum GenerationStage {
     EventLinks,
     ToolIo,
     IngestErrors,
-    McpOpenEvents,
-    McpOpenTurns,
-    McpOpenHeader,
-    McpOpenReadiness,
     FinalCheckpoint,
     SourceReadiness,
 }
 
 impl GenerationStage {
-    const PRE_HEAD_MATRIX: [Self; 11] = [
+    // The four v1 compatibility-preparation stages (mcp_open events/turns/
+    // header/readiness) left this matrix with the projection (issue #603
+    // WI-10): publication no longer issues those statements, so a fault
+    // keyed on them would never fire.
+    const PRE_HEAD_MATRIX: [Self; 7] = [
         Self::RawEvents,
         Self::CanonicalAndSearch,
         Self::EventLinks,
         Self::ToolIo,
         Self::IngestErrors,
-        Self::McpOpenEvents,
-        Self::McpOpenTurns,
-        Self::McpOpenHeader,
-        Self::McpOpenReadiness,
         Self::FinalCheckpoint,
         Self::SourceReadiness,
     ];
@@ -96,10 +84,6 @@ impl GenerationStage {
             Self::EventLinks => "event-links",
             Self::ToolIo => "tool-io",
             Self::IngestErrors => "ingest-errors",
-            Self::McpOpenEvents => "mcp-open-events",
-            Self::McpOpenTurns => "mcp-open-turns",
-            Self::McpOpenHeader => "mcp-open-header",
-            Self::McpOpenReadiness => "mcp-open-readiness",
             Self::FinalCheckpoint => "final-checkpoint",
             Self::SourceReadiness => "source-readiness",
         }
@@ -112,10 +96,6 @@ impl GenerationStage {
             Self::EventLinks => "event_links",
             Self::ToolIo => "tool_io",
             Self::IngestErrors => "ingest_errors",
-            Self::McpOpenEvents => "mcp_open_events",
-            Self::McpOpenTurns => "mcp_open_turns",
-            Self::McpOpenHeader => "mcp_open_publication_headers",
-            Self::McpOpenReadiness => "mcp_open_generation_readiness",
             Self::FinalCheckpoint => "ingest_checkpoint_transitions",
             Self::SourceReadiness => "source_generation_publication_readiness",
         }
@@ -154,14 +134,6 @@ impl FaultTarget {
                             && row.get("session_id").and_then(Value::as_str)
                                 == Some(PROCESS_SESSION)
                     })
-                }
-                GenerationStage::McpOpenEvents | GenerationStage::McpOpenTurns => {
-                    query.contains(PROCESS_SESSION)
-                        && query.contains(source_file)
-                        && query.contains(&format!("source_generation = {generation}"))
-                }
-                GenerationStage::McpOpenHeader | GenerationStage::McpOpenReadiness => {
-                    query.contains(&candidate_publication_id(source_file, *generation))
                 }
                 GenerationStage::FinalCheckpoint => json_each_rows(body).any(|row| {
                     row_matches_owned_generation(&row, source_file, *generation)
@@ -727,57 +699,6 @@ struct EventRow {
 }
 
 #[derive(Debug, Deserialize)]
-struct LegacyPointerRow {
-    slot: u8,
-    generation: u64,
-    source_revision: u64,
-}
-
-#[derive(Debug, Deserialize)]
-struct SourceRevisionRow {
-    source_revision: u64,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-struct RequiredSourceHead {
-    source_host: String,
-    source_name: String,
-    source_file: String,
-    source_generation: u32,
-    publication_revision: u64,
-}
-
-#[derive(Debug, Deserialize)]
-struct McpReadinessRow {
-    candidate_publication_id: String,
-    operation_id: String,
-    affected_session_count: u64,
-    prepared_session_count: u64,
-    tombstone_count: u64,
-    ready: u8,
-    block_reason: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct CandidateHeaderRow {
-    slot: u8,
-    generation: u64,
-    source_revision: u64,
-    total_turns: u64,
-    total_events: u64,
-    tombstone: u8,
-    required_source_heads: Vec<RequiredSourceHead>,
-    required_heads_fingerprint: String,
-    operation_id: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct CandidateChildCounts {
-    event_count: u64,
-    turn_count: u64,
-}
-
-#[derive(Debug, Deserialize)]
 struct TransitionRow {
     inode: u64,
     source_generation: u32,
@@ -821,16 +742,6 @@ fn sql_string(value: &str) -> String {
     format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
 }
 
-fn candidate_publication_id(source_file: &str, generation: u32) -> String {
-    let mut hasher = Sha256::new();
-    for value in ["", PROCESS_SOURCE, source_file] {
-        hasher.update((value.len() as u64).to_le_bytes());
-        hasher.update(value.as_bytes());
-    }
-    hasher.update(generation.to_le_bytes());
-    format!("source-publication-{:x}", hasher.finalize())
-}
-
 async fn scalar_count(
     clickhouse: &ClickHouseClient,
     database: &OwnedDatabaseName,
@@ -847,49 +758,12 @@ async fn scalar_count(
         .with_context(|| format!("{label} returned no row"))
 }
 
-async fn mcp_child_generation(
-    clickhouse: &ClickHouseClient,
-    database: &OwnedDatabaseName,
-    table: &str,
-) -> Result<u64> {
-    let query = format!(
-        "SELECT toUInt64(if(count() = 0, 0, max(generation))) AS value \
-         FROM `{}`.`{table}` WHERE session_id = {} FORMAT JSONEachRow",
-        database.as_str(),
-        sql_string(PROCESS_SESSION),
-    );
-    scalar_count(
-        clickhouse,
-        database,
-        &query,
-        &format!("maximum {table} generation"),
-    )
-    .await
-}
-
-async fn stage_baseline(
-    clickhouse: &ClickHouseClient,
-    database: &OwnedDatabaseName,
-    stage: GenerationStage,
-) -> Result<u64> {
-    match stage {
-        GenerationStage::McpOpenEvents => {
-            mcp_child_generation(clickhouse, database, "mcp_open_events").await
-        }
-        GenerationStage::McpOpenTurns => {
-            mcp_child_generation(clickhouse, database, "mcp_open_turns").await
-        }
-        _ => Ok(0),
-    }
-}
-
 async fn assert_stage_commit(
     clickhouse: &ClickHouseClient,
     database: &OwnedDatabaseName,
     source_file: &str,
     generation: u32,
     stage: GenerationStage,
-    baseline: u64,
 ) -> Result<()> {
     let owned_filter = format!(
         "source_host = '' AND source_name = {} AND source_file = {} AND source_generation = {}",
@@ -958,31 +832,6 @@ async fn assert_stage_commit(
             if scalar_count(clickhouse, database, &query, stage.label()).await? == 0 {
                 bail!(
                     "committed response loss at {} left no exactly owner-bound generation {generation} row",
-                    stage.label()
-                );
-            }
-        }
-        GenerationStage::McpOpenEvents | GenerationStage::McpOpenTurns => {
-            let observed = mcp_child_generation(clickhouse, database, stage.table()).await?;
-            if observed <= baseline {
-                bail!(
-                    "committed response loss at {} did not advance its physical child generation: before={baseline}, after={observed}",
-                    stage.label()
-                );
-            }
-        }
-        GenerationStage::McpOpenHeader | GenerationStage::McpOpenReadiness => {
-            let candidate = candidate_publication_id(source_file, generation);
-            let query = format!(
-                "SELECT toUInt64(count()) AS value FROM `{}`.`{}` FINAL \
-                 WHERE candidate_publication_id = {} FORMAT JSONEachRow",
-                database.as_str(),
-                stage.table(),
-                sql_string(&candidate),
-            );
-            if scalar_count(clickhouse, database, &query, stage.label()).await? != 1 {
-                bail!(
-                    "committed response loss at {} did not leave exactly one durable candidate {candidate}",
                     stage.label()
                 );
             }
@@ -1105,193 +954,6 @@ async fn live_events(
         .context("failed to read production-process live events")
 }
 
-async fn legacy_events(
-    clickhouse: &ClickHouseClient,
-    database: &OwnedDatabaseName,
-) -> Result<Vec<EventRow>> {
-    let query = format!(
-        "SELECT toUInt32(0) AS source_generation, projected.text_content AS text_content \
-         FROM ( \
-           SELECT * FROM `{0}`.`mcp_open_events` FINAL \
-           WHERE session_id = {1} \
-         ) AS projected \
-         INNER JOIN ( \
-           SELECT session_id, slot, generation \
-           FROM `{0}`.`mcp_open_sessions` FINAL \
-           WHERE session_id = {1} \
-         ) AS current \
-           ON projected.session_id = current.session_id \
-          AND projected.slot = current.slot \
-          AND projected.generation = current.generation \
-          AND projected.candidate_generation = current.generation \
-         WHERE projected.session_id = {1} AND notEmpty(projected.text_content) \
-         ORDER BY projected.event_order, projected.event_uid FORMAT JSONEachRow",
-        database.as_str(),
-        sql_string(PROCESS_SESSION),
-    );
-    clickhouse
-        .query_rows(&query, Some(database.as_str()))
-        .await
-        .context("failed to read production-process legacy projection")
-}
-
-async fn legacy_session_row(
-    clickhouse: &ClickHouseClient,
-    database: &OwnedDatabaseName,
-) -> Result<Value> {
-    let query = format!(
-        "SELECT * FROM `{}`.`mcp_open_sessions` FINAL \
-         WHERE session_id = {} FORMAT JSONEachRow",
-        database.as_str(),
-        sql_string(PROCESS_SESSION),
-    );
-    let rows = clickhouse
-        .query_rows::<Value>(&query, Some(database.as_str()))
-        .await
-        .context("failed to read exact production-process legacy session tuple")?;
-    if rows.len() != 1 {
-        bail!(
-            "expected one production-process legacy session tuple, observed {}",
-            rows.len()
-        );
-    }
-    Ok(rows.into_iter().next().expect("length checked"))
-}
-
-async fn legacy_pointer(
-    clickhouse: &ClickHouseClient,
-    database: &OwnedDatabaseName,
-) -> Result<LegacyPointerRow> {
-    let query = format!(
-        "SELECT toUInt8(slot) AS slot, toUInt64(generation) AS generation, \
-                toUInt64(source_revision) AS source_revision \
-         FROM `{}`.`mcp_open_sessions` FINAL \
-         WHERE session_id = {} FORMAT JSONEachRow",
-        database.as_str(),
-        sql_string(PROCESS_SESSION),
-    );
-    let rows = clickhouse
-        .query_rows::<LegacyPointerRow>(&query, Some(database.as_str()))
-        .await
-        .context("failed to read production-process legacy pointer")?;
-    if rows.len() != 1 {
-        bail!(
-            "expected one production-process legacy pointer, observed {}",
-            rows.len()
-        );
-    }
-    Ok(rows.into_iter().next().expect("length checked"))
-}
-
-async fn assert_legacy_pointer_authorized(
-    clickhouse: &ClickHouseClient,
-    database: &OwnedDatabaseName,
-    source_file: &str,
-    source_generation: u32,
-) -> Result<()> {
-    let pointer = legacy_pointer(clickhouse, database).await?;
-    let expected =
-        canonical_source_revision(clickhouse, database, source_file, source_generation).await?;
-    if pointer.slot > 1
-        || pointer.generation == 0
-        || pointer.source_revision == 0
-        || pointer.source_revision != expected
-    {
-        bail!(
-            "legacy pointer is not authorized by canonical generation {source_generation}: pointer={pointer:?}, expected_source_revision={expected}"
-        );
-    }
-    Ok(())
-}
-
-async fn canonical_source_revision(
-    clickhouse: &ClickHouseClient,
-    database: &OwnedDatabaseName,
-    source_file: &str,
-    source_generation: u32,
-) -> Result<u64> {
-    let query = format!(
-        "SELECT toUInt64(if(count() = 0, 0, \
-                    cityHash64(arraySort(groupArray(tuple(event_uid, event_version)))))) \
-                    AS source_revision \
-         FROM `{}`.`events` FINAL \
-         WHERE session_id = {} AND source_host = '' AND source_name = {} \
-           AND source_file = {} AND source_generation = {} FORMAT JSONEachRow",
-        database.as_str(),
-        sql_string(PROCESS_SESSION),
-        sql_string(PROCESS_SOURCE),
-        sql_string(source_file),
-        source_generation,
-    );
-    let expected = clickhouse
-        .query_rows::<SourceRevisionRow>(&query, Some(database.as_str()))
-        .await
-        .context("failed to recompute production-process legacy source revision")?
-        .into_iter()
-        .next()
-        .context("source-revision recomputation returned no row")?;
-    Ok(expected.source_revision)
-}
-
-async fn legacy_session_publication_tuple(
-    clickhouse: &ClickHouseClient,
-    database: &OwnedDatabaseName,
-) -> Result<Value> {
-    let query = format!(
-        "SELECT {LEGACY_SESSION_PUBLICATION_COLUMNS} \
-         FROM `{}`.`mcp_open_sessions` FINAL \
-         WHERE session_id = {} FORMAT JSONEachRow",
-        database.as_str(),
-        sql_string(PROCESS_SESSION),
-    );
-    one_json_row(
-        clickhouse,
-        database,
-        &query,
-        "active production-process legacy session publication tuple",
-    )
-    .await
-}
-
-async fn candidate_session_publication_tuple(
-    clickhouse: &ClickHouseClient,
-    database: &OwnedDatabaseName,
-    candidate_publication_id: &str,
-) -> Result<Value> {
-    let query = format!(
-        "SELECT {LEGACY_SESSION_PUBLICATION_COLUMNS} \
-         FROM `{}`.`mcp_open_publication_headers` FINAL \
-         WHERE session_id = {} AND candidate_publication_id = {} AND tombstone = 0 \
-         FORMAT JSONEachRow",
-        database.as_str(),
-        sql_string(PROCESS_SESSION),
-        sql_string(candidate_publication_id),
-    );
-    one_json_row(
-        clickhouse,
-        database,
-        &query,
-        "prepared production-process legacy session candidate tuple",
-    )
-    .await
-}
-
-async fn one_json_row(
-    clickhouse: &ClickHouseClient,
-    database: &OwnedDatabaseName,
-    query: &str,
-    label: &str,
-) -> Result<Value> {
-    let rows = clickhouse
-        .query_rows::<Value>(query, Some(database.as_str()))
-        .await
-        .with_context(|| format!("failed to read {label}"))?;
-    if rows.len() != 1 {
-        bail!("expected one {label}, observed {}", rows.len());
-    }
-    Ok(rows.into_iter().next().expect("length checked"))
-}
-
 async fn current_transition(
     clickhouse: &ClickHouseClient,
     database: &OwnedDatabaseName,
@@ -1347,96 +1009,6 @@ async fn current_readiness(
         .next())
 }
 
-async fn current_mcp_readiness(
-    clickhouse: &ClickHouseClient,
-    database: &OwnedDatabaseName,
-    source_file: &str,
-    generation: u32,
-) -> Result<McpReadinessRow> {
-    let query = format!(
-        "SELECT candidate_publication_id, operation_id, \
-                toUInt64(affected_session_count) AS affected_session_count, \
-                toUInt64(prepared_session_count) AS prepared_session_count, \
-                toUInt64(tombstone_count) AS tombstone_count, ready, block_reason \
-         FROM `{}`.`v_current_mcp_open_generation_readiness` \
-         WHERE source_host = '' AND source_name = {} AND source_file = {} \
-           AND source_generation = {} FORMAT JSONEachRow",
-        database.as_str(),
-        sql_string(PROCESS_SOURCE),
-        sql_string(source_file),
-        generation,
-    );
-    let rows = clickhouse
-        .query_rows::<McpReadinessRow>(&query, Some(database.as_str()))
-        .await
-        .context("failed to read production-process MCP generation readiness")?;
-    if rows.len() != 1 {
-        bail!(
-            "expected one production-process MCP generation readiness row, observed {}",
-            rows.len()
-        );
-    }
-    Ok(rows.into_iter().next().expect("length checked"))
-}
-
-async fn candidate_header(
-    clickhouse: &ClickHouseClient,
-    database: &OwnedDatabaseName,
-    candidate_publication_id: &str,
-) -> Result<CandidateHeaderRow> {
-    let query = format!(
-        "SELECT toUInt8(slot) AS slot, toUInt64(generation) AS generation, \
-                toUInt64(source_revision) AS source_revision, \
-                toUInt64(total_turns) AS total_turns, \
-                toUInt64(total_events) AS total_events, tombstone, required_source_heads, \
-                required_heads_fingerprint, operation_id \
-         FROM `{}`.`mcp_open_publication_headers` FINAL \
-         WHERE session_id = {} AND candidate_publication_id = {} FORMAT JSONEachRow",
-        database.as_str(),
-        sql_string(PROCESS_SESSION),
-        sql_string(candidate_publication_id),
-    );
-    let rows = clickhouse
-        .query_rows::<CandidateHeaderRow>(&query, Some(database.as_str()))
-        .await
-        .context("failed to read production-process candidate header")?;
-    if rows.len() != 1 {
-        bail!(
-            "expected one production-process candidate header, observed {}",
-            rows.len()
-        );
-    }
-    Ok(rows.into_iter().next().expect("length checked"))
-}
-
-async fn candidate_child_counts(
-    clickhouse: &ClickHouseClient,
-    database: &OwnedDatabaseName,
-    header: &CandidateHeaderRow,
-) -> Result<CandidateChildCounts> {
-    let query = format!(
-        "SELECT \
-           toUInt64((SELECT count() FROM `{0}`.`mcp_open_events` FINAL \
-             WHERE session_id = {1} AND slot = {2} AND generation = {3} \
-               AND candidate_generation = {3})) AS event_count, \
-           toUInt64((SELECT count() FROM `{0}`.`mcp_open_turns` FINAL \
-             WHERE session_id = {1} AND slot = {2} AND generation = {3} \
-               AND candidate_generation = {3})) AS turn_count \
-         FORMAT JSONEachRow",
-        database.as_str(),
-        sql_string(PROCESS_SESSION),
-        header.slot,
-        header.generation,
-    );
-    clickhouse
-        .query_rows::<CandidateChildCounts>(&query, Some(database.as_str()))
-        .await
-        .context("failed to count production-process candidate children")?
-        .into_iter()
-        .next()
-        .context("candidate child count query returned no row")
-}
-
 fn expected_texts(generation: u32) -> BTreeSet<String> {
     (1..=FIXTURE_LINES)
         .map(|line| format!("process generation {generation} line {line}"))
@@ -1468,18 +1040,6 @@ async fn assert_live_generation(
     Ok(())
 }
 
-async fn assert_legacy_generation(
-    clickhouse: &ClickHouseClient,
-    database: &OwnedDatabaseName,
-    generation: u32,
-) -> Result<()> {
-    let rows = legacy_events(clickhouse, database).await?;
-    if !rows_match_generation(&rows, generation, false) {
-        bail!("legacy projection is not complete generation {generation}: {rows:?}");
-    }
-    Ok(())
-}
-
 async fn wait_for_complete_generation(
     clickhouse: &ClickHouseClient,
     database: &OwnedDatabaseName,
@@ -1494,17 +1054,15 @@ async fn wait_for_complete_generation(
         process.ensure_running()?;
         let observation = generation_observation(clickhouse, database, source_file).await;
         match observation {
-            Ok((Some(head), history, live, legacy))
+            Ok((Some(head), history, live))
                 if head.source_generation == generation
                     && history_matches_head(&history, &head, history_count)
-                    && rows_match_generation(&live, generation, true)
-                    && rows_match_generation(&legacy, generation, false) =>
+                    && rows_match_generation(&live, generation, true) =>
             {
                 return Ok(head);
             }
-            Ok((head, history, live, legacy)) => {
-                last_observation =
-                    format!("head={head:?}, history={history:?}, live={live:?}, legacy={legacy:?}");
+            Ok((head, history, live)) => {
+                last_observation = format!("head={head:?}, history={history:?}, live={live:?}");
             }
             Err(error) => last_observation = error.to_string(),
         }
@@ -1517,12 +1075,11 @@ async fn generation_observation(
     clickhouse: &ClickHouseClient,
     database: &OwnedDatabaseName,
     source_file: &str,
-) -> Result<(Option<HeadRow>, HistoryRow, Vec<EventRow>, Vec<EventRow>)> {
+) -> Result<(Option<HeadRow>, HistoryRow, Vec<EventRow>)> {
     let head = current_head(clickhouse, database, source_file).await?;
     let history = head_history(clickhouse, database, source_file).await?;
     let live = live_events(clickhouse, database, source_file).await?;
-    let legacy = legacy_events(clickhouse, database).await?;
-    Ok((head, history, live, legacy))
+    Ok((head, history, live))
 }
 
 fn write_generation(path: &Path, generation: u32) -> Result<()> {
@@ -1757,7 +1314,7 @@ async fn assert_final_boundary(
     database: &OwnedDatabaseName,
     source_file: &str,
     head: &HeadRow,
-) -> Result<String> {
+) -> Result<()> {
     let transition = current_transition(clickhouse, database, source_file)
         .await?
         .context("final checkpoint is missing after committed head response loss")?;
@@ -1790,63 +1347,7 @@ async fn assert_final_boundary(
         bail!("unexpected final readiness after committed head response loss: {readiness:?}");
     }
 
-    let mcp_readiness =
-        current_mcp_readiness(clickhouse, database, source_file, head.source_generation).await?;
-    let required_head = RequiredSourceHead {
-        source_host: String::new(),
-        source_name: PROCESS_SOURCE.to_string(),
-        source_file: source_file.to_string(),
-        source_generation: head.source_generation,
-        publication_revision: head.publication_revision,
-    };
-    if mcp_readiness.candidate_publication_id.is_empty() {
-        bail!("MCP readiness has an empty candidate publication id: {mcp_readiness:?}");
-    }
-    if mcp_readiness.operation_id.is_empty() {
-        bail!("MCP readiness has an empty preparation operation id: {mcp_readiness:?}");
-    }
-    if mcp_readiness.affected_session_count != 1
-        || mcp_readiness.prepared_session_count != 1
-        || mcp_readiness.tombstone_count != 0
-    {
-        bail!("MCP readiness candidate cardinality is incomplete: {mcp_readiness:?}");
-    }
-    if mcp_readiness.ready != 1 || !mcp_readiness.block_reason.is_empty() {
-        bail!("MCP readiness authorization is incomplete: {mcp_readiness:?}");
-    }
-
-    let candidate = candidate_header(
-        clickhouse,
-        database,
-        &mcp_readiness.candidate_publication_id,
-    )
-    .await?;
-    let expected_source_revision =
-        canonical_source_revision(clickhouse, database, source_file, head.source_generation)
-            .await?;
-    if candidate.slot > 1
-        || candidate.generation == 0
-        || candidate.source_revision != expected_source_revision
-        || candidate.total_events != FIXTURE_EVENTS
-        || candidate.total_turns == 0
-        || candidate.tombstone != 0
-        || candidate.required_source_heads != vec![required_head]
-        || candidate.required_heads_fingerprint.is_empty()
-        || candidate.operation_id != mcp_readiness.operation_id
-    {
-        bail!(
-            "candidate header is not authorized by the committed causal chain: candidate={candidate:?}, expected_source_revision={expected_source_revision}"
-        );
-    }
-    let children = candidate_child_counts(clickhouse, database, &candidate).await?;
-    if children.event_count != candidate.total_events
-        || children.turn_count != candidate.total_turns
-    {
-        bail!(
-            "candidate children are incomplete at their pinned generation: header={candidate:?}, children={children:?}"
-        );
-    }
-    Ok(mcp_readiness.candidate_publication_id)
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1865,8 +1366,6 @@ async fn exercise_pre_head_stage_fault(
     generation: u32,
     stage: GenerationStage,
 ) -> Result<HeadRow> {
-    let baseline = stage_baseline(clickhouse, database, stage).await?;
-    let legacy_before_fault = legacy_session_row(clickhouse, database).await?;
     let target = FaultTarget::GenerationStage { generation, stage };
     process.drain_logs();
     faults.arm(target.clone())?;
@@ -1878,15 +1377,7 @@ async fn exercise_pre_head_stage_fault(
     process.sigkill()?;
     faults.release_after_sigkill(&target)?;
 
-    assert_stage_commit(
-        clickhouse,
-        database,
-        source_file_text,
-        generation,
-        stage,
-        baseline,
-    )
-    .await?;
+    assert_stage_commit(clickhouse, database, source_file_text, generation, stage).await?;
     let old_head = current_head(clickhouse, database, source_file_text)
         .await?
         .with_context(|| format!("old head disappeared after {} SIGKILL", stage.label()))?;
@@ -1910,21 +1401,6 @@ async fn exercise_pre_head_stage_fault(
         head.source_generation,
     )
     .await?;
-    assert_legacy_generation(clickhouse, database, head.source_generation).await?;
-    assert_legacy_pointer_authorized(
-        clickhouse,
-        database,
-        source_file_text,
-        head.source_generation,
-    )
-    .await?;
-    let legacy_after_fault = legacy_session_row(clickhouse, database).await?;
-    if legacy_after_fault != legacy_before_fault {
-        bail!(
-            "{} SIGKILL changed the exact legacy session tuple: before={legacy_before_fault}, after={legacy_after_fault}",
-            stage.label()
-        );
-    }
 
     *process = IngestProcess::spawn(binary, config_path)?;
     *history_count += 1;
@@ -1943,7 +1419,6 @@ async fn exercise_pre_head_stage_fault(
             stage.label()
         );
     }
-    assert_legacy_pointer_authorized(clickhouse, database, source_file_text, generation).await?;
     Ok(repaired)
 }
 
@@ -1979,7 +1454,6 @@ pub(super) async fn run(clickhouse: &ClickHouseClient, database: &OwnedDatabaseN
         history_count,
     )
     .await?;
-    assert_legacy_pointer_authorized(clickhouse, database, &source_file_text, 1).await?;
 
     for (offset, last_line) in (0..=FIXTURE_LINES).enumerate() {
         let generation = u32::try_from(offset)
@@ -1990,7 +1464,6 @@ pub(super) async fn run(clickhouse: &ClickHouseClient, database: &OwnedDatabaseN
             generation,
             last_line,
         };
-        let legacy_before_fault = legacy_session_row(clickhouse, database).await?;
         process.drain_logs();
         faults.arm(target.clone())?;
         replace_generation(&owned.path, &source_file, generation)?;
@@ -2022,15 +1495,6 @@ pub(super) async fn run(clickhouse: &ClickHouseClient, database: &OwnedDatabaseN
             bail!("replay checkpoint SIGKILL changed head history: {history:?}");
         }
         assert_live_generation(clickhouse, database, &source_file_text, generation - 1).await?;
-        assert_legacy_generation(clickhouse, database, generation - 1).await?;
-        assert_legacy_pointer_authorized(clickhouse, database, &source_file_text, generation - 1)
-            .await?;
-        let legacy_after_fault = legacy_session_row(clickhouse, database).await?;
-        if legacy_after_fault != legacy_before_fault {
-            bail!(
-                "replay checkpoint SIGKILL changed the exact legacy session tuple: before={legacy_before_fault}, after={legacy_after_fault}"
-            );
-        }
 
         process = IngestProcess::spawn(&binary, &config_path)?;
         history_count += 1;
@@ -2048,8 +1512,6 @@ pub(super) async fn run(clickhouse: &ClickHouseClient, database: &OwnedDatabaseN
                 "replay repair did not switch publication exactly once: before={head:?}, after={repaired:?}"
             );
         }
-        assert_legacy_pointer_authorized(clickhouse, database, &source_file_text, generation)
-            .await?;
         head = repaired;
     }
 
@@ -2086,7 +1548,6 @@ pub(super) async fn run(clickhouse: &ClickHouseClient, database: &OwnedDatabaseN
         .checked_add(1)
         .context("process-test head generation overflow")?;
     let target = FaultTarget::SourceHead { generation };
-    let legacy_before_fault = legacy_session_row(clickhouse, database).await?;
     process.drain_logs();
     faults.arm(target.clone())?;
     replace_generation(&owned.path, &source_file, generation)?;
@@ -2112,28 +1573,8 @@ pub(super) async fn run(clickhouse: &ClickHouseClient, database: &OwnedDatabaseN
     if !history_matches_head(&committed_history, &committed_head, history_count) {
         bail!("committed head response loss changed logical history: {committed_history:?}");
     }
-    let candidate_publication_id =
-        assert_final_boundary(clickhouse, database, &source_file_text, &committed_head).await?;
+    assert_final_boundary(clickhouse, database, &source_file_text, &committed_head).await?;
     assert_live_generation(clickhouse, database, &source_file_text, generation).await?;
-    assert_legacy_generation(clickhouse, database, head_generation).await?;
-    assert_legacy_pointer_authorized(clickhouse, database, &source_file_text, head_generation)
-        .await?;
-    let legacy_after_fault = legacy_session_row(clickhouse, database).await?;
-    if legacy_after_fault != legacy_before_fault {
-        bail!(
-            "committed head response loss changed the exact legacy session tuple before restart: before={legacy_before_fault}, after={legacy_after_fault}"
-        );
-    }
-    let legacy_publication_before_repair =
-        legacy_session_publication_tuple(clickhouse, database).await?;
-    let prepared_candidate =
-        candidate_session_publication_tuple(clickhouse, database, &candidate_publication_id)
-            .await?;
-    if legacy_publication_before_repair == prepared_candidate {
-        bail!(
-            "committed head response loss activated its prepared legacy candidate before restart"
-        );
-    }
 
     process = IngestProcess::spawn(&binary, &config_path)?;
     let repaired_head = wait_for_complete_generation(
@@ -2150,14 +1591,6 @@ pub(super) async fn run(clickhouse: &ClickHouseClient, database: &OwnedDatabaseN
             "restart changed the committed response-loss head: committed={committed_head:?}, repaired={repaired_head:?}"
         );
     }
-    let legacy_publication_after_repair =
-        legacy_session_publication_tuple(clickhouse, database).await?;
-    if legacy_publication_after_repair != prepared_candidate {
-        bail!(
-            "startup repair did not activate the exact prepared legacy candidate: candidate={prepared_candidate}, active={legacy_publication_after_repair}"
-        );
-    }
-    assert_legacy_pointer_authorized(clickhouse, database, &source_file_text, generation).await?;
     tokio::time::sleep(Duration::from_millis(250)).await;
     let stable_history = head_history(clickhouse, database, &source_file_text).await?;
     if !history_matches_head(&stable_history, &repaired_head, history_count) {
@@ -2278,39 +1711,6 @@ mod tests {
                 &derived,
                 source_file,
             ));
-        }
-
-        for (stage, table) in [
-            (GenerationStage::McpOpenEvents, "mcp_open_events"),
-            (GenerationStage::McpOpenTurns, "mcp_open_turns"),
-        ] {
-            let query = format!(
-                "INSERT INTO `db`.{table}\nSELECT * FROM `db`.events AS e WHERE e.session_id = '{PROCESS_SESSION}' AND e.source_file = '{source_file}' AND e.source_generation = 7"
-            );
-            assert!(FaultTarget::GenerationStage {
-                generation: 7,
-                stage,
-            }
-            .matches(&query, &[], source_file));
-        }
-
-        let candidate = candidate_publication_id(source_file, 7);
-        for (stage, table) in [
-            (
-                GenerationStage::McpOpenHeader,
-                "mcp_open_publication_headers",
-            ),
-            (
-                GenerationStage::McpOpenReadiness,
-                "mcp_open_generation_readiness",
-            ),
-        ] {
-            let query = format!("INSERT INTO `db`.{table}\nVALUES ('{candidate}')");
-            assert!(FaultTarget::GenerationStage {
-                generation: 7,
-                stage,
-            }
-            .matches(&query, &[], source_file));
         }
 
         let final_checkpoint = serde_json::to_vec(&json!({

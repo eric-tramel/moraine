@@ -386,15 +386,17 @@ class SeedTests(unittest.TestCase):
         self.assertNotIn(expected_id, sql)
         self.assertNotIn("ordered_identities", serialized_manifest)
 
-    def test_publication_control_seed_is_causal_and_dirties_after_the_head(self) -> None:
+    def test_publication_control_seed_is_causal_and_ends_at_the_head(self) -> None:
+        # Issue #603 WI-10 removed the fourth statement, which primed the
+        # retired projection's dirty queue. The head insert is now last, and
+        # nothing after it may name a dropped relation.
         statements = seed_publication_control_sql(self.target, self.recipe)
 
-        self.assertEqual(len(statements), 4)
+        self.assertEqual(len(statements), 3)
         self.assertIn("ingest_checkpoint_transitions", statements[0])
         self.assertIn("source_generation_publication_readiness", statements[1])
         self.assertIn("published_source_generations", statements[2])
-        self.assertIn("mcp_open_dirty_sessions", statements[3])
-        self.assertIn("v_live_events", statements[3])
+        self.assertTrue(all("mcp_open" not in sql for sql in statements))
         self.assertIn("'active'", statements[0])
         self.assertIn("final_scan_complete", statements[0])
         self.assertIn("compatibility_prepared", statements[1])

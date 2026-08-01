@@ -1739,13 +1739,15 @@ EOF
   assert_clickhouse_count "$clickhouse_url" "Qwen domain fields" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'qwen-code' AND harness = 'qwen-code' AND session_id = '${qwen_session_id}' AND cwd = '${tmp_root}/qwen-project'" "14"
   assert_clickhouse_count "$clickhouse_url" "Qwen model without provider" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'qwen-code' AND model = 'qwen3-coder-plus' AND inference_provider = ''" "13"
   assert_clickhouse_count "$clickhouse_url" "Qwen token accounting" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'qwen-code' AND item_id = 'qwen-assistant-${run_stamp}' AND event_kind = 'reasoning' AND input_tokens = 120 AND output_tokens = 80 AND cache_read_tokens = 20 AND cache_write_tokens = 0 AND token_usage_buckets['input_text'] = 91 AND token_usage_buckets['output_text'] = 62 AND token_usage_buckets['input_image'] = 4 AND token_usage_buckets['output_audio'] = 11 AND token_usage_buckets['reasoning'] = 7 AND token_usage_buckets['server_tool_use'] = 5" "1"
-  # Initial source publication now prepares each source's complete MCP
-  # compatibility candidate before making that source live. Physical event
-  # rows can therefore precede this pointer while the initial backfill drains.
-  wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.mcp_open_sessions FINAL WHERE session_id = '${qwen_session_id}' AND title = 'Qwen e2e ${run_stamp}'" 120
-  assert_clickhouse_count "$clickhouse_url" "Qwen title projection" "SELECT count() FROM ${clickhouse_database}.mcp_open_sessions FINAL WHERE session_id = '${qwen_session_id}' AND title = 'Qwen e2e ${run_stamp}'" "1"
+  # Initial source publication prepares a source completely before making it
+  # live; physical event rows can precede the published head while the
+  # initial backfill drains. The canonical read surface is authoritative
+  # since #603 retired the projection: wait for the session's full event set
+  # to become live, and assert the derived title through the MCP read path
+  # (the mcp_smoke qwen invocation below carries --expect-title).
+  wait_for_clickhouse_count "$clickhouse_url" "SELECT toUInt64(count() = 14) FROM ${clickhouse_database}.v_live_events WHERE session_id = '${qwen_session_id}'" 120
   assert_clickhouse_count "$clickhouse_url" "Qwen reasoning row" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'qwen-code' AND item_id = 'qwen-assistant-${run_stamp}' AND event_kind = 'reasoning' AND has_reasoning = 1" "1"
-  assert_clickhouse_count "$clickhouse_url" "Qwen projected assistant part order" "SELECT uniqExact(tuple(event_ordinal, event_class)) FROM ${clickhouse_database}.mcp_open_events FINAL WHERE session_id = '${qwen_session_id}' AND item_id = 'qwen-assistant-${run_stamp}' AND ((event_ordinal = 2 AND event_class = 'reasoning') OR (event_ordinal = 3 AND event_class = 'message') OR (event_ordinal = 4 AND event_class = 'tool_call'))" "3"
+  assert_clickhouse_count "$clickhouse_url" "Qwen assistant parts in the navigation index" "SELECT uniqExact(event_kind) FROM ${clickhouse_database}.mcp_event_navigation FINAL WHERE session_id = '${qwen_session_id}' AND item_id = 'qwen-assistant-${run_stamp}' AND event_kind IN ('reasoning', 'message', 'tool_call')" "3"
   assert_clickhouse_count "$clickhouse_url" "Qwen tool request and response rows" "SELECT count() FROM ${clickhouse_database}.tool_io FINAL WHERE source_name = 'qwen-code' AND tool_call_id IN ('qwen-call-search-${run_stamp}', 'qwen-call-fail-${run_stamp}')" "4"
   assert_clickhouse_count "$clickhouse_url" "Qwen failed tool response" "SELECT count() FROM ${clickhouse_database}.tool_io FINAL WHERE source_name = 'qwen-code' AND tool_call_id = 'qwen-call-fail-${run_stamp}' AND tool_phase = 'response' AND tool_error = 1" "1"
   assert_clickhouse_count "$clickhouse_url" "Qwen rewind event" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'qwen-code' AND item_id = 'qwen-rewind-${run_stamp}' AND op_kind = 'rewind'" "1"
@@ -1754,7 +1756,9 @@ EOF
   assert_clickhouse_count "$clickhouse_url" "Qwen both rewind branches preserved" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'qwen-code' AND (position(text_content, 'Qwen abandoned branch ${run_stamp}') > 0 OR position(text_content, 'Qwen replacement branch answer ${run_stamp}') > 0)" "2"
   assert_clickhouse_count "$clickhouse_url" "Qwen compression is bounded" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'qwen-code' AND item_id = 'qwen-compression-${run_stamp}' AND event_kind = 'summary' AND text_content = '' AND position(payload_json, 'compressedHistory') = 0" "1"
   assert_clickhouse_count "$clickhouse_url" "Qwen malformed timestamp neighbor retained" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'qwen-code' AND item_id = 'qwen-bad-ts-${run_stamp}'" "1"
-  assert_clickhouse_count "$clickhouse_url" "Qwen qualified Moraine mode" "SELECT count() FROM ${clickhouse_database}.mcp_open_sessions FINAL WHERE session_id = '${qwen_session_id}' AND mode = 'mcp_internal'" "1"
+  # mode_hint rank 2 = mcp_internal (sql/036 directory MV); the exact mode is
+  # additionally asserted through list_sessions by the qwen mcp_smoke call.
+  assert_clickhouse_count "$clickhouse_url" "Qwen qualified Moraine mode hint" "SELECT toUInt64(max(mode_hint) = 2) FROM ${clickhouse_database}.mcp_session_directory FINAL WHERE session_id = '${qwen_session_id}'" "1"
   assert_clickhouse_count "$clickhouse_url" "kiro unique raw rows" "SELECT uniqExact(raw_json_hash) FROM ${clickhouse_database}.raw_events WHERE source_name = 'ci-kiro'" "6"
   assert_clickhouse_count "$clickhouse_url" "kiro event rows" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-kiro'" "8"
   assert_clickhouse_count "$clickhouse_url" "kiro link rows" "SELECT count() FROM ${clickhouse_database}.event_links FINAL WHERE source_name = 'ci-kiro'" "0"
@@ -2052,7 +2056,6 @@ PY
   assert_clickhouse_count "$clickhouse_url" "nac deleted remote body remains archived" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-nac' AND (position(text_content, '${nac_remote_keyword}') > 0 OR position(payload_json, '${nac_remote_keyword}') > 0)" "4"
   assert_clickhouse_count "$clickhouse_url" "nac deletion preserves canonical event count" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-nac'" "19"
   assert_clickhouse_scalar "$clickhouse_url" "nac deletion appends no raw history" "SELECT count() FROM ${clickhouse_database}.raw_events WHERE source_name = 'ci-nac'" "$nac_raw_rows_before_delete"
-  wait_for_clickhouse_count "$clickhouse_url" "SELECT toUInt64(count() = 0) FROM (SELECT dirty.session_id FROM ${clickhouse_database}.mcp_open_dirty_sessions AS dirty FINAL ANY INNER JOIN (SELECT DISTINCT session_id FROM ${clickhouse_database}.v_live_events WHERE source_name = 'ci-nac') AS live USING (session_id) ANY LEFT JOIN (SELECT session_id, dirty_revision FROM ${clickhouse_database}.mcp_open_sessions FINAL) AS projected USING (session_id) WHERE dirty.dirty_revision > ifNull(projected.dirty_revision, toUInt64(0)))" 120
 
 
   assert_clickhouse_count "$clickhouse_url" "hermes session unique raw rows" "SELECT uniqExact(raw_json_hash) FROM ${clickhouse_database}.raw_events WHERE source_name = 'ci-hermes-session'" "5"
@@ -2250,10 +2253,10 @@ if not valid:
   assert_clickhouse_scalar "$clickhouse_url" "codex session summary turn count unchanged by un-merged duplicate" "SELECT total_turns FROM ${clickhouse_database}.v_session_summary WHERE session_id = '${codex_session_id}'" "$codex_turns_before"
   # Re-enable merges now that the pre-merge assertions have passed.
   clickhouse_scalar "$clickhouse_url" "SYSTEM START MERGES ${clickhouse_database}.events" >/dev/null
-  # This fixture mutation bypasses the ingest sink, which normally refreshes
-  # the MCP read model after every event batch. Reconcile the dirty session so
-  # the retrieval smoke below exercises the same clean projection contract as
-  # production ingestion.
+  # This fixture mutation bypasses the ingest sink. Re-run migrate so its
+  # canonical sweep + audit re-covers the directly inserted rows, keeping the
+  # retrieval smoke below on the same published contract as production
+  # ingestion.
   "$moraine_bin" db migrate --config "$config_path" >/dev/null
 
   # `/api/v1/sessions` now serves the same shared discovery operation MCP
@@ -2417,6 +2420,8 @@ PY
     --query "$qwen_keyword" \
     --expect-session-id "$qwen_session_id" \
     --expect-open-text "$qwen_trace_marker" \
+    --expect-title "Qwen e2e ${run_stamp}" \
+    --expect-mode "mcp_internal" \
     --harness-filter "qwen-code" \
     --source-filter "qwen-code"
 
@@ -2539,13 +2544,14 @@ PY
 )"
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-nac' AND source_generation = 2 AND session_id = '${nac_replacement_session_id}' AND position(text_content, '${nac_replacement_keyword}') > 0" 120
   assert_clickhouse_count "$clickhouse_url" "nac replacement advances source generation" "SELECT count() FROM ${clickhouse_database}.ingest_checkpoints FINAL WHERE source_name = 'ci-nac' AND source_generation = 2" "1"
-  # Replacement replay rows are deliberately excluded from the ordinary
-  # append dirty-session MV until their source head is published. A session
-  # introduced by the replacement can therefore have a clean revision of zero
-  # without ever acquiring a physical dirty row.
-  wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM (SELECT session_id, generation, dirty_revision, total_events FROM ${clickhouse_database}.mcp_open_sessions FINAL WHERE session_id = '${nac_replacement_session_id}') AS projected ANY LEFT JOIN (SELECT session_id, dirty_revision FROM ${clickhouse_database}.mcp_open_dirty_sessions FINAL WHERE session_id = '${nac_replacement_session_id}') AS dirty USING (session_id) WHERE projected.total_events = 8 AND projected.dirty_revision = ifNull(dirty.dirty_revision, toUInt64(0))" 120
-  assert_clickhouse_count "$clickhouse_url" "nac replacement bypasses append dirtiness" "SELECT count() FROM ${clickhouse_database}.mcp_open_dirty_sessions FINAL WHERE session_id = '${nac_replacement_session_id}'" "0"
-  wait_for_clickhouse_scalar_stable "$clickhouse_url" "SELECT concat(toString(slot), ':', toString(generation), ':', toString(source_revision), ':', toString(dirty_revision), ':', toString(total_events)) FROM ${clickhouse_database}.mcp_open_sessions FINAL WHERE session_id = '${nac_replacement_session_id}' LIMIT 1" 60 5 >/dev/null
+  # Replacement replay rows become live only when their source head is
+  # published; the canonical navigation index carries the replacement
+  # generation the moment its events insert (its MV fired with the insert),
+  # and the read surface serves it once the head advances. Wait for the
+  # published live set to be exactly the replacement's eight events, then
+  # pin the navigation index rows for the replacement generation.
+  wait_for_clickhouse_count "$clickhouse_url" "SELECT toUInt64(count() = 8) FROM ${clickhouse_database}.v_live_events WHERE session_id = '${nac_replacement_session_id}' AND source_generation = 2" 120
+  assert_clickhouse_count "$clickhouse_url" "nac replacement generation is indexed" "SELECT count() FROM ${clickhouse_database}.mcp_event_navigation FINAL WHERE session_id = '${nac_replacement_session_id}' AND source_generation = 2" "8"
   "$python_bin" "$repo_root/scripts/ci/mcp_smoke.py" \
     --moraine "$moraine_bin" \
     --config "$config_path" \

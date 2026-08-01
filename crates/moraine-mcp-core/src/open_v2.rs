@@ -9,16 +9,15 @@
 //! (session pages break after a turn; turn pages break after an
 //! `(event_order, event_uid)` anchor).
 //!
-//! Response shaping reuses `open_v1`'s byte-identical formatters so both readers
-//! emit the same tool JSON (design D2). The staleness decision itself is a pure
-//! function inside the repository reader (`plan_continuation`); this module only
-//! translates its outcomes to the wire.
+//! Response shaping reuses `open_shape`'s formatters — byte-identical to the
+//! retired v1 reader's output (design D2). The staleness decision itself is a
+//! pure function inside the repository reader (`plan_continuation`); this
+//! module only translates its outcomes to the wire.
 //!
 //! This module is on the `open` dispatch path via [`AppState::open`] (WI-08):
-//! `call_tool` routes here whenever the resolved reader mode is v2 (the
-//! configured `[mcp] open_reader` selector resolved against this backend's
-//! cached `open_v2` readiness and Local status). The v1 module stays byte-
-//! identical and handles every other resolution.
+//! `call_tool` routes here whenever the backend's cached `open_v2` readiness
+//! admits reads. Since issue #603 WI-10 retired the v1 projection this is the
+//! only reader; an unready backend fails typed in the dispatch instead.
 
 use crate::contract::{
     classify_open_cursor, encode_open_cursor_v2, CanonicalOpenV1Args, ContractError, McpEntityKind,
@@ -26,7 +25,7 @@ use crate::contract::{
     OPEN_CURSOR_MAX_CHARS, OPEN_CURSOR_STALE_REOPEN_MESSAGE, OPEN_CURSOR_V2_VERSION,
     OPEN_MIN_LIMIT,
 };
-use crate::open_v1::{
+use crate::open_shape::{
     compact_text_content, compact_tools, contract_error_tool_response, encode_event_ref_id,
     encode_optional_event_id, encode_session_id, encode_turn_id, encode_turn_ref_id,
     error_tool_response, format_unix_ms, internal_error_tool_response, not_found_tool_response,
@@ -363,7 +362,7 @@ fn mint_cursor(
         .transpose()
 }
 
-/// The v2 turn-open shaper: identical JSON to `open_v1::open_turn_data` except
+/// The v2 turn-open shaper: identical JSON to `open_shape::open_turn_data` except
 /// the events are already the page slice, ordinals continue from
 /// `ordinal_offset` (the anchor's within-turn ordinal), and `next_cursor` is the
 /// v2 continuation token.
@@ -452,7 +451,7 @@ fn stale_reopen_cursor() -> ContractError {
 mod tests {
     use super::*;
     use crate::contract::{McpSessionId, McpTurnId};
-    use crate::open_v1::{open_session_data, open_turn_data};
+    use crate::open_shape::{open_session_data, open_turn_data};
     use moraine_config::AppConfig;
     use moraine_conversations::{
         CanonicalReadAnchor, CanonicalSessionSignals, ConversationMode,
@@ -560,7 +559,6 @@ mod tests {
             turns: (1..=turn_count).map(compact_turn).collect(),
             completed: true,
             terminal_event_uid: Some(format!("turn-{turn_count}-final")),
-            snapshot: None,
         }
     }
 
@@ -634,7 +632,6 @@ mod tests {
                 event_count as u64,
                 1,
             )),
-            snapshot: None,
         }
     }
 

@@ -38,8 +38,11 @@ pub(super) enum ConversationSessionFilter<'a> {
     Sessions(&'a [String]),
 }
 
-/// One bounded ranking pass's result, shared by the v1 (projected-header) and
-/// v2 (canonical-index) engines.
+/// One bounded ranking pass's result.
+///
+/// It was the shape shared by the v1 (projected-header) and v2
+/// (canonical-index) engines; issue #603 WI-10 retired v1 with the projection,
+/// so `search_mcp_event_page_v2` is the only producer.
 pub(super) struct McpSearchPage {
     pub(super) rows: Vec<SearchMcpEventRow>,
     pub(super) docs: u64,
@@ -78,12 +81,12 @@ pub(super) struct McpEventRankingOptions {
     /// The issue-598 `open_v2` readiness verdict, when the caller has already
     /// resolved it.
     ///
-    /// `None` means "probe it" and is right for a request whose only readiness
-    /// branch is the ranking engine. `Some` is required of any caller that
-    /// branches on readiness AGAIN after ranking: a second probe is a second
-    /// point read, and — because the latch flips when a backfill publishes —
-    /// two probes in one request can disagree, ranking over the `mcp_open_*`
-    /// projection and then hydrating from the canonical navigation index.
+    /// `None` means "probe it" and is right for a request that consults
+    /// readiness once. `Some` is required of any caller that consults it AGAIN
+    /// after ranking: a second probe is a second point read, and — because the
+    /// latch flips when a backfill publishes — two probes in one request can
+    /// disagree, so one request could refuse at ranking and serve at hydration
+    /// (or the reverse) rather than answering consistently.
     pub(super) canonical_ready: Option<bool>,
 }
 
@@ -99,92 +102,6 @@ impl McpEventRankingOptions {
 }
 
 impl ClickHouseConversationRepository {
-    /// Session headers that are authorized by the operation's captured source
-    /// heads and by the current canonical session contents.
-    pub(super) fn mcp_search_sessions_source(&self) -> String {
-        self.mcp_search_sessions_source_for(None)
-    }
-
-    fn mcp_search_sessions_source_for(&self, session_ids_source: Option<&str>) -> String {
-        let snapshot = require_active_publication_snapshot("MCP search session reads");
-
-        let headers = self.table_ref("mcp_open_publication_headers");
-        let history = self.table_ref("v_published_source_generation_history");
-        let dirty_sessions = self.table_ref("mcp_open_dirty_sessions");
-        let captured_heads = snapshot.captured_source_heads_sql(&history);
-        let live_events = self.live_events_source();
-        let candidate_filter = |alias: &str| {
-            session_ids_source
-                .map(|source| {
-                    format!("\n      AND {alias}.session_id IN (SELECT session_id FROM {source})")
-                })
-                .unwrap_or_default()
-        };
-        let header_candidate_filter = candidate_filter("h");
-        let source_candidate_filter = candidate_filter("e");
-        let dirty_candidate_filter = candidate_filter("dirty");
-        format!(
-            "(WITH
-  {captured_heads} AS captured_heads,
-  head_authorized_headers AS (
-    SELECT h.*
-    FROM {headers} AS h FINAL
-    WHERE h.tombstone = 0
-      AND length(h.required_source_heads) > 0
-      AND arrayAll(
-        required_head -> has(captured_heads, required_head),
-        h.required_source_heads
-      ){header_candidate_filter}
-  ),
-  current_sources AS (
-    SELECT
-      e.session_id AS session_id,
-      toUInt64(cityHash64(arraySort(groupArray(tuple(e.event_uid, e.event_version))))) AS source_revision
-    FROM {live_events} AS e
-    WHERE notEmpty(e.session_id){source_candidate_filter}
-      AND e.session_id IN (SELECT session_id FROM head_authorized_headers)
-    GROUP BY e.session_id
-  ),
-  current_dirty AS (
-    SELECT
-      dirty.session_id AS session_id,
-      toUInt64(max(dirty.dirty_revision)) AS dirty_revision
-    FROM {dirty_sessions} AS dirty FINAL
-    WHERE notEmpty(dirty.session_id){dirty_candidate_filter}
-      AND dirty.session_id IN (SELECT session_id FROM head_authorized_headers)
-    GROUP BY dirty.session_id
-  )
-SELECT
-  h.session_id AS session_id,
-  toUInt8(h.slot) AS slot,
-  toUInt64(h.generation) AS generation,
-  toUInt64(h.source_revision) AS source_revision,
-  toUInt64(h.dirty_revision) AS dirty_revision,
-  h.first_event_time AS first_event_time,
-  h.last_event_time AS last_event_time,
-  toUInt32(h.total_turns) AS total_turns,
-  toUInt64(h.total_events) AS total_events,
-  toUInt64(h.user_messages) AS user_messages,
-  toUInt64(h.assistant_messages) AS assistant_messages,
-  toUInt64(h.tool_calls) AS tool_calls,
-  toUInt64(h.tool_results) AS tool_results,
-  h.title AS title,
-  h.session_slug AS session_slug,
-  h.session_summary AS session_summary,
-  toUInt8(h.completed) AS completed,
-  h.origin_cwd AS origin_cwd
-FROM head_authorized_headers AS h
-ALL INNER JOIN current_sources AS source
-  ON source.session_id = h.session_id
-ANY LEFT JOIN current_dirty AS dirty
-  ON dirty.session_id = h.session_id
-WHERE h.source_revision = source.source_revision
-  AND h.dirty_revision = ifNull(dirty.dirty_revision, toUInt64(0))
-ORDER BY h.session_id ASC, h.header_revision DESC
-LIMIT 1 BY h.session_id)"
-        )
-    }
-
     /// The retired exact oracle (issue #597 §1.5/F1, F3).
     ///
     /// This is the unbounded shape the issue exists to remove: an unfiltered
@@ -385,449 +302,6 @@ FORMAT JSONEachRow",
         ))
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn build_search_mcp_events_sql(
-        &self,
-        terms: &[String],
-        event_types: &[McpEventType],
-        session_id: Option<&str>,
-        turn_seq: Option<u32>,
-        harness: Option<&str>,
-        source_name: Option<&str>,
-        min_should_match: u16,
-        min_score: f64,
-        corpus_stats: Option<(u64, u64)>,
-        limit: u32,
-    ) -> RepoResult<String> {
-        if terms.is_empty() {
-            return Err(RepoError::invalid_argument(
-                "cannot build search query with empty terms",
-            ));
-        }
-        if event_types.is_empty() {
-            return Err(RepoError::invalid_argument(
-                "event_types filter cannot be an empty list",
-            ));
-        }
-
-        let postings_table = self.table_ref("v_live_search_postings");
-        let corpus_table = self.table_ref("search_corpus_stats");
-        let projection_state_table = self.table_ref("mcp_open_projection_state");
-        let sessions_source = self.mcp_search_sessions_source();
-        let sessions_table = "authorized_sessions";
-        let turns_table = self.table_ref("mcp_open_turns");
-        let events_table = self.table_ref("mcp_open_events");
-        let dirty_sessions_table = self.table_ref("mcp_open_dirty_sessions");
-        let live_events_source = self.live_events_source();
-        let terms_array_sql = sql_array_strings(terms);
-        let corpus_stats_sql = match corpus_stats {
-            Some((docs, total_doc_len)) => {
-                format!("tuple(toUInt64({docs}), toUInt64({total_doc_len}))")
-            }
-            None => format!(
-                "(\n    SELECT tuple(toUInt64(docs), toUInt64(total_doc_len))\n    FROM {corpus_table}\n  )"
-            ),
-        };
-
-        let mut posting_clauses = Vec::new();
-        if let Some(session_id) = session_id {
-            posting_clauses.push(format!("p.session_id = {}", sql_quote(session_id)));
-        }
-        let mut event_clauses = Vec::new();
-        if let Some(turn_seq) = turn_seq {
-            let Some(session_id) = session_id else {
-                return Err(RepoError::invalid_argument(
-                    "turn-scoped search requires session_id",
-                ));
-            };
-            event_clauses.push(format!(
-                "e.session_id = {} AND e.turn_seq = {}",
-                sql_quote(session_id),
-                turn_seq
-            ));
-        }
-        if let Some(harness) = harness {
-            posting_clauses.push(format!("p.harness = {}", sql_quote(harness)));
-        }
-        if let Some(source_name) = source_name {
-            posting_clauses.push(format!("p.source_name = {}", sql_quote(source_name)));
-        }
-        posting_clauses.push("p.source_name != 'codex-mcp'".to_string());
-        posting_clauses.push(format!(
-            "NOT {}",
-            moraine_clickhouse::mcp_tool_names::sql_predicate("p.name")
-        ));
-        posting_clauses.push(Self::mcp_event_type_filter_clause(
-            "p.event_class",
-            "p.payload_type",
-            "p.actor_role",
-            event_types,
-        ));
-
-        let projected_origin_clause = |alias: &str| {
-            self.cfg.session_scope.as_ref().map(|scope| {
-                let roots = scope
-                    .roots
-                    .iter()
-                    .map(|root| {
-                        format!(
-                        "{alias}.origin_cwd = {root} OR startsWith({alias}.origin_cwd, {prefix})",
-                        root = sql_quote(root),
-                        prefix = sql_quote(&format!("{root}/")),
-                    )
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" OR ");
-                format!("({roots})")
-            })
-        };
-        let posting_origin_clause = projected_origin_clause("s");
-        if let Some(scope_clause) = posting_origin_clause.as_ref() {
-            posting_clauses.push(scope_clause.clone());
-        }
-        let posting_where_sql = posting_clauses.join("\n      AND ");
-        event_clauses.push("projection_ready = 1".to_string());
-        event_clauses.push("projection_clean = 1".to_string());
-        let event_where_sql = event_clauses.join("\n      AND ");
-        let scope_origin_filter = projected_origin_clause("scope_s")
-            .as_deref()
-            .map(|clause| format!(" AND {clause}"))
-            .unwrap_or_default();
-        let scope_state_sql = match (session_id, turn_seq) {
-            (Some(session_id), Some(turn_seq)) => format!(
-                "SELECT toUInt8(count() > 0) AS scope_exists
-FROM {sessions_table} AS scope_s
-ALL INNER JOIN {turns_table} AS scope_t FINAL
-  ON scope_t.session_id = scope_s.session_id
-  AND scope_t.slot = scope_s.slot
-  AND scope_t.generation = scope_s.generation
-WHERE scope_s.session_id = {session_id}
-  AND scope_t.turn_seq = {turn_seq}{scope_origin_filter}",
-                session_id = sql_quote(session_id),
-            ),
-            (Some(session_id), None) => format!(
-                "SELECT toUInt8(count() > 0) AS scope_exists
-FROM {sessions_table} AS scope_s
-WHERE scope_s.session_id = {session_id}{scope_origin_filter}",
-                session_id = sql_quote(session_id),
-            ),
-            (None, Some(_)) => {
-                return Err(RepoError::invalid_argument(
-                    "turn-scoped search requires session_id",
-                ));
-            }
-            (None, None) => "SELECT toUInt8(1) AS scope_exists".to_string(),
-        };
-        let k1 = self.cfg.bm25_k1.max(0.01);
-        let b = self.cfg.bm25_b.clamp(0.0, 1.0);
-
-        Ok(format!(
-            "WITH
-  authorized_sessions AS {sessions_source},
-  live_session_ids AS (
-    SELECT e.session_id AS session_id
-    FROM {live_events_source} AS e
-    WHERE notEmpty(e.session_id)
-    GROUP BY e.session_id
-  ),
-  {k1:.6} AS k1,
-  {b:.6} AS b,
-  {terms_array_sql} AS q_terms,
-  {corpus_stats_sql} AS corpus_stats,
-  tupleElement(corpus_stats, 1) AS corpus_docs,
-  tupleElement(corpus_stats, 2) AS corpus_total_doc_len,
-  greatest(
-    if(corpus_docs = 0, 1.0, toFloat64(corpus_total_doc_len) / toFloat64(corpus_docs)),
-    1.0
-  ) AS avgdl,
-  (
-    SELECT toUInt8(if(count() = 0, 0, max(ready)))
-    FROM {projection_state_table} FINAL
-    WHERE state_key = 'global'
-  ) AS projection_ready,
-  (
-    SELECT tuple(
-      toUInt8(countIf(dirty.dirty_revision > ifNull(published.dirty_revision, 0)) = 0),
-      toUInt64(ifNull(max(dirty.dirty_revision), 0))
-    )
-    FROM (
-      SELECT session_id, dirty_revision
-      FROM {dirty_sessions_table} FINAL
-      WHERE notEmpty(session_id)
-        AND session_id IN (SELECT session_id FROM live_session_ids)
-    ) AS dirty
-    ANY LEFT JOIN (
-      SELECT session_id, dirty_revision
-      FROM {sessions_table}
-    ) AS published ON published.session_id = dirty.session_id
-  ) AS projection_status,
-  tupleElement(projection_status, 1) AS projection_clean,
-  tupleElement(projection_status, 2) AS projection_revision,
-  ({scope_state_sql}) AS scope_exists,
-  term_postings AS (
-    SELECT
-      p.*,
-      toUInt64(count() OVER (PARTITION BY p.term)) AS df
-    FROM {postings_table} AS p FINAL
-    WHERE p.term IN q_terms
-  ),
-  ranked AS (
-    SELECT
-      p.source_host AS source_host,
-      p.doc_id AS event_uid,
-      any(s.session_id) AS session_id,
-      toUInt8(any(s.slot)) AS slot,
-      toUInt64(any(s.generation)) AS generation,
-      sum(
-        log(1.0 + ((greatest(toFloat64(corpus_docs), toFloat64(p.df))
-          - toFloat64(p.df) + 0.5) / (toFloat64(p.df) + 0.5)))
-        * ((toFloat64(p.tf) * (k1 + 1.0))
-          / (toFloat64(p.tf) + k1 * (1.0 - b + b * (toFloat64(p.doc_len) / avgdl))))
-      ) AS raw_score,
-      toUInt64(count()) AS matched_terms,
-      toInt64(toUnixTimestamp64Milli(any(e.event_time))) AS event_unix_ms
-    FROM term_postings AS p
-    ALL INNER JOIN {sessions_table} AS s ON s.session_id = p.session_id
-    ALL INNER JOIN {events_table} AS e FINAL
-      ON e.source_host = p.source_host
-      AND e.event_uid = p.doc_id
-      AND e.session_id = s.session_id
-      AND e.slot = s.slot
-      AND e.generation = s.generation
-    WHERE {posting_where_sql}
-      AND {event_where_sql}
-    GROUP BY p.doc_id, p.source_host
-    HAVING matched_terms >= {min_should_match} AND raw_score >= {min_score:.6}
-    ORDER BY raw_score DESC, event_unix_ms DESC, event_uid ASC, source_host ASC
-    LIMIT {limit}
-  )
-SELECT *
-FROM (
-SELECT
-  toUInt8(0) AS row_kind,
-  ranked.event_uid AS event_uid,
-  ranked.source_host AS source_host,
-  ranked.session_id AS session_id,
-  ranked.slot AS slot,
-  ranked.generation AS generation,
-  ranked.raw_score AS raw_score,
-  ranked.matched_terms AS matched_terms,
-  ranked.event_unix_ms AS event_unix_ms,
-  corpus_docs AS docs,
-  corpus_total_doc_len AS total_doc_len,
-  scope_exists AS scope_exists,
-  projection_ready AS projection_ready,
-  projection_clean AS projection_clean,
-  projection_revision AS projection_revision
-FROM ranked
-UNION ALL
-SELECT
-  toUInt8(1) AS row_kind,
-  '' AS event_uid,
-  '' AS source_host,
-  '' AS session_id,
-  toUInt8(0) AS slot,
-  toUInt64(0) AS generation,
-  toFloat64(0) AS raw_score,
-  toUInt64(0) AS matched_terms,
-  toInt64(0) AS event_unix_ms,
-  corpus_docs AS docs,
-  corpus_total_doc_len AS total_doc_len,
-  scope_exists AS scope_exists,
-  projection_ready AS projection_ready,
-  projection_clean AS projection_clean,
-  projection_revision AS projection_revision
-)
-ORDER BY row_kind ASC, raw_score DESC, event_unix_ms DESC, event_uid ASC, source_host ASC
-SETTINGS max_bytes_before_external_group_by = 67108864,
-  max_bytes_before_external_sort = 67108864
-FORMAT JSONEachRow",
-            postings_table = postings_table,
-            projection_state_table = projection_state_table,
-            sessions_source = sessions_source,
-            sessions_table = sessions_table,
-            live_events_source = live_events_source,
-            events_table = events_table,
-            dirty_sessions_table = dirty_sessions_table,
-        ))
-    }
-
-    pub(super) fn build_search_mcp_event_details_sql(
-        &self,
-        candidates: &[SearchMcpCandidateRow],
-    ) -> RepoResult<String> {
-        if candidates.is_empty() {
-            return Err(RepoError::invalid_argument(
-                "cannot hydrate MCP search rows for empty event_uids",
-            ));
-        }
-
-        let documents_table = self.table_ref("v_live_search_documents");
-        let mut candidate_session_ids = candidates
-            .iter()
-            .map(|candidate| candidate.session_id.clone())
-            .collect::<Vec<_>>();
-        candidate_session_ids.sort_unstable();
-        candidate_session_ids.dedup();
-        let candidate_session_ids_sql = sql_array_strings(&candidate_session_ids);
-        let sessions_source = self.mcp_search_sessions_source_for(Some("candidate_session_ids"));
-        let sessions_table = "authorized_sessions";
-        let turns_table = self.table_ref("mcp_open_turns");
-        let projected_events_table = self.table_ref("mcp_open_events");
-        let events_table = self.table_ref("v_live_events");
-        let event_uids = candidates
-            .iter()
-            .map(|candidate| candidate.event_uid.clone())
-            .collect::<Vec<_>>();
-        let event_uids_sql = sql_array_strings(&event_uids);
-        let candidate_heads_sql = candidates
-            .iter()
-            .map(|candidate| {
-                format!(
-                    "({}, {}, {}, toUInt8({}), toUInt64({}))",
-                    sql_quote(&candidate.source_host),
-                    sql_quote(&candidate.event_uid),
-                    sql_quote(&candidate.session_id),
-                    candidate.slot,
-                    candidate.generation,
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(",");
-        let preview = self.cfg.preview_chars;
-        let text_content_limit = usize::from(preview).saturating_mul(4);
-        let payload_json_limit = usize::from(preview).saturating_mul(8);
-
-        Ok(format!(
-            "WITH
-  candidate_session_ids AS (
-    SELECT arrayJoin({candidate_session_ids_sql}) AS session_id
-  ),
-  authorized_sessions AS {sessions_source},
-  {event_uids_sql} AS event_uids,
-  candidate_heads AS (
-    SELECT
-      tupleElement(candidate, 1) AS source_host,
-      tupleElement(candidate, 2) AS event_uid,
-      tupleElement(candidate, 3) AS session_id,
-      toUInt8(tupleElement(candidate, 4)) AS slot,
-      toUInt64(tupleElement(candidate, 5)) AS generation
-    FROM (SELECT arrayJoin([{candidate_heads_sql}]) AS candidate)
-  ),
-  documents AS (
-    SELECT
-      document.source_host AS source_host,
-      document.event_uid AS event_uid,
-      argMax(document.session_id, document.doc_version) AS session_id,
-      argMax(document.source_name, document.doc_version) AS source_name,
-      argMax(document.harness, document.doc_version) AS harness,
-      argMax(document.inference_provider, document.doc_version) AS inference_provider,
-      argMax(document.event_class, document.doc_version) AS event_class,
-      argMax(document.payload_type, document.doc_version) AS payload_type,
-      argMax(document.actor_role, document.doc_version) AS actor_role,
-      argMax(document.name, document.doc_version) AS name,
-      argMax(document.phase, document.doc_version) AS phase,
-      argMax(JSONExtractString(document.payload_json, 'phase'), document.doc_version) AS payload_phase,
-      argMax(document.source_ref, document.doc_version) AS source_ref,
-      toUInt32(argMax(document.doc_len, document.doc_version)) AS doc_len,
-      argMax(leftUTF8(document.text_content, {preview}), document.doc_version) AS text_preview,
-      argMax(leftUTF8(document.text_content, {text_content_limit}), document.doc_version) AS text_content,
-      argMax(leftUTF8(document.payload_json, {payload_json_limit}), document.doc_version) AS payload_json
-    FROM {documents_table} AS document
-    WHERE (document.source_host, document.event_uid) IN (
-      SELECT source_host, event_uid FROM candidate_heads
-    )
-    GROUP BY document.source_host, document.event_uid
-  ),
-  models AS (
-    SELECT source_event.source_host AS source_host,
-      source_event.event_uid AS event_uid,
-      argMax(source_event.model, source_event.event_version) AS model
-    FROM {events_table} AS source_event
-    WHERE (source_event.source_host, source_event.event_uid) IN (
-      SELECT source_host, event_uid FROM candidate_heads
-    )
-    GROUP BY source_event.source_host, source_event.event_uid
-  )
-SELECT
-  documents.event_uid AS event_uid,
-  documents.source_host AS source_host,
-  documents.session_id AS session_id,
-  documents.source_name AS source_name,
-  documents.harness AS harness,
-  documents.inference_provider AS inference_provider,
-  projected_events.endpoint_kind AS endpoint_kind,
-  documents.event_class AS event_class,
-  documents.payload_type AS payload_type,
-  documents.actor_role AS actor_role,
-  documents.name AS name,
-  documents.phase AS phase,
-  documents.payload_phase AS payload_phase,
-  documents.source_ref AS source_ref,
-  documents.doc_len AS doc_len,
-  documents.text_preview AS text_preview,
-  documents.text_content AS text_content,
-  hex(SHA256(projected_events.text_content)) AS text_content_digest,
-  documents.payload_json AS payload_json,
-  projected_events.event_type AS mcp_event_type,
-  toFloat64(0) AS raw_score,
-  toUInt64(0) AS matched_terms,
-  toString(projected_events.event_time) AS event_time,
-  toInt64(toUnixTimestamp64Milli(projected_events.event_time)) AS event_unix_ms,
-  toUInt64(projected_events.event_order) AS event_order,
-  toUInt32(projected_events.turn_seq) AS turn_seq,
-  toUInt32(projected_events.event_ordinal) AS event_ordinal,
-  toUInt64(ifNull(turns.total_events, 0)) AS turn_event_count,
-  toUInt8(ifNull(turns.completed, 0)) AS turn_completed,
-  ifNull(turns.terminal_event_uid, '') AS turn_terminal_event_uid,
-  projected_events.call_id AS call_id,
-  projected_events.item_id AS item_id,
-  ifNull(models.model, '') AS model,
-  toInt64(toUnixTimestamp64Milli(sessions.first_event_time)) AS session_started_at_unix_ms,
-  toInt64(toUnixTimestamp64Milli(sessions.last_event_time)) AS session_updated_at_unix_ms,
-  sessions.title AS session_title,
-  sessions.session_slug AS session_slug,
-  sessions.session_summary AS session_summary,
-  toUInt8(sessions.completed) AS session_completed
-FROM documents
-ALL INNER JOIN candidate_heads AS candidate
-  ON candidate.source_host = documents.source_host
-  AND candidate.event_uid = documents.event_uid
-ALL INNER JOIN {sessions_table} AS sessions
-  ON sessions.session_id = candidate.session_id
-  AND sessions.slot = candidate.slot
-  AND sessions.generation = candidate.generation
-ALL INNER JOIN {projected_events_table} AS projected_events FINAL
-  ON projected_events.source_host = candidate.source_host
-  AND projected_events.event_uid = candidate.event_uid
-  AND projected_events.session_id = candidate.session_id
-  AND projected_events.slot = candidate.slot
-  AND projected_events.generation = candidate.generation
-ANY LEFT JOIN {turns_table} AS turns FINAL
-  ON turns.session_id = sessions.session_id
-  AND turns.slot = sessions.slot
-  AND turns.generation = sessions.generation
-  AND turns.turn_seq = projected_events.turn_seq
-ANY LEFT JOIN models
-  ON models.source_host = documents.source_host
-  AND models.event_uid = documents.event_uid
-ORDER BY indexOf(event_uids, documents.event_uid) ASC
-FORMAT JSONEachRow",
-        ))
-    }
-
-    /// Bounded winner hydration for `search_events`: the document row for
-    /// exactly the requested identities, with the wide columns truncated inside
-    /// the aggregate.
-    ///
-    /// Issue #597/F8 removed the `use_document_codex_flag` branch. When the
-    /// probe reported the column absent this statement fell back to
-    /// `positionCaseInsensitiveUTF8(t.payload_json, 'codex-mcp')`, which scans
-    /// every full payload value in the requested set. `has_codex_mcp` is a
-    /// MATERIALIZED column installed by migration 009 and listed in
-    /// `REQUIRED_SCHEMA_OBJECTS`, so a backend that lacks it has not been
-    /// migrated and must fail loudly rather than silently switch to a
-    /// content scan.
     pub(super) fn build_search_events_hydrate_sql(
         &self,
         document_identities: &[SearchDocumentIdentity],
@@ -1218,17 +692,14 @@ FORMAT JSONEachRow",
     /// error. `resource_exhausted` stays reserved for a #600 envelope
     /// violation.
     ///
-    /// The engine is chosen by the issue-598 `open_v2` readiness latch — the
-    /// same authority the `open` cutover and the issue-599 listing path use.
-    /// While the canonical read indexes are not published the legacy
-    /// projected-header engine still serves; it is deleted wholesale in the
-    /// projector-retirement PR.
+    /// Readiness is the issue-598 `open_v2` latch — the same authority the
+    /// `open` cutover and the issue-599 listing path use. Since issue #603
+    /// WI-10 retired the v1 projected engine, an unready latch is a typed
+    /// refusal rather than a fallback.
     ///
     /// `canonical_ready` is that latch's verdict, PASSED IN rather than probed
     /// here: a request whose later stages also branch on readiness must reach
-    /// them with the same verdict this one used, or a backfill publishing
-    /// mid-request produces one answer ranked over the `mcp_open_*` projection
-    /// and hydrated from the canonical navigation index.
+    /// them with the same verdict this one used.
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn search_mcp_event_page(
         &self,
@@ -1243,22 +714,10 @@ FORMAT JSONEachRow",
         unique_fetch_limit: u16,
         canonical_ready: bool,
     ) -> RepoResult<McpSearchPage> {
-        if canonical_ready {
-            return self
-                .search_mcp_event_page_v2(
-                    terms,
-                    event_types,
-                    session_id,
-                    turn_seq,
-                    harness,
-                    source_name,
-                    min_should_match,
-                    min_score,
-                    unique_fetch_limit,
-                )
-                .await;
+        if !canonical_ready {
+            return Err(Self::canonical_read_path_unready_error());
         }
-        self.search_mcp_event_page_v1(
+        self.search_mcp_event_page_v2(
             terms,
             event_types,
             session_id,
@@ -1272,117 +731,19 @@ FORMAT JSONEachRow",
         .await
     }
 
-    /// Legacy engine: ranks and hydrates through the `mcp_open_*` projection.
-    /// Unchanged apart from losing the refill loop — one ranking statement, one
-    /// detail statement, and the same global projector gates it has always
-    /// enforced. Retired with the projector.
-    #[allow(clippy::too_many_arguments)]
-    async fn search_mcp_event_page_v1(
-        &self,
-        terms: &[String],
-        event_types: &[McpEventType],
-        session_id: Option<&str>,
-        turn_seq: Option<u32>,
-        harness: Option<&str>,
-        source_name: Option<&str>,
-        min_should_match: u16,
-        min_score: f64,
-        unique_fetch_limit: u16,
-    ) -> RepoResult<McpSearchPage> {
-        let candidate_fetch_size = mcp_candidate_fetch_size(unique_fetch_limit);
-        // v1 inlines `search_corpus_stats` into its own ranking statement when
-        // the cache is cold, and that is the SAME statement every other path
-        // reads its corpus scalars from — one population, one cache slot.
-        let corpus_stats = self.cached_corpus_stats().await;
-        let scanned_corpus_stats = corpus_stats.is_none();
-
-        let sql = self.build_search_mcp_events_sql(
-            terms,
-            event_types,
-            session_id,
-            turn_seq,
-            harness,
-            source_name,
-            min_should_match,
-            min_score,
-            corpus_stats,
-            candidate_fetch_size,
-        )?;
-        let candidate_rows: Vec<SearchMcpCandidateRow> =
-            self.map_backend(self.query_rows(&sql, None).await)?;
-        let metadata = candidate_rows
-            .iter()
-            .find(|row| row.row_kind == 1)
-            .ok_or_else(|| RepoError::backend("MCP search candidate query omitted metadata"))?;
-        let docs = metadata.docs;
-        let total_doc_len = metadata.total_doc_len;
-        let scope_exists = metadata.scope_exists != 0;
-        if scanned_corpus_stats {
-            // What v1 just scanned is `search_corpus_stats`, inlined into its
-            // own ranking statement — the document-authorized population, which
-            // is the one its inline `df` pairs with.
-            self.cache_corpus_stats(docs, total_doc_len, Instant::now())
-                .await;
-        }
-        if metadata.projection_ready == 0 {
-            return Err(RepoError::backend(
-                "MCP search read model is not ready; run `moraine db migrate`",
-            ));
-        }
-        if metadata.projection_clean == 0 {
-            return Err(RepoError::ReadModelChanged);
-        }
-
-        let candidates = candidate_rows
-            .into_iter()
-            .filter(|row| row.row_kind == 0)
-            .collect::<Vec<_>>();
-        if candidates.is_empty() {
-            return Ok(McpSearchPage {
-                rows: Vec::new(),
-                docs,
-                total_doc_len,
-                scope_exists,
-                incomplete_due_to_candidate_budget: false,
-            });
-        }
-        let saturated = candidates.len() as u32 == candidate_fetch_size;
-
-        let detail_sql = self.build_search_mcp_event_details_sql(&candidates)?;
-        let detail_rows: Vec<SearchMcpEventRow> =
-            self.map_backend(self.query_rows(&detail_sql, None).await)?;
-        let mut details_by_identity = detail_rows
-            .into_iter()
-            .map(|row| ((row.source_host.clone(), row.event_uid.clone()), row))
-            .collect::<HashMap<_, _>>();
-
-        let mut rows = Vec::<SearchMcpEventRow>::with_capacity(candidates.len());
-        for candidate in candidates {
-            let identity = (candidate.source_host, candidate.event_uid);
-            let Some(mut detail) = details_by_identity.remove(&identity) else {
-                return Err(RepoError::ReadModelChanged);
-            };
-            detail.raw_score = candidate.raw_score;
-            detail.matched_terms = candidate.matched_terms;
-            // Ranking is defined by the candidate snapshot. Preserve its
-            // timestamp if the projection publishes between the two reads.
-            detail.event_unix_ms = candidate.event_unix_ms;
-            rows.push(detail);
-        }
-        Self::sort_search_mcp_event_rows(&mut rows);
-        let rows = Self::dedupe_mcp_search_rows(rows, unique_fetch_limit);
-
-        Ok(McpSearchPage {
-            incomplete_due_to_candidate_budget: Self::candidate_budget_incomplete(
-                saturated,
-                rows.len(),
-                unique_fetch_limit,
-            ),
-            rows,
-            docs,
-            total_doc_len,
-            scope_exists,
-        })
+    /// The typed refusal every discovery/search surface returns while the
+    /// canonical read indexes are unpublished. Since issue #603 WI-10 retired
+    /// the v1 projection there is no other read model to fall back to, and
+    /// the only stores that can reach this are ones whose first canonical
+    /// sweep has not completed yet — a fresh install in its first seconds.
+    /// Migration 041 refuses to drop a populated projection before `open_v2`
+    /// published, so an upgraded store is ready by construction.
+    pub(super) fn canonical_read_path_unready_error() -> RepoError {
+        RepoError::backend(
+            "canonical read indexes are not ready; run `moraine db migrate` (the canonical \
+             sweep publishes open_v2 readiness), or `moraine db core-index rebuild` if the \
+             sweep keeps failing",
+        )
     }
 
     /// The bounded canonical engine (issue #597 §1–§2). Statement budget for a
@@ -1778,8 +1139,8 @@ FORMAT JSONEachRow",
 
         // One statement yields BOTH grains. Per-turn rows decorate the hit;
         // the session-level `completed` is `argMax(turn_completed, turn_seq)`
-        // over the same rows — v1's two-level rule (`build_session_terminal_sql`
-        // and the projector agree on it), which is NOT the hit's own turn.
+        // over the same rows — v1's two-level rule, inherited here and shared
+        // with `build_session_terminal_sql`, which is NOT the hit's own turn.
         // Reporting the hit's turn flag as `session_completed` would call a
         // session complete because the matched turn happened to end in
         // `task_complete`.
@@ -1894,6 +1255,10 @@ FORMAT JSONEachRow",
         })
     }
 
+    /// The retired v1 engine's sort order, kept under `cfg(test)` as the
+    /// contrast witness for `sort_canonical_search_rows`' F-TIE fixture: the
+    /// two keys must genuinely disagree on that fixture or it proves nothing.
+    #[cfg(test)]
     pub(super) fn sort_search_mcp_event_rows(rows: &mut [SearchMcpEventRow]) {
         rows.sort_by(|a, b| {
             b.raw_score
@@ -3452,7 +2817,7 @@ FORMAT JSONEachRow",
                 // above the lookup.
                 let canonical_ready = match options.canonical_ready {
                     Some(ready) => ready,
-                    None => self.canonical_list_path_ready().await,
+                    None => self.canonical_list_path_ready().await?,
                 };
                 let page = self
                     .search_mcp_event_page(

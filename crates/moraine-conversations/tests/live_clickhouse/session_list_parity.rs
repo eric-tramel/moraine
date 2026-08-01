@@ -61,7 +61,7 @@ fn fixture_corpus() -> Vec<Ev> {
             .source("omp", "/tmp/omp/DispatchTitle.jsonl"),
         // --- omp LIST chain: an explicit `title_change` outranks a later
         // name. `is_metadata_bearing` admits the omp title payload
-        // (sql/036:213), so the omp branch's `latest_metadata_title` sees it
+        // (sql/036:216), so the omp branch's `latest_metadata_title` sees it
         // while the non-omp branch (session_meta only) would not.
         Ev::new("list-omp-explicit", "list-omp-explicit-title", 20)
             .source("omp", "/tmp/omp/ExplicitTask.jsonl")
@@ -208,15 +208,16 @@ fn tombstone_replacement_generation() -> Vec<Ev> {
 }
 
 /// Every session id [`fixture_corpus`] seeds, and therefore exactly what an
-/// unfiltered traversal must return under BOTH paths before the tombstone
+/// unfiltered traversal must return, on each arm, before the tombstone
 /// replacement runs.
 ///
-/// This is the gate's non-vacuity guard. A parity diff of two empty vectors
-/// passes, so a fixture that failed to publish its source heads, a projector
-/// backfill that left every session dirty, or a canonical backfill that
-/// covered nothing would all read as "the paths agree". Pinning the set makes
-/// each of those name itself, and it is also what stops a session silently
-/// disappearing from both implementations at once.
+/// This is the gate's non-vacuity guard. A diff of two empty vectors passes,
+/// so a fixture that failed to publish its source heads or a canonical
+/// backfill that covered nothing would read as "the arms agree" — as would a
+/// projector backfill that left every session dirty, back when one of the arms
+/// was the projected-header path. Pinning the set makes each of those name
+/// itself, and it is what stops a session disappearing from both arms at
+/// once.
 const FIXTURE_SESSIONS: &[&str] = &[
     "list-blank-neighbour",
     "list-mode-chat",
@@ -239,9 +240,11 @@ const FIXTURE_SESSIONS: &[&str] = &[
 ];
 
 /// The LIST title/summary the §2.6 fold must produce, asserted directly as
-/// well as through parity. Parity alone would pass if BOTH paths regressed
-/// together; these expectations come from the projector golden
-/// (`projected_publication_header.sql:123-124`).
+/// well as through the page-size diff. The diff alone would pass if both arms
+/// regressed together — and would have passed if both READERS had, back when
+/// the second arm was the projected-header path. These expectations come from
+/// the projector golden (`projected_publication_header.sql:123-124`), which is
+/// the record of what the fold must reproduce.
 const EXPECTED_LIST_METADATA: &[(&str, Option<&str>, Option<&str>)] = &[
     (
         "list-omp-dispatch",
@@ -450,9 +453,11 @@ fn items_json(items: &[McpSessionListItem]) -> Result<Vec<Value>> {
 
 /// Assert one unfiltered traversal is the whole seeded corpus.
 ///
-/// Run against BOTH paths before they are diffed, because the diff itself
-/// cannot distinguish "the two paths agree" from "neither path returned
-/// anything".
+/// Run against EACH arm before they are diffed, because the diff itself cannot
+/// distinguish "the two arms agree" from "neither arm returned anything". The
+/// surviving diff is traversal-vs-single-page on the one canonical path (issue
+/// #603 WI-10 retired the projected-header path that used to be the second
+/// arm), and an empty-vs-empty pass is exactly as worthless there.
 fn assert_is_whole_corpus(path: &str, items: &[McpSessionListItem]) -> Result<()> {
     let returned: BTreeSet<&str> = items
         .iter()
@@ -470,18 +475,14 @@ fn assert_is_whole_corpus(path: &str, items: &[McpSessionListItem]) -> Result<()
     Ok(())
 }
 
-/// Publish every fixture source head, then build ONLY the v1 projector, so the
-/// first collection pass provably runs the projected-header path (the
-/// canonical `open_v2` readiness key is still 0).
-async fn publish_and_build_headers(
+/// Publish every fixture source head. Since issue #603 WI-10 retired the v1
+/// projector there is no header read model to build; the canonical `open_v2`
+/// readiness key is still 0 after this, so the pre-sweep refusal is provable.
+async fn publish_fixture_sources(
     clickhouse: &ClickHouseClient,
     database: &OwnedDatabaseName,
 ) -> Result<()> {
     publish_missing_schema_fixture_sources(clickhouse, database).await?;
-    clickhouse
-        .backfill_mcp_open_read_model()
-        .await
-        .context("failed to backfill the v1 projector read model")?;
     Ok(())
 }
 
@@ -597,17 +598,20 @@ GROUP BY session_id, source_host, source_name, source_file, source_generation, h
 // Gate 1: list-parity
 // ===========================================================================
 
-/// **Fails for:** any semantic divergence between the directory path and the
-/// projected-header path it replaces — a wrong LIST title/summary fold, a
-/// dropped or mis-ordered session, a `completed` derived from the wrong turn,
-/// a recall filter left as the exact filter, a blank id consuming a LIMIT slot,
-/// a lost `--project-only` boundary, or a precision `mode_hint` prefilter.
+/// **Fails for:** a wrong LIST title/summary fold, a dropped or mis-ordered
+/// session, a `completed` derived from the wrong turn, a recall filter left
+/// as the exact filter, a blank id consuming a LIMIT slot, a lost
+/// `--project-only` boundary, a precision `mode_hint` prefilter, a paging
+/// divergence between the multi-page traversal and the single-page read, or
+/// an unpublished store answering confidently instead of refusing typed.
 ///
-/// Both paths are driven off ONE seeded corpus. The projected-header page is
-/// collected first, while `open_v2` readiness is still 0; the canonical
-/// backfill then publishes readiness and the same matrix is collected from the
-/// directory path. Comparing full multi-page traversals (not page 1) is what
-/// makes the cursor and the `limit + 1` probe part of the contract.
+/// The retired projected-header path was the original comparison oracle
+/// (issue #599); issue #603 WI-10 removed it with the projection, and the
+/// page-size diff — the full multi-page traversal against the one-page read
+/// of the same matrix arm — is the property the two-path diff was stressing.
+/// Comparing full traversals (not page 1) is what makes the cursor and the
+/// `limit + 1` probe part of the contract; the concrete fold values are
+/// pinned separately below so a both-page-sizes-wrong drift cannot pass.
 pub(super) async fn directory_parity() -> Result<()> {
     with_owned_live_db("session-list parity gate", |clickhouse, database| async move {
         clickhouse
@@ -615,7 +619,7 @@ pub(super) async fn directory_parity() -> Result<()> {
             .await
             .context("failed to migrate the session-list parity database")?;
         seed_events(&clickhouse, &fixture_corpus()).await?;
-        publish_and_build_headers(&clickhouse, &database).await?;
+        publish_fixture_sources(&clickhouse, &database).await?;
 
         let arms = parity_matrix();
         let sorts = [
@@ -623,7 +627,10 @@ pub(super) async fn directory_parity() -> Result<()> {
             ("asc", ConversationListSort::Asc),
         ];
 
-        // --- collection pass 1: the projected-header path -----------------
+        // --- the pre-sweep refusal (issue #603 WI-10) ---------------------
+        // With no projected-header fallback left, an unpublished store must
+        // refuse typed rather than answer confidently from an incomplete
+        // index.
         if clickhouse
             .open_v2_reader_ready()
             .await
@@ -631,31 +638,30 @@ pub(super) async fn directory_parity() -> Result<()> {
         {
             bail!("open_v2 readiness must still be 0 before the canonical backfill");
         }
-        let mut header_results: Vec<(String, Vec<Value>)> = Vec::new();
-        for matrix_arm in &arms {
-            let repository = scoped_repository(&clickhouse, matrix_arm.scope);
-            for (sort_label, sort) in sorts {
-                let arm = format!("{}/{sort_label}", matrix_arm.label);
-                let items = traverse(
-                    &repository,
-                    &matrix_arm.filter(sort),
-                    PAGE_LIMIT,
-                    &format!("header {arm}"),
-                )
-                .await?;
-                if matrix_arm.is_unfiltered() && matches!(sort, ConversationListSort::Desc) {
-                    assert_is_whole_corpus("projected-header", &items)?;
-                }
-                header_results.push((arm, items_json(&items)?));
-            }
+        let unready = scoped_repository(&clickhouse, None)
+            .list_mcp_sessions(
+                filter(None, None, None, ConversationListSort::Desc),
+                PageRequest {
+                    limit: PAGE_LIMIT,
+                    cursor: None,
+                },
+            )
+            .await;
+        match unready {
+            Err(RepoError::Backend(message)) if message.contains("not ready") => {}
+            other => bail!(
+                "an unpublished store must refuse list_sessions typed (issue #603 WI-10), \
+                 got {other:?}"
+            ),
         }
 
         // --- publish the canonical read path ------------------------------
         backfill_and_promote_canonical(&clickhouse).await?;
         force_stale_mode_hint(&clickhouse, &database, "list-mode-mcp").await?;
 
-        // --- collection pass 2: the directory path ------------------------
-        let mut directory_results: Vec<(String, Vec<Value>)> = Vec::new();
+        // --- collection: the directory path, two page sizes ---------------
+        let mut paged_results: Vec<(String, Vec<Value>)> = Vec::new();
+        let mut single_results: Vec<(String, Vec<Value>)> = Vec::new();
         let mut unfiltered_desc: Vec<McpSessionListItem> = Vec::new();
         for matrix_arm in &arms {
             let repository = scoped_repository(&clickhouse, matrix_arm.scope);
@@ -675,35 +681,36 @@ pub(super) async fn directory_parity() -> Result<()> {
                     assert_is_whole_corpus("directory", &items)?;
                     unfiltered_desc.clone_from(&items);
                 }
-                directory_results.push((arm, items_json(&items)?));
+                paged_results.push((arm.clone(), items_json(&items)?));
+                let single = traverse(
+                    &repository,
+                    &matrix_arm.filter(sort),
+                    100,
+                    &format!("single-page {arm}"),
+                )
+                .await?;
+                single_results.push((arm, items_json(&single)?));
             }
         }
 
-        // --- the parity diff ----------------------------------------------
-        if header_results.len() != directory_results.len() {
-            bail!(
-                "collected {} header arms and {} directory arms",
-                header_results.len(),
-                directory_results.len()
-            );
-        }
-        for ((header_arm, header_items), (directory_arm, directory_items)) in
-            header_results.iter().zip(directory_results.iter())
+        // --- the page-size parity diff ------------------------------------
+        for ((paged_arm, paged_items), (single_arm, single_items)) in
+            paged_results.iter().zip(single_results.iter())
         {
-            if header_arm != directory_arm {
-                bail!("arm order diverged: {header_arm} vs {directory_arm}");
+            if paged_arm != single_arm {
+                bail!("arm order diverged: {paged_arm} vs {single_arm}");
             }
-            if header_items != directory_items {
+            if paged_items != single_items {
                 bail!(
-                    "session-list parity mismatch on arm {header_arm}\n  headers  ={}\n  directory={}",
-                    Value::Array(header_items.clone()),
-                    Value::Array(directory_items.clone())
+                    "session-list page-size parity mismatch on arm {paged_arm}\n  paged ={}\n  single={}",
+                    Value::Array(paged_items.clone()),
+                    Value::Array(single_items.clone())
                 );
             }
         }
 
         // --- the assertions parity alone cannot make ----------------------
-        // Parity proves the two paths agree; these prove they agree on the
+        // The diff proves the two arms agree; these prove they agree on the
         // RIGHT answer, so a fold that regressed in both cannot pass.
         let by_id: HashMap<&str, &McpSessionListItem> = unfiltered_desc
             .iter()
@@ -961,8 +968,9 @@ async fn assert_arm_is_clean(
 /// selection from passing the negative half for free.
 ///
 /// Both repositories are project-scoped, so a scope regression has something
-/// to reintroduce; the fixture publishes BOTH read models, so a header-path
-/// fallback would return data rather than fail loudly on an empty table.
+/// to reintroduce. Since issue #603 WI-10 the `mcp_open_*` relations named in
+/// [`FORBIDDEN_RELATIONS`] no longer exist at all — a path that reopened one
+/// would now fail loudly on the missing table as well as this log gate.
 pub(super) async fn query_log_clean() -> Result<()> {
     with_owned_live_db(
         "session-list query-log gate",
@@ -972,7 +980,7 @@ pub(super) async fn query_log_clean() -> Result<()> {
                 .await
                 .context("failed to migrate the session-list query-log database")?;
             seed_events(&clickhouse, &fixture_corpus()).await?;
-            publish_and_build_headers(&clickhouse, &database).await?;
+            publish_fixture_sources(&clickhouse, &database).await?;
             backfill_and_promote_canonical(&clickhouse).await?;
 
             let database_name = database.as_str();

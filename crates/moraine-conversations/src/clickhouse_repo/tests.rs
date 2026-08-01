@@ -174,51 +174,6 @@ fn repository_reads_leave_thread_scheduling_to_clickhouse() {
     );
 }
 
-#[tokio::test]
-async fn mcp_search_sql_excludes_internal_tool_calls() {
-    let client = ClickHouseClient::new(moraine_config::ClickHouseConfig::default())
-        .expect("build ClickHouse client");
-    let repo = ClickHouseConversationRepository::new(client, RepoConfig::default());
-    let sql = with_test_publication_snapshot(TestPublicationSnapshot::idle_local(1, 1), async {
-        repo.build_search_mcp_events_sql(
-            &["needle".to_string()],
-            &[McpEventType::ToolCall],
-            None,
-            None,
-            None,
-            None,
-            1,
-            0.0,
-            Some((1, 1)),
-            20,
-        )
-        .expect("build MCP event search SQL")
-    })
-    .await;
-
-    assert!(sql.contains("p.source_name != 'codex-mcp'"));
-    assert!(sql.contains("splitByString('__', lowerUTF8(trimBoth(p.name)))"));
-    assert!(sql.contains("arrayElement"));
-    assert!(sql.contains("= 'moraine'"));
-    assert!(sql.contains("FROM `moraine`.`v_live_search_postings` AS p FINAL"));
-    assert!(sql.contains("WHERE p.term IN q_terms"));
-    assert_eq!(
-        sql.matches("FROM `moraine`.`v_live_search_postings` AS p FINAL")
-            .count(),
-        1
-    );
-    assert!(!sql.contains("matching_doc_ids AS ("));
-    assert!(!sql.contains("projected_candidates AS ("));
-    assert!(sql.contains("ALL INNER JOIN `moraine`.`mcp_open_events` AS e FINAL"));
-    assert!(sql.contains("ON e.source_host = p.source_host"));
-    assert!(sql.contains("AND e.event_uid = p.doc_id"));
-    assert!(sql.contains("AND e.session_id = s.session_id"));
-    assert!(sql.contains("AND e.slot = s.slot"));
-    assert!(sql.contains("AND e.generation = s.generation"));
-    assert!(sql.contains("GROUP BY p.doc_id, p.source_host"));
-    assert!(!sql.contains("PREWHERE p.term"));
-}
-
 #[test]
 fn exact_oracle_still_pins_the_full_document_view_contract() {
     // The oracle survives ONLY under cfg(test) (issue #597 §1.5/F1+F3). This
@@ -654,9 +609,10 @@ fn sql_array_builders_escape_values() {
 /// the Rust-side order must use the same key the SQL did.
 ///
 /// MUTATION: point `sort_canonical_search_rows` at `event_unix_ms` (i.e. reuse
-/// `sort_search_mcp_event_rows`, which is correct for the v1 engine) and this
-/// fails: the malformed-`record_ts` row sorts first by display time and last by
-/// sort time.
+/// `sort_search_mcp_event_rows`, which was the right key for the retired v1
+/// engine and is still the right key for the non-canonical event searches) and
+/// this fails: the malformed-`record_ts` row sorts first by display time and
+/// last by sort time.
 #[test]
 fn canonical_search_rows_order_by_sort_time_not_display_time() {
     // Two hits, identical score. `evt-broken` has an unparseable `record_ts`:

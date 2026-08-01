@@ -186,9 +186,14 @@ pub(super) async fn query_log_coverage() -> Result<()> {
         install_schema_fixture(&clickhouse, &database).await?;
         publish_missing_schema_fixture_sources(&clickhouse, &database).await?;
         clickhouse
-            .backfill_mcp_open_read_model()
+            .backfill_canonical_read_indexes(
+                true,
+                &live_fixture_budget(),
+                &default_interactive_budget(),
+                |_| {},
+            )
             .await
-            .context("failed to project envelope query-log gate fixtures")?;
+            .context("failed to index envelope query-log gate fixtures")?;
         let repository =
             ClickHouseConversationRepository::new(clickhouse.clone(), RepoConfig::default());
         let interactive = default_interactive_budget();
@@ -212,9 +217,9 @@ pub(super) async fn query_log_coverage() -> Result<()> {
             .context("enveloped list_mcp_sessions failed")?;
 
         QueryEnvelope::new("gate-open", QueryClass::Interactive, &interactive)
-            .scope(repository.get_mcp_session("issue454-dedup-session"))
+            .scope(repository.canonical_open_session_page("issue454-dedup-session", 25, None))
             .await
-            .context("enveloped get_mcp_session failed")?
+            .context("enveloped canonical open failed")?
             .context("envelope gate fixture session missing")?;
 
         QueryEnvelope::new("gate-search", QueryClass::Interactive, &interactive)
@@ -518,9 +523,14 @@ pub(super) async fn shared_budget_and_statement_cap() -> Result<()> {
         install_schema_fixture(&clickhouse, &database).await?;
         publish_missing_schema_fixture_sources(&clickhouse, &database).await?;
         clickhouse
-            .backfill_mcp_open_read_model()
+            .backfill_canonical_read_indexes(
+                true,
+                &live_fixture_budget(),
+                &default_interactive_budget(),
+                |_| {},
+            )
             .await
-            .context("failed to project envelope budget gate fixtures")?;
+            .context("failed to index envelope budget gate fixtures")?;
 
         // (a) Fixed statement cap: the fourth statement is refused locally
         // and never reaches the server.
@@ -582,7 +592,11 @@ pub(super) async fn shared_budget_and_statement_cap() -> Result<()> {
         let envelope = QueryEnvelope::new("gate-repo-cap", QueryClass::Interactive, &tight_budget);
         let repo_cap_request_id = envelope.request_id().to_string();
         let refused = envelope
-            .scope(capped_repository.get_mcp_session("issue454-dedup-session"))
+            .scope(capped_repository.canonical_open_session_page(
+                "issue454-dedup-session",
+                25,
+                None,
+            ))
             .await;
         match refused {
             Err(RepoError::ResourceExhausted { .. }) => {}
@@ -660,9 +674,9 @@ pub(super) async fn shared_budget_and_statement_cap() -> Result<()> {
         );
         let shared_request_id = envelope.request_id().to_string();
         envelope
-            .scope(repository.get_mcp_session("issue454-dedup-session"))
+            .scope(repository.canonical_open_session_page("issue454-dedup-session", 25, None))
             .await
-            .context("shared-budget get_mcp_session failed")?
+            .context("shared-budget canonical open failed")?
             .context("shared-budget fixture session missing")?;
         flush_query_log(&clickhouse).await?;
         let shared_rows = query_log_settings(

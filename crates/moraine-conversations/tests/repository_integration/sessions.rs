@@ -201,91 +201,6 @@ async fn list_conversations_rejects_cursor_when_sort_changes() {
     })
     .await;
 }
-#[tokio::test(flavor = "multi_thread")]
-async fn list_mcp_sessions_uses_overlap_filter_and_cursor_pagination() {
-    scoped(async {
-        let (repo, state) = build_repo().await;
-
-        let filter = McpSessionListFilter {
-            start_unix_ms: 1767261600000_i64,
-            end_unix_ms: 1767500000000_i64,
-            mode: Some(ConversationMode::WebSearch),
-            harness: Some("codex".to_string()),
-            source_name: Some("codex".to_string()),
-            sort: ConversationListSort::Desc,
-        };
-
-        let first = repo
-            .list_mcp_sessions(
-                filter.clone(),
-                PageRequest {
-                    limit: 2,
-                    cursor: None,
-                },
-            )
-            .await
-            .expect("first page");
-
-        assert_eq!(first.items.len(), 2);
-        assert_eq!(first.items[0].session_id, "sess_c");
-        assert_eq!(first.items[0].title.as_deref(), Some("Session C title"));
-        assert_eq!(first.items[0].source.as_deref(), Some("codex"));
-        assert_eq!(first.items[0].harness.as_deref(), Some("codex"));
-        let public_items =
-            serde_json::to_string(&first.items).expect("serialize public list items");
-        assert!(!public_items.contains("\"originator\":"));
-        assert!(!public_items.contains("\"project\":"));
-        assert!(!public_items.contains("acme-secret-merger"));
-        assert!(first.items[0].completed);
-        assert_eq!(first.items[1].session_id, "sess_b");
-        assert!(first.next_cursor.is_some());
-
-        let second = repo
-            .list_mcp_sessions(
-                filter,
-                PageRequest {
-                    limit: 2,
-                    cursor: first.next_cursor,
-                },
-            )
-            .await
-            .expect("second page");
-
-        assert_eq!(second.items.len(), 1);
-        assert_eq!(second.items[0].session_id, "sess_a");
-        assert!(!second.items[0].completed);
-        assert!(second.next_cursor.is_none());
-
-        let queries = state.queries.lock().expect("queries lock").clone();
-        let list_query = queries
-            .iter()
-            .find(|q| q.contains("current_headers AS") && q.contains("AS completed"))
-            .expect("list_sessions query should be captured");
-
-        assert!(list_query.contains("toUnixTimestamp64Milli(s.last_event_time) >= 1767261600000"));
-        assert!(list_query.contains("toUnixTimestamp64Milli(s.first_event_time) < 1767500000000"));
-        assert!(list_query.contains("s.mode = 'web_search'"));
-        assert!(list_query.contains("s.harness = 'codex'"));
-        assert!(list_query.contains("s.source = 'codex'"));
-        assert!(list_query.contains("s.source AS source"));
-        assert!(list_query.contains("FROM `moraine`.`mcp_open_publication_headers` AS h FINAL"));
-        assert!(list_query.contains("FROM `moraine`.`mcp_open_dirty_sessions` FINAL"));
-        assert!(list_query
-            .contains("FROM `moraine`.`v_published_source_generation_history` AS history"));
-        assert!(list_query.contains("length(h.required_source_heads) > 0"));
-        assert!(list_query.contains("required_head -> has(captured_heads, required_head)"));
-        assert!(list_query.contains("h.dirty_revision = ifNull(d.dirty_revision, toUInt64(0))"));
-        assert!(list_query.contains("ORDER BY s.last_event_time DESC, s.session_id DESC"));
-        // Blank session_id rows are filtered at the source so they never consume a
-        // LIMIT slot or anchor the keyset cursor (#386).
-        assert!(list_query.contains("notEmpty(trimBoth(s.session_id))"));
-        assert!(
-            !list_query.contains("v_live_events") && !list_query.contains("v_session_summary"),
-            "list_sessions must not reconstruct projected metadata from canonical events"
-        );
-    })
-    .await;
-}
 /// The issue-599 filter: every dimension populated, so the assertions below
 /// exercise each one's recall predicate and exact re-check.
 fn directory_filter() -> McpSessionListFilter {
@@ -303,23 +218,21 @@ fn directory_filter() -> McpSessionListFilter {
 /// [`ClickHouseConversationRepository::list_mcp_sessions`].
 ///
 /// The semantics-preservation checklist (issue-599 §4) is a contract on the
-/// OPERATION, not on one implementation of it, so every shared assertion runs
-/// against both. The mock serves the same three fixture sessions to each path,
-/// which is what makes a field-for-field page comparison meaningful.
+/// OPERATION. Until issue #603 WI-10 retired the projected-header fallback it
+/// ran against both readers; the directory reader is the only one left, and
+/// the checklist stays behavioral so a future second implementation inherits
+/// it unchanged.
 #[derive(Copy, Clone, Debug)]
 enum ListPath {
-    /// Pre-#599 `mcp_open_publication_headers` reader (`open_v2` unpublished).
-    Headers,
     /// Issue-599 `mcp_session_directory` reader (`open_v2` published).
     Directory,
 }
 
 impl ListPath {
-    const ALL: [Self; 2] = [Self::Headers, Self::Directory];
+    const ALL: [Self; 1] = [Self::Directory];
 
     async fn repo(self) -> (ClickHouseConversationRepository, Arc<MockState>) {
         match self {
-            Self::Headers => build_repo().await,
             Self::Directory => build_directory_repo().await,
         }
     }
@@ -329,7 +242,6 @@ impl ListPath {
         roots: &[&str],
     ) -> (ClickHouseConversationRepository, Arc<MockState>) {
         match self {
-            Self::Headers => build_scoped_repo(roots).await,
             Self::Directory => build_scoped_directory_repo(roots).await,
         }
     }
@@ -468,47 +380,12 @@ async fn assert_shared_list_sessions_semantics(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn list_sessions_semantics_are_identical_on_both_paths() {
+async fn list_sessions_semantics_hold_on_the_directory_path() {
     scoped(async {
-        let mut pages: Vec<(ListPath, Page<McpSessionListItem>)> = Vec::new();
         for path in ListPath::ALL {
             let (repo, _state) = path.repo().await;
-            pages.push((
-                path,
-                assert_shared_list_sessions_semantics(&repo, path).await,
-            ));
-        }
-
-        // Same filter, same fixture corpus: the two readers must agree on the
-        // session set and on every per-item field.
-        //
-        // The CURSOR is deliberately excluded from that comparison and asserted
-        // to differ instead. Each path anchors on the `updated_at` IT reports,
-        // and those come from different relations — the header path from the
-        // projector's exact aggregate, the directory path from the
-        // live-generation `max_observed_event_time` — so a token is only
-        // meaningful to the path that minted it. Comparing the tokens for
-        // equality would re-assert the false premise this test used to carry,
-        // and would fail the moment the two relations legitimately diverge (the
-        // fixture holds them equal, which is the ordinary corpus).
-        let (reference_path, reference) = &pages[0];
-        for (path, page) in &pages[1..] {
-            assert_eq!(
-                serde_json::to_value(&page.items).expect("serialize items"),
-                serde_json::to_value(&reference.items).expect("serialize items"),
-                "{path:?} diverged from {reference_path:?}"
-            );
-            assert_eq!(
-                page.next_cursor.is_some(),
-                reference.next_cursor.is_some(),
-                "{path:?} and {reference_path:?} must agree on whether more pages exist"
-            );
-            if let (Some(theirs), Some(ours)) = (&page.next_cursor, &reference.next_cursor) {
-                assert_ne!(
-                    theirs, ours,
-                    "{path:?} must mint a path-tagged token distinct from {reference_path:?}"
-                );
-            }
+            let first = assert_shared_list_sessions_semantics(&repo, path).await;
+            assert!(first.next_cursor.is_some(), "{path:?}");
         }
     })
     .await;
@@ -578,8 +455,8 @@ fn totals_row(session_id: &str, harness: &str) -> serde_json::Value {
 #[tokio::test(flavor = "multi_thread")]
 async fn list_mcp_sessions_directory_path_emits_the_content_free_candidate_page() {
     scoped(async {
-        // The page's OUTPUT is asserted against the projected-header page by
-        // `list_sessions_semantics_are_identical_on_both_paths`; this test
+        // The page's OUTPUT is asserted by the shared issue-599 §4 checklist
+        // (`list_sessions_semantics_hold_on_the_directory_path`); this test
         // pins the SQL that produces it.
         let (repo, state) = build_directory_repo().await;
 
@@ -1141,15 +1018,16 @@ async fn list_mcp_sessions_accepts_legacy_cursors_and_rejects_unknown_versions()
             URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).expect("re-encode cursor"))
         };
 
-        // This repository serves the DIRECTORY path. A pre-#599 token carries
-        // no `version` key, which decodes to the header path's version — so it
-        // is a token this path did not mint, and it must be REFUSED rather
-        // than resumed. The two paths anchor on different values (the header
-        // path on the projector's exact aggregate, the directory path on the
+        // This repository serves the DIRECTORY path — the only path since
+        // issue #603 WI-10. A pre-#599 token carries no `version` key, which
+        // decodes to the retired header path's version, so it is a token this
+        // path did not mint and it must be REFUSED rather than resumed. The
+        // two paths anchored on different values (the header path on the
+        // projector's exact aggregate, the directory path on the
         // live-generation `max_observed_event_time` it also reports), so
-        // resuming it here would silently skip every session whose two anchors
-        // straddle it — a gap the caller cannot see. A mismatch is recoverable:
-        // restart the feed.
+        // resuming one here would silently skip every session whose two
+        // anchors straddle it — a gap the caller cannot see. A mismatch is
+        // recoverable: restart the feed.
         let error = repo
             .list_mcp_sessions(
                 filter.clone(),
@@ -1363,42 +1241,6 @@ async fn list_mcp_sessions_rejects_cursor_filter_mismatch() {
     .await;
 }
 #[tokio::test(flavor = "multi_thread")]
-async fn list_mcp_sessions_applies_session_origin_scope() {
-    scoped(async {
-        let (repo, state) = build_scoped_repo(&["/work/project"]).await;
-
-        repo.list_mcp_sessions(
-            McpSessionListFilter {
-                start_unix_ms: 1767261600000_i64,
-                end_unix_ms: 1767500000000_i64,
-                mode: None,
-                harness: None,
-                source_name: None,
-                sort: ConversationListSort::Desc,
-            },
-            PageRequest {
-                limit: 5,
-                cursor: None,
-            },
-        )
-        .await
-        .expect("scoped list_mcp_sessions");
-
-        let queries = state.queries.lock().expect("queries lock").clone();
-        let list_query = queries
-            .iter()
-            .find(|q| q.contains("current_headers AS") && q.contains("AS completed"))
-            .expect("list_sessions query should be captured");
-
-        assert!(list_query.contains("s.origin_cwd = '/work/project'"));
-        assert!(list_query.contains("startsWith(s.origin_cwd, '/work/project/')"));
-        assert!(list_query.contains("ORDER BY s.last_event_time DESC, s.session_id DESC"));
-        assert!(list_query.contains("LIMIT 6"));
-        assert!(!list_query.contains("argMin(cwd"));
-    })
-    .await;
-}
-#[tokio::test(flavor = "multi_thread")]
 async fn list_mcp_sessions_rejects_cursor_from_differently_scoped_server() {
     scoped(async {
         let (unscoped_repo, _state) = build_repo().await;
@@ -1439,99 +1281,6 @@ async fn list_mcp_sessions_rejects_cursor_from_differently_scoped_server() {
         assert_eq!(
             err.to_string(),
             "invalid cursor: cursor does not match current list_sessions filter"
-        );
-    })
-    .await;
-}
-#[tokio::test(flavor = "multi_thread")]
-async fn scoped_point_lookups_hide_out_of_scope_sessions() {
-    scoped(async {
-        let (repo, state) = build_scoped_repo(&["/work/project"]).await;
-
-        let metadata = repo
-            .get_session_metadata("sess-out-of-scope")
-            .await
-            .expect("metadata query succeeds");
-        assert!(metadata.is_none(), "out-of-scope metadata must be hidden");
-
-        let session = repo
-            .get_mcp_session("sess-out-of-scope")
-            .await
-            .expect("session query succeeds");
-        assert!(session.is_none(), "out-of-scope session must be hidden");
-
-        let turn = repo
-            .get_mcp_turn("sess-out-of-scope", 1)
-            .await
-            .expect("turn query succeeds");
-        assert!(turn.is_none(), "out-of-scope turn must be hidden");
-
-        let event = repo
-            .get_mcp_event("evt-out-of-scope")
-            .await
-            .expect("event query succeeds");
-        assert!(event.is_none(), "out-of-scope event must be hidden");
-
-        let queries = state.queries.lock().expect("queries lock").clone();
-        let legacy_gate_count = queries
-            .iter()
-            .filter(|query| {
-                query.starts_with("SELECT session_id FROM (")
-                    && query.contains("argMin(cwd, tuple(event_ts, event_uid))")
-            })
-            .count();
-        assert_eq!(
-            legacy_gate_count, 1,
-            "only the legacy metadata lookup should need the canonical scope gate"
-        );
-        assert!(
-            queries
-                .iter()
-                .filter(|query| {
-                    query.contains("FROM `moraine`.`mcp_open_publication_headers`")
-                        && query.contains("session_id = 'sess-out-of-scope'")
-                })
-                .count()
-                >= 3
-        );
-        assert!(
-            !queries
-                .iter()
-                .any(|query| query.contains("FROM `moraine`.`mcp_open_turns`")),
-            "an out-of-scope committed session must be rejected before child rows are read"
-        );
-    })
-    .await;
-}
-#[tokio::test(flavor = "multi_thread")]
-async fn scoped_point_lookups_serve_in_scope_sessions() {
-    scoped(async {
-        let (repo, state) = build_scoped_repo(&["/work/project"]).await;
-
-        let session = repo
-            .get_mcp_session("sess-open")
-            .await
-            .expect("session query succeeds")
-            .expect("in-scope session is served");
-        assert_eq!(session.metadata.session_id, "sess-open");
-
-        // The positive result is cached: a second lookup must not re-run the gate.
-        let _ = repo
-            .get_session_metadata("sess-open")
-            .await
-            .expect("metadata query succeeds");
-
-        let queries = state.queries.lock().expect("queries lock").clone();
-        let gate_queries: Vec<&String> = queries
-            .iter()
-            .filter(|q| {
-                q.starts_with("SELECT session_id FROM (") && q.contains("session_id = 'sess-open'")
-            })
-            .collect();
-        assert_eq!(
-            gate_queries.len(),
-            1,
-            "in-scope verdicts should be cached after the first gate query"
         );
     })
     .await;
@@ -1634,524 +1383,6 @@ async fn get_session_metadata_keeps_empty_boundary_fields_when_summary_exists() 
         assert!(metadata.first_event_uid.is_empty());
         assert!(metadata.last_event_uid.is_empty());
         assert!(metadata.last_actor_role.is_empty());
-    })
-    .await;
-}
-#[tokio::test(flavor = "multi_thread")]
-async fn get_mcp_session_includes_turn_summaries_and_latest_completion() {
-    scoped(async {
-        let (repo, state) = build_repo().await;
-
-        let session = repo
-            .get_mcp_session("sess-open")
-            .await
-            .expect("mcp session open succeeds")
-            .expect("mcp session exists");
-
-        assert_eq!(session.metadata.session_id, "sess-open");
-        assert_eq!(session.metadata.mode, ConversationMode::ToolCalling);
-        assert_eq!(session.title.as_deref(), Some("Open model session"));
-        assert_eq!(session.source.as_deref(), Some("codex-source"));
-        assert_eq!(session.session_slug.as_deref(), Some("open-model-session"));
-        assert_eq!(session.turns.len(), 2);
-        assert!(session.completed);
-        assert_eq!(session.terminal_event_uid.as_deref(), Some("evt-open-8"));
-
-        let first_turn = &session.turns[0];
-        assert_eq!(first_turn.metadata.turn_seq, 1);
-        assert!(first_turn.completed);
-        assert_eq!(first_turn.terminal_event_uid.as_deref(), Some("evt-open-5"));
-        assert_eq!(
-            first_turn.user_input_summary.as_deref(),
-            Some("How should repository open models work?")
-        );
-        assert_eq!(
-            first_turn.final_response_summary.as_deref(),
-            Some("First answer with repository context.")
-        );
-        assert_eq!(first_turn.tools_called, vec!["search_repo"]);
-        assert_eq!(
-            first_turn.normalized_event_types,
-            vec![
-                "user_input",
-                "tool_call",
-                "tool_response",
-                "assistant_response",
-                "runtime"
-            ]
-        );
-        assert_eq!(
-            first_turn
-                .first_event
-                .as_ref()
-                .map(|event| event.event_uid.as_str()),
-            Some("evt-open-1")
-        );
-        assert_eq!(
-            first_turn
-                .last_event
-                .as_ref()
-                .map(|event| event.event_uid.as_str()),
-            Some("evt-open-5")
-        );
-
-        let listed_turns = repo
-            .list_turns(
-                "sess-open",
-                TurnListFilter::default(),
-                PageRequest::default(),
-            )
-            .await
-            .expect("turn list projection succeeds");
-        assert_eq!(listed_turns.items.len(), 2);
-
-        let opened_turn = repo
-            .get_turn("sess-incomplete", 2)
-            .await
-            .expect("turn detail projection succeeds")
-            .expect("turn detail exists");
-        assert_eq!(opened_turn.summary.turn_seq, 2);
-
-        let queries = state.queries.lock().expect("queries lock").clone();
-        let open_turn_query = queries
-            .iter()
-            .find(|query| {
-                query.contains("FROM `moraine`.`mcp_open_turns`")
-                    && query.contains("WHERE t.session_id = 'sess-open'")
-            })
-            .expect("session open must read its committed turn projection");
-        assert!(open_turn_query.contains("t.slot = 0 AND t.generation = 100"));
-        assert!(open_turn_query.contains("ORDER BY t.turn_seq ASC"));
-        assert!(!open_turn_query.contains("v_conversation_trace"));
-        assert!(!queries.iter().any(|query| {
-            query.contains("v_conversation_trace")
-                && query.contains("WHERE session_id = 'sess-open'")
-                && query.contains("ORDER BY event_order ASC, event_uid ASC")
-        }));
-        let legacy_turn_summary_queries = queries
-            .iter()
-            .filter(|query| query.contains("FROM `moraine`.`v_turn_summary`"))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            legacy_turn_summary_queries.len(),
-            2,
-            "only the explicit turn-list and turn-detail calls use legacy detail projections"
-        );
-        for query in legacy_turn_summary_queries {
-            assert_typed_turn_timestamp_projection(query);
-        }
-    })
-    .await;
-}
-#[tokio::test(flavor = "multi_thread")]
-async fn get_mcp_session_uses_only_bounded_projection_queries() {
-    scoped(async {
-        let (repo, state) = build_repo().await;
-
-        let session = repo
-            .get_mcp_session("sess-open")
-            .await
-            .expect("bounded session open succeeds")
-            .expect("session exists");
-        assert_eq!(session.metadata.session_id, "sess-open");
-
-        let queries = state.queries.lock().expect("queries lock").clone();
-        assert_eq!(queries.len(), 4);
-        assert!(queries[0].contains("mcp_open_projection_state"));
-        assert!(queries[1].contains("FROM `moraine`.`mcp_open_publication_headers`"));
-        assert!(queries[1].contains("WHERE s.session_id = 'sess-open'"));
-        assert!(queries[2].contains("FROM `moraine`.`mcp_open_turns`"));
-        assert!(queries[2]
-            .contains("WHERE t.session_id = 'sess-open' AND t.slot = 0 AND t.generation = 100"));
-        assert!(queries[3].contains("FROM `moraine`.`mcp_open_publication_headers`"));
-        assert!(queries
-            .iter()
-            .all(|query| !query.contains("v_conversation_trace")));
-        assert!(queries[1].contains("required_source_heads"));
-        assert!(queries[1].contains("v_published_source_generation_history"));
-    })
-    .await;
-}
-#[tokio::test(flavor = "multi_thread")]
-async fn get_mcp_session_retries_when_projection_head_changes_during_open() {
-    scoped(async {
-        let mut generation_100 = session_row("sess-open").expect("fixture session");
-        generation_100["generation"] = json!(100_u64);
-        let mut generation_101 = generation_100.clone();
-        generation_101["slot"] = json!(1_u8);
-        generation_101["generation"] = json!(101_u64);
-        let responses = vec![
-            ScriptedResponse::rows(
-                &["mcp_open_projection_state", "state_key = 'global'"],
-                json!([{ "ready": 1_u8 }]),
-            ),
-            ScriptedResponse::rows(
-                &[
-                    "FROM `moraine`.`mcp_open_publication_headers`",
-                    "s.session_id = 'sess-open'",
-                ],
-                json!([generation_100]),
-            ),
-            ScriptedResponse::rows(
-                &["FROM `moraine`.`mcp_open_turns`", "t.generation = 100"],
-                json!(turn_rows("sess-open", None)),
-            ),
-            ScriptedResponse::rows(
-                &[
-                    "FROM `moraine`.`mcp_open_publication_headers`",
-                    "s.session_id = 'sess-open'",
-                ],
-                json!([generation_101.clone()]),
-            ),
-            ScriptedResponse::rows(
-                &[
-                    "FROM `moraine`.`mcp_open_publication_headers`",
-                    "s.session_id = 'sess-open'",
-                ],
-                json!([generation_101.clone()]),
-            ),
-            ScriptedResponse::rows(
-                &["FROM `moraine`.`mcp_open_turns`", "t.generation = 101"],
-                json!(turn_rows("sess-open", None)),
-            ),
-            ScriptedResponse::rows(
-                &[
-                    "FROM `moraine`.`mcp_open_publication_headers`",
-                    "s.session_id = 'sess-open'",
-                ],
-                json!([generation_101]),
-            ),
-        ];
-        let (repo, state) = build_scripted_repo(responses).await;
-
-        let session = repo
-            .get_mcp_session("sess-open")
-            .await
-            .expect("snapshot retry succeeds")
-            .expect("session exists");
-
-        assert_eq!(session.turns.len(), 2);
-        assert_script_consumed(&state, 7);
-    })
-    .await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn get_mcp_session_missing_committed_header_skips_child_queries() {
-    scoped(async {
-        let responses = vec![
-            ScriptedResponse::rows(
-                &["mcp_open_projection_state", "state_key = 'global'"],
-                json!([{ "ready": 1_u8 }]),
-            ),
-            ScriptedResponse::rows(
-                &[
-                    "FROM `moraine`.`mcp_open_publication_headers`",
-                    "WHERE s.session_id = 'sess-missing-projection'",
-                ],
-                json!([]),
-            ),
-            ScriptedResponse::rows(
-                &[
-                    "toUInt8(count() > 0) AS exists",
-                    "e.session_id = 'sess-missing-projection'",
-                ],
-                json!([{ "exists": 0_u8 }]),
-            ),
-        ];
-        let (repo, state) = build_scripted_repo(responses).await;
-
-        let session = repo
-            .get_mcp_session("sess-missing-projection")
-            .await
-            .expect("missing committed header is a not-found result");
-        assert!(session.is_none());
-        assert_script_consumed(&state, 3);
-    })
-    .await;
-}
-#[tokio::test(flavor = "multi_thread")]
-async fn get_mcp_turn_returns_compact_events_and_incomplete_state() {
-    scoped(async {
-        let (repo, _state) = build_repo().await;
-
-        let turn = repo
-            .get_mcp_turn("sess-incomplete", 2)
-            .await
-            .expect("mcp turn open succeeds")
-            .expect("mcp turn exists");
-
-        assert_eq!(turn.metadata.session_id, "sess-incomplete");
-        assert_eq!(turn.metadata.turn_seq, 2);
-        assert_eq!(turn.parent_session_source.as_deref(), Some("fixture"));
-        assert_eq!(turn.events.len(), 3);
-        assert_eq!(turn.events[0].event_uid, "evt-inc-2");
-        assert_eq!(turn.events[0].event_type, "user_input");
-        assert_eq!(
-            turn.events[0].text_preview.as_deref(),
-            Some("Run the incomplete workflow.")
-        );
-        assert_eq!(turn.events[1].event_type, "tool_call");
-        assert_eq!(turn.events[2].event_type, "tool_response");
-        assert_eq!(
-            turn.user_input_summary.as_deref(),
-            Some("Run the incomplete workflow.")
-        );
-        assert!(turn.final_response_summary.is_none());
-        assert_eq!(turn.tools_called, vec!["inspect"]);
-        assert_eq!(
-            turn.normalized_event_types,
-            vec!["user_input", "tool_call", "tool_response"]
-        );
-        assert!(!turn.completed);
-        assert!(turn.terminal_event_uid.is_none());
-        assert_eq!(
-            turn.previous_turn.as_ref().map(|turn| turn.turn_seq),
-            Some(1)
-        );
-        assert!(turn.next_turn.is_none());
-        assert_eq!(
-            turn.first_event
-                .as_ref()
-                .map(|event| event.event_uid.as_str()),
-            Some("evt-inc-2")
-        );
-        assert_eq!(
-            turn.last_event
-                .as_ref()
-                .map(|event| event.event_uid.as_str()),
-            Some("evt-inc-4")
-        );
-        assert_eq!(
-            turn.snapshot.as_ref().map(|snapshot| snapshot.generation),
-            Some(100)
-        );
-    })
-    .await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn get_mcp_turn_summary_skips_projected_event_json_and_keeps_handles() {
-    scoped(async {
-        let (repo, state) = build_repo().await;
-
-        let turn = repo
-            .get_mcp_turn_summary("sess-incomplete", 2)
-            .await
-            .expect("mcp turn summary succeeds")
-            .expect("mcp turn exists");
-
-        assert!(turn.events.is_empty());
-        assert_eq!(
-            turn.user_input_event
-                .as_ref()
-                .map(|event| event.event_uid.as_str()),
-            Some("evt-inc-2")
-        );
-        assert!(turn.final_response_event.is_none());
-        assert_eq!(turn.tools_called, vec!["inspect"]);
-        assert_eq!(
-            turn.first_event
-                .as_ref()
-                .map(|event| event.event_uid.as_str()),
-            Some("evt-inc-2")
-        );
-        assert_eq!(
-            turn.last_event
-                .as_ref()
-                .map(|event| event.event_uid.as_str()),
-            Some("evt-inc-4")
-        );
-
-        let queries = state.queries.lock().expect("queries lock").clone();
-        let turn_query = queries
-            .iter()
-            .find(|query| {
-                query.contains("FROM `moraine`.`mcp_open_turns`")
-                    && query.contains("t.session_id = 'sess-incomplete'")
-            })
-            .expect("turn query captured");
-        assert!(turn_query.contains("'[]' AS event_summaries_json"));
-        assert!(!turn_query.contains("  event_summaries_json AS event_summaries_json"));
-    })
-    .await;
-}
-#[tokio::test(flavor = "multi_thread")]
-async fn get_mcp_event_retries_stale_lookup_generation() {
-    scoped(async {
-        let mut stale_lookup = event_lookup("evt-open-full").expect("fixture event lookup");
-        stale_lookup["generation"] = json!(100_u64);
-        let mut current_lookup = stale_lookup.clone();
-        current_lookup["generation"] = json!(101_u64);
-        let mut current_session = session_row("sess-event").expect("fixture session");
-        current_session["generation"] = json!(101_u64);
-        let responses = vec![
-            ScriptedResponse::rows(
-                &["mcp_open_projection_state", "state_key = 'global'"],
-                json!([{ "ready": 1_u8 }]),
-            ),
-            ScriptedResponse::rows(
-                &[
-                    "FROM `moraine`.`mcp_open_events` FINAL",
-                    "event_uid = 'evt-open-full'",
-                ],
-                json!([stale_lookup]),
-            ),
-            ScriptedResponse::rows(
-                &[
-                    "FROM `moraine`.`mcp_open_publication_headers`",
-                    "s.session_id = 'sess-event'",
-                ],
-                json!([current_session.clone()]),
-            ),
-            ScriptedResponse::rows(
-                &[
-                    "toUInt8(count() > 0) AS exists",
-                    "e.event_uid = 'evt-open-full'",
-                ],
-                json!([{ "exists": 1_u8 }]),
-            ),
-            ScriptedResponse::rows(
-                &["mcp_open_projection_state", "state_key = 'global'"],
-                json!([{ "ready": 1_u8 }]),
-            ),
-            ScriptedResponse::rows(
-                &[
-                    "FROM `moraine`.`mcp_open_events` FINAL",
-                    "event_uid = 'evt-open-full'",
-                ],
-                json!([current_lookup]),
-            ),
-            ScriptedResponse::rows(
-                &[
-                    "FROM `moraine`.`mcp_open_publication_headers`",
-                    "s.session_id = 'sess-event'",
-                ],
-                json!([current_session.clone()]),
-            ),
-            ScriptedResponse::rows(
-                &["FROM `moraine`.`mcp_open_events`", "previous_event_uid"],
-                json!([full_event_row("evt-open-full").expect("fixture full event")]),
-            ),
-            ScriptedResponse::rows(
-                &["FROM `moraine`.`mcp_open_turns`", "t.generation = 101"],
-                json!(turn_rows("sess-event", Some(1))),
-            ),
-            ScriptedResponse::rows(
-                &["FROM `moraine`.`mcp_open_events` FINAL", "event_order IN"],
-                json!(event_ref_rows()),
-            ),
-            ScriptedResponse::rows(
-                &[
-                    "FROM `moraine`.`mcp_open_publication_headers`",
-                    "s.session_id = 'sess-event'",
-                ],
-                json!([current_session]),
-            ),
-        ];
-        let (repo, state) = build_scripted_repo(responses).await;
-
-        let event = repo
-            .get_mcp_event("evt-open-full")
-            .await
-            .expect("stale event lookup retries")
-            .expect("event exists");
-
-        assert_eq!(event.event.event_uid, "evt-open-full");
-        assert_script_consumed(&state, 11);
-    })
-    .await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn get_mcp_event_returns_full_content_and_navigation_refs() {
-    scoped(async {
-        let (repo, state) = build_repo().await;
-
-        let event = repo
-            .get_mcp_event("evt-open-full")
-            .await
-            .expect("mcp event open succeeds")
-            .expect("mcp event exists");
-
-        assert_eq!(event.event.event_uid, "evt-open-full");
-        assert_eq!(event.event_type, "assistant_response");
-        assert_eq!(event.event.session_id, "sess-event");
-        assert_eq!(event.event.turn_seq, 1);
-        assert_eq!(
-            event.event.text_content,
-            "This is the full available event content that must not be clipped by the repository open model."
-        );
-        assert_eq!(
-            event.event.payload_json,
-            "{\"text\":\"This is the full payload JSON value that must also remain intact\",\"nested\":{\"answer\":42}}"
-        );
-        assert_eq!(event.parent_session.session_id, "sess-event");
-        assert_eq!(event.parent_turn.turn_seq, 1);
-        assert_eq!(
-            event
-                .previous_event
-                .as_ref()
-                .map(|event| event.event_uid.as_str()),
-            Some("evt-event-1")
-        );
-        assert_eq!(
-            event
-                .next_event
-                .as_ref()
-                .map(|event| event.event_uid.as_str()),
-            Some("evt-event-3")
-        );
-        assert!(event.previous_turn.is_none());
-        assert_eq!(event.next_turn.as_ref().map(|turn| turn.turn_seq), Some(2));
-
-        let queries = state.queries.lock().expect("queries lock").clone();
-        assert_eq!(queries.len(), 7);
-        assert!(queries.iter().all(|query| {
-            query.contains("mcp_open_projection_state")
-                || query.contains("mcp_open_publication_headers")
-                || query.contains("mcp_open_turns")
-                || query.contains("mcp_open_events")
-        }));
-        assert!(queries
-            .iter()
-            .all(|query| !query.contains("v_conversation_trace")));
-        let lookup_query = queries
-            .iter()
-            .find(|query| query.contains("ORDER BY generation DESC, source_host ASC"))
-            .expect("host-qualified MCP event lookup query");
-        assert!(lookup_query.contains("SELECT\n  source_host,\n  event_uid"));
-        // Issue #603 OQ-8b. The candidate window is a correctness surface: a
-        // uid carrying more headerless generations than the window is wide
-        // resolves to `ReadModelChanged`/`None` however healthy its authorized
-        // row is. Restricting the window to header-backed generations changes
-        // no answer — `get_mcp_event_impl` already skips a candidate no
-        // header matches — and makes that failure unreachable whether or not a
-        // reclaim has run.
-        //
-        // MUTATION (executed 2026-07-28): delete the
-        // `AND (session_id, candidate_generation) IN (…)` clause from
-        // `load_projected_event_candidates` => FAILS here.
-        assert!(
-            lookup_query.contains(
-                "AND (session_id, candidate_generation) IN (\n    SELECT session_id, generation \
-                 FROM `moraine`.`mcp_open_publication_headers`\n  )"
-            ),
-            "the candidate window must admit only header-backed generations: {lookup_query}"
-        );
-        assert!(lookup_query.contains("\nLIMIT 64\n"), "{lookup_query}");
-        let event_query = queries
-            .iter()
-            .find(|query| query.contains("previous_event_uid"))
-            .expect("host-qualified MCP event content query");
-        assert!(event_query.contains("e.source_host = 'host-a'"));
-        assert!(event_query.contains("e.session_id = 'sess-event'"));
-        let neighbor_query = queries
-            .iter()
-            .find(|query| query.contains("event_order IN"))
-            .expect("order-qualified MCP event neighbor query");
-        assert!(neighbor_query.contains("session_id = 'sess-event'"));
-        assert!(neighbor_query.contains("event_order IN [1, 3]"));
     })
     .await;
 }
@@ -2677,9 +1908,12 @@ async fn session_search_reports_that_the_exact_recheck_shortened_the_answer() {
 /// **The readiness guard.** While the issue-598 canonical read indexes are
 /// unpublished, `mcp_event_navigation` is EMPTY. Hydrating discovery from it
 /// anyway answers every query with `sessions: []` — a confident "the whole
-/// corpus was searched and nothing matched" — at the same moment
-/// `list_mcp_sessions` is still serving those very sessions from the projected
-/// headers. Both discovery surfaces must branch on the same latch.
+/// corpus was searched and nothing matched" — for a corpus that may hold
+/// thousands of sessions. Before issue #603 WI-10 that also diverged from
+/// `list_mcp_sessions`, which was still serving those very sessions from the
+/// projected headers; with the fallback retired the requirement is stricter,
+/// not weaker: both discovery surfaces must branch on the same latch and both
+/// must REFUSE, because neither has anything else to read.
 ///
 /// The fixture models **a store whose backfill has not started**: the canonical
 /// relations are empty for every reader. That is the pre-backfill worst case,
@@ -2706,23 +1940,26 @@ async fn session_search_serves_summaries_while_the_canonical_indexes_are_unpubli
         )
         .await;
 
-        let result = repo
+        // Since issue #603 WI-10 retired the projected-header fallback, an
+        // unpublished read index is a typed refusal on BOTH discovery
+        // surfaces — never a confident empty answer, and never a divergence
+        // between the two.
+        let error = repo
             .search_session_summaries(SessionSearchQuery {
                 query: "hello world".to_string(),
                 limit: Some(10),
                 ..SessionSearchQuery::default()
             })
             .await
-            .expect("whole-corpus session search on a not-ready store");
-
+            .expect_err("a not-ready store must refuse, not serve an empty match set");
         assert!(
-            !result.sessions.is_empty(),
-            "a not-ready store must serve session summaries, never an empty match set",
+            error
+                .to_string()
+                .contains("canonical read indexes are not ready"),
+            "{error}"
         );
 
-        // The sibling surface answers from the same read model in the same
-        // regime, which is the disagreement this guard exists to prevent.
-        let feed = repo
+        let feed_error = repo
             .list_mcp_sessions(
                 McpSessionListFilter {
                     start_unix_ms: 0,
@@ -2735,71 +1972,21 @@ async fn session_search_serves_summaries_while_the_canonical_indexes_are_unpubli
                 PageRequest::default(),
             )
             .await
-            .expect("session feed on a not-ready store");
-        assert!(!feed.items.is_empty());
-        for session in &result.sessions {
-            assert!(
-                feed.items
-                    .iter()
-                    .any(|item| item.session_id == session.session_id),
-                "search disclosed {} which the feed does not serve",
-                session.session_id,
-            );
-        }
+            .expect_err("the sibling surface refuses in the same regime");
+        assert!(
+            feed_error
+                .to_string()
+                .contains("canonical read indexes are not ready"),
+            "{feed_error}"
+        );
 
         let queries = state.queries.lock().expect("queries lock").clone();
-        assert!(
-            queries
-                .iter()
-                .any(|query| query.contains("current_headers AS")),
-            "the fallback must hydrate from the projected headers",
-        );
         assert!(
             !queries
                 .iter()
-                .any(|query| query.contains("AS counter_user_messages")),
-            "a not-ready store must not be hydrated from the canonical navigation index",
+                .any(|query| query.contains("current_headers AS") || query.contains("mcp_open_")),
+            "a refusal must not touch the retired projection: {queries:?}",
         );
-    })
-    .await;
-}
-
-/// The fallback narrows SERVER-SIDE, through the one predicate builder the
-/// projected-header feed uses. A fallback that hydrated unnarrowed rows would
-/// disclose out-of-scope sessions and render sessions under a harness the
-/// caller did not ask for.
-///
-/// MUTATION: stop threading `harness` / `source_name` into
-/// `hydrate_session_headers`, or drop the scope clause from
-/// `header_visibility_clauses`; the corresponding assertion below fails.
-#[tokio::test(flavor = "multi_thread")]
-async fn the_projected_header_fallback_narrows_through_the_shared_predicate_builder() {
-    scoped(async {
-        // A `--project-only` backend whose canonical read indexes are not
-        // published: the projected headers are the only read model available.
-        let (repo, state) = build_scoped_repo(&["/repo"]).await;
-
-        repo.search_session_summaries(SessionSearchQuery {
-            query: "hello world".to_string(),
-            limit: Some(10),
-            harness: Some("codex".to_string()),
-            source_name: Some("ci-codex".to_string()),
-            ..SessionSearchQuery::default()
-        })
-        .await
-        .expect("scoped, narrowed search on a not-ready store");
-
-        let queries = state.queries.lock().expect("queries lock").clone();
-        let hydration = queries
-            .iter()
-            .find(|query| query.contains("current_headers AS") && query.contains("s.session_id IN"))
-            .expect("a projected-header hydration statement");
-        assert!(hydration.contains("s.tombstone = 0"));
-        assert!(hydration.contains("notEmpty(trimBoth(s.session_id))"));
-        assert!(hydration.contains("s.origin_cwd = '/repo'"));
-        assert!(hydration.contains("startsWith(s.origin_cwd, '/repo/')"));
-        assert!(hydration.contains("s.harness = 'codex'"));
-        assert!(hydration.contains("s.source = 'ci-codex'"));
     })
     .await;
 }
@@ -3062,9 +2249,9 @@ async fn both_discovery_surfaces_describe_one_session_identically() {
 ///
 /// `dropped` plus `truncated` makes `limit - result_count` an exact count of
 /// what the answer withheld. That is acceptable only because project scope can
-/// never be one of the causes: BOTH ranking arms apply the configured scope
-/// while they are still choosing candidates, so an out-of-scope session never
-/// enters the ranked set and cannot be subtracted from it afterwards. Were it
+/// never be one of the causes: ranking applies the configured scope while it
+/// is still choosing candidates, so an out-of-scope session never enters the
+/// ranked set and cannot be subtracted from it afterwards. Were it
 /// otherwise, `?q=term&limit=50` on a `--project-only` backend would report an
 /// exact, per-term count of activity outside the caller's scope.
 ///
@@ -3082,13 +2269,14 @@ async fn both_discovery_surfaces_describe_one_session_identically() {
 /// by the post-hydration re-check instead, and the first arm's
 /// `assert!(!dropped)` fails.
 ///
-/// Deleting the `posting_origin_clause` push in `build_search_mcp_events_sql`
-/// does NOT fail this test; an earlier revision of this comment offered it as
-/// an equivalent recipe and it was never executed. That builder is the
+/// An earlier revision of this comment offered "delete the origin-scope push
+/// in the v1 event-search builder" as an equivalent recipe. It was never
+/// executed, and it could not fail this test: that builder served the
 /// pre-cutover projected-header path, while this fixture sets
 /// `open_v2_reader_ready: Some(true)` and therefore issues the canonical v2
-/// statement, which never carries that clause. The v1 clause is guarded —
-/// by `search::search_mcp_events_applies_session_origin_scope`, not here.
+/// statement, which never carried the clause. Issue #603 WI-10 deleted the
+/// builder outright; scope on the surviving event-search path is guarded by
+/// `search::search_mcp_events_applies_session_origin_scope`, not here.
 ///
 /// That mutation only reaches `dropped` because the first arm ALSO sets
 /// `out_of_scope_hydrated_cwd_for_sess_a`. Without it the ranking mutation is
@@ -3248,14 +2436,17 @@ async fn session_search_over_fetch_is_bounded_at_every_reachable_limit_region() 
 
 /// **The one-verdict guard (issue-599 WI-09).**
 ///
-/// A content search branches on the issue-598 readiness latch TWICE — once to
-/// pick the ranking engine, once to pick the hydration read model — and both
-/// branches must see the SAME verdict. Probing separately costs a second
-/// `mcp_read_index_state` point read on every pre-cutover search, and, because
-/// the latch flips when a backfill publishes, two probes in one request can
-/// disagree: the answer would then be ranked over the `mcp_open_*` projection
-/// and hydrated from the canonical navigation index, a mixed regime nothing
-/// tests and `list_mcp_sessions` cannot produce.
+/// A content search consults the issue-598 readiness latch at TWO points —
+/// before ranking and before hydration — and both must see the SAME verdict.
+/// That is still two consultations after issue #603 WI-10; what changed is
+/// what disagreement costs. Before the retirement a split verdict ranked over
+/// the `mcp_open_*` projection and hydrated from the canonical navigation
+/// index. Now there is no second read model, so a split verdict inside one
+/// request means it refuses at one step and serves at the other — a request
+/// that is half-answered on a store the operator was told is not ready.
+/// Probing separately also costs a second `mcp_read_index_state` point read on
+/// every search of a not-ready store, which is exactly the store that cannot
+/// afford it.
 ///
 /// The backend is declared NOT ready on purpose. A positive verdict latches on
 /// first success (`canonical_list_path_ready`), so a second probe would be
@@ -3282,7 +2473,7 @@ async fn a_content_search_resolves_canonical_readiness_exactly_once() {
             ..SessionSearchQuery::default()
         })
         .await
-        .expect("whole-corpus session search on a not-ready store");
+        .expect_err("a not-ready store refuses content discovery (issue #603 WI-10)");
 
         // One logical probe is TWO statements — the `system.tables` existence
         // check and the state read itself (`ClickHouseClient::read_index_state`)

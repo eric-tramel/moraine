@@ -415,12 +415,6 @@ pub struct McpTurnCompact {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct McpOpenSnapshot {
-    pub slot: u8,
-    pub generation: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpSessionOpen {
     pub metadata: SessionMetadata,
     pub title: Option<String>,
@@ -432,8 +426,6 @@ pub struct McpSessionOpen {
     pub turns: Vec<McpTurnCompact>,
     pub completed: bool,
     pub terminal_event_uid: Option<String>,
-    #[serde(default)]
-    pub snapshot: Option<McpOpenSnapshot>,
 }
 
 /// One session as BOTH discovery surfaces render it.
@@ -544,11 +536,11 @@ pub struct SessionSearchResults {
     /// corpus genuinely held three, i.e. it would claim to be complete when it
     /// is a strict subset of what the ranking offered.
     ///
-    /// **Project scope cannot set this bit.** Both ranking arms apply the
-    /// configured scope while they are still choosing candidates — against the
-    /// navigation `argMinIf(cwd, …)` on the canonical path, against
-    /// `mcp_open_publication_headers.origin_cwd` on the pre-cutover path — so
-    /// an out-of-scope session never enters the ranked set and cannot be
+    /// **Project scope cannot set this bit.** Ranking applies the configured
+    /// scope while it is still choosing candidates — against the navigation
+    /// index's `argMinIf(cwd, …)`, the canonical reader's only origin source
+    /// since issue #603 WI-10 retired the projected headers — so an
+    /// out-of-scope session never enters the ranked set and cannot be
     /// subtracted from it afterwards. That is what stops `limit -
     /// result_count`, which is exact whenever `truncated` is also set, from
     /// being a per-term count of activity outside the caller's scope. The
@@ -578,8 +570,6 @@ pub struct McpTurnOpen {
     pub next_turn: Option<McpTurnRef>,
     pub first_event: Option<McpEventRef>,
     pub last_event: Option<McpEventRef>,
-    #[serde(default)]
-    pub snapshot: Option<McpOpenSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -675,8 +665,8 @@ pub struct CanonicalContinuation {
 pub type CanonicalPageAfter = CanonicalContinuation;
 
 /// One page of a session open plus its continuation. `session.turns` holds only
-/// this page's `K` turns and `session.snapshot` is always `None` (v2 uses the
-/// continuation, not generation-pinned snapshots).
+/// this page's `K` turns (v2 uses the continuation, not the retired v1
+/// generation-pinned snapshots).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CanonicalSessionPage {
     pub session: McpSessionOpen,
@@ -1291,84 +1281,12 @@ impl SessionLookback {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SessionAnalyticsQuery {
-    #[serde(default)]
-    pub lookback: SessionLookback,
-    #[serde(default = "default_session_analytics_limit")]
-    pub limit: u16,
-}
-
-impl Default for SessionAnalyticsQuery {
-    fn default() -> Self {
-        Self {
-            lookback: SessionLookback::default(),
-            limit: default_session_analytics_limit(),
-        }
-    }
-}
-
-impl SessionAnalyticsQuery {
-    pub(crate) fn normalized_limit(&self) -> u16 {
-        self.limit.clamp(1, 200)
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolResult {
     pub event_unix_ms: i64,
     pub text: String,
     pub latency_ms: u32,
     pub is_error: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum SessionStep {
-    User {
-        event_unix_ms: i64,
-        text: String,
-    },
-    Assistant {
-        event_unix_ms: i64,
-        text: String,
-        endpoint_kind: String,
-        latency_ms: Option<u32>,
-        token_usage_buckets: BTreeMap<String, u64>,
-        token_usage_native_units: BTreeMap<String, f64>,
-    },
-    Thinking {
-        event_unix_ms: i64,
-        text: String,
-    },
-    ToolCall {
-        event_unix_ms: i64,
-        tool_name: String,
-        call_id: String,
-        arguments: Value,
-        latency_ms: Option<u32>,
-        is_error: bool,
-        result: Option<ToolResult>,
-    },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SessionTurn {
-    pub summary: TurnSummary,
-    pub model: String,
-    pub token_usage_buckets: BTreeMap<String, u64>,
-    pub steps: Vec<SessionStep>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SessionAnalytics {
-    pub summary: ConversationSummary,
-    pub harness: String,
-    pub source_name: String,
-    pub models: Vec<String>,
-    pub trace_id: String,
-    pub first_user_text: String,
-    pub turns: Vec<SessionTurn>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1562,10 +1480,6 @@ pub struct StoreDiagnostics {
     pub errors: Vec<String>,
 }
 
-fn default_session_analytics_limit() -> u16 {
-    50
-}
-
 fn default_table_preview_limit() -> u16 {
     25
 }
@@ -1627,9 +1541,8 @@ fn default_page_limit() -> u16 {
 mod tests {
     use super::{
         AnalyticsRange, CoreIndexHealth, PublicationDiagnostics, SearchEventKind,
-        SearchEventsQuery, SearchStrategyHint, SessionAnalyticsQuery, SessionLookback,
-        SessionOriginScope, SessionStep, StoreConnectionMetrics, StoreHealth, StoreProbe,
-        TablePreviewQuery,
+        SearchEventsQuery, SearchStrategyHint, SessionLookback, SessionOriginScope,
+        StoreConnectionMetrics, StoreHealth, StoreProbe, TablePreviewQuery,
     };
 
     #[test]
@@ -1792,15 +1705,7 @@ mod tests {
     }
 
     #[test]
-    fn analytics_query_and_table_preview_limits_are_normalized() {
-        let mut sessions = SessionAnalyticsQuery::default();
-        assert_eq!(sessions.limit, 50);
-        assert_eq!(sessions.normalized_limit(), 50);
-        sessions.limit = 0;
-        assert_eq!(sessions.normalized_limit(), 1);
-        sessions.limit = u16::MAX;
-        assert_eq!(sessions.normalized_limit(), 200);
-
+    fn table_preview_limits_are_normalized() {
         let mut preview = TablePreviewQuery {
             table: "events".to_string(),
             limit: 0,
@@ -1808,23 +1713,5 @@ mod tests {
         assert_eq!(preview.normalized_limit(), 1);
         preview.limit = u16::MAX;
         assert_eq!(preview.normalized_limit(), 500);
-    }
-
-    #[test]
-    fn session_steps_use_a_stable_kind_tag() {
-        let value = serde_json::to_value(SessionStep::User {
-            event_unix_ms: 123,
-            text: "hello".to_string(),
-        })
-        .expect("serialize typed session step");
-
-        assert_eq!(
-            value,
-            serde_json::json!({
-                "kind": "user",
-                "event_unix_ms": 123,
-                "text": "hello",
-            })
-        );
     }
 }

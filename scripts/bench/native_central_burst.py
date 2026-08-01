@@ -968,23 +968,7 @@ def _fixture_database_sql(endpoint: ClickHouseEndpoint, recipe: Mapping[str, Any
   (SELECT max(event_uid) FROM {database}.search_documents FINAL) AS document_max_uid,
   (SELECT uniqExact(doc_id) FROM {database}.search_postings FINAL) AS posting_documents,
   (SELECT docs FROM {database}.search_corpus_stats LIMIT 1) AS corpus_documents,
-  (SELECT count() FROM {database}.mcp_open_sessions FINAL) AS projected_sessions,
-  (SELECT ifNull(sum(total_events), 0) FROM {database}.mcp_open_sessions FINAL)
-    AS projected_session_events,
-  (SELECT count()
-   FROM {database}.mcp_open_events AS e FINAL
-   INNER JOIN {database}.mcp_open_sessions AS s FINAL
-     ON e.session_id = s.session_id
-     AND e.slot = s.slot
-     AND e.generation = s.generation) AS projected_events,
-  (SELECT count()
-   FROM {database}.mcp_open_dirty_sessions AS d FINAL
-   LEFT JOIN {database}.mcp_open_sessions AS s FINAL
-     ON d.session_id = s.session_id
-   WHERE d.dirty_revision > ifNull(s.dirty_revision, 0)) AS dirty_session_count,
-  (SELECT countIf(state_key = 'global' AND ready = 1 AND backfill_cursor = '')
-   FROM {database}.mcp_open_projection_state FINAL) AS projection_ready_rows
-  ,(SELECT countIf(
+  (SELECT countIf(
       source_host = ''
       AND source_name = {source_name}
       AND source_file = {source_file}
@@ -1043,11 +1027,6 @@ def _validate_fixture_database_evidence(
         "document_max_uid",
         "posting_documents",
         "corpus_documents",
-        "projected_sessions",
-        "projected_session_events",
-        "projected_events",
-        "dirty_session_count",
-        "projection_ready_rows",
         "publication_head_count",
         "active_checkpoint_count",
         "publication_readiness_count",
@@ -1102,11 +1081,6 @@ def _validate_fixture_database_evidence(
         and evidence["document_max_uid"] == expected_max_uid
         and evidence["posting_documents"] == expected_documents
         and evidence["corpus_documents"] == expected_documents
-        and evidence["projected_sessions"] == evidence["event_sessions"]
-        and evidence["projected_session_events"] == expected_documents
-        and evidence["projected_events"] == expected_documents
-        and evidence["dirty_session_count"] == 0
-        and evidence["projection_ready_rows"] == 1
         and evidence["publication_head_count"] == 1
         and evidence["active_checkpoint_count"] == 1
         and evidence["publication_readiness_count"] == 1
@@ -1146,11 +1120,6 @@ def _fixture_database_evidence(
         "documents_unique_ids",
         "posting_documents",
         "corpus_documents",
-        "projected_sessions",
-        "projected_session_events",
-        "projected_events",
-        "dirty_session_count",
-        "projection_ready_rows",
         "publication_head_count",
         "active_checkpoint_count",
         "publication_readiness_count",
@@ -1180,7 +1149,7 @@ def _fixture_database_evidence(
     _validate_fixture_database_evidence(evidence, recipe)
     if not evidence["pass"]:
         raise NativeBurstFailure(
-            "native fixture database is not isolated, complete, and projection-ready"
+            "native fixture database is not isolated, complete, and indexed"
         )
     return evidence
 

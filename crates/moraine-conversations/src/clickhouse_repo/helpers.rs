@@ -7,10 +7,11 @@ impl ClickHouseConversationRepository {
 
     pub(super) fn mode_aggregate_sql() -> String {
         // Shared authority: the presence-ranked session-mode multiIf lives in
-        // `moraine_clickhouse::canonical_derivations` so the list/search path,
-        // the `mcp_open_*` projector header, and the 036 directory `mode_hint`
-        // agree on mode. This consumer reads the physical `events` columns
-        // (`tool_name`/`event_kind`), unlike the projector's aliased set.
+        // `moraine_clickhouse::canonical_derivations` so the list/search path
+        // and the 036 directory `mode_hint` agree on mode. (The retired
+        // `mcp_open_*` projector header was the third consumer; it read the
+        // same expression through the aliased column set.) This consumer reads
+        // the physical `events` columns, `tool_name`/`event_kind`.
         moraine_clickhouse::canonical_derivations::mode_aggregate_expr(
             moraine_clickhouse::canonical_derivations::DerivationColumns::EVENTS,
         )

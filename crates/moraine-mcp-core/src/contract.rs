@@ -847,13 +847,21 @@ pub fn decode_open_cursor(token: &str) -> ContractResult<OpenCursor> {
 // --- issue-598 v2 canonical `open` continuation cursor (WI-07) --------------
 
 /// The cursor wire version the v2 canonical `open` reader mints (design §6).
-/// Legacy tokens carry `version == 1` and are handled by the v1 paging module;
-/// the version-tolerant [`classify_open_cursor`] recognizes both.
+/// **This build mints only this version.** Legacy tokens carry
+/// `version == 1`; the module that served them is gone (issue #603 WI-10), so
+/// nothing can mint one again and only tokens already in client hands arrive
+/// here. The version-tolerant [`classify_open_cursor`] still recognizes them
+/// on purpose — as [`OpenCursorClassified::V1Legacy`], which `open_v2` refuses
+/// with [`OPEN_CURSOR_STALE_REOPEN_MESSAGE`]. A client mid-pagination across
+/// the upgrade gets a reopen instruction rather than "cursor is malformed".
 pub const OPEN_CURSOR_V2_VERSION: u8 = 2;
 
 /// The message a legacy v1 continuation token yields on the v2 path, and the
 /// text the v2 reader uses for a repository-signalled staleness reopen (design
-/// §6, reusing the v1 stale-cursor wording, open_v1.rs).
+/// §6). The wording is inherited from the retired v1 reader deliberately, so a
+/// client that already handles it keeps working; the same inheritance is
+/// recorded for session-list tokens on
+/// `moraine_conversations::cursor::MCP_SESSION_LIST_CURSOR_VERSION_HEADERS`.
 pub const OPEN_CURSOR_STALE_REOPEN_MESSAGE: &str =
     "cursor snapshot is stale; reopen the target to restart expansion";
 

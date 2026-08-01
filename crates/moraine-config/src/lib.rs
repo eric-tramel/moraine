@@ -343,33 +343,28 @@ impl Default for SqliteIngestConfig {
 }
 
 /// The configured `[mcp] open_reader` selector for the `open` tool family
-/// (issue #598 BINDING D6). It decides which repository reader backs
-/// `open(session|turn|event)`:
+/// (issue #598 BINDING D6; retired to a single reader by issue #603 WI-10).
 ///
-/// - [`OpenReaderMode::Auto`] (the default): use the canonical v2 reader only
-///   once its read indexes are published (`open_v2.ready == 1`) AND the backend
-///   is the default single-owner Local backend; otherwise stay on the legacy v1
-///   projected reader. Readiness is cached monotonically after the first
-///   positive, so a mid-run demotion never happens.
-/// - [`OpenReaderMode::V1`]: force the legacy v1 reader regardless of published
-///   readiness — the non-silent operational kill-switch. `moraine status` and
-///   `moraine db doctor` must surface that an override is in effect.
-/// - [`OpenReaderMode::V2`]: force the canonical v2 reader (for testing or a
-///   promoted Shared backend). When the indexes are not ready the reader fails
-///   with a typed error rather than silently falling back to v1.
+/// Since WI-10 dropped the legacy v1 projection, the canonical v2 reader is
+/// the only reader, and `auto` and `v2` are synonyms: serve v2 once its read
+/// indexes are published (`open_v2.ready == 1`), fail with a typed error
+/// otherwise. `v1` — the former kill-switch — is still **accepted** so an
+/// existing `moraine.toml` cannot brick the load on upgrade, but it selects
+/// nothing: reads are served by v2, and `moraine status` / `moraine db
+/// doctor` surface that the configured selector is retired. Remove it from
+/// the config at leisure.
 ///
-/// The value is validated at config load (an unknown string is rejected with a
-/// friendly error listing the valid selectors), and a config override beats the
-/// process-cached readiness at process start.
+/// The value is validated at config load (an unknown string is rejected with
+/// a friendly error listing the valid selectors).
 #[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum OpenReaderMode {
-    /// Readiness- and Local-gated selection (the default).
+    /// Readiness-gated canonical reader (the default; synonym of `V2`).
     #[default]
     Auto,
-    /// Force the legacy v1 projected reader (the kill-switch).
+    /// The retired v1 kill-switch. Accepted-and-noted; serves v2.
     V1,
-    /// Force the canonical v2 reader.
+    /// The canonical v2 reader (synonym of `Auto`).
     V2,
 }
 
@@ -401,51 +396,38 @@ impl OpenReaderMode {
         }
     }
 
-    /// Resolve the configured selector against the published `open_v2` readiness
-    /// and the backend's Local status (BINDING D6/D3). This is the single
-    /// authority for turning config + readiness into an effective reader and is
+    /// Resolve the configured selector against the published `open_v2`
+    /// readiness (BINDING D6, post-WI-10 form). This is the single authority
+    /// for turning config + readiness into an effective reader and is
     /// consumed by status/doctor surfacing and repository dispatch alike.
     ///
-    /// `open_v2_ready` is `mcp_read_index_state('open_v2').ready == 1`;
-    /// `publication_mode_is_local` is whether the backend is the default
-    /// single-owner Local backend (only the Local backend auto-selects v2).
-    pub fn resolve(
-        self,
-        open_v2_ready: bool,
-        publication_mode_is_local: bool,
-    ) -> OpenReaderResolution {
-        match self {
-            // Non-silent kill-switch: always v1, flagged as an override.
-            Self::V1 => OpenReaderResolution::V1 {
-                config_override: true,
-            },
-            // Forced v2 (testing / promoted Shared backend). Does NOT require
-            // Local — that is the point of promotion — but does require the
-            // indexes to be ready; otherwise the reader must fail typed rather
-            // than silently fall back.
-            Self::V2 => {
-                if open_v2_ready {
-                    OpenReaderResolution::V2 {
-                        config_override: true,
-                    }
-                } else {
-                    OpenReaderResolution::ForcedV2Unready
-                }
+    /// `open_v2_ready` is `mcp_read_index_state('open_v2').ready == 1`. The
+    /// pre-retirement resolution also consulted whether the backend was the
+    /// default single-owner Local one, because only Local auto-selected v2
+    /// while v1 existed to fall back to; with a single reader the input is
+    /// gone, and a Shared backend serves v2 exactly as Local does.
+    ///
+    /// Whether the configured selector was the retired `v1` kill-switch is
+    /// carried on both arms so no surface can lose the deprecation note.
+    pub fn resolve(self, open_v2_ready: bool) -> OpenReaderResolution {
+        let retired_v1_requested = matches!(self, Self::V1);
+        if open_v2_ready {
+            OpenReaderResolution::V2 {
+                retired_v1_requested,
             }
-            // Default: v2 only when published AND Local.
-            Self::Auto => {
-                if open_v2_ready && publication_mode_is_local {
-                    OpenReaderResolution::V2 {
-                        config_override: false,
-                    }
-                } else {
-                    OpenReaderResolution::V1 {
-                        config_override: false,
-                    }
-                }
+        } else {
+            OpenReaderResolution::Unready {
+                retired_v1_requested,
             }
         }
     }
+
+    /// The operator-facing note for a configured-but-retired `v1` selector,
+    /// rendered by status/doctor and logged by the MCP backend. One string,
+    /// so the surfaces cannot drift.
+    pub const RETIRED_V1_NOTE: &'static str = "open_reader = \"v1\" is retired (issue #603 \
+        WI-10 dropped the v1 projection); the canonical v2 reader serves all reads — remove \
+        the key from [mcp] in moraine.toml";
 }
 
 impl fmt::Display for OpenReaderMode {
@@ -477,16 +459,17 @@ impl<'de> Deserialize<'de> for OpenReaderMode {
 /// readiness (see [`OpenReaderMode::resolve`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenReaderResolution {
-    /// The legacy v1 projected reader is in effect. `config_override` is true
-    /// only when `open_reader = "v1"` forced it (the kill-switch), false when
-    /// auto simply has not selected v2 yet.
-    V1 { config_override: bool },
-    /// The canonical v2 reader is in effect. `config_override` is true when
-    /// `open_reader = "v2"` forced it, false when auto selected it.
-    V2 { config_override: bool },
-    /// `open_reader = "v2"` was forced but the read indexes are not ready:
-    /// `open` must fail with a typed error rather than fall back to v1.
-    ForcedV2Unready,
+    /// The canonical v2 reader is in effect — the only reader since issue
+    /// #603 WI-10 retired the v1 projection. `retired_v1_requested` is true
+    /// when the config still says `v1`; the request is honored with v2 and
+    /// the surfaces say so ([`OpenReaderMode::RETIRED_V1_NOTE`]).
+    V2 { retired_v1_requested: bool },
+    /// The read indexes are not ready: `open` must fail with a typed error
+    /// naming the sweep, because there is no other reader to fall back to.
+    /// Reachable only before the first canonical sweep of a fresh store
+    /// completes — migration 041 refuses to retire a populated projection
+    /// until `open_v2` published.
+    Unready { retired_v1_requested: bool },
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -539,10 +522,13 @@ pub struct McpConfig {
     #[serde(default = "default_central_connect_timeout_ms")]
     pub central_connect_timeout_ms: u64,
     /// Selects which repository reader backs the `open` tool family
-    /// (issue #598). `"auto"` (the default) uses the canonical v2 reader once
-    /// its indexes are published on a Local backend; `"v1"` forces the legacy
-    /// projected reader (the non-silent kill-switch); `"v2"` forces the
-    /// canonical reader. Validated at config load; see [`OpenReaderMode`].
+    /// (issue #598). One reader survives issue #603 WI-10, so this key no
+    /// longer selects between engines: `"auto"` (the default) and `"v2"` both
+    /// use the canonical reader once its indexes are published, and `"v1"` is
+    /// still ACCEPTED — an existing config keeps loading — but selects nothing.
+    /// It is served by v2 and reported with [`OpenReaderMode::RETIRED_V1_NOTE`]
+    /// on the status/doctor surfaces. Validated at config load; see
+    /// [`OpenReaderMode`].
     #[serde(default)]
     pub open_reader: OpenReaderMode,
 }
@@ -604,7 +590,7 @@ pub struct QueryBudgetClassConfig {
 pub struct QueryBudgetsConfig {
     /// MCP tools, monitor reads, CLI status/doctor and other user-facing reads.
     pub interactive: QueryBudgetClassConfig,
-    /// Ingest publication inspections, projection refreshes, janitor work.
+    /// Ingest publication inspections and janitor work.
     pub background: QueryBudgetClassConfig,
     /// Schema migrations and read-model backfill machinery.
     pub migration: QueryBudgetClassConfig,
@@ -625,9 +611,10 @@ const DEFAULT_INTERACTIVE_QUERY_BUDGET: QueryBudgetClassConfig = QueryBudgetClas
 };
 
 const DEFAULT_BACKGROUND_QUERY_BUDGET: QueryBudgetClassConfig = QueryBudgetClassConfig {
-    // 600s matches the projection debounce ceiling so the worst-case
-    // legitimate projection refresh fits inside one budget (amendment A7);
-    // allowances are sized for publication-actor full-table inspections.
+    // 600s was chosen to match the retired v1 projection's debounce ceiling
+    // (amendment A7); issue #603 WI-10 removed that consumer, and the value is
+    // kept because it is also the janitor's largest legitimate single unit.
+    // Allowances are sized for publication-actor full-table inspections.
     deadline_seconds: 600.0,
     memory_bytes: 2 * BYTES_PER_GIB,
     spill_bytes: 512 * BYTES_PER_MIB,
@@ -980,7 +967,10 @@ impl ValidatedQueryBudgets {
 ///
 /// The horizon must exceed (a) the longest legitimate publication-pin
 /// lifetime, which is one request and therefore seconds; (b) the longest
-/// legitimate projection `prepare` window before its header is written; and
+/// legitimate window in which derived rows exist before the write that
+/// authorizes them lands — the canonical read-index generation's publish step,
+/// and until issue #603 WI-10 also the projection's `prepare` before its header
+/// was written; and
 /// (c) an operator's chance to notice a bad publication and roll back. (a) and
 /// (b) argue minutes; (c) argues a day. This is the floor, not just the
 /// default: a config naming a shorter horizon is rejected at load.
@@ -1058,23 +1048,30 @@ pub struct RetentionConfig {
     /// Bucket 1 retention in days. **Absent by default.**
     pub canonical_history_horizon_days: Option<f64>,
     /// Whether the ingest maintenance tick drives issue #603 storage
-    /// reclamation for the two bucket-3 `mcp_open` scopes.
+    /// reclamation for the bucket-3 canonical read-index scope. That is the
+    /// one scope the janitor may drive: the two `mcp_open` scopes this key was
+    /// introduced for were retired with their tables by WI-10 / migration 041,
+    /// and `sink::STORAGE_RECLAIM_MAINTENANCE_SCOPES` is the authority.
     ///
     /// **`false` by default, and that default is the point of the key.**
     ///
     /// A reclaim delete is a server-side mutation that writes a `_row_exists`
     /// mask into every part it touches, so the disk grows before background
-    /// merges shrink it — and the delete against `mcp_open_events` cannot be
-    /// index-pruned at all. That table is `PARTITION BY cityHash64(event_uid)
-    /// % 64 PRIMARY KEY (event_uid, slot)` while the unit key is
-    /// `(session_id, candidate_generation)`, so `EXPLAIN indexes = 1` reports
-    /// `Condition: true` and reads every active part and every granule. That is
-    /// a property of the sort key and holds on any day; the size of the scan is
-    /// not, and is of order 10 GiB on the reference host (sampled 2026-07-28:
-    /// 452/452 parts, 9 692/9 692 granules over 9.66 GiB — the counts move with
-    /// every background merge, the shape does not). Defaulting a 60-second tick
-    /// into that on a host with no headroom turns disk pressure into an
-    /// outage.
+    /// merges shrink it, and whether the delete can be index-pruned at all
+    /// depends on the target's sort key rather than on the unit's.
+    ///
+    /// The worst case measured under this key was the retired `mcp_open_events`
+    /// scope, and it is worth keeping as the reason the default is `false`:
+    /// that table was `PARTITION BY cityHash64(event_uid) % 64 PRIMARY KEY
+    /// (event_uid, slot)` while the unit key was `(session_id,
+    /// candidate_generation)`, so `EXPLAIN indexes = 1` reported
+    /// `Condition: true` and read every active part and every granule
+    /// (sampled 2026-07-28 on the reference host: 452/452 parts,
+    /// 9 692/9 692 granules over 9.66 GiB). Migration 041 dropped that table,
+    /// so no such scan is reachable from this key today — but a future scope
+    /// whose target is keyed against its unit reintroduces it, and defaulting a
+    /// 60-second tick into that on a host with no headroom turns disk pressure
+    /// into an outage.
     ///
     /// `moraine db reclaim run --confirm` is always available and is **not**
     /// gated on this key: an operator watching the host can reclaim whenever
@@ -3634,56 +3631,68 @@ max_parallel_requests = 0
         assert!(message.contains("v2"), "message: {message}");
     }
 
+    /// Issue #603 WI-10 config compatibility: an existing `open_reader =
+    /// "v1"` must not brick the load — it is accepted, resolved to the v2
+    /// reader, and flagged so status/doctor render the retirement note.
+    ///
+    /// MUTATION (executed 2026-08-01): remove the `V1` arm from
+    /// `OpenReaderMode::parse` (the "just reject it" retirement) => FAILS
+    /// here on the load, which is the exact brick this test forbids. The
+    /// load assertion is deliberately inside THIS test and not only in
+    /// `load_config_accepts_every_open_reader_selector`: without it, the
+    /// mutation left this test — the one whose name claims `v1` is accepted
+    /// — green, and a guard that cannot fail for its own claim is the shape
+    /// this epic keeps paying for.
+    ///
+    /// MUTATION (executed 2026-08-01): remove the `V1` variant from
+    /// `OpenReaderMode` entirely => fails to compile here and in every other
+    /// `OpenReaderMode::V1` reference. **Width: the variant is the
+    /// compatibility surface, so deleting it cannot be silent.**
     #[test]
-    fn open_reader_v1_override_beats_published_readiness() {
-        // The kill-switch forces v1 even when the indexes are ready and Local,
-        // and is flagged as an override so status/doctor can surface it.
+    fn open_reader_v1_is_accepted_and_serves_v2_with_the_retirement_note() {
+        // The load path: an existing moraine.toml carrying the retired
+        // kill-switch must still produce a config, not an error.
+        let path = write_temp_config("[mcp]\nopen_reader = \"v1\"\n", "mcp-open-reader-v1-compat");
+        let cfg = load_config(&path).expect("open_reader = \"v1\" must not brick the load");
+        assert_eq!(cfg.mcp.open_reader, OpenReaderMode::V1);
+
         assert_eq!(
-            OpenReaderMode::V1.resolve(true, true),
-            OpenReaderResolution::V1 {
-                config_override: true
+            OpenReaderMode::V1.resolve(true),
+            OpenReaderResolution::V2 {
+                retired_v1_requested: true
             }
         );
+        assert_eq!(
+            OpenReaderMode::V1.resolve(false),
+            OpenReaderResolution::Unready {
+                retired_v1_requested: true
+            }
+        );
+        assert!(OpenReaderMode::RETIRED_V1_NOTE.contains("retired"));
+        assert!(OpenReaderMode::RETIRED_V1_NOTE.contains("moraine.toml"));
     }
 
+    /// `auto` and `v2` are synonyms since WI-10: one reader, gated on
+    /// readiness alone (the Local/Shared distinction resolved which reader
+    /// auto picked while v1 existed; it no longer participates).
     #[test]
-    fn open_reader_auto_selects_v2_only_when_ready_and_local() {
-        assert_eq!(
-            OpenReaderMode::Auto.resolve(true, true),
-            OpenReaderResolution::V2 {
-                config_override: false
-            }
-        );
-        // Not ready: stay on v1 (not an override).
-        assert_eq!(
-            OpenReaderMode::Auto.resolve(false, true),
-            OpenReaderResolution::V1 {
-                config_override: false
-            }
-        );
-        // Ready but Shared (not Local): auto never auto-selects v2 there.
-        assert_eq!(
-            OpenReaderMode::Auto.resolve(true, false),
-            OpenReaderResolution::V1 {
-                config_override: false
-            }
-        );
-    }
-
-    #[test]
-    fn open_reader_v2_forces_v2_without_requiring_local_but_fails_when_unready() {
-        // Forced v2 does not require Local (that is the promoted-Shared case).
-        assert_eq!(
-            OpenReaderMode::V2.resolve(true, false),
-            OpenReaderResolution::V2 {
-                config_override: true
-            }
-        );
-        // Forced v2 with unready indexes yields the typed no-fallback outcome.
-        assert_eq!(
-            OpenReaderMode::V2.resolve(false, true),
-            OpenReaderResolution::ForcedV2Unready
-        );
+    fn open_reader_auto_and_v2_are_synonyms_gated_on_readiness_alone() {
+        for mode in [OpenReaderMode::Auto, OpenReaderMode::V2] {
+            assert_eq!(
+                mode.resolve(true),
+                OpenReaderResolution::V2 {
+                    retired_v1_requested: false
+                },
+                "{mode}"
+            );
+            assert_eq!(
+                mode.resolve(false),
+                OpenReaderResolution::Unready {
+                    retired_v1_requested: false
+                },
+                "{mode}"
+            );
+        }
     }
 
     fn assert_backend_defaults(backend: &BackendConfig) {

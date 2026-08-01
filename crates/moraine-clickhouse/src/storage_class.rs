@@ -187,18 +187,19 @@ pub const SCHEMA_VIEW_OBJECTS: &[&str] = &[
     "v_live_tool_io",
     "v_live_search_documents",
     "v_live_search_postings",
-    "v_mcp_open_publication_headers",
-    "v_current_mcp_open_generation_readiness",
     "v_publication_diagnostics",
 ];
 
 /// The §1 ownership model. Every physical table in the Moraine database plus
 /// the three ClickHouse system logs.
 ///
-/// Verified against the reference host on 2026-07-27: `system.tables` reports
-/// exactly 32 non-view relations in `moraine`, and this list carries those 32
+/// Verified against the reference host on 2026-07-27: `system.tables` reported
+/// exactly 32 non-view relations in `moraine`, and this list carried those 32
 /// plus `storage_reclaim_ledger` (added by migration 038) and the 3 system
-/// logs.
+/// logs. Migration 041 (issue #603 WI-10) then dropped the eight-table
+/// `mcp_open_*` projection family; those names moved to [`RETIRED_TABLES`],
+/// which is what keeps the historical migrations that created and truncated
+/// them judgeable — see [`classify_at_version`].
 pub const CLASSIFIED_TABLES: &[ClassifiedTable] = &[
     // ---- Bucket 1 — canonical user history -------------------------------
     ClassifiedTable {
@@ -303,51 +304,6 @@ pub const CLASSIFIED_TABLES: &[ClassifiedTable] = &[
                     oq1_search_conversation_terms_is_decommissioned_not_reclaimed`.",
     },
     // ---- Bucket 3 — rebuildable derived data -----------------------------
-    ClassifiedTable {
-        name: "mcp_open_events",
-        class: TableClass::Derived,
-        rationale: "Legacy open projection. `candidate_generation` is in the sort key so \
-                    ReplacingMergeTree can never collapse two candidate generations — the \
-                    uncollapsible-generation mechanism behind the PR-604 disk-fill incident.",
-    },
-    ClassifiedTable {
-        name: "mcp_open_turns",
-        class: TableClass::Derived,
-        rationale: "Same uncollapsible-generation property; the single largest table on the \
-                    reference host, almost entirely `event_summaries_json`.",
-    },
-    ClassifiedTable {
-        name: "mcp_open_publication_headers",
-        class: TableClass::Derived,
-        rationale: "One durable row per candidate publication per session; the authorization \
-                    barrier a reader pins. Never collapses.",
-    },
-    ClassifiedTable {
-        name: "mcp_open_sessions",
-        class: TableClass::Derived,
-        rationale: "Published per-session pointer for the v1 open engine. Collapses cleanly.",
-    },
-    ClassifiedTable {
-        name: "mcp_open_generation_readiness",
-        class: TableClass::Derived,
-        rationale: "Grows as candidate-publications x sources.",
-    },
-    ClassifiedTable {
-        name: "mcp_open_dirty_sessions",
-        class: TableClass::Derived,
-        rationale: "Projection debt queue; post-merge bounded by session count.",
-    },
-    ClassifiedTable {
-        name: "mcp_open_backfill_plans",
-        class: TableClass::Derived,
-        rationale: "One row per session mid-backfill. A live plan row is also the exclusion \
-                    that keeps orphan reclaim off a session currently being prepared.",
-    },
-    ClassifiedTable {
-        name: "mcp_open_projection_state",
-        class: TableClass::Derived,
-        rationale: "Single 'global' row; the v1 projection readiness flag.",
-    },
     ClassifiedTable {
         name: "mcp_session_directory",
         class: TableClass::Derived,
@@ -472,6 +428,149 @@ pub fn classify(table: &str) -> Option<TableClass> {
 /// The full classification entry, including the rationale, for `table`.
 pub fn classification(table: &str) -> Option<&'static ClassifiedTable> {
     CLASSIFIED_TABLES.iter().find(|entry| entry.name == table)
+}
+
+/// One table that existed, held a classification, and was dropped by a
+/// bundled migration (issue #603 WI-10).
+#[derive(Debug, Clone, Copy)]
+pub struct RetiredTable {
+    /// Unqualified table name inside the Moraine database.
+    pub name: &'static str,
+    /// The class the table held while it existed — the class every migration
+    /// **before** [`Self::retired_by`] is judged under, so history stays
+    /// exactly as legal as it was when it was written.
+    pub class: TableClass,
+    /// The bundled migration that drops it. From this version onward
+    /// (inclusive) the name is unknown to [`classify_at_version`], so the
+    /// retiring migration's own drops are findings the
+    /// [`MIGRATION_DELETE_ALLOWLIST`] must license explicitly, and any later
+    /// migration that names the table fails the gate outright.
+    pub retired_by: &'static str,
+    /// Whether a row in this table is *projected content* — something that
+    /// exists only because the v1 projector ran over a corpus.
+    ///
+    /// Seven of the eight are content. `mcp_open_projection_state` is not: it
+    /// is the family's bookkeeping marker, and five of the migrations that
+    /// build the family seed it **without reading any corpus** (seven
+    /// `INSERT`s, none of which reads one; 027's is guarded, but only against
+    /// the marker table itself), so a store that has never projected anything
+    /// still holds rows there. Corpus-independence, not the absence of a
+    /// `WHERE`, is what the derivation tests and what makes the marker useless
+    /// as an emptiness signal. Measured on a real ClickHouse 25.12.5.44
+    /// server, 2026-08-01, after applying bundled migrations 001–040 to an
+    /// empty database: `mcp_open_projection_state` held 2 rows / 392 B across
+    /// 2 active parts, and the other seven tables held nothing at all. The
+    /// exact count is merge state — ReplacingMergeTree collapses those seeds
+    /// in the background — but it is bounded below by one, never zero.
+    ///
+    /// That distinction is what the retirement gate's emptiness arm has to
+    /// measure. Counting the marker rows makes "the projection holds no rows"
+    /// unreachable on every store that ran 027–035 — i.e. every store — so a
+    /// brand-new install is told on first startup that it "has not cut over"
+    /// and pointed at a recovery recipe for a condition it does not have.
+    /// See [`crate::retired_family_footprint_sql`] and
+    /// `the_bookkeeping_table_is_the_one_the_migrations_seed_without_reading_data`.
+    pub holds_projected_content: bool,
+}
+
+/// The retired tables whose rows are projected content — the ones the
+/// retirement gate's emptiness arm measures. Excludes the family's
+/// bookkeeping marker; see [`RetiredTable::holds_projected_content`].
+pub fn retired_content_tables() -> impl Iterator<Item = &'static RetiredTable> {
+    RETIRED_TABLES
+        .iter()
+        .filter(|entry| entry.holds_projected_content)
+}
+
+/// The legacy `mcp_open_*` open-projection family, dropped by migration 041
+/// (issue #603 WI-10, plan WS-1) once the issue-598 canonical read indexes
+/// replaced its every reader. All eight were [`TableClass::Derived`].
+///
+/// Also dropped by 041, needing no entry here because views hold no rows and
+/// `migration_created_tables` never reports them:
+/// `mv_mcp_open_dirty_sessions_from_events`, `v_mcp_open_publication_headers`,
+/// `v_current_mcp_open_generation_readiness`.
+///
+/// `the_retired_roster_matches_migration_041` pins this list against the
+/// retiring migration's actual DROP statements, in both directions.
+pub const RETIRED_TABLES: &[RetiredTable] = &[
+    RetiredTable {
+        name: "mcp_open_events",
+        class: TableClass::Derived,
+        retired_by: "041",
+        holds_projected_content: true,
+    },
+    RetiredTable {
+        name: "mcp_open_turns",
+        class: TableClass::Derived,
+        retired_by: "041",
+        holds_projected_content: true,
+    },
+    RetiredTable {
+        name: "mcp_open_sessions",
+        class: TableClass::Derived,
+        retired_by: "041",
+        holds_projected_content: true,
+    },
+    RetiredTable {
+        name: "mcp_open_dirty_sessions",
+        class: TableClass::Derived,
+        retired_by: "041",
+        holds_projected_content: true,
+    },
+    RetiredTable {
+        name: "mcp_open_publication_headers",
+        class: TableClass::Derived,
+        retired_by: "041",
+        holds_projected_content: true,
+    },
+    RetiredTable {
+        name: "mcp_open_generation_readiness",
+        class: TableClass::Derived,
+        retired_by: "041",
+        holds_projected_content: true,
+    },
+    RetiredTable {
+        name: "mcp_open_backfill_plans",
+        class: TableClass::Derived,
+        retired_by: "041",
+        holds_projected_content: true,
+    },
+    RetiredTable {
+        name: "mcp_open_projection_state",
+        class: TableClass::Derived,
+        retired_by: "041",
+        holds_projected_content: false,
+    },
+];
+
+/// The retirement entry for `table`, when one exists.
+pub fn retired(table: &str) -> Option<&'static RetiredTable> {
+    RETIRED_TABLES.iter().find(|entry| entry.name == table)
+}
+
+/// The classification visible to migration `version` (§4 S4).
+///
+/// A retired table keeps its historical class for every migration strictly
+/// before its retiring version, and is **unknown — therefore guarded — from
+/// the retiring version onward**, the retiring migration included. That split
+/// is what makes retirement a one-way door in the gate: migrations 027–035
+/// truncate and write the `mcp_open_*` family exactly as legally as they did
+/// when the family was classified `Derived`, migration 041's own `DROP`s are
+/// findings that [`MIGRATION_DELETE_ALLOWLIST`] licenses by explicit
+/// `(version, table, shape)` entries, and a migration 042 that named any of
+/// the eight would fail the gate with an unknown-table finding.
+///
+/// Bundled versions are zero-padded three-digit strings, so the lexicographic
+/// comparison is the numeric one.
+pub fn classify_at_version(version: &str, table: &str) -> Option<TableClass> {
+    if let Some(entry) = retired(table) {
+        if version < entry.retired_by {
+            return Some(entry.class);
+        }
+        return None;
+    }
+    classify(table)
 }
 
 /// Every Moraine (non-`system.`) table of `class`, sorted.
@@ -601,6 +700,12 @@ fn classification_gaps_between(
             let mut created: Vec<String> = created
                 .iter()
                 .filter(|name| !classified.contains(name.as_str()))
+                // A table created by one bundled migration and dropped by a
+                // later one is not a gap: it is retired, and
+                // `the_retired_roster_matches_migration_041` is what pins the
+                // roster to the retiring migration's actual DROPs so this
+                // filter cannot silently grow.
+                .filter(|name| retired(name).is_none())
                 .cloned()
                 .collect();
             created.sort();
@@ -856,6 +961,38 @@ pub const MIGRATION_DELETE_ALLOWLIST: &[MigrationRemovalExemption] = &[
         reason: "stamps the three canonical read indexes as built. `mcp_read_index_state` is \
                  never-delete because it is the fence a reader consults before trusting an \
                  index, and these three appends are what set the fence in the first place",
+    },
+    MigrationRemovalExemption {
+        version: "041",
+        tables: &[
+            "mcp_open_events",
+            "mcp_open_turns",
+            "mcp_open_sessions",
+            "mcp_open_dirty_sessions",
+            "mcp_open_publication_headers",
+            "mcp_open_generation_readiness",
+            "mcp_open_backfill_plans",
+            "mcp_open_projection_state",
+        ],
+        shapes: &[DeleteShape::DropRelation],
+        reason: "issue #603 WI-10 retires the legacy mcp_open_* open projection: the canonical \
+                 read indexes replaced its every reader, the runner gates the drop on the \
+                 durable open_v2 cutover (or an empty family), and `classify_at_version` makes \
+                 the eight names unknown-therefore-guarded from this version onward — so these \
+                 eight DROPs are findings that only this entry licenses, and a ninth DROP in \
+                 the same migration fails the retirement drop-set pin",
+    },
+    MigrationRemovalExemption {
+        version: "041",
+        tables: &["storage_reclaim_ledger"],
+        shapes: &[DeleteShape::InsertInto],
+        reason: "settle-by-drop: the retiring migration appends `abandoned` phase rows for \
+                 every unsettled unit of the two retired mcp_open reclaim scopes. The ledger \
+                 is a ReplacingMergeTree keyed on (scope, reclaim_id), so the append is a \
+                 phase advance in the driver's own idiom — dropping the tables satisfied each \
+                 unit's entire target set, and no executor for those scopes exists to drive \
+                 them. Split from the DropRelation entry so the licence is not the cross \
+                 product",
     },
 ];
 
@@ -1679,11 +1816,11 @@ const PROTECTED_REPLACE_HEADS: &[(&str, DeleteShape)] =
 /// an *undeclared* view name is unknown, so it is. That is the condition that
 /// makes `CREATE OR REPLACE VIEW` safe — the name has to be one somebody
 /// registered as a view — rather than the shape of the head.
-fn relation_is_guarded(table: &str) -> bool {
+fn relation_is_guarded(version: &str, table: &str) -> bool {
     if SCHEMA_VIEW_OBJECTS.contains(&table) {
         return false;
     }
-    classify(table).is_none_or(|class| class.is_protected())
+    classify_at_version(version, table).is_none_or(|class| class.is_protected())
         || MIGRATION_PRESERVED_DERIVED_TABLES
             .iter()
             .any(|(name, _)| *name == table)
@@ -1737,7 +1874,7 @@ fn write_target(normalized: &str, head: &str) -> Option<String> {
 /// Returns the matched head — `"ALTER TABLE"` for the clause-parsed case — so a
 /// test can assert *which* entry admitted a statement rather than only that
 /// something did.
-fn benign_shape(statement: &str) -> Option<&'static str> {
+fn benign_shape(version: &str, statement: &str) -> Option<&'static str> {
     let masked = mask_quoted(&statement.to_ascii_uppercase());
     if masked.starts_with("ALTER TABLE ") {
         let relation = named_relations(statement, None).into_iter().next();
@@ -1769,7 +1906,7 @@ fn benign_shape(statement: &str) -> Option<&'static str> {
         // MUTATION: restore the bare `return Some(head)` and
         // `an_insert_whose_target_this_parser_cannot_resolve_is_a_finding` fails.
         if let Some(target) = write_target(statement, head) {
-            return (!relation_is_guarded(&target)).then_some(head);
+            return (!relation_is_guarded(version, &target)).then_some(head);
         }
         return (head != "INSERT INTO ").then_some(head);
     }
@@ -1781,7 +1918,7 @@ fn benign_shape(statement: &str) -> Option<&'static str> {
         // unlike the write heads there is no benign "no target" reading, so an
         // unparseable one is a finding.
         let target = replace_target(statement)?;
-        return (!relation_is_guarded(&target)).then_some(head);
+        return (!relation_is_guarded(version, &target)).then_some(head);
     }
     Some(head)
 }
@@ -2408,7 +2545,7 @@ pub fn migration_row_removals(version: &str, sql: &str) -> Vec<MigrationDeleteFi
             if normalized.is_empty() {
                 return Vec::new();
             }
-            if benign_shape(&normalized).is_some() {
+            if benign_shape(version, &normalized).is_some() {
                 return Vec::new();
             }
             let shape = delete_shape(&normalized);
@@ -2433,8 +2570,11 @@ pub fn migration_row_removals(version: &str, sql: &str) -> Vec<MigrationDeleteFi
                 })
                 .map(|table| {
                     // Unknown => treated as protected (S1: unknown is not
-                    // deletable).
-                    let class = classify(&table).unwrap_or(TableClass::NeverDelete);
+                    // deletable). Retired tables are judged under the class
+                    // they held at this migration's version — see
+                    // [`classify_at_version`].
+                    let class =
+                        classify_at_version(version, &table).unwrap_or(TableClass::NeverDelete);
                     MigrationDeleteFinding {
                         version: version.to_string(),
                         table,
@@ -2452,6 +2592,17 @@ pub fn migration_row_removals(version: &str, sql: &str) -> Vec<MigrationDeleteFi
 mod tests {
     use super::*;
     use crate::bundled_migrations;
+
+    /// Version under which shape probes run when the probe is about the
+    /// parser/gate machinery rather than about retirement: the last bundled
+    /// version before migration 041 retired the `mcp_open_*` family, so the
+    /// family's names still classify `Derived` and remain usable as the
+    /// negative corpus's unguarded-derived control.
+    const PRE_RETIREMENT_VERSION: &str = "040";
+
+    /// A version after every retirement, for probes that must see the
+    /// current rules (retired names unknown, therefore guarded).
+    const POST_RETIREMENT_VERSION: &str = "999";
 
     #[test]
     fn every_class_is_enumerated() {
@@ -2533,13 +2684,19 @@ mod tests {
             !created.contains("schema_migrations"),
             "the migration ledger is created by the runner, not by sql/"
         );
+        // The retired `mcp_open_*` family is created by migrations 027/033/034
+        // and dropped by 041; it is in neither CLASSIFIED_TABLES nor the gap
+        // report, and `the_retired_roster_matches_migration_041` pins that.
+        for retired_table in RETIRED_TABLES {
+            assert!(created.contains(retired_table.name), "{created:?}");
+        }
         let classified: BTreeSet<&str> = CLASSIFIED_TABLES
             .iter()
             .map(|entry| entry.name)
             .filter(|name| !name.starts_with("system."))
             .collect();
         assert_eq!(
-            created.len(),
+            created.len() - RETIRED_TABLES.len(),
             classified.len() - 1,
             "every classified Moraine table except `schema_migrations` is created by a bundled \
              migration: created={created:?}"
@@ -2582,14 +2739,17 @@ mod tests {
     #[test]
     fn classification_covers_the_hosts_thirty_two_physical_tables() {
         // Verified against the reference host 2026-07-27: `system.tables`
-        // reports 32 non-view relations in `moraine`. This build adds
-        // `storage_reclaim_ledger` (migration 038), so the classified Moraine
-        // table count is 33 and the total including system logs is 36.
+        // reported 32 non-view relations in `moraine`. Migration 038 added
+        // `storage_reclaim_ledger` (33) and migration 041 dropped the eight
+        // `mcp_open_*` tables (25); classified + retired must still cover the
+        // full pre-retirement roster, so neither list can silently shrink.
         let moraine_tables = CLASSIFIED_TABLES
             .iter()
             .filter(|entry| !entry.name.starts_with("system."))
             .count();
-        assert_eq!(moraine_tables, 33, "classified Moraine tables");
+        assert_eq!(moraine_tables, 25, "classified Moraine tables");
+        assert_eq!(RETIRED_TABLES.len(), 8, "retired mcp_open_* tables");
+        assert_eq!(moraine_tables + RETIRED_TABLES.len(), 33);
         assert_eq!(CLICKHOUSE_SYSTEM_LOGS.len(), 3);
         assert_eq!(CLASSIFIED_TABLES.len(), moraine_tables + 3);
     }
@@ -2797,6 +2957,1837 @@ mod tests {
         );
     }
 
+    /// **G-RETIRE (the roster).** The retired-table roster and migration 041
+    /// agree exactly, in both directions, and the retired names have really
+    /// left every live surface.
+    ///
+    /// Fails for: a retired name the migration does not drop (the roster
+    /// suppressing a classification gap for a table that still exists), a
+    /// dropped table the roster does not name (an unclassified drop), a
+    /// retired name still registered in the schema handshake or the
+    /// classification, or one no bundled migration ever created.
+    ///
+    /// MUTATION (executed 2026-07-31): add `"events"` to `RETIRED_TABLES`
+    /// (class `Derived`, retired_by "041") => FAILS here on the drop-set
+    /// equality — and `no_bundled_migration_removes_protected_rows` stays
+    /// green through it, which is why this direction needs its own gate.
+    ///
+    /// MUTATION (executed 2026-07-31): remove the `mcp_open_events` entry =>
+    /// FAILS here on the drop-set equality, and
+    /// `classification_and_required_schema_objects_are_mutually_exhaustive`
+    /// fails with it (the created-but-unclassified third side reports it).
+    #[test]
+    fn the_retired_roster_matches_migration_041() {
+        let retiring = bundled_migrations()
+            .into_iter()
+            .find(|migration| migration.version == "041")
+            .expect("the retiring migration is bundled");
+
+        // The migration's DROP TABLE set, read from the SQL itself (through
+        // the same parse the gate uses, at a version where nothing is exempt
+        // and nothing is retired-guarded, so every drop is visible).
+        let mut dropped: Vec<String> = migration_row_removals("000-probe", retiring.sql)
+            .into_iter()
+            .filter(|finding| finding.shape == Some(DeleteShape::DropRelation))
+            .map(|finding| finding.table)
+            .collect();
+        dropped.sort();
+        let mut roster: Vec<String> = RETIRED_TABLES
+            .iter()
+            .map(|entry| entry.name.to_string())
+            .collect();
+        roster.sort();
+        assert_eq!(
+            dropped, roster,
+            "RETIRED_TABLES and migration 041's DROP set must agree exactly"
+        );
+
+        let created: BTreeSet<String> = bundled_migrations()
+            .iter()
+            .filter(|migration| migration.version < "041")
+            .flat_map(|migration| migration_created_tables(migration.sql))
+            .collect();
+        for entry in RETIRED_TABLES {
+            assert_eq!(entry.retired_by, "041", "`{}`", entry.name);
+            assert_eq!(entry.class, TableClass::Derived, "`{}`", entry.name);
+            assert!(
+                created.contains(entry.name),
+                "`{}` was never created by a pre-retirement migration",
+                entry.name
+            );
+            assert!(
+                !REQUIRED_SCHEMA_OBJECTS.contains(&entry.name),
+                "`{}` is retired and must not be required by the schema handshake",
+                entry.name
+            );
+            assert!(
+                classify(entry.name).is_none(),
+                "`{}` is retired and must be unknown to the live classification",
+                entry.name
+            );
+        }
+    }
+
+    /// **G-RETIRE (the drop is scoped).** Migration 041's removal statements
+    /// are exactly the eight family drops plus the one ledger settle — so a
+    /// drop of anything OUTSIDE the family in the same migration fails this
+    /// pin even when the table's class alone would not make it a finding.
+    ///
+    /// MUTATION (executed 2026-07-31): append
+    /// `DROP TABLE IF EXISTS moraine.file_attention_project_roots SYNC;` to
+    /// `sql/041` => FAILS here on the exact-set assertion, naming the drop.
+    /// `no_bundled_migration_removes_protected_rows` stays GREEN through it
+    /// (a `Derived`, non-preserved table is not a protected finding), and
+    /// `every_allowlist_entry_is_load_bearing_and_still_exempts_a_live_\
+    /// migration` also FAILS on the unexempted leak — this pin is the check
+    /// that additionally states the intended drop set, so a widened 041
+    /// allowlist entry cannot quietly relicense the leak. A protected table
+    /// would fail `no_bundled_migration_removes_protected_rows` too, since
+    /// no 041 entry names it.
+    #[test]
+    fn the_retirement_migration_drops_exactly_the_retired_family() {
+        let retiring = bundled_migrations()
+            .into_iter()
+            .find(|migration| migration.version == "041")
+            .expect("the retiring migration is bundled");
+        let mut removals: Vec<(String, Option<DeleteShape>)> =
+            migration_row_removals("000-probe", retiring.sql)
+                .into_iter()
+                .map(|finding| (finding.table, finding.shape))
+                .collect();
+        removals.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut expected: Vec<(String, Option<DeleteShape>)> = RETIRED_TABLES
+            .iter()
+            .map(|entry| (entry.name.to_string(), Some(DeleteShape::DropRelation)))
+            .collect();
+        expected.push((
+            "storage_reclaim_ledger".to_string(),
+            Some(DeleteShape::InsertInto),
+        ));
+        expected.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(removals, expected);
+
+        // And under its own version, the allowlist licenses all of it: the
+        // shipped tree carries zero findings for 041.
+        assert!(
+            migration_delete_findings("041", retiring.sql).is_empty(),
+            "the 041 allowlist entries must cover exactly what the migration does"
+        );
+    }
+
+    /// `materialized view -> the table it writes into`, derived from every
+    /// bundled migration's `CREATE MATERIALIZED VIEW … TO …` DDL. A later
+    /// redefinition of the same view wins, exactly as it does on the server.
+    fn materialized_view_targets() -> std::collections::BTreeMap<String, String> {
+        let mut targets = std::collections::BTreeMap::new();
+        for migration in bundled_migrations() {
+            for statement in crate::split_sql_statements(migration.sql) {
+                let normalized = normalize_statement(&statement);
+                if !normalized
+                    .to_ascii_uppercase()
+                    .starts_with("CREATE MATERIALIZED VIEW ")
+                {
+                    continue;
+                }
+                // Skip `CREATE MATERIALIZED VIEW`, then the optional
+                // `IF NOT EXISTS`, and take the view's own name.
+                let view = normalized
+                    .split_whitespace()
+                    .skip(3)
+                    .find(|word| !is_relation_noise(word))
+                    .and_then(unqualified_name);
+                let (Some(view), Some(target)) =
+                    (view, write_target(&normalized, "CREATE MATERIALIZED VIEW "))
+                else {
+                    continue;
+                };
+                targets.insert(view, target);
+            }
+        }
+        targets
+    }
+
+    /// **G-RETIRE (the drop order is load-bearing).** A materialized view must
+    /// be dropped BEFORE the table it writes into. While
+    /// `mv_mcp_open_dirty_sessions_from_events` is attached, every
+    /// `INSERT INTO moraine.events` — the canonical bucket-1 ingest write path
+    /// — also pushes a row into `mcp_open_dirty_sessions`. Drop that target
+    /// first and every ingest insert fails server-side for as long as the view
+    /// outlives it.
+    ///
+    /// Executed against a ClickHouse **25.12.5.44** server (the version this
+    /// product ships; `clickhouse local` is unusable for this because at
+    /// 25.12.5.44 it hangs indefinitely on `DROP TABLE ... SYNC` for a table
+    /// created in the same process), over a stand-in built from `sql/027`'s
+    /// DDL verbatim. Three measured arms:
+    ///
+    /// * **Reversed, then crash.** Target dropped first, migration dies before
+    ///   the view drop. `INSERT INTO moraine.events` fails `Code: 60.
+    ///   DB::Exception: Target table 'moraine.mcp_open_dirty_sessions' of view
+    ///   'moraine.events' doesn't exists. (UNKNOWN_TABLE)` and the row is LOST
+    ///   — `moraine.events` still holds only the pre-drop baseline row.
+    /// * **Reversed, then replayed.** 041 is not in `schema_migrations`, so the
+    ///   next pass re-applies it — and the replay HEALS the write path rather
+    ///   than re-entering the broken state, because every statement is
+    ///   `IF EXISTS`: the drop of the already-gone target is a no-op and the
+    ///   pass reaches the view drop. The next insert succeeds. So the reversal
+    ///   is an ingest OUTAGE lasting until some pass gets past the view drop,
+    ///   losing every write that arrives meanwhile — **not** a permanently
+    ///   wedged store. (The "permanent" framing in this docstring through
+    ///   review round 2 was wrong, and wrong in the direction that makes a
+    ///   guard sound more load-bearing than it is; it was corrected by
+    ///   executing it.)
+    /// * **Shipped order.** A crash in the corresponding window — after the
+    ///   view drop, before the target drop — breaks nothing: an insert issued
+    ///   between the two statements succeeds and is retained. The shipped order
+    ///   has no window at all.
+    ///
+    /// The pairing is **derived** from the DDL rather than listed here, so a
+    /// later migration that drops another view alongside its target is checked
+    /// by the same rule — and the pair count is asserted, so a derivation that
+    /// silently finds nothing cannot pass.
+    ///
+    /// MUTATION (executed 2026-08-01): move
+    /// `DROP VIEW IF EXISTS moraine.mv_mcp_open_dirty_sessions_from_events`
+    /// after `DROP TABLE IF EXISTS moraine.mcp_open_dirty_sessions SYNC` in
+    /// `sql/041` => FAILS here, and FAILS
+    /// `the_retirement_migration_drops_synchronously_in_the_pinned_order` with
+    /// it. At workspace denominator (`cargo test --workspace --locked
+    /// --no-fail-fast`; unmutated baseline 1666 passed, 0 failed, 20 ignored,
+    /// 28 suites)
+    /// the reversal reports **1664 passed, 2 failed**, and the two failures are
+    /// exactly
+    /// these two tests — nothing else in the workspace notices, which is why
+    /// they had to be written.
+    #[test]
+    fn the_retirement_migration_drops_each_materialized_view_before_its_target_table() {
+        let retiring = bundled_migrations()
+            .into_iter()
+            .find(|migration| migration.version == "041")
+            .expect("the retiring migration is bundled");
+
+        // Every relation 041 drops, and the statement index that drops it.
+        // Parsed here rather than through `named_relations`, which answers
+        // nothing for `DROP VIEW` on purpose (`VIEW` is a NEVER_A_RELATION
+        // keyword, and a view holds no rows for the delete gate to protect) —
+        // and a view is precisely what this ordering rule is about.
+        let mut drop_at: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        for (index, statement) in crate::split_sql_statements(retiring.sql).iter().enumerate() {
+            let normalized = normalize_statement(statement);
+            if !normalized.to_ascii_uppercase().starts_with("DROP ") {
+                continue;
+            }
+            let relation = normalized
+                .split_whitespace()
+                .skip(1)
+                .find(|word| !is_relation_noise(word) && !word.eq_ignore_ascii_case("VIEW"))
+                .and_then(unqualified_name)
+                .unwrap_or_else(|| panic!("unparsed DROP in migration 041: `{normalized}`"));
+            assert!(
+                drop_at.insert(relation.clone(), index).is_none(),
+                "`{relation}` is dropped twice by migration 041"
+            );
+        }
+        assert_eq!(
+            drop_at.len(),
+            RETIRED_TABLES.len() + 3,
+            "041 drops the eight retired tables plus three views: {drop_at:#?}"
+        );
+
+        let targets = materialized_view_targets();
+        let mut pairs = 0;
+        for (view, target) in &targets {
+            let (Some(view_at), Some(target_at)) = (drop_at.get(view), drop_at.get(target)) else {
+                continue;
+            };
+            assert!(
+                view_at < target_at,
+                "migration 041 drops `{target}` (statement {target_at}) while the \
+                 materialized view `{view}` that writes into it is still attached \
+                 (statement {view_at}); every insert into that view's source table \
+                 fails UNKNOWN_TABLE and is lost until the view goes, and a crash \
+                 between the two statements extends that outage to whenever a later \
+                 pass gets past the view drop"
+            );
+            pairs += 1;
+        }
+        assert_eq!(
+            pairs, 1,
+            "041's drop set contains exactly one view/target pair \
+             (mv_mcp_open_dirty_sessions_from_events -> mcp_open_dirty_sessions); the \
+             derivation found {pairs}. A changed drop set must re-state this \
+             denominator deliberately, because a derivation that pairs nothing would \
+             otherwise pass for free. Derived views: {targets:#?}"
+        );
+    }
+
+    /// **G-RETIRE (`SYNC`, and the order it runs in).** Migration 041's DDL is
+    /// pinned as exact normalized text in statement order.
+    ///
+    /// Two claims live in that text and nowhere else:
+    ///
+    /// * **Order.** The dependent view goes before the table it writes into
+    ///   (the reason is on
+    ///   `the_retirement_migration_drops_each_materialized_view_before_its_
+    ///   target_table`), the v1 readiness flag `mcp_open_projection_state`
+    ///   goes first so a straggling down-level reader fails its readiness
+    ///   probe cleanly, and the authorization parent
+    ///   `mcp_open_publication_headers` goes last.
+    /// * **`SYNC`.** The retirement gate's Proceed note tells the operator the
+    ///   `system.parts` bytes it just measured are returned immediately —
+    ///   "DROP TABLE ... SYNC deletes the parts before returning, so unlike a
+    ///   reclaim DELETE none of it is merge-deferred". Without `SYNC` that
+    ///   operator claim is false, on the exact axis **G-DENOM** exists to
+    ///   police. Measured, not assumed: on a ClickHouse **25.12.5.44** server
+    ///   (the shipped version) with
+    ///   `database_atomic_delay_before_drop_table_sec` at its 480 s default,
+    ///   two identically-populated tables were dropped — the plain drop left a
+    ///   row in `system.dropped_tables` (physical removal still pending), the
+    ///   `SYNC` drop left none.
+    ///
+    /// MUTATION (executed 2026-08-01): strip `SYNC` from all eight table drops
+    /// in `sql/041` => FAILS here, and at workspace denominator
+    /// (`cargo test --workspace --locked --no-fail-fast`; unmutated baseline
+    /// 1666 passed, 0 failed, 20 ignored, 28 suites) it reports
+    /// **1665 passed, 1 failed** —
+    /// this test
+    /// is the only one in the workspace that sees the keyword.
+    /// `the_retirement_migration_drops_exactly_the_retired_family` does not:
+    /// it reads shape and count.
+    #[test]
+    fn the_retirement_migration_drops_synchronously_in_the_pinned_order() {
+        let retiring = bundled_migrations()
+            .into_iter()
+            .find(|migration| migration.version == "041")
+            .expect("the retiring migration is bundled");
+        let ddl: Vec<String> = crate::split_sql_statements(retiring.sql)
+            .iter()
+            .map(|statement| normalize_statement(statement))
+            .filter(|statement| !statement.to_ascii_uppercase().starts_with("INSERT INTO"))
+            .collect();
+
+        // The `SYNC` claim, stated on its own so a strip fails with the reason
+        // rather than only with a text diff — and denominated, so the loop
+        // cannot pass by iterating over nothing.
+        let table_drops = ddl
+            .iter()
+            .filter(|statement| statement.to_ascii_uppercase().starts_with("DROP TABLE"))
+            .inspect(|statement| {
+                assert!(
+                    statement.to_ascii_uppercase().ends_with(" SYNC"),
+                    "`{statement}` must drop SYNC: the retirement preflight note promises \
+                     the measured system.parts bytes are returned before the statement \
+                     returns, which is only true of a synchronous drop"
+                );
+            })
+            .count();
+        assert_eq!(table_drops, RETIRED_TABLES.len(), "{ddl:#?}");
+
+        assert_eq!(
+            ddl.iter().map(String::as_str).collect::<Vec<_>>(),
+            vec![
+                "DROP VIEW IF EXISTS moraine.mv_mcp_open_dirty_sessions_from_events",
+                "DROP VIEW IF EXISTS moraine.v_mcp_open_publication_headers",
+                "DROP VIEW IF EXISTS moraine.v_current_mcp_open_generation_readiness",
+                "DROP TABLE IF EXISTS moraine.mcp_open_projection_state SYNC",
+                "DROP TABLE IF EXISTS moraine.mcp_open_events SYNC",
+                "DROP TABLE IF EXISTS moraine.mcp_open_turns SYNC",
+                "DROP TABLE IF EXISTS moraine.mcp_open_sessions SYNC",
+                "DROP TABLE IF EXISTS moraine.mcp_open_dirty_sessions SYNC",
+                "DROP TABLE IF EXISTS moraine.mcp_open_generation_readiness SYNC",
+                "DROP TABLE IF EXISTS moraine.mcp_open_backfill_plans SYNC",
+                "DROP TABLE IF EXISTS moraine.mcp_open_publication_headers SYNC",
+            ],
+            "migration 041's DDL is pinned in statement order; a migration is immutable \
+             once shipped, so a diff here is a change to a statement that has already run \
+             on real stores"
+        );
+    }
+
+    /// **G-RETIRE (the settle actually settles).** Migration 041's
+    /// settle-by-drop statement is pinned as exact normalized text, and its
+    /// scope list is pinned against [`crate::reclaim::RETIRED_SCOPE_STRINGS`]
+    /// in both directions.
+    ///
+    /// Fails for: a settle predicate that selects nothing. That is the whole
+    /// point of the equality — every other assertion this statement has is a
+    /// `contains`, and `contains` cannot see a **narrowing**. A settle that
+    /// reaches the wire and matches zero rows leaves a mid-drain host with
+    /// units permanently `claimed`/`deleting` against tables that no longer
+    /// exist: no executor will ever drive them (their scope no longer parses)
+    /// and no operator report will ever show them settled. It also fails for
+    /// the mirror hazard, a widening that settles a live scope's units — which
+    /// would mark work as abandoned that the reclaimer still has to do.
+    ///
+    /// MUTATION (executed 2026-08-01): append ` AND 0` to the settle's
+    /// `WHERE` in `sql/041` => FAILS here. Recorded because this mutation
+    /// **survived** the three-host walk: `a_cut_over_host_retires_the_
+    /// projection_in_the_first_pass` asserts the statement's substrings
+    /// ('abandoned', both scopes, both phases) and every one of them is still
+    /// present in the neutered statement. That walk proves the settle is
+    /// ISSUED; this proves it MATCHES.
+    ///
+    /// MUTATION (executed 2026-08-01): drop `'mcp_open_retired_lineage'` from
+    /// the migration's scope list => FAILS here on both the text equality and
+    /// the `RETIRED_SCOPE_STRINGS` set equality.
+    #[test]
+    fn the_retirement_settle_matches_exactly_the_retired_scopes_unsettled_units() {
+        let retiring = bundled_migrations()
+            .into_iter()
+            .find(|migration| migration.version == "041")
+            .expect("the retiring migration is bundled");
+        let settles: Vec<String> = crate::split_sql_statements(retiring.sql)
+            .into_iter()
+            .filter(|statement| {
+                normalize_statement(statement)
+                    .to_ascii_uppercase()
+                    .starts_with("INSERT INTO")
+            })
+            .map(|statement| statement.split_whitespace().collect::<Vec<_>>().join(" "))
+            .collect();
+        assert_eq!(
+            settles.len(),
+            1,
+            "exactly one settle statement: {settles:#?}"
+        );
+        assert_eq!(
+            settles[0],
+            "INSERT INTO moraine.storage_reclaim_ledger \
+             (reclaim_id, scope, source_host, source_name, source_file, source_generation, \
+             session_id, candidate_generation, phase, estimated_rows, estimated_bytes, \
+             claimed_at, ledger_revision) \
+             SELECT \
+             reclaim_id, scope, source_host, source_name, source_file, source_generation, \
+             session_id, candidate_generation, 'abandoned', estimated_rows, \
+             estimated_bytes, claimed_at, generateSnowflakeID() \
+             FROM moraine.storage_reclaim_ledger FINAL \
+             WHERE scope IN ('mcp_open_orphan', 'mcp_open_retired_lineage') \
+             AND phase IN ('claimed', 'deleting')",
+            "the settle-by-drop statement is pinned exactly; a narrowing settles nothing and \
+             a widening settles a live scope's work"
+        );
+
+        // The scopes the migration settles are exactly the scopes the code
+        // declares retired — two lists that must agree and otherwise would not.
+        for scope in crate::reclaim::RETIRED_SCOPE_STRINGS {
+            assert!(
+                settles[0].contains(&format!("'{scope}'")),
+                "`{scope}` is declared retired but migration 041 does not settle it"
+            );
+        }
+        let settled_scopes = settles[0]
+            .split("WHERE scope IN (")
+            .nth(1)
+            .and_then(|rest| rest.split(')').next())
+            .expect("the settle carries a scope list")
+            .matches('\'')
+            .count()
+            / 2;
+        assert_eq!(
+            settled_scopes,
+            crate::reclaim::RETIRED_SCOPE_STRINGS.len(),
+            "migration 041 settles a scope that is not declared retired"
+        );
+    }
+
+    /// **G-RETIRE (the header quotes the string moraine prints).** Migration
+    /// 041's header tells the operator that the runner reports the bytes the
+    /// drop returns, and quotes the opening of the note it reports them in. A
+    /// migration is IMMUTABLE once released, so that quotation can never be
+    /// corrected in place — and a quoted operator string that moraine does not
+    /// emit is worse than no quotation, because it sends the operator grepping
+    /// their log for words that are not in it. (The header shipped in review
+    /// round 2 quoted `released N GiB across the mcp_open_* family`, a string
+    /// that appears nowhere in this workspace.)
+    ///
+    /// Both directions are executed. This asserts the header quotes
+    /// [`crate::RETIREMENT_PROCEED_NOTE_PREFIX`]; the runner formats its
+    /// Proceed note FROM that constant, and
+    /// `commands::tests::a_cut_over_host_retires_the_projection_in_the_first_pass`
+    /// asserts the rendered note begins with it. Neither end can move without
+    /// the other.
+    ///
+    /// MUTATION (executed 2026-08-01): replace the quoted line in `sql/041`'s
+    /// header with `released N GiB across the mcp_open_* family` (the round-2
+    /// text) => FAILS here.
+    #[test]
+    fn the_migration_header_quotes_the_note_the_runner_emits() {
+        let header = retirement_migration_header();
+        assert!(
+            header.lines().count() > 20,
+            "migration 041's header is the operator-facing rationale for an immutable \
+             file; {} comment lines is not it",
+            header.lines().count()
+        );
+        assert!(
+            header.contains(crate::RETIREMENT_PROCEED_NOTE_PREFIX.trim_end()),
+            "sql/041's header must quote the preflight note the runner actually emits \
+             (`{}`), because a released migration cannot be corrected in place. Header:\n{header}",
+            crate::RETIREMENT_PROCEED_NOTE_PREFIX
+        );
+    }
+
+    /// Migration 041's leading comment block, joined. The header is comment
+    /// text, so it is not among `statements()`; it is read from the bundled
+    /// file. Callers assert the block is non-empty before asserting its
+    /// contents, or a file trimmed to bare DDL passes those assertions free.
+    fn retirement_migration_header() -> String {
+        let retiring = bundled_migrations()
+            .into_iter()
+            .find(|migration| migration.version == "041")
+            .expect("the retiring migration is bundled");
+        retiring
+            .sql
+            .lines()
+            .take_while(|line| {
+                !line
+                    .trim_start()
+                    .to_ascii_uppercase()
+                    .starts_with("INSERT ")
+            })
+            .filter(|line| line.trim_start().starts_with("--"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// **G-RETIRE (the header's measurement names the column the runner sums).**
+    /// `sql/041`'s header carries one number an operator can hold against what
+    /// moraine prints: the reference host's footprint at the moment the
+    /// migration was written. Two `system.parts` columns could plausibly
+    /// supply it and they disagree — on that host `sum(data_compressed_bytes)`
+    /// was 30 451 044 275 and `sum(bytes_on_disk)` was 30 459 477 709, which
+    /// [`crate::format_binary_bytes`] renders as `28.36 GiB` and `28.37 GiB`.
+    /// Both are AS-OF an instant (below), because background merges move them;
+    /// what does not move is the GAP, which is the whole reason this guard
+    /// exists.
+    /// The header shipped in review round 4 carried the second while
+    /// [`crate::retired_family_footprint_sql`] sums the first, so an operator
+    /// comparing the header against the preflight note would have found a
+    /// discrepancy with no way to tell which end was wrong — and a released
+    /// migration cannot be corrected in place.
+    ///
+    /// Bounded from both sides, and pinned to the extent that matters. The
+    /// statement must sum `data_compressed_bytes` and must NOT mention
+    /// `bytes_on_disk`; the header must name that column, must carry the
+    /// rendering of the compressed figure, and must NOT carry the rendering of
+    /// the on-disk one. The two renderings are asserted distinct first, so a
+    /// `format_binary_bytes` that collapsed them (coarser units, say) fails
+    /// here rather than making the rest pass vacuously.
+    ///
+    /// MUTATION (executed 2026-08-01): restore the round-4 header figure
+    /// `28.37 GiB` => FAILS here. **The header end.**
+    ///
+    /// MUTATION (executed 2026-08-01): make
+    /// [`crate::retired_family_footprint_sql`] sum `bytes_on_disk` => FAILS
+    /// here. **The runner end.**
+    #[test]
+    fn the_header_footprint_figure_is_what_the_runner_would_print() {
+        // Measured read-only on the reference host with the runner's own query
+        // shape, AS OF 2026-08-01 09:15:47 local: 1031 active parts,
+        // 25 114 507 rows. Background merges move the part count and both byte
+        // sums continuously — an earlier read the same day gave 1033 parts,
+        // 30 451 052 638 and 30 459 493 288 — so these are a timestamped
+        // observation, not a constant of the host. What the assertions below
+        // rest on survives that: the two columns render DIFFERENTLY (asserted
+        // outright, first), the row count is stable, and sql/041's header
+        // quotes the compressed rendering.
+        const REFERENCE_COMPRESSED_BYTES: u64 = 30_451_044_275;
+        const REFERENCE_ON_DISK_BYTES: u64 = 30_459_477_709;
+
+        let compressed = crate::format_binary_bytes(REFERENCE_COMPRESSED_BYTES);
+        let on_disk = crate::format_binary_bytes(REFERENCE_ON_DISK_BYTES);
+        assert_ne!(
+            compressed, on_disk,
+            "the two candidate columns must still render differently, or nothing below \
+             distinguishes them"
+        );
+
+        let sql = crate::retired_family_footprint_sql("moraine");
+        assert!(
+            sql.contains("sum(data_compressed_bytes)"),
+            "the footprint statement must sum the column sql/041's header names: {sql}"
+        );
+        assert!(
+            !sql.contains("bytes_on_disk"),
+            "the footprint statement must not read bytes_on_disk — sql/041's header quotes a \
+             measurement of the other column and cannot be edited: {sql}"
+        );
+
+        let header = retirement_migration_header();
+        assert!(
+            header.lines().count() > 20,
+            "migration 041's header is {} comment lines; the assertions below would pass \
+             vacuously against a trimmed file",
+            header.lines().count()
+        );
+        assert!(
+            header.contains("data_compressed_bytes"),
+            "sql/041's header must name the column its measurement came from. Header:\n{header}"
+        );
+        assert!(
+            header.contains(&compressed),
+            "sql/041's header must carry the figure the runner would print for the reference \
+             host's footprint (`{compressed}`). Header:\n{header}"
+        );
+        assert!(
+            !header.contains(&on_disk),
+            "sql/041's header carries `{on_disk}`, which is sum(bytes_on_disk) — a column the \
+             runner does not read. Header:\n{header}"
+        );
+        assert!(
+            header.contains("25,114,507"),
+            "the row count comes from the same statement as the byte figure and must travel \
+             with it. Header:\n{header}"
+        );
+    }
+
+    /// **G-RETIRE (the gate's emptiness test measures data, not bookkeeping).**
+    /// Migration 041's third arm — "nothing was ever projected here, so the
+    /// drop loses nothing" — is the arm a fresh install takes, and through
+    /// review round 4 it was unreachable: `retired_family_footprint` summed all
+    /// eight tables, and `mcp_open_projection_state` is seeded UNCONDITIONALLY
+    /// by five of them — 027 (`WHERE NOT EXISTS`), 029 (`VALUES`), 033, 034
+    /// and 035 — across seven `INSERT`s, none reading a corpus. Executed
+    /// against a real ClickHouse 25.12.5.44 server with bundled migrations
+    /// 001–040 applied to an empty database: the family held 2 rows / 392 B,
+    /// every byte of it that marker, and the runner deferred 041 on a
+    /// brand-new store while telling its operator to run `moraine db
+    /// core-index rebuild`. (2 is merge state, not a constant — seven
+    /// unconditional seeds that ReplacingMergeTree collapses; what the arm
+    /// rests on is that it is never 0.)
+    ///
+    /// So the split has to be derived from the migrations, not asserted from
+    /// memory. A retired table is BOOKKEEPING exactly when some bundled
+    /// migration seeds it with a statement whose row source is data-independent
+    /// — no `FROM moraine.<other table>` — because such a table is non-empty on
+    /// every store that ran the migration and therefore cannot distinguish a
+    /// store that projected something from one that never did.
+    ///
+    /// Bounded from both sides and pinned to its extent: the derived
+    /// bookkeeping set must equal the set flagged `!holds_projected_content`,
+    /// the derived seeding migrations are named, the split is 1 of 8, and
+    /// [`crate::retired_family_footprint_sql`]'s content list must be exactly
+    /// the other seven — so a flag that drifts from the SQL, and a statement
+    /// that stops honoring the flag, both fail here.
+    ///
+    /// The derivation also owns the SENTENCE. The gate's no-projected-content
+    /// note names the seeding migrations to an operator, and that list is the
+    /// one thing here a human would otherwise transcribe from memory — review
+    /// round 6 transcribed "migrations 027 and 029", the orchestrator brief's
+    /// wording, into the only string an operator ever sees, while this walk was
+    /// already asserting five migrations and seven `INSERT`s three screens
+    /// above and `sql/041`'s immutable header was spelling the list correctly.
+    /// So [`crate::BOOKKEEPING_SEED_CLAUSE`] is checked against the derived
+    /// set both ways: every derived version must appear in it, no other bundled
+    /// version may, and its count word must be the number of seeds found.
+    ///
+    /// MUTATION (executed 2026-08-01): flip
+    /// `mcp_open_projection_state`'s `holds_projected_content` to `true` =>
+    /// FAILS here. Nothing else in the tree notices: the three retirement
+    /// shape walks steer the footprint probe's four figures directly, so the
+    /// stand-in cannot see which tables the statement summed.
+    ///
+    /// MUTATION (executed 2026-08-01): reword
+    /// [`crate::BOOKKEEPING_SEED_CLAUSE`] to review round 6's spelling —
+    /// "migrations 027 and 029 … (two INSERTs …)" — => FAILS here on the count
+    /// word ("the derivation finds 7 data-independent seeds, but the note an
+    /// operator reads says: …"), which is asserted before the version loop and
+    /// so is where it stops. It does NOT fail the fresh-install shape walk:
+    /// that walk interpolates this same constant into its expectation, so a
+    /// reworded constant moves both sides together. Deriving the sentence is
+    /// the only thing that can tell it is wrong. **The sentence half.**
+    #[test]
+    fn the_bookkeeping_table_is_the_one_the_migrations_seed_without_reading_data() {
+        let migrations = bundled_migrations();
+        let mut derived: Vec<(&str, &'static str)> = Vec::new();
+        for migration in &migrations {
+            if migration.version >= crate::RETIREMENT_MIGRATION_VERSION {
+                continue;
+            }
+            for statement in crate::split_sql_statements(migration.sql) {
+                let squashed = statement.split_whitespace().collect::<Vec<_>>().join(" ");
+                let Some(rest) = squashed.strip_prefix("INSERT INTO moraine.") else {
+                    continue;
+                };
+                let named = rest
+                    .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .next()
+                    .unwrap_or_default();
+                let Some(target) = retired(named).map(|entry| entry.name) else {
+                    continue;
+                };
+                // Data-independent iff no `FROM moraine.<other>`: a seed that
+                // reads only itself (027's `WHERE NOT EXISTS` guard) or reads
+                // nothing (029's `VALUES`) writes its row on an empty store.
+                let reads_other_data = squashed
+                    .match_indices("FROM moraine.")
+                    .any(|(at, _)| !squashed[at + 13..].starts_with(target));
+                if !reads_other_data {
+                    derived.push((migration.version, target));
+                }
+            }
+        }
+        derived.sort_unstable();
+        assert_eq!(
+            derived,
+            vec![
+                ("027", "mcp_open_projection_state"),
+                ("029", "mcp_open_projection_state"),
+                ("033", "mcp_open_projection_state"),
+                ("034", "mcp_open_projection_state"),
+                ("034", "mcp_open_projection_state"),
+                ("035", "mcp_open_projection_state"),
+                ("035", "mcp_open_projection_state"),
+            ],
+            "the data-independent family seeds in the bundled migrations"
+        );
+
+        // The operator-facing sentence names the DERIVED set. Both directions
+        // plus the count, so neither an unnamed seeding migration nor an
+        // invented one nor a stale total survives.
+        const COUNT_WORDS: [&str; 11] = [
+            "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+        ];
+        let clause = crate::BOOKKEEPING_SEED_CLAUSE;
+        let mut seeding: Vec<&str> = derived.iter().map(|(version, _)| *version).collect();
+        seeding.dedup();
+        assert!(
+            clause.contains(&format!("{} INSERTs", COUNT_WORDS[derived.len()])),
+            "the derivation finds {} data-independent seeds, but the note an operator reads \
+             says: {clause}",
+            derived.len()
+        );
+        for version in &seeding {
+            assert!(
+                clause.contains(version),
+                "migration {version} seeds the marker without reading other data, so a store \
+                 that ran it holds marker rows — but the note does not name it: {clause}"
+            );
+        }
+        for migration in &migrations {
+            assert!(
+                seeding.contains(&migration.version) || !clause.contains(migration.version),
+                "the note names migration {}, which seeds the marker under no data-independent \
+                 statement: {clause}",
+                migration.version
+            );
+        }
+
+        let mut bookkeeping: Vec<&str> = derived.iter().map(|(_, table)| *table).collect();
+        bookkeeping.dedup();
+        let mut flagged: Vec<&str> = RETIRED_TABLES
+            .iter()
+            .filter(|entry| !entry.holds_projected_content)
+            .map(|entry| entry.name)
+            .collect();
+        flagged.sort_unstable();
+        assert_eq!(
+            bookkeeping, flagged,
+            "the tables the migrations seed without reading data and the tables flagged \
+             as bookkeeping must be the same set"
+        );
+        assert_eq!(
+            retired_content_tables().count(),
+            RETIRED_TABLES.len() - 1,
+            "exactly one of the eight is bookkeeping; a second would need its own derivation"
+        );
+
+        // And the statement the gate actually issues honors the split.
+        let sql = crate::retired_family_footprint_sql("moraine");
+        let content_clause = sql
+            .split("sumIf(rows, table IN (")
+            .nth(1)
+            .and_then(|rest| rest.split("))").next())
+            .expect("the footprint statement carries a content-table list");
+        for entry in RETIRED_TABLES {
+            assert_eq!(
+                content_clause.contains(&format!("'{}'", entry.name)),
+                entry.holds_projected_content,
+                "`{}` is {} the footprint statement's content list, which contradicts its \
+                 holds_projected_content flag: {content_clause}",
+                entry.name,
+                if entry.holds_projected_content {
+                    "missing from"
+                } else {
+                    "present in"
+                }
+            );
+        }
+    }
+
+    /// **G-RETIRE (every migration that names the family says it is gone).**
+    /// Eleven bundled migrations describe the `mcp_open_*` projection in the
+    /// present tense — 036 says the projector "keeps running as the
+    /// compatibility reconciler", 038 says the reference host's orphan rows are
+    /// "still accumulating" — and a fresh install of this build executes all of
+    /// them, then drops the family with 041 in the same migrate pass. Every one
+    /// of those sentences was true when written and none of them may be
+    /// rewritten (a released migration is immutable), so the policy is an
+    /// append-only supersession note carrying a fixed marker.
+    ///
+    /// Both directions, so the marker means something in each. Every bundled
+    /// migration that names a [`RETIRED_TABLES`] table must carry the marker
+    /// exactly once, and no migration that carries the marker may be free of
+    /// the family — a marker sprayed across unrelated files would make the
+    /// grep that motivates it useless. 041 is excluded by name: it is the
+    /// retirement, not something superseded by it.
+    ///
+    /// MUTATION (executed 2026-08-01): delete the marker from `sql/036`,
+    /// leaving "the legacy `mcp_open_*` projector keeps running as the
+    /// compatibility reconciler" as the only account a fresh install reads
+    /// => FAILS here.
+    #[test]
+    fn every_migration_naming_the_retired_family_carries_the_supersession_note() {
+        const MARKER: &str = "SUPERSEDED 2026-08-01 (issue #603 WI-10, `sql/041`)";
+
+        let migrations = bundled_migrations();
+        let mut marked = 0usize;
+        let mut naming = 0usize;
+        for migration in &migrations {
+            if migration.version == crate::RETIREMENT_MIGRATION_VERSION {
+                assert!(
+                    !migration.sql.contains(MARKER),
+                    "sql/{} IS the retirement; it is not superseded by itself",
+                    migration.name
+                );
+                continue;
+            }
+            let names_family = RETIRED_TABLES
+                .iter()
+                .any(|table| migration.sql.contains(table.name));
+            let occurrences = migration.sql.matches(MARKER).count();
+            if names_family {
+                naming += 1;
+                assert_eq!(
+                    occurrences, 1,
+                    "sql/{} names the retired `mcp_open_*` family, so it must carry the \
+                     supersession note exactly once (found {occurrences}); an operator \
+                     grepping `mcp_open` across sql/ otherwise reads it as a live description",
+                    migration.name
+                );
+            } else {
+                assert_eq!(
+                    occurrences, 0,
+                    "sql/{} carries the supersession note but never names the retired family",
+                    migration.name
+                );
+            }
+            marked += occurrences;
+        }
+        assert_eq!(
+            marked, naming,
+            "the marked set and the family-naming set must be the same set"
+        );
+        assert_eq!(
+            naming, 11,
+            "eleven bundled migrations name the retired family; a change to that count is a \
+             change to what an operator greps, so it is pinned rather than derived"
+        );
+    }
+
+    /// **G-RETIRE (a released migration cites only what its recipients have).**
+    /// `plans/` is gitignored, so a `plans/…` pointer in a bundled migration
+    /// resolves for exactly one person: whoever wrote it. Migration 041 shipped
+    /// one in review round 4 (`See … plans/603-reclamation.md WS-1`), and since
+    /// a migration is immutable once released it could never have been
+    /// redirected — every recipient of that release would hold a pointer to
+    /// nothing, permanently.
+    ///
+    /// Both directions, because "cite a tracked path instead" is otherwise
+    /// satisfied by citing a tracked path that does not exist: no bundled
+    /// migration may name a gitignored directory, AND every `docs/….md` path a
+    /// migration does name must be present in the tree. The gitignored set is
+    /// derived from `.gitignore` rather than listed here, so the guard follows
+    /// the ignore file instead of drifting from it.
+    ///
+    /// MUTATION (executed 2026-08-01): restore `sql/041`'s round-4 pointer to
+    /// `plans/603-reclamation.md` WS-1 => FAILS here. **The gitignore half.**
+    ///
+    /// MUTATION (executed 2026-08-01): point the same citation at
+    /// `docs/operations/nope.md` — tracked-looking, absent — => FAILS here.
+    /// **The existence half**, which the gitignore assertion cannot see.
+    #[test]
+    fn a_bundled_migration_cites_only_paths_its_recipients_have() {
+        use std::path::PathBuf;
+
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..");
+        let gitignore = std::fs::read_to_string(repo_root.join(".gitignore"))
+            .expect("the repository has a .gitignore");
+        let ignored_dirs: Vec<&str> = gitignore
+            .lines()
+            .map(str::trim)
+            .filter(|line| {
+                !line.is_empty()
+                    && !line.starts_with('#')
+                    && !line.starts_with('!')
+                    && !line.contains('*')
+                    && line.ends_with('/')
+            })
+            .collect();
+        assert!(
+            ignored_dirs.contains(&"plans/"),
+            "`plans/` is the directory this guard exists for; .gitignore no longer ignores it, \
+             so the derivation is reading the wrong file: {ignored_dirs:?}"
+        );
+
+        let migrations = bundled_migrations();
+        assert!(
+            migrations.len() >= 41,
+            "only {} bundled migrations — the sweep below would be near-vacuous",
+            migrations.len()
+        );
+
+        let mut cited_docs = 0usize;
+        for migration in &migrations {
+            for ignored in &ignored_dirs {
+                assert!(
+                    !migration.sql.contains(ignored),
+                    "sql/{} cites `{ignored}`, which is gitignored: nobody who receives this \
+                     release has that path, and a migration cannot be corrected in place",
+                    migration.name
+                );
+            }
+            for token in migration
+                .sql
+                .split(|c: char| !(c.is_ascii_alphanumeric() || "/._-#".contains(c)))
+            {
+                let Some(start) = token.find("docs/") else {
+                    continue;
+                };
+                let path = token[start..].trim_end_matches(['.', ',', ')']);
+                if !path.ends_with(".md") {
+                    continue;
+                }
+                assert!(
+                    repo_root.join(path).is_file(),
+                    "sql/{} cites `{path}`, which does not exist in this tree",
+                    migration.name
+                );
+                cited_docs += 1;
+            }
+        }
+        assert!(
+            cited_docs >= 1,
+            "no bundled migration cites a docs/ page, so the existence half of this guard \
+             asserted nothing"
+        );
+    }
+
+    /// Every `(migration version, line)` a `sql/NNN:LINE` citation in the SWEPT
+    /// ROOTS points at, and a token the cited line must carry. (See
+    /// [`a_cross_file_line_citation_resolves_to_what_it_claims`] for exactly
+    /// what is swept and what is not.)
+    ///
+    /// Seventeen distinct lines across seven migrations. The tokens are what
+    /// makes a citation checkable rather than merely in-range: line 49 of
+    /// `sql/036` is cited three times — twice from `canonical_list.rs`, once
+    /// from `search_canonical.rs` — as the sort key `mcp_session_directory`
+    /// leads with `session_id`, so that line has to still BE that sort key.
+    /// It is the DIRECTORY's, not the navigation index's: `mcp_event_navigation`
+    /// is created at line 87 and ordered at line 117, and nothing cites either.
+    const CITED_MIGRATION_LINES: &[(&str, usize, &str)] = &[
+        ("001", 42, "event_kind LowCardinality(String)"),
+        ("001", 43, "actor_kind LowCardinality(String)"),
+        ("001", 125, "ORDER BY (session_id, event_ts, source_name"),
+        (
+            "004",
+            213,
+            "DROP TABLE IF EXISTS moraine.search_term_stats;",
+        ),
+        ("006", 4, "DROP TABLE IF EXISTS moraine.search_term_stats;"),
+        (
+            "025",
+            2,
+            "DROP CONSTRAINT IF EXISTS event_links_link_type_domain;",
+        ),
+        (
+            "032",
+            25,
+            "ADD COLUMN IF NOT EXISTS source_host String AFTER ingested_at",
+        ),
+        (
+            "032",
+            70,
+            "ADD COLUMN IF NOT EXISTS source_host String AFTER session_date",
+        ),
+        (
+            "033",
+            8,
+            "ADD COLUMN IF NOT EXISTS candidate_generation UInt64 AFTER generation",
+        ),
+        (
+            "033",
+            13,
+            "ADD COLUMN IF NOT EXISTS candidate_generation UInt64 AFTER generation",
+        ),
+        ("036", 49, "ORDER BY (session_id, source_host, source_name"),
+        ("036", 116, "PARTITION BY cityHash64(session_id) % 64"),
+        ("036", 156, "AS mode_hint"),
+        ("036", 162, "WHERE notEmpty(session_id)"),
+        ("036", 181, "WHERE notEmpty(session_id);"),
+        ("036", 216, "AS is_metadata_bearing"),
+        ("036", 218, "WHERE notEmpty(session_id);"),
+    ];
+
+    /// Per cited migration: the highest line any citation reaches, and the
+    /// SHA-256 of the file's first that-many lines.
+    ///
+    /// The token check above cannot see a shift that lands one instance of a
+    /// repeated line on another — `sql/036` carries `WHERE notEmpty(session_id);`
+    /// at both 181 and 218, and the round-4 regression moved 162 to 181 and
+    /// 181 to 200 while leaving 181 spelled exactly as its citation expected. The
+    /// prefix digest closes that: no line at or before the last cited line may
+    /// move, full stop. It is a PREFIX rather than the whole file so that an
+    /// append below the last citation — which is where the supersession notes
+    /// now live, precisely so they move nothing — stays free.
+    const CITED_MIGRATION_PREFIXES: &[(&str, usize, &str)] = &[
+        (
+            "001",
+            125,
+            "374d441b00052ec7e4d56d6c7f3691ea32c010ac67c970eeaed50eef8ef4909c",
+        ),
+        (
+            "004",
+            213,
+            "17d412d4eff46aff1d69d05b282e569ee1148ef66b84931521be229adfa53b4e",
+        ),
+        (
+            "006",
+            4,
+            "82109348e7cea013efebef1440776cce820ecac09624942fea6d6cebaea24634",
+        ),
+        (
+            "025",
+            2,
+            "995dca3e3f8cb00c7e91176fa421be22e08a108185e2d09fc5e82988d8a5303b",
+        ),
+        (
+            "032",
+            70,
+            "c65024dd9fc53ee8be1fb0099e86a87da4e4a1c3afb01c69ab6002a61ff4f173",
+        ),
+        (
+            "033",
+            13,
+            "8dd57e9bf80235931832bb05c0682bdf9c2ae8ae30c3b608b1caf9e41e45710e",
+        ),
+        (
+            "036",
+            218,
+            "18dc8ff2b54672e40e3c884d4e185a053e3d73b2b7ad8bce873690eb14aba2ce",
+        ),
+    ];
+
+    /// Total `sql/NNN:LINE` citation sites in the SWEPT ROOTS (see
+    /// [`a_cross_file_line_citation_resolves_to_what_it_claims`] for exactly
+    /// what is swept and what is not), counted per cited line
+    /// (a comment citing `sql/036` lines 162, 181 and 218 is three). Pinned so a new citation
+    /// has to be added to [`CITED_MIGRATION_LINES`] deliberately rather than
+    /// riding in unchecked.
+    const SQL_LINE_CITATION_SITES: usize = 30;
+
+    /// The two files cited by line that are NOT bundled migrations.
+    const GOLDEN_HEADER: &str = "crates/moraine-clickhouse/src/testdata/projector_golden/\
+                                 projected_publication_header.sql";
+    const LIST_PARITY: &str =
+        "crates/moraine-conversations/tests/live_clickhouse/session_list_parity.rs";
+
+    /// Every NON-migration `<file name>:LINE` citation the SWEPT ROOTS carry
+    /// (see [`a_cross_file_line_citation_resolves_to_what_it_claims`] for
+    /// exactly what is swept and what is not), as the
+    /// repository path it resolves to, the line, and a token that line must
+    /// carry.
+    ///
+    /// Six lines across two files. The migration grammar cannot see any of
+    /// them: five address the frozen projector golden, whose citations spell a
+    /// file name rather than `sql/NNN`, and the sixth addresses an ordinary
+    /// `.rs` file. Bundled migrations never appear here — a citation that
+    /// spells a migration's file name out in full is matched by BOTH grammars,
+    /// and the sweep proves they agree on every such citation rather than
+    /// assuming the two sets are disjoint. (Spelled out rather than
+    /// exemplified: a literal example would be a citation site of its own, and
+    /// the sweep would count it.)
+    const CITED_SOURCE_LINES: &[(&str, usize, &str)] = &[
+        (
+            GOLDEN_HEADER,
+            45,
+            "leftUTF8(text_content, 65536)) AS summary_source,",
+        ),
+        (
+            GOLDEN_HEADER,
+            120,
+            "nullIf(h.latest_metadata_name, ''), '')), h.source,",
+        ),
+        (
+            GOLDEN_HEADER,
+            122,
+            "coalesce(nullIf(h.latest_metadata_summary, ''), \
+             nullIf(h.latest_metadata_title, ''), nullIf(h.latest_metadata_name, ''), '')),",
+        ),
+        (GOLDEN_HEADER, 123, "''), h.latest_session_meta_title),"),
+        (GOLDEN_HEADER, 124, "''), h.latest_session_meta_summary),"),
+        (
+            LIST_PARITY,
+            64,
+            "so the omp branch's `latest_metadata_title` sees it",
+        ),
+    ];
+
+    /// Per cited FROZEN file: the highest line any citation reaches, and the
+    /// SHA-256 of the file's first that-many lines.
+    ///
+    /// The same technique [`CITED_MIGRATION_PREFIXES`] applies to migrations,
+    /// and for the same reason — the projector golden's own README calls it "a
+    /// historical record, not a live fixture", nothing executes it, and its
+    /// five citations are the only reason it survives at all. A repeated line
+    /// landing on another is exactly as invisible there as it was in `sql/036`.
+    ///
+    /// It is deliberately NOT applied to [`LIST_PARITY`]. That file is live
+    /// test code this very change edits; a digest over its first 64 lines
+    /// would fire on every unrelated edit above them and be re-derived
+    /// reflexively until it meant nothing. Its citation is held by the token
+    /// alone — which is the check with content, because an insertion above
+    /// line 64 moves the cited comment off it and the token stops matching.
+    const CITED_SOURCE_PREFIXES: &[(&str, usize, &str)] = &[(
+        GOLDEN_HEADER,
+        124,
+        "3f11daf2731ea57f8356670115ddfb4d469f35cedda12b84b4489ed5d3752593",
+    )];
+
+    /// Total non-migration `<file name>:LINE` citation sites in the SWEPT
+    /// ROOTS, counted per cited
+    /// line, exactly as [`SQL_LINE_CITATION_SITES`] counts the other grammar's.
+    const SOURCE_LINE_CITATION_SITES: usize = 13;
+
+    /// Citations in the SWEPT ROOTS that spell a bundled migration with a file
+    /// name the migration grammar admits, and so
+    /// are seen by BOTH grammars. Pinned so the bridge assertion below — every
+    /// such hit must also have been found by the `sql/NNN` sweep — cannot go
+    /// vacuous by the last one being rewritten.
+    ///
+    /// All six are `sql/001_schema.sql`, and that is not a coincidence: see
+    /// the migration grammar's own comment in
+    /// [`a_cross_file_line_citation_resolves_to_what_it_claims`] for why it is
+    /// the only bundled migration whose full file name that grammar can read.
+    const MIGRATION_SITES_SPELLED_WITH_FILE_NAME: usize = 6;
+
+    /// Every cross-file `file:line` citation in the SWEPT ROOTS, resolved.
+    ///
+    /// Source cites migrations by line — `sql/036` line 49 for the sort key
+    /// `mcp_session_directory` leads with `session_id`, `sql/033` lines 8 and
+    /// 13 for the columns the reclaim path reads — from 24 sites across nine
+    /// files. A migration is immutable once released, so those line numbers
+    /// were expected never to move; review round 4 moved them anyway by
+    /// inserting an eleven-file supersession note at the TOP of each header,
+    /// and fourteen citations silently came to name the note's own prose
+    /// instead of the statements they described. Four of the fourteen were in
+    /// files that change did not otherwise touch, so nothing in the diff
+    /// pointed at them, and
+    /// [`a_bundled_migration_cites_only_paths_its_recipients_have`] checks
+    /// paths, never lines.
+    ///
+    /// TWO GRAMMARS, because immutability is not what makes a line citation
+    /// checkable — being read is. Review round 6 pinned only `sql/NNN:LINE`
+    /// and left five cross-file citations unpinned: four into the frozen
+    /// projector golden, and one from this very file into
+    /// `session_list_parity.rs` line 64 — a file this change edits. That last
+    /// one is round 4's failure mode exactly, one file's edit repointing
+    /// another file's citation with nothing in the diff to show it, still live
+    /// for the pair this guard's own worked example uses. So the sweep also
+    /// reads `<file name>:LINE` for `.rs` and `.sql` targets, resolves the name
+    /// against the swept tree, and holds those to [`CITED_SOURCE_LINES`]. A
+    /// citation both grammars can see — a migration spelled with its full file
+    /// name — is checked for agreement rather than assumed away.
+    ///
+    /// WHAT IS SWEPT, exactly, because every constant above is scoped to it and
+    /// not to the tree: the four roots `apps`, `crates`, `sql` and `docs`,
+    /// recursively, skipping any directory named `target`, admitting only files
+    /// whose extension is `rs`, `sql` or `md`. Nothing else is read. So
+    /// `plugins/`, `scripts/`, `web/`, `bin/`, `config/`, `rust/`,
+    /// `moraine-monitor/`, `fixtures/`, `maintenance/` and the repository-root
+    /// markdown (`README.md`, `AGENTS.md`) are OUT, and so is every file inside
+    /// a swept root whose extension is not one of the three — a citation
+    /// written into `crates/moraine-clickhouse/Cargo.toml` is invisible here
+    /// even though its directory is walked.
+    ///
+    /// Narrowing the CLAIM rather than widening the walk, deliberately. Nine
+    /// live sites outside it would fail these assertions today and SHOULD NOT
+    /// be rewritten, because all nine are illustrative placeholders whose
+    /// unresolvability is the point:
+    /// `plugins/moraine-dev/skills/code-review-{correctness,elegance,idomatic,
+    /// security-review,yagni}/SKILL.md` each show a reviewer how to spell a
+    /// finding, using a source path under a crate that does not exist;
+    /// `code-review-completeness/SKILL.md` shows the same for a markdown target,
+    /// which is the class this sweep refuses outright; and
+    /// `scripts/ci/test_dependency_policy.py` carries three more in its own
+    /// fixtures. Widening the walk would force nine edits that make six teaching
+    /// examples worse and buy no enforcement, so the roots stay four and every
+    /// constant here says so.
+    ///
+    /// Bounded from both sides and pinned to its extent, in both grammars. The
+    /// set of cited lines discovered by the sweep must EQUAL its pinned set, so
+    /// neither a new unpinned citation nor a pinned line no citation reaches
+    /// passes; every cited line must carry its token, and every cited MIGRATION
+    /// line must be a statement rather than a comment or blank; and a prefix
+    /// digest forbids movement at or above the last cited line of every cited
+    /// migration and of every cited frozen fixture. The number of files swept,
+    /// the number of sites found under each grammar, the number of sites both
+    /// grammars see, and the presence of at least one `.rs` and one `.sql`
+    /// target are all asserted, so a walker that stopped finding files — or a
+    /// grammar that stopped matching one kind of target — fails here rather
+    /// than passing vacuously. The file count is bounded from BOTH sides and
+    /// each root is required to contribute, because through review round 6 it
+    /// was `>= 150` against 216 actual: dropping `apps` and `docs` from the
+    /// roots left 165 files, half the roots, and PASSED.
+    ///
+    /// MUTATION (executed 2026-08-01): reinstate review round 4's placement —
+    /// the supersession preamble at the head of `sql/036` instead of its foot
+    /// => FAILS here on `sql/036` line 49, the FIRST cited line of the first
+    /// cited migration the loop reaches. Round 6 recorded this as failing on
+    /// the `036` prefix digest and on line 116; it reaches neither, because
+    /// the token check is an
+    /// `assert!` inside the loop over [`CITED_MIGRATION_LINES`] and (036, 49)
+    /// is ordered before (036, 116) and before the digest loop entirely.
+    ///
+    /// The SITE is the claim, not the text the failure quotes. Two readings of
+    /// "round 4's placement" were executed, and both stop at (036, 49) and
+    /// never reach 116 or the digest — but they report different lines, because
+    /// a preamble of N lines simply makes line 49 read what line `49 - N` read
+    /// before. A 13-line head comment block gives `  session_id String,`
+    /// (original line 36); the 24-line note this file now ships at its foot,
+    /// relocated to the head, gives the comment line beginning
+    /// `-- merge without losing historical bounds.`
+    /// (original line 25, a prose line of 036's ORIGINAL header — not of the
+    /// note, which under that reading occupies lines 1-24 and so cannot reach
+    /// 49 at all). Review round 6 recorded a failure on line 116 and on the
+    /// digest, which neither reading produces; review round 7 corrected the
+    /// site and then quoted a line no executed reading emits. Hence: quote the
+    /// site, and quote a line only alongside the exact reading that produced
+    /// it. **The movement half.**
+    ///
+    /// MUTATION (executed 2026-08-01): repoint the `is_metadata_bearing`
+    /// citation at `session_list_parity.rs:64` back to its pre-round-5 line
+    /// 213 of `sql/036` => FAILS here on set equality (213 is not pinned, 216
+    /// is unreached). **The citation half**, which no digest can see.
+    ///
+    /// MUTATION (executed 2026-08-01): repoint `canonical_derivations.rs`'s
+    /// citation of the golden's v1 hydration cap from line 45 to line 46 =>
+    /// FAILS here on the source set equality (46 is not pinned, and 45 is still
+    /// reached from the golden's README, so both sides differ). **The
+    /// source-grammar citation half.**
+    ///
+    /// MUTATION (executed 2026-08-01): insert one comment line above line 64 of
+    /// `session_list_parity.rs`, moving the cited comment to 65 => FAILS here
+    /// on that line's token. This is the case round 6 could not see at all: an
+    /// edit in one file silently repointing a citation held in another.
+    /// **The live-source movement half.**
+    ///
+    /// MUTATION (executed 2026-08-01): edit one line of the frozen golden
+    /// above its last cited line — line 44, itself uncited, leaving the line
+    /// count unchanged so that no token can see it => FAILS here on the
+    /// golden's prefix digest. **The frozen-fixture movement half**, which is
+    /// the half no token covers.
+    ///
+    /// MUTATION (executed 2026-08-01): repoint `session_list_parity.rs`'s
+    /// `EXPECTED_LIST_METADATA` citation at lines 900-901 of the golden, ~770
+    /// lines past the end of a 131-line file => FAILS here on the source set
+    /// equality, which reaches it before the range check does. The range check
+    /// stays because it turns an out-of-range PIN into a message instead of an
+    /// index panic. **The out-of-range half.**
+    ///
+    /// MUTATION (executed 2026-08-01): drop `docs` — the SMALLEST swept root —
+    /// from the roots => FAILS on the file-count band, "199 sources swept …
+    /// at 205..=235". Dropping `apps` and `docs` together, which is the shape
+    /// review round 6's `>= 150` accepted, gives "165 sources swept" and fails
+    /// the same way. **The lower half of the extent bound.**
+    ///
+    /// MUTATION (executed 2026-08-01): ADD `plugins` to the roots => FAILS on
+    /// the same band, "237 sources swept". It fails there rather than on the
+    /// six unresolvable placeholder citations that root carries (the other
+    /// three of the nine live in `scripts/ci/test_dependency_policy.py`, which
+    /// this mutation does not add), which is the point: the band notices a
+    /// widened walk before the walk's contents can.
+    /// **The upper half of the extent bound.**
+    ///
+    /// MUTATION (executed 2026-08-01): rewrite `canonical_list.rs`'s citation
+    /// of `sql/036` line 49 with migration 036's full file name => FAILS on
+    /// the migration site count, 29 against 30 — NOT on the two-grammars
+    /// bridge below, which is ordered after it. That is the migration
+    /// grammar's `_schema.sql`-or-`.sql` suffix rule being fail-closed, and it
+    /// is why the grammar comment in the body spells out what it strips rather
+    /// than calling it "an optional file name". **The unreadable-spelling
+    /// half.**
+    ///
+    /// The sweep also refuses any markdown citation carrying a line number.
+    /// Four existed — two in this change's own diff — and all four named a
+    /// spec that lived under gitignored `plans/`, so they resolved for exactly
+    /// one person and could never be redirected. Prose has no immutability
+    /// rule to make a line number an address even when the file is present.
+    /// `.md` targets are therefore refused rather than resolved: the source
+    /// grammar never routes one to [`CITED_SOURCE_LINES`].
+    ///
+    /// MUTATION (executed 2026-08-01): restore `sink.rs`'s round-4 citation of
+    /// `issue-598.md` lines 38-45 => FAILS here on the markdown half.
+    ///
+    /// What this does NOT cover: a citation of a gitignored markdown path
+    /// WITHOUT a line number. There are ELEVEN of those in the tree, across
+    /// EIGHT files (counting citations only — the prose above and below, which
+    /// names such paths in order to describe the class, is not one), and FOUR
+    /// of the eight are files this change edits: this file's own module
+    /// docstring, `bounded_search.rs`, `search_canonical.rs`, and
+    /// `live_clickhouse.rs`, which carries four of the eleven on its own and is
+    /// in `git diff --name-only 36c3094` like the other three. Round 6 wrote
+    /// "roughly fifteen … in ten files it does not touch". That was miscounted
+    /// in both figures and, for four of the eight, simply false — and since
+    /// "not my files" was the whole justification for deferring the class, the
+    /// justification was false too. (Review round 6 said THREE, having missed
+    /// `live_clickhouse.rs`; the decision to defer the class is unaffected, but
+    /// the count that was the whole point of disclosing it has to be right.)
+    ///
+    /// The real justification: a guard here has to forbid all eleven, so it
+    /// lands with all eleven rewrites, and a rewrite means replacing a pointer
+    /// with the substance it points at. TEN of the eleven name a document
+    /// absent from this checkout (`plans/597-bounded-search.md`,
+    /// `plans/597-open-defects.md`, `plans/601-delta-sqlite.md`,
+    /// `design-598-final.md`, `design-600.md`, `599-discovery-cutover.md`) —
+    /// which IS the defect, and also means the substance cannot be recovered
+    /// here, only guessed; the eleventh (`plans/603-reclamation.md`, this
+    /// file's own header) is the only one whose target is readable.
+    ///
+    /// So: none of the three in-diff sites is fixed here, deliberately. Fixing
+    /// them would leave the class alive and the guard still unlandable, would
+    /// put three of eleven citations in a style the other eight do not share,
+    /// and would cost a reviewer of migration 041 three hunks unrelated to it —
+    /// while buying no enforcement at all. Two of the three point at plans this
+    /// machine does not have, so the rewrite is not available even in
+    /// principle. All eleven are deferred together, and counted honestly.
+    #[test]
+    fn a_cross_file_line_citation_resolves_to_what_it_claims() {
+        use sha2::{Digest, Sha256};
+        use std::path::{Path, PathBuf};
+
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..");
+
+        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    if path.file_name().is_some_and(|name| name == "target") {
+                        continue;
+                    }
+                    walk(&path, out);
+                } else if path
+                    .extension()
+                    .is_some_and(|ext| ext == "rs" || ext == "sql" || ext == "md")
+                {
+                    out.push(path);
+                }
+            }
+        }
+
+        // The swept roots, and the band the total must land in. Both sides
+        // matter and the roots are checked individually: 216 files today, of
+        // which `apps` 34, `crates` 124, `sql` 41, `docs` 17. The band is tight
+        // enough that dropping the SMALLEST root falls out of it (216 - 17 =
+        // 199), and that silently adding one does too (the largest excluded
+        // root, `plugins`, carries 21 admitted files: 216 + 21 = 237). Re-derive
+        // it deliberately when the tree genuinely grows past it — that is the
+        // cost of the bound being able to see anything at all.
+        const SWEPT_ROOTS: [&str; 4] = ["apps", "crates", "sql", "docs"];
+        const SWEPT_FILES: std::ops::RangeInclusive<usize> = 205..=235;
+
+        let mut sources = Vec::new();
+        for dir in SWEPT_ROOTS {
+            let before = sources.len();
+            walk(&repo_root.join(dir), &mut sources);
+            assert!(
+                sources.len() - before >= 10,
+                "the sweep found {} files under `{dir}` — a root it names but cannot read \
+                 contributes no citations, and every assertion below would pass that much \
+                 more vacuously",
+                sources.len() - before
+            );
+        }
+        sources.sort();
+        assert!(
+            SWEPT_FILES.contains(&sources.len()),
+            "{} sources swept, outside {SWEPT_ROOTS:?} at {}..={} — either the walk stopped \
+             reaching part of what it claims (and every assertion below would pass vacuously) \
+             or it started reaching more than the constants above are scoped to",
+            sources.len(),
+            SWEPT_FILES.start(),
+            SWEPT_FILES.end()
+        );
+
+        // Line numbers are parsed the same way under both grammars: one or
+        // more runs of digits separated by `,` or `-`.
+        fn line_numbers(mut numbers: &str, mut push: impl FnMut(usize)) {
+            loop {
+                let digits: String = numbers.chars().take_while(char::is_ascii_digit).collect();
+                if digits.is_empty() {
+                    return;
+                }
+                push(digits.parse().expect("digits parse"));
+                numbers = &numbers[digits.len()..];
+                match numbers
+                    .strip_prefix(',')
+                    .or_else(|| numbers.strip_prefix('-'))
+                {
+                    Some(next) => numbers = next,
+                    None => return,
+                }
+            }
+        }
+
+        // The MIGRATION grammar: `sql/`, a three-digit version, optionally
+        // followed by the literal suffix `_schema.sql` or the literal suffix
+        // `.sql`, then `:` and the line numbers. The SOURCE grammar: any run
+        // of path characters ending `.rs` or `.sql`, immediately followed by
+        // `:` and the line numbers. Both spelled out rather than exemplified —
+        // a literal example here would be a citation site of its own, and the
+        // sweep would count it.
+        //
+        // Those two literal suffixes are NOT "an optional file name". Every
+        // bundled migration but one is named `NNN_<words>.sql`, and this
+        // grammar cannot read that: the only bundled migration whose full file
+        // name it admits is the one named `NNN_schema.sql`, which is why all
+        // six MIGRATION_SITES_SPELLED_WITH_FILE_NAME hits are that single
+        // file. Writing a citation of any other migration out in full puts it
+        // beyond this grammar entirely.
+        //
+        // That is FAIL-CLOSED, not a hole, and the difference is worth being
+        // exact about because a reviewer will reach for it. Such a citation is
+        // still read by the SOURCE grammar below, which resolves it, sees that
+        // the path it resolved to is a bundled migration, and demands that the
+        // migration sweep found it too. It did not — so the guard fires. It
+        // fires one assertion EARLIER than that bridge, though: dropping a
+        // citation out of the migration sweep moves `found.len()` off
+        // SQL_LINE_CITATION_SITES, and the site count is checked first.
+        let path_char = |c: char| c.is_ascii_alphanumeric() || "/._-".contains(c);
+        let mut found: Vec<(String, usize, String)> = Vec::new();
+        let mut source_found: Vec<(String, usize, String)> = Vec::new();
+        let mut markdown_line_citations: Vec<String> = Vec::new();
+        let mut displays: Vec<String> = Vec::new();
+        for source in &sources {
+            let text = std::fs::read_to_string(source).unwrap_or_default();
+            let display = source
+                .strip_prefix(&repo_root)
+                .unwrap_or(source)
+                .display()
+                .to_string();
+            displays.push(display.clone());
+            // A markdown file cited BY LINE. Every one this tree ever carried
+            // named `issue-598.md`, which lived under gitignored `plans/` and
+            // resolved for nobody; unlike a migration, a prose document has no
+            // immutability rule to make a line number mean anything later
+            // either. Cite the substance, or a heading.
+            for (index, line) in text.lines().enumerate() {
+                let mut scan = line;
+                while let Some(at) = scan.find(".md:") {
+                    scan = &scan[at + 4..];
+                    if scan.starts_with(|c: char| c.is_ascii_digit()) {
+                        markdown_line_citations.push(format!("{display}:{}", index + 1));
+                    }
+                }
+            }
+            for (index, line) in text.lines().enumerate() {
+                let mut rest = line;
+                while let Some(at) = rest.find("sql/") {
+                    let tail = &rest[at + 4..];
+                    rest = tail;
+                    let version: String = tail.chars().take_while(char::is_ascii_digit).collect();
+                    if version.len() != 3 {
+                        continue;
+                    }
+                    let after_name = &tail[version.len()..];
+                    let after_name = after_name
+                        .strip_prefix("_schema.sql")
+                        .or_else(|| after_name.strip_prefix(".sql"))
+                        .unwrap_or(after_name);
+                    let Some(numbers) = after_name.strip_prefix(':') else {
+                        continue;
+                    };
+                    line_numbers(numbers, |line| {
+                        found.push((version.clone(), line, format!("{display}:{}", index + 1)));
+                    });
+                }
+            }
+            // The source grammar. For every `:` on the line, take the maximal
+            // run of path characters ending immediately before it; that run is
+            // a citation iff it names a `.rs` or `.sql` file. `.md` is
+            // deliberately absent — a markdown file cited by line is refused
+            // above, and resolving one would be answering the wrong question.
+            for (index, line) in text.lines().enumerate() {
+                let mut consumed = 0usize;
+                while let Some(at) = line[consumed..].find(':') {
+                    let colon = consumed + at;
+                    consumed = colon + 1;
+                    let name_start = line[..colon]
+                        .char_indices()
+                        .rev()
+                        .take_while(|(_, c)| path_char(*c))
+                        .map(|(at, _)| at)
+                        .last();
+                    let Some(name_start) = name_start else {
+                        continue;
+                    };
+                    let name = &line[name_start..colon];
+                    if !(name.ends_with(".rs") || name.ends_with(".sql")) {
+                        continue;
+                    }
+                    line_numbers(&line[consumed..], |cited| {
+                        source_found.push((
+                            name.to_string(),
+                            cited,
+                            format!("{display}:{}", index + 1),
+                        ));
+                    });
+                }
+            }
+        }
+        assert_eq!(
+            found.len(),
+            SQL_LINE_CITATION_SITES,
+            "citation sites found: {:?}",
+            found
+        );
+        assert!(
+            markdown_line_citations.is_empty(),
+            "these sites cite a markdown file by line: {markdown_line_citations:?}. A prose \
+             document is not immutable and its line numbers are not addresses — inline the \
+             substance, or cite a heading in a tracked page"
+        );
+
+        // Resolve every source-grammar citation against the swept tree. A file
+        // name matching no source, or more than one, is not an address an
+        // editor can follow.
+        let mut resolved: Vec<(String, usize, String)> = Vec::new();
+        let mut spelled_out_migrations = 0usize;
+        for (name, line, site) in &source_found {
+            let matches: Vec<&String> = displays
+                .iter()
+                .filter(|display| {
+                    display.as_str() == name || display.ends_with(&format!("/{name}"))
+                })
+                .collect();
+            assert_eq!(
+                matches.len(),
+                1,
+                "`{name}` line {line}, cited from {site}, resolves to {matches:?}; a citation \
+                 that does not name exactly one file in the tree is not an address"
+            );
+            let path = matches[0].clone();
+            // A bundled migration spelled out in full is seen by BOTH
+            // grammars. It stays with CITED_MIGRATION_LINES, which knows about
+            // immutability and prefix digests; here it only has to AGREE, so a
+            // grammar that silently stopped matching one spelling fails.
+            if let Some(version) = path
+                .strip_prefix("sql/")
+                .and_then(|name| name.get(..3))
+                .filter(|version| version.chars().all(|c| c.is_ascii_digit()))
+            {
+                spelled_out_migrations += 1;
+                assert!(
+                    found.contains(&(version.to_string(), *line, site.clone())),
+                    "`{name}` line {line} at {site} names bundled migration {version}, but the \
+                     migration sweep never found it — the two grammars disagree, so one of \
+                     them is not reading what it claims to"
+                );
+                continue;
+            }
+            resolved.push((path, *line, site.clone()));
+        }
+        assert_eq!(
+            spelled_out_migrations, MIGRATION_SITES_SPELLED_WITH_FILE_NAME,
+            "citations both grammars see: {source_found:?}"
+        );
+        assert_eq!(
+            resolved.len(),
+            SOURCE_LINE_CITATION_SITES,
+            "non-migration citation sites found: {resolved:?}"
+        );
+
+        // Both directions: the discovered set of cited lines and the pinned
+        // set are the same set.
+        let mut discovered: Vec<(String, usize)> = found
+            .iter()
+            .map(|(version, line, _)| (version.clone(), *line))
+            .collect();
+        discovered.sort();
+        discovered.dedup();
+        let pinned: Vec<(String, usize)> = CITED_MIGRATION_LINES
+            .iter()
+            .map(|(version, line, _)| ((*version).to_string(), *line))
+            .collect();
+        assert_eq!(
+            discovered, pinned,
+            "the cited lines and the pinned lines must be the same set; discovered from {:?}",
+            found
+        );
+
+        let migrations = bundled_migrations();
+        let migration = |version: &str| {
+            migrations
+                .iter()
+                .find(|migration| migration.version == version)
+                .unwrap_or_else(|| panic!("sql/{version} is bundled"))
+        };
+
+        for (version, line_number, must_contain) in CITED_MIGRATION_LINES {
+            let sql = migration(version).sql;
+            let lines: Vec<&str> = sql.lines().collect();
+            let citers: Vec<&String> = found
+                .iter()
+                .filter(|(found_version, found_line, _)| {
+                    found_version == version && found_line == line_number
+                })
+                .map(|(_, _, site)| site)
+                .collect();
+            assert!(
+                *line_number <= lines.len(),
+                "sql/{version}:{line_number} is past the end of a {}-line file, cited from {citers:?}",
+                lines.len()
+            );
+            let cited = lines[line_number - 1];
+            assert!(
+                cited.contains(must_contain),
+                "sql/{version}:{line_number} is cited from {citers:?} as `{must_contain}`, but \
+                 that line reads:\n  {cited}"
+            );
+            let trimmed = cited.trim_start();
+            assert!(
+                !trimmed.is_empty() && !trimmed.starts_with("--"),
+                "sql/{version}:{line_number}, cited from {citers:?}, is prose or blank — a \
+                 citation names a statement:\n  {cited}"
+            );
+        }
+
+        for (version, prefix_lines, digest) in CITED_MIGRATION_PREFIXES {
+            let highest = CITED_MIGRATION_LINES
+                .iter()
+                .filter(|(cited_version, _, _)| cited_version == version)
+                .map(|(_, line, _)| *line)
+                .max()
+                .unwrap_or_else(|| panic!("sql/{version} has a pinned prefix but no cited line"));
+            assert_eq!(
+                highest, *prefix_lines,
+                "the pinned prefix of sql/{version} must cover exactly what is cited"
+            );
+            let sql = migration(version).sql;
+            let prefix: String = sql
+                .split_inclusive('\n')
+                .take(*prefix_lines)
+                .collect::<String>();
+            let actual = format!("{:x}", Sha256::digest(prefix.as_bytes()));
+            assert_eq!(
+                &actual, digest,
+                "sql/{version}'s first {prefix_lines} lines moved. Every citation into this \
+                 file addresses it by line and a released migration cannot be corrected in \
+                 place, so nothing at or above line {prefix_lines} may change — append below \
+                 it instead. Re-derive the citations and this digest if the move is intended."
+            );
+        }
+
+        let mut pinned_versions: Vec<&str> = CITED_MIGRATION_PREFIXES
+            .iter()
+            .map(|(version, _, _)| *version)
+            .collect();
+        let mut cited_versions: Vec<&str> = CITED_MIGRATION_LINES
+            .iter()
+            .map(|(version, _, _)| *version)
+            .collect();
+        cited_versions.sort_unstable();
+        cited_versions.dedup();
+        pinned_versions.sort_unstable();
+        assert_eq!(
+            pinned_versions, cited_versions,
+            "every cited migration needs a prefix digest and no others"
+        );
+
+        // ---- the source grammar, held to the same standard ----
+
+        let mut discovered_sources: Vec<(String, usize)> = resolved
+            .iter()
+            .map(|(path, line, _)| (path.clone(), *line))
+            .collect();
+        discovered_sources.sort();
+        discovered_sources.dedup();
+        let mut pinned_sources: Vec<(String, usize)> = CITED_SOURCE_LINES
+            .iter()
+            .map(|entry| (entry.0.to_string(), entry.1))
+            .collect();
+        pinned_sources.sort();
+        assert_eq!(
+            discovered_sources, pinned_sources,
+            "the cited non-migration lines and the pinned ones must be the same set; \
+             discovered from {resolved:?}"
+        );
+
+        for entry in CITED_SOURCE_LINES {
+            let (path, line_number, must_contain) = (entry.0, entry.1, entry.2);
+            let text = std::fs::read_to_string(repo_root.join(path)).unwrap_or_else(|error| {
+                panic!("`{path}` is cited by line but unreadable: {error}")
+            });
+            let lines: Vec<&str> = text.lines().collect();
+            let citers: Vec<&String> = resolved
+                .iter()
+                .filter(|(found_path, found_line, _)| {
+                    found_path == path && *found_line == line_number
+                })
+                .map(|(_, _, site)| site)
+                .collect();
+            assert!(
+                line_number <= lines.len(),
+                "`{path}` line {line_number} is past the end of a {}-line file, cited from \
+                 {citers:?}",
+                lines.len()
+            );
+            let cited = lines[line_number - 1];
+            assert!(
+                cited.contains(must_contain),
+                "`{path}` line {line_number} is cited from {citers:?} as `{must_contain}`, but \
+                 that line reads:\n  {cited}\nEither the citation moved with an edit above it, \
+                 or the line it named is gone. Unlike a migration these files are editable, so \
+                 the fix is to repoint the citation and this token — not to put the line back."
+            );
+        }
+
+        // The frozen half. A cited file under `src/testdata/` is a historical
+        // record: nothing executes it, and its citations are the only reason it
+        // is kept, so it gets the same prefix digest a released migration gets.
+        // Live source does not — see [`CITED_SOURCE_PREFIXES`].
+        let mut frozen_cited: Vec<&str> = CITED_SOURCE_LINES
+            .iter()
+            .map(|entry| entry.0)
+            .filter(|path| path.contains("/testdata/"))
+            .collect();
+        frozen_cited.sort_unstable();
+        frozen_cited.dedup();
+        let mut digested: Vec<&str> = CITED_SOURCE_PREFIXES.iter().map(|entry| entry.0).collect();
+        digested.sort_unstable();
+        assert_eq!(
+            digested, frozen_cited,
+            "every cited frozen fixture needs a prefix digest, and no live source may carry \
+             one — a digest over a file that is edited gets re-derived until it means nothing"
+        );
+        for entry in CITED_SOURCE_PREFIXES {
+            let (path, prefix_lines, digest) = (entry.0, entry.1, entry.2);
+            let highest = CITED_SOURCE_LINES
+                .iter()
+                .filter(|cited| cited.0 == path)
+                .map(|cited| cited.1)
+                .max()
+                .unwrap_or_else(|| panic!("`{path}` has a pinned prefix but no cited line"));
+            assert_eq!(
+                highest, prefix_lines,
+                "the pinned prefix of `{path}` must cover exactly what is cited"
+            );
+            let text = std::fs::read_to_string(repo_root.join(path))
+                .unwrap_or_else(|error| panic!("`{path}` has a pinned prefix: {error}"));
+            let prefix: String = text.split_inclusive('\n').take(prefix_lines).collect();
+            let actual = format!("{:x}", Sha256::digest(prefix.as_bytes()));
+            assert_eq!(
+                &actual, digest,
+                "`{path}`'s first {prefix_lines} lines moved. It is a frozen record cited by \
+                 line, so nothing at or above line {prefix_lines} may change — append below it \
+                 instead. Re-derive the citations and this digest if the move is intended."
+            );
+        }
+
+        // Extent: both target kinds are exercised, so a grammar that stopped
+        // matching one of them fails here instead of quietly covering less.
+        assert!(
+            CITED_SOURCE_LINES
+                .iter()
+                .any(|entry| entry.0.ends_with(".rs")),
+            "no `.rs` target is pinned, so the grammar's hardest case — a citation into a file \
+             that gets edited — is untested"
+        );
+        assert!(
+            CITED_SOURCE_LINES
+                .iter()
+                .any(|entry| entry.0.ends_with(".sql")),
+            "no `.sql` target outside sql/ is pinned"
+        );
+    }
+
+    /// **G-RETIRE (the one-way door).** From the retiring version onward a
+    /// retired name is unknown, and unknown is guarded: the retiring
+    /// migration's own drops are findings only its allowlist entry licenses,
+    /// and any later migration that names the family fails the gate outright
+    /// — while every migration before it stays exactly as legal as when it
+    /// was written.
+    ///
+    /// MUTATION (executed 2026-07-31): make `classify_at_version` ignore
+    /// `retired()` and fall through to `classify` => FAILS here on the
+    /// post-retirement half (`classify` answers `None` for both versions, so
+    /// the pre-retirement half fails too, on `Derived`).
+    #[test]
+    fn a_retired_table_is_guarded_from_its_retiring_version_onward() {
+        // The boundary, both sides, on every retired name.
+        for entry in RETIRED_TABLES {
+            assert_eq!(
+                classify_at_version("040", entry.name),
+                Some(TableClass::Derived),
+                "`{}` under a pre-retirement version",
+                entry.name
+            );
+            assert_eq!(
+                classify_at_version("041", entry.name),
+                None,
+                "`{}` under the retiring version",
+                entry.name
+            );
+            assert_eq!(
+                classify_at_version("042", entry.name),
+                None,
+                "`{}` after retirement",
+                entry.name
+            );
+        }
+        // A live table answers the same at every version.
+        assert_eq!(
+            classify_at_version("001", "events"),
+            Some(TableClass::CanonicalHistory)
+        );
+        assert_eq!(
+            classify_at_version("999", "events"),
+            Some(TableClass::CanonicalHistory)
+        );
+
+        // Driven through the gate: a hypothetical migration 042 touching the
+        // family is a finding in every shape.
+        for sql in [
+            "TRUNCATE TABLE moraine.mcp_open_turns",
+            "DROP TABLE IF EXISTS moraine.mcp_open_events SYNC",
+            "INSERT INTO moraine.mcp_open_sessions SELECT 1",
+            "CREATE MATERIALIZED VIEW moraine.mv_x TO moraine.mcp_open_dirty_sessions AS \
+             SELECT 1",
+        ] {
+            let findings = migration_delete_findings("042", sql);
+            assert_eq!(findings.len(), 1, "`{sql}`: {findings:#?}");
+            assert_eq!(
+                findings[0].class,
+                TableClass::NeverDelete,
+                "unknown is not deletable: `{sql}`"
+            );
+        }
+        // …and the same statements under the versions that legitimately ran
+        // them are not protected findings, because history is judged as
+        // written.
+        assert!(
+            migration_delete_findings("034", "TRUNCATE TABLE moraine.mcp_open_turns").is_empty()
+        );
+    }
+
     /// Every `(relation, shape)` an unexempted migration would be reported
     /// for, in statement order. The allowlist's own denominator.
     ///
@@ -2805,13 +4796,13 @@ mod tests {
     /// filter here made the denominator wider than the numerator it is compared
     /// against, which stayed invisible for as long as no migration that drops a
     /// declared view name (`004`, `006`) also had an allowlist entry.
-    fn unexempted_relations(sql: &str) -> Vec<(String, Option<DeleteShape>)> {
+    fn unexempted_relations(version: &str, sql: &str) -> Vec<(String, Option<DeleteShape>)> {
         let views: BTreeSet<&str> = SCHEMA_VIEW_OBJECTS.iter().copied().collect();
         crate::split_sql_statements(sql)
             .into_iter()
             .flat_map(|statement| {
                 let normalized = normalize_statement(&statement);
-                if normalized.is_empty() || benign_shape(&normalized).is_some() {
+                if normalized.is_empty() || benign_shape(version, &normalized).is_some() {
                     return Vec::new();
                 }
                 let shape = delete_shape(&normalized);
@@ -2861,7 +4852,7 @@ mod tests {
             versions,
             vec![
                 "004", "009", "010", "011", "012", "012", "013", "014", "014", "020", "031", "032",
-                "032", "032", "036"
+                "032", "032", "036", "041", "041"
             ]
         );
 
@@ -2879,7 +4870,7 @@ mod tests {
             // Unexempted, every pair in the cross product really is reported:
             // this is what proves the allowlist is load-bearing rather than
             // decorative, and that the entry is not wider than its migration.
-            let unexempted = unexempted_relations(migration.sql);
+            let unexempted = unexempted_relations(version, migration.sql);
             for table in exemption.tables {
                 for shape in exemption.shapes {
                     assert!(
@@ -2905,15 +4896,16 @@ mod tests {
             if entries.is_empty() {
                 continue;
             }
-            let leaked: Vec<(String, Option<DeleteShape>)> = unexempted_relations(migration.sql)
-                .into_iter()
-                .filter(|(table, shape)| {
-                    !entries.iter().any(|exemption| {
-                        exemption.tables.contains(&table.as_str())
-                            && shape.is_some_and(|shape| exemption.shapes.contains(&shape))
+            let leaked: Vec<(String, Option<DeleteShape>)> =
+                unexempted_relations(migration.version, migration.sql)
+                    .into_iter()
+                    .filter(|(table, shape)| {
+                        !entries.iter().any(|exemption| {
+                            exemption.tables.contains(&table.as_str())
+                                && shape.is_some_and(|shape| exemption.shapes.contains(&shape))
+                        })
                     })
-                })
-                .collect();
+                    .collect();
             assert!(
                 leaked.is_empty(),
                 "`{}` destroys rows in {leaked:?}, which its exemptions do not name — add them \
@@ -3082,13 +5074,13 @@ mod tests {
             assert!(
                 statements
                     .iter()
-                    .any(|statement| benign_shape(statement) == Some(*head)),
+                    .any(|statement| benign_shape(PRE_RETIREMENT_VERSION, statement) == Some(*head)),
                 "benign head `{head}` is not reached by any bundled migration or corpus row; a \
                  benign form nobody writes is a hole in the gate, not a convenience"
             );
             if !tree
                 .iter()
-                .any(|statement| benign_shape(statement) == Some(*head))
+                .any(|statement| benign_shape(PRE_RETIREMENT_VERSION, statement) == Some(*head))
             {
                 corpus_only.insert(head);
             }
@@ -3288,7 +5280,7 @@ mod tests {
             "INSERT INTO FUNCTION clusterAllReplicas('c', 'moraine', 'events') SELECT 1",
         ] {
             assert!(
-                benign_shape(&normalize_statement(statement)).is_none(),
+                benign_shape(PRE_RETIREMENT_VERSION, &normalize_statement(statement)).is_none(),
                 "an INSERT whose target this parser cannot resolve must not be admitted: \
                  {statement}"
             );
@@ -3299,7 +5291,7 @@ mod tests {
         let mv = "CREATE MATERIALIZED VIEW moraine.mv_own ENGINE = MergeTree ORDER BY a \
                   AS SELECT a FROM moraine.events";
         assert!(
-            benign_shape(&normalize_statement(mv)).is_some(),
+            benign_shape(PRE_RETIREMENT_VERSION, &normalize_statement(mv)).is_some(),
             "a materialized view with no TO displaces nothing and must stay benign"
         );
     }
@@ -3333,7 +5325,7 @@ mod tests {
                     );
                     let normalized = normalize_statement(probe);
                     assert_eq!(
-                        benign_shape(&normalized),
+                        benign_shape(PRE_RETIREMENT_VERSION, &normalized),
                         None,
                         "`{head}`'s probe `{probe}` aims at bucket-1 `moraine.events` and must be \
                          a finding"
@@ -3469,7 +5461,7 @@ mod tests {
             ),
         ] {
             assert!(
-                benign_shape(&normalize_statement(sql)).is_none(),
+                benign_shape(PRE_RETIREMENT_VERSION, &normalize_statement(sql)).is_none(),
                 "`{sql}` must not be admitted by the benign allowlist"
             );
             // `Derived`, so `migration_delete_findings` filters it out on
@@ -3485,9 +5477,10 @@ mod tests {
         // Width: a `Derived` target that is *not* on the preserved list stays
         // benign, so this is not "no migration may write into anything
         // derived". `mcp_open_turns` is the corpus's control.
-        assert!(benign_shape(&normalize_statement(
-            "INSERT INTO moraine.mcp_open_turns SELECT * FROM moraine.events"
-        ))
+        assert!(benign_shape(
+            PRE_RETIREMENT_VERSION,
+            &normalize_statement("INSERT INTO moraine.mcp_open_turns SELECT * FROM moraine.events")
+        )
         .is_some());
     }
 
@@ -3533,7 +5526,7 @@ mod tests {
             ),
         ] {
             assert!(
-                benign_shape(&normalize_statement(sql)).is_none(),
+                benign_shape(PRE_RETIREMENT_VERSION, &normalize_statement(sql)).is_none(),
                 "`{sql}` must not be admitted by the benign allowlist"
             );
             let findings = migration_delete_findings("999", sql);
@@ -3562,7 +5555,7 @@ mod tests {
             "CREATE OR REPLACE VIEW moraine.mcp_open_turns AS SELECT 1",
         ] {
             assert!(
-                benign_shape(&normalize_statement(sql)).is_some(),
+                benign_shape(PRE_RETIREMENT_VERSION, &normalize_statement(sql)).is_some(),
                 "`{sql}` must stay admitted"
             );
         }
@@ -3615,8 +5608,8 @@ mod tests {
         // An MV writing into a `Derived` target. The class is the whole
         // difference: the same statement aimed at `moraine.events` is a
         // finding, two rows down in the positive corpus.
-        "CREATE MATERIALIZED VIEW IF NOT EXISTS moraine.mv_events TO moraine.mcp_open_turns AS \
-         SELECT * FROM moraine.raw_events",
+        "CREATE MATERIALIZED VIEW IF NOT EXISTS moraine.mv_events TO \
+         moraine.mcp_event_navigation AS SELECT * FROM moraine.raw_events",
         // An MV with no `TO` owns its storage and supersedes nothing.
         "CREATE MATERIALIZED VIEW moraine.mv_own ENGINE = MergeTree ORDER BY a AS SELECT a FROM \
          moraine.events",
@@ -4098,7 +6091,7 @@ mod tests {
             ),
         ] {
             assert!(
-                benign_shape(&normalize_statement(sql)).is_none(),
+                benign_shape(PRE_RETIREMENT_VERSION, &normalize_statement(sql)).is_none(),
                 "`{sql}` must not be admitted by the benign allowlist"
             );
             let findings = migration_delete_findings("999", sql);
@@ -4123,7 +6116,7 @@ mod tests {
                 vec!["events", "attic_events"],
             ),
             (
-                "RENAME TABLE moraine.mcp_open_turns TO moraine.events",
+                "RENAME TABLE moraine.mcp_event_navigation TO moraine.events",
                 vec!["events"],
             ),
             // Width for the `ON CLUSTER` break: without it, `'c'` is parsed as
@@ -4140,7 +6133,7 @@ mod tests {
                 vec!["moraine", "moraine_old"],
             ),
             (
-                "EXCHANGE TABLES moraine.events AND moraine.mcp_open_turns",
+                "EXCHANGE TABLES moraine.events AND moraine.mcp_event_navigation",
                 vec!["events"],
             ),
         ] {
@@ -4159,7 +6152,7 @@ mod tests {
         for sql in BENIGN_CORPUS {
             let normalized = normalize_statement(sql);
             assert!(
-                benign_shape(&normalized).is_some(),
+                benign_shape(PRE_RETIREMENT_VERSION, &normalized).is_some(),
                 "`{sql}` must be admitted by the benign allowlist"
             );
             assert!(
@@ -4176,7 +6169,7 @@ mod tests {
             "DROP TABLE IF EXISTS moraine.search_term_stats",
             "DROP TABLE IF EXISTS moraine.search_corpus_stats",
         ] {
-            assert!(benign_shape(&normalize_statement(sql)).is_none());
+            assert!(benign_shape(PRE_RETIREMENT_VERSION, &normalize_statement(sql)).is_none());
             assert!(
                 migration_delete_findings("999", sql).is_empty(),
                 "`{sql}` names a declared view and must not be a finding"
@@ -4251,7 +6244,7 @@ mod tests {
         ] {
             let normalized = normalize_statement(sql);
             assert!(
-                benign_shape(&normalized).is_none(),
+                benign_shape(PRE_RETIREMENT_VERSION, &normalized).is_none(),
                 "`{sql}` must not be admitted by the benign allowlist"
             );
             let findings = migration_delete_findings("999", sql);
@@ -4302,14 +6295,22 @@ mod tests {
     #[test]
     fn a_derived_truncate_is_seen_as_a_removal_and_suppressed_only_by_its_class() {
         let sql = "TRUNCATE TABLE moraine.mcp_open_turns";
-        let removals = migration_row_removals("999", sql);
+        // At the versions where the family existed (034/035 reset it on every
+        // run), the truncate is a recognized removal suppressed by its
+        // `Derived` class — history stays exactly as legal as it was.
+        let removals = migration_row_removals(PRE_RETIREMENT_VERSION, sql);
         assert_eq!(removals.len(), 1, "the shape must be recognized: {sql}");
         assert_eq!(removals[0].table, "mcp_open_turns");
         assert_eq!(removals[0].class, TableClass::Derived);
         assert!(
-            migration_delete_findings("999", sql).is_empty(),
+            migration_delete_findings(PRE_RETIREMENT_VERSION, sql).is_empty(),
             "and suppressed by `is_protected()`, not by the parser"
         );
+        // From the retiring version onward the name is unknown, and unknown is
+        // protected: a post-retirement migration touching the family fails.
+        let findings = migration_delete_findings(POST_RETIREMENT_VERSION, sql);
+        assert_eq!(findings.len(), 1, "{findings:#?}");
+        assert_eq!(findings[0].class, TableClass::NeverDelete);
     }
 
     /// **G-SHAPE, exemption width.** The `SCHEMA_VIEW_OBJECTS` exemption is
@@ -4366,7 +6367,7 @@ mod tests {
             "ALTER TABLE moraine.events ON CLUSTER 'c' ADD COLUMN x String",
         ] {
             assert!(
-                benign_shape(&normalize_statement(sql)).is_some(),
+                benign_shape(PRE_RETIREMENT_VERSION, &normalize_statement(sql)).is_some(),
                 "`{sql}` is one benign clause"
             );
         }
@@ -4386,10 +6387,13 @@ mod tests {
         }
 
         // And the tiering forms stay benign, clause-locally.
-        assert!(benign_shape(&normalize_statement(
-            "ALTER TABLE moraine.events ADD COLUMN c String, MOVE PARTITION '202601' TO DISK \
+        assert!(benign_shape(
+            PRE_RETIREMENT_VERSION,
+            &normalize_statement(
+                "ALTER TABLE moraine.events ADD COLUMN c String, MOVE PARTITION '202601' TO DISK \
              'cold'"
-        ))
+            )
+        )
         .is_some());
     }
 
@@ -4430,7 +6434,7 @@ mod tests {
         ] {
             let normalized = normalize_statement(sql);
             assert!(
-                benign_shape(&normalized).is_none(),
+                benign_shape(PRE_RETIREMENT_VERSION, &normalized).is_none(),
                 "`{sql}` must not be admitted"
             );
         }
@@ -4588,7 +6592,7 @@ mod tests {
             ),
         ] {
             assert!(
-                benign_shape(&normalize_statement(sql)).is_none(),
+                benign_shape(PRE_RETIREMENT_VERSION, &normalize_statement(sql)).is_none(),
                 "`{sql}` must not be admitted"
             );
             let findings = migration_delete_findings("999", sql);
@@ -4647,7 +6651,7 @@ mod tests {
         ] {
             let normalized = normalize_statement(sql);
             assert!(
-                benign_shape(&normalized).is_none(),
+                benign_shape(PRE_RETIREMENT_VERSION, &normalized).is_none(),
                 "`{sql}` must not be admitted; it drops a column of canonical history"
             );
             let findings = migration_delete_findings("999", sql);
@@ -4662,7 +6666,7 @@ mod tests {
         let unbalanced =
             "ALTER TABLE moraine.events ADD COLUMN c String COMMENT 'x'), DROP COLUMN payload_json";
         assert!(alter_clauses(&mask_quoted(&unbalanced.to_ascii_uppercase())).is_empty());
-        assert!(benign_shape(&normalize_statement(unbalanced)).is_none());
+        assert!(benign_shape(PRE_RETIREMENT_VERSION, &normalize_statement(unbalanced)).is_none());
         assert_eq!(migration_delete_findings("999", unbalanced).len(), 1);
 
         // Bounded in the benign direction: the same syntaxes carrying nothing
@@ -4674,7 +6678,7 @@ mod tests {
              $x$",
         ] {
             assert!(
-                benign_shape(&normalize_statement(sql)).is_some(),
+                benign_shape(PRE_RETIREMENT_VERSION, &normalize_statement(sql)).is_some(),
                 "`{sql}` must stay admitted"
             );
         }
@@ -4799,10 +6803,13 @@ mod tests {
              moraine.events",
         ] {
             assert!(
-                benign_shape(&normalize_statement(sql)).is_some(),
+                benign_shape(PRE_RETIREMENT_VERSION, &normalize_statement(sql)).is_some(),
                 "`{sql}` writes into a rebuildable relation"
             );
-            assert!(migration_row_removals("999", sql).is_empty(), "`{sql}`");
+            assert!(
+                migration_row_removals(PRE_RETIREMENT_VERSION, sql).is_empty(),
+                "`{sql}`"
+            );
         }
 
         // An unclassified target is unknown, and unknown is protected.

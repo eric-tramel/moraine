@@ -15,7 +15,7 @@ pub use domain::{
     is_user_facing_content_event, Conversation, ConversationDetailOptions, ConversationListFilter,
     ConversationListSort, ConversationMode, ConversationSearchHit, ConversationSearchQuery,
     ConversationSearchResults, ConversationSearchStats, ConversationSummary, FileAttentionQuery,
-    FileAttentionTouch, McpEventOpen, McpEventRef, McpEventSummary, McpEventType, McpOpenSnapshot,
+    FileAttentionTouch, McpEventOpen, McpEventRef, McpEventSummary, McpEventType,
     McpSessionListFilter, McpSessionListItem, McpSessionOpen, McpTurnCompact, McpTurnOpen,
     McpTurnRef, OpenContext, OpenEvent, OpenEventRequest, Page, PageRequest, RepoConfig,
     SearchEventHit, SearchEventKind, SearchEventsQuery, SearchEventsResult, SearchEventsStats,
@@ -27,11 +27,10 @@ pub use domain::{
 pub use domain::{
     AnalyticsConcurrencyPoint, AnalyticsRange, AnalyticsSnapshot, AnalyticsTokenPoint,
     AnalyticsTurnPoint, AnalyticsWindow, CoreIndexAuditOutcome, CoreIndexHealth, IngestHeartbeat,
-    IngestHeartbeatRead, PublicationDiagnostics, RetentionPolicyEntry, SessionAnalytics,
-    SessionAnalyticsQuery, SessionLookback, SessionStep, SessionTurn, StorageBucketReport,
-    StorageDiskReport, StorageReport, StorageTableReport, StoreConnectionMetrics, StoreDiagnostics,
-    StoreHealth, StoreProbe, TableClass, TableColumn, TablePreview, TablePreviewQuery,
-    TableSummaries, TableSummary, ToolResult, WebSearchEvent,
+    IngestHeartbeatRead, PublicationDiagnostics, RetentionPolicyEntry, SessionLookback,
+    StorageBucketReport, StorageDiskReport, StorageReport, StorageTableReport,
+    StoreConnectionMetrics, StoreDiagnostics, StoreHealth, StoreProbe, TableClass, TableColumn,
+    TablePreview, TablePreviewQuery, TableSummaries, TableSummary, ToolResult, WebSearchEvent,
 };
 pub use domain::{
     CanonicalContinuation, CanonicalPageAfter, CanonicalReadAnchor, CanonicalReadOutcome,
@@ -98,8 +97,10 @@ pub fn build_clickhouse_repository_with_user_agent(
 /// client for the given backend config and runs the single readiness read
 /// under an Administrative-class envelope (issue #600 amendment A10 — startup
 /// probes carry a query id and finite deadline). Best-effort by design: an
-/// unreachable or un-migrated backend reports `false` (stay on v1) rather
-/// than failing startup.
+/// unreachable or un-migrated backend reports `false` rather than failing
+/// startup. Since issue #603 WI-10 there is no v1 reader behind that `false`:
+/// it means `open` and the discovery surfaces refuse with a typed error naming
+/// the canonical sweep until readiness publishes.
 pub async fn probe_open_v2_ready(
     clickhouse: moraine_config::ClickHouseConfig,
     budgets: &moraine_config::ValidatedQueryBudgets,

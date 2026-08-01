@@ -25,8 +25,9 @@
 //!    any delete**, from relations the deletes do not touch. Everything after
 //!    this point is re-derivable from that one row.
 //! 3. **Execute** — advance to `deleting`, then issue the unit's deletes
-//!    **children first, parent last** — the inverse of
-//!    `reclaim_superseded_mcp_open_snapshots`.
+//!    **children first, parent last** — the inverse of the retired
+//!    `mcp_open` reclaimer's parent-first order (see the ledger section
+//!    below for why that order was the bug).
 //! 4. **Settle** — `phase='done'`.
 //!
 //! [`ClickHouseClient::reclaim_redrive`] runs at the head of **every** run,
@@ -75,10 +76,13 @@
 //!
 //! ## The ledger, and why the delete order is the inverse of the old reclaimer
 //!
-//! The existing `mcp_open` reclaimer derives its target set *from headers* and
-//! deletes the headers first. A crash between statements strands the children
-//! **forever**, because the set can never be re-derived; the reference host's
-//! 10.9M orphan `mcp_open_events` rows are that bug's output.
+//! The `mcp_open` reclaimer this driver replaced derived its target set *from
+//! headers* and deleted the headers first. A crash between statements stranded
+//! the children **forever**, because the set could never be re-derived; the
+//! reference host's 10.9M orphan `mcp_open_events` rows were that bug's output.
+//! Issue #603 WI-10 deleted that reclaimer and migration 041 dropped the tables
+//! the orphans sat in, so the failure mode is now only reachable by writing a
+//! new parent-first executor — which is what the order below exists to prevent.
 //!
 //! The ledger makes the set durable independently of the rows, so this driver
 //! can delete **children first, parent last**. A crash then leaves an intact,
@@ -174,12 +178,12 @@ pub const CONTROL_RELATIONS: &[&str] = &[
 
 /// Maximum `(key)` tuples inlined into one `DELETE … WHERE … IN (…)`.
 ///
-/// Defined *as* the existing `mcp_open` reclaimer's chunk rather than
-/// restating the literal, so the two paths cannot claim "one shape" while
-/// drifting to two numbers. The definition is the coupling;
-/// `the_two_reclaim_paths_share_one_chunk_size` names it so a future edit that
-/// re-copies the literal fails a test rather than a code review.
-pub const RECLAIM_DELETE_CHUNK: usize = crate::mcp_open_projection::RECLAIM_DELETE_CHUNK;
+/// The value the retired `mcp_open` reclaimer established; kept as the single
+/// chunk bound for every remaining scope. (Until issue #603 WI-10 dropped the
+/// v1 projector, this was defined *as* that reclaimer's constant so the two
+/// paths could not drift; the projector is gone, so the literal lives here
+/// now.)
+pub const RECLAIM_DELETE_CHUNK: usize = 1000;
 
 /// Whether `statement` writes a control relation, and which one (INV-2).
 ///
@@ -363,20 +367,6 @@ pub fn reclaimed_bytes_note() -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReclaimScope {
-    /// WS-3a (WI-05): `(session_id, candidate_generation)` pairs present in
-    /// the `mcp_open_*` child tables with no corresponding publication header.
-    /// Provably dead: an exact `(slot, generation)` match against the
-    /// header-authorized session is required to pin one, on either engine.
-    McpOpenOrphan,
-    /// WS-3a′ (WI-05b, plan §0 F4): `(session_id, candidate_generation)` pairs
-    /// whose header is complete and valid but whose **lineage** the session has
-    /// left. `reclaim_superseded_mcp_open_snapshots` joins within one
-    /// `required_heads_fingerprint` and excludes everything else by design
-    /// (`mcp_open_projection::superseded_snapshot_set_sql`), so a replacement replay's
-    /// predecessor is unreachable by it forever. Retirement rests on the
-    /// monotone dirty revision the reader compares for equality, never on
-    /// generation order — see `reclaim_mcp_open::retired_lineage_candidate_sql`.
-    McpOpenRetiredLineage,
     /// WS-3b (WI-07): canonical read-index rows whose
     /// `(source_host, source_name, source_file, source_generation)` is not in
     /// the published heads. All three targets are content-free and rebuildable
@@ -387,18 +377,22 @@ pub enum ReclaimScope {
     CanonicalGeneration,
 }
 
+/// Scope strings retired by issue #603 WI-10 alongside the `mcp_open_*`
+/// projection they targeted (`mcp_open_orphan`, `mcp_open_retired_lineage`).
+///
+/// Migration 041 settles every unsettled ledger unit of these scopes to
+/// `abandoned` (settle-by-drop: dropping the tables removes every row a unit
+/// could name, so the unit's postcondition holds trivially) — so a redrive can
+/// only meet one of these strings on a ledger written by a NEWER binary than
+/// the migrations that ran, and the `unresumable` counter is the right place
+/// for that. [`ReclaimScope::parse`] deliberately does not accept them.
+pub const RETIRED_SCOPE_STRINGS: &[&str] = &["mcp_open_orphan", "mcp_open_retired_lineage"];
+
 impl ReclaimScope {
-    pub const ALL: [ReclaimScope; 4] = [
-        Self::McpOpenOrphan,
-        Self::McpOpenRetiredLineage,
-        Self::ReadIndexGeneration,
-        Self::CanonicalGeneration,
-    ];
+    pub const ALL: [ReclaimScope; 2] = [Self::ReadIndexGeneration, Self::CanonicalGeneration];
 
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::McpOpenOrphan => "mcp_open_orphan",
-            Self::McpOpenRetiredLineage => "mcp_open_retired_lineage",
             Self::ReadIndexGeneration => "read_index_generation",
             Self::CanonicalGeneration => "canonical_generation",
         }
@@ -413,18 +407,6 @@ impl ReclaimScope {
     /// over intact canonical data, never the inverse.
     pub fn tables(self) -> &'static [ReclaimTable] {
         match self {
-            // The header is named even though an orphan unit has none: the
-            // delete is a predicate over a key set, so it removes zero rows —
-            // and naming it means a header written *between* the probe and the
-            // delete (a prepare that completed inside the horizon this unit
-            // already passed) does not survive its own children. Statement
-            // order is what makes that safe rather than merely tidy: children
-            // first, header last.
-            Self::McpOpenOrphan | Self::McpOpenRetiredLineage => &[
-                ReclaimTable::McpOpenEvents,
-                ReclaimTable::McpOpenTurns,
-                ReclaimTable::McpOpenPublicationHeaders,
-            ],
             Self::ReadIndexGeneration => &[
                 ReclaimTable::McpEventNavigation,
                 ReclaimTable::McpEventLocator,
@@ -450,7 +432,7 @@ impl ReclaimScope {
     /// from a default config.
     pub fn is_default_on(self) -> bool {
         match self {
-            Self::McpOpenOrphan | Self::McpOpenRetiredLineage | Self::ReadIndexGeneration => true,
+            Self::ReadIndexGeneration => true,
             Self::CanonicalGeneration => false,
         }
     }
@@ -459,9 +441,6 @@ impl ReclaimScope {
     /// [`ReclaimUnitGrain`]; exhaustive, so a new scope must decide.
     pub fn unit_grain(self) -> ReclaimUnitGrain {
         match self {
-            Self::McpOpenOrphan | Self::McpOpenRetiredLineage => {
-                ReclaimUnitGrain::SessionCandidateGeneration
-            }
             Self::ReadIndexGeneration | Self::CanonicalGeneration => {
                 ReclaimUnitGrain::SourceGeneration
             }
@@ -471,13 +450,6 @@ impl ReclaimScope {
     /// Human-readable description used by the CLI refusal.
     pub fn describe(self) -> &'static str {
         match self {
-            Self::McpOpenOrphan => {
-                "orphan legacy open-projection rows (no publication header; unreadable by design)"
-            }
-            Self::McpOpenRetiredLineage => {
-                "legacy open-projection snapshots in a source lineage the session has left \
-                 (a newer lineage is published and live, and no reader can select the old one)"
-            }
             Self::ReadIndexGeneration => {
                 "canonical read-index rows for superseded source generations (content-free, \
                  rebuildable with `moraine db core-index rebuild`)"
@@ -501,9 +473,6 @@ impl fmt::Display for ReclaimScope {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReclaimTable {
-    McpOpenEvents,
-    McpOpenTurns,
-    McpOpenPublicationHeaders,
     McpSessionDirectory,
     McpEventLocator,
     McpEventNavigation,
@@ -530,22 +499,6 @@ pub enum ReclaimPredicate {
     /// `(source_host, source_name, source_file, source_generation)` is on the
     /// row itself and is exact.
     Generation,
-    /// `(session_id, candidate_generation)` is on the row itself. The two
-    /// `mcp_open` **child** tables, and only those.
-    SessionGeneration,
-    /// `(session_id, generation)` is on the row itself.
-    ///
-    /// **`mcp_open_publication_headers` has no `candidate_generation` column**
-    /// — verified against the deployed schema on 2026-07-28: its columns are
-    /// `(session_id, candidate_publication_id, slot, generation, …)`
-    /// (`sql/033:16-60`), and the existing reclaimer's own header delete says
-    /// so (`mcp_open_projection::superseded_snapshot_delete_statements` predicates
-    /// `(session_id, generation)` on the header and
-    /// `(session_id, candidate_generation)` on the two children). Folding the
-    /// header into [`Self::SessionGeneration`] made every legal header delete
-    /// unemittable and every *emittable* one name a column the table does not
-    /// have — hazard H3, one table over from the pair it was written for.
-    SessionHeaderGeneration,
     /// The row carries no generation. Its liveness is a `(source_host,
     /// source_name, event_uid)` set **re-derived from the parent `events`
     /// rows by subquery at execution time** — sound because the unit's
@@ -584,9 +537,12 @@ impl ReclaimPredicate {
     /// Every name here is verified present on every table of the shape:
     /// `source_host` reaches `events`/`raw_events`/`ingest_errors`/
     /// `search_documents` via sql/032:25-70 and the read indexes via sql/036;
-    /// `candidate_generation` reaches `mcp_open_events`/`mcp_open_turns` via
-    /// sql/033:8,13 and **not** `mcp_open_publication_headers`, which carries
-    /// `generation` — see [`Self::SessionHeaderGeneration`].
+    /// `candidate_generation` reached `mcp_open_events`/`mcp_open_turns` via
+    /// sql/033:8,13 and **not** `mcp_open_publication_headers`, which carried
+    /// `generation` — see [`Self::SessionHeaderGeneration`]. Those three tables
+    /// are gone (issue #603 WI-10, migration 041); the distinction is kept
+    /// because the shape's column-name discipline is what generalizes, and the
+    /// header/child column split is the cleanest example of it.
     /// `search_postings` has **no** `event_uid` column at all — its link to
     /// the document is `doc_id` — which is why `DocumentJoin` is a separate
     /// shape rather than `UidSet`. Both derived shapes also require
@@ -610,8 +566,6 @@ impl ReclaimPredicate {
                 "source_file",
                 "source_generation",
             ],
-            Self::SessionGeneration => &["session_id", "candidate_generation"],
-            Self::SessionHeaderGeneration => &["session_id", "generation"],
             Self::UidSet => &["source_host", "source_name", "event_uid"],
             Self::DocumentJoin => &["source_host", "source_name", "doc_id"],
         }
@@ -644,9 +598,6 @@ pub fn predicate_names_column(predicate_sql: &str, column: &str) -> bool {
 impl ReclaimTable {
     pub fn name(self) -> &'static str {
         match self {
-            Self::McpOpenEvents => "mcp_open_events",
-            Self::McpOpenTurns => "mcp_open_turns",
-            Self::McpOpenPublicationHeaders => "mcp_open_publication_headers",
             Self::McpSessionDirectory => "mcp_session_directory",
             Self::McpEventLocator => "mcp_event_locator",
             Self::McpEventNavigation => "mcp_event_navigation",
@@ -664,10 +615,6 @@ impl ReclaimTable {
     /// construction: a new variant without an arm is a compile error.
     pub fn predicate(self) -> ReclaimPredicate {
         match self {
-            Self::McpOpenEvents | Self::McpOpenTurns => ReclaimPredicate::SessionGeneration,
-            // Not `SessionGeneration`: the header table's column is
-            // `generation`. See `ReclaimPredicate::SessionHeaderGeneration`.
-            Self::McpOpenPublicationHeaders => ReclaimPredicate::SessionHeaderGeneration,
             Self::McpSessionDirectory | Self::McpEventNavigation => ReclaimPredicate::Generation,
             // `mcp_event_locator` is ORDER BY (event_uid, source_host) and
             // `event_uid` embeds `source_generation`, so a generation
@@ -754,9 +701,7 @@ impl ReclaimAuthority {
         retention: &RetentionConfig,
     ) -> Result<Vec<ReclaimAuthority>, MissingAuthority> {
         match scope {
-            ReclaimScope::McpOpenOrphan
-            | ReclaimScope::McpOpenRetiredLineage
-            | ReclaimScope::ReadIndexGeneration => Ok(vec![Self::DerivedOnly]),
+            ReclaimScope::ReadIndexGeneration => Ok(vec![Self::DerivedOnly]),
             ReclaimScope::CanonicalGeneration => {
                 let canonical = RetentionHorizon::from_config(
                     retention,
@@ -786,7 +731,7 @@ impl ReclaimAuthority {
 ///
 /// One computation site for the per-bucket rule (plan §3.5, WI-09):
 ///
-/// * the three bucket-3 scopes use `retention.derived_horizon_hours`;
+/// * the bucket-3 scope uses `retention.derived_horizon_hours`;
 /// * `CanonicalGeneration` uses the **stricter (larger) of the two protected
 ///   horizons**, `max(canonical_history, raw_audit)`. Per bucket: `events`
 ///   (bucket 1) is gated by `canonical_history_horizon_days`, `raw_events`/
@@ -806,9 +751,7 @@ pub fn probe_horizon_seconds(
     retention: &RetentionConfig,
 ) -> Result<u64, MissingAuthority> {
     match scope {
-        ReclaimScope::McpOpenOrphan
-        | ReclaimScope::McpOpenRetiredLineage
-        | ReclaimScope::ReadIndexGeneration => {
+        ReclaimScope::ReadIndexGeneration => {
             Ok(retention.derived_horizon_seconds().max(0.0) as u64)
         }
         ReclaimScope::CanonicalGeneration => {
@@ -969,28 +912,44 @@ pub struct ReclaimUnit {
 /// its grain is a compile error, and the grain drives both the unit's
 /// `reclaim_id` (its ledger identity) and the claim-time validation in
 /// [`ReclaimCandidateRow::into_unit`].
+///
+/// **One variant as of issue #603 WI-10.** The session-candidate grain existed
+/// only for the `mcp_open_*` scopes, which retired with migration 041. While
+/// this enum is a singleton, `unit_grain` is a total function into a set of
+/// size one and no per-scope pin can fail — see the note where
+/// `each_scopes_unit_grain_is_pinned` used to live.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReclaimUnitGrain {
-    /// One `(session_id, candidate_generation)` pair — the two `mcp_open`
-    /// scopes.
-    SessionCandidateGeneration,
     /// One `(source_host, source_name, source_file, source_generation)` tuple
-    /// — the read-index scope, and WI-09's canonical scope.
+    /// — WI-07's read-index scope and WI-09's canonical scope, which is every
+    /// scope this build has.
     SourceGeneration,
 }
 
 /// Row shape every registered candidate probe returns.
 ///
-/// One struct across both grains, with the other grain's key fields defaulted
-/// — the transport deserializes one shape, and [`Self::into_unit`] restores
-/// fail-loud behaviour by refusing a row that does not carry its scope's own
-/// key. Without that check, a probe emitting the wrong column names would
-/// deserialize into all-default rows and claim ledger units keyed `('', 0)`
-/// whose deletes bind nothing.
+/// One struct across every scope, with the fields a given probe does not
+/// report defaulted — the transport deserializes one shape, and
+/// [`Self::into_unit`] restores fail-loud behaviour by refusing a row that does
+/// not carry its scope's own key. Without that check, a probe emitting the
+/// wrong column names would deserialize into all-default rows and claim ledger
+/// units keyed `('', 0)` whose deletes bind nothing.
+///
+/// **Every rollup field here is one a surviving probe emits.** Issue #603 WI-10
+/// removed `turn_rows` and `header_rows`, which the retired `mcp_open_*` probes
+/// were the only emitters of: `serde(default)` left them permanently `0` while
+/// [`Self::estimated_rows`] went on summing them, so a reader could mistake two
+/// structural zeroes for measured values in a reported estimate.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub(crate) struct ReclaimCandidateRow {
+    /// Session grain, kept although no surviving probe emits it: it is a
+    /// `storage_reclaim_ledger` column (`sql/038`) that [`Self::into_unit`]
+    /// carries into [`ReclaimUnit`], so its shape is the ledger's, not a
+    /// probe's. Structurally empty for both current scopes, which are
+    /// [`ReclaimUnitGrain::SourceGeneration`]-grained.
     #[serde(default)]
     pub(crate) session_id: String,
+    /// Same: a ledger column, not a measurement. See `session_id`.
     #[serde(default)]
     pub(crate) candidate_generation: u64,
     #[serde(default)]
@@ -1004,10 +963,6 @@ pub(crate) struct ReclaimCandidateRow {
     #[serde(default)]
     pub(crate) event_rows: u64,
     #[serde(default)]
-    pub(crate) turn_rows: u64,
-    #[serde(default)]
-    pub(crate) header_rows: u64,
-    #[serde(default)]
     pub(crate) navigation_rows: u64,
     #[serde(default)]
     pub(crate) locator_rows: u64,
@@ -1019,9 +974,8 @@ pub(crate) struct ReclaimCandidateRow {
     /// `ingest_errors` rows — same.
     #[serde(default)]
     pub(crate) error_rows: u64,
-    /// `search_documents` rows. `event_rows` carries the `events` count for
-    /// the canonical probe, exactly as it carries `mcp_open_events` for the
-    /// orphan one: both are "the parent event table's physical rows".
+    /// `search_documents` rows. `event_rows` carries the canonical probe's
+    /// `events` count — the parent event table's physical rows.
     #[serde(default)]
     pub(crate) document_rows: u64,
 }
@@ -1029,8 +983,6 @@ pub(crate) struct ReclaimCandidateRow {
 impl ReclaimCandidateRow {
     pub(crate) fn estimated_rows(&self) -> u64 {
         self.event_rows
-            .saturating_add(self.turn_rows)
-            .saturating_add(self.header_rows)
             .saturating_add(self.navigation_rows)
             .saturating_add(self.locator_rows)
             .saturating_add(self.directory_rows)
@@ -1041,27 +993,8 @@ impl ReclaimCandidateRow {
 
     /// The claimable unit this candidate describes, or an error naming the
     /// missing key when the row does not carry its scope's grain.
-    ///
-    /// The `reclaim_id` format for the session grain is unchanged from WI-05
-    /// (`{scope}:{session}:{generation}`), deliberately: it is the ledger's
-    /// `(scope, reclaim_id)` key, and reformatting it would stop a re-claim of
-    /// an in-flight unit from collapsing onto its existing row.
     pub(crate) fn into_unit(self, scope: ReclaimScope) -> Result<ReclaimUnit> {
         let reclaim_id = match scope.unit_grain() {
-            ReclaimUnitGrain::SessionCandidateGeneration => {
-                if self.session_id.is_empty() || self.candidate_generation == 0 {
-                    anyhow::bail!(
-                        "scope `{scope}` is session-grained but its probe returned a candidate \
-                         without a `(session_id, candidate_generation)` key: {self:?}"
-                    );
-                }
-                format!(
-                    "{}:{}:{}",
-                    scope.as_str(),
-                    self.session_id,
-                    self.candidate_generation
-                )
-            }
             ReclaimUnitGrain::SourceGeneration => {
                 if self.source_file.is_empty() || self.source_generation == 0 {
                     anyhow::bail!(
@@ -1164,11 +1097,11 @@ pub struct ReclaimStatusReport {
 
 /// Outcome of `moraine db reclaim run`.
 ///
-/// **Hazard H9, as a type.** The existing projection reclaim gate returns
-/// `Ok(default)` with no log and no counter when a mutation is pending, so a
-/// permanently stuck mutation disables reclamation forever with zero operator
-/// signal. `Blocked` is a distinct variant carrying the pending count, and it
-/// is surfaced by `reclaim status`.
+/// **Hazard H9, as a type.** The projection reclaim gate this driver replaced
+/// returned `Ok(default)` with no log and no counter when a mutation was
+/// pending, so a permanently stuck mutation disabled reclamation forever with
+/// zero operator signal. `Blocked` is a distinct variant carrying the pending
+/// count, and it is surfaced by `reclaim status`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum ReclaimOutcome {
@@ -1260,49 +1193,18 @@ impl ReclaimOutcome {
 /// behaviours covered — rather than the constant alone.
 pub const LEDGER_DRIVER_WIRED: bool = true;
 
-/// Units one run may claim, **derived from the measured cost of one unit**
-/// rather than chosen as a round number.
+/// Units one run may claim.
 ///
-/// One unit issues three deletes, and `EXPLAIN indexes = 1` against the shipped
-/// predicates reports two different shapes. **The shape is what this bound
-/// rests on; the absolute counts below are not, and must not be read as
-/// stable.** Parts and granules move with every background merge — a re-run
-/// hours later gives different numbers for an unchanged schema and an unchanged
-/// query — so what follows is a dated sample of a date-independent property.
-///
-/// | table | pruning shape | sample, reference host 2026-07-28 |
-/// |---|---|---|
-/// | `mcp_open_events` | **none: `Condition: true`, every active part and every granule read** | 452/452 parts, 9 692/9 692 granules over 9.66 GiB |
-/// | `mcp_open_turns` | one partition of 64; parts and granules within it are session-dependent | 1/294 parts and 1 granule for an absent session; 10/294 parts and 2 743/4 421 granules for the host's largest |
-/// | `mcp_open_publication_headers` | one partition of 64 | 1/79 parts for an absent session, 2/79 for a present one |
-///
-/// The date-independent reason is the sort key, not the sample.
-/// `mcp_open_turns` and `mcp_open_publication_headers` are `PARTITION BY
-/// cityHash64(session_id) % 64` with `session_id` leading the primary key, so a
-/// predicate naming one `session_id` reaches exactly one partition — how many
-/// parts and granules that partition currently holds depends on the session's
-/// size and on merge state, which is why the turns row above spans two orders
-/// of magnitude between an absent session and the largest present one.
-/// `mcp_open_events` is `PARTITION BY cityHash64(event_uid) % 64 PRIMARY KEY
-/// (event_uid, slot)` — **`session_id` appears in neither**, and
-/// `candidate_generation` is only the trailing `ORDER BY` column, so the
-/// planner reports `Condition: true` and reads every part. No predicate over
-/// `(session_id, candidate_generation)` can prune this table; that is a
-/// property of the sort key, and no rewrite here fixes it.
-///
-/// So each unit costs one full scan of the largest `mcp_open` table plus a
-/// mutation that writes a `_row_exists` mask into every part it touches — and a
-/// mask makes the table *larger* until merges rewrite the parts. At the
-/// previous value of 64, two scopes on a 60 s tick issued up to **128 full
-/// scans of `mcp_open_events` per minute** on a host selected for reclamation
-/// precisely because it is nearly out of disk.
-///
-/// 8 keeps a full sweep of the reference host's orphan backlog — of order
-/// 700 units, 730 on the last read-only measurement of 2026-07-28, and
-/// growing with every interrupted prepare — at roughly 90 ticks, an hour and a
-/// half of draining. That is the right trade when the alternative is
-/// amplifying a disk-full incident. `moraine db reclaim run --confirm` is the
-/// path for an operator who wants it faster and is watching.
+/// The value was derived for the retired `mcp_open_orphan` scope, whose
+/// per-unit delete against `mcp_open_events` could not be index-pruned at all
+/// (its sort key named neither `session_id` nor a leading
+/// `candidate_generation`), so every unit cost a full scan of the family's
+/// largest table and 64 units per 60 s tick amplified a disk-full incident.
+/// The remaining scopes are generation-keyed and prune, but a lightweight
+/// DELETE still writes a `_row_exists` mask into every part it touches — the
+/// disk gets fuller before merges make it emptier — so the conservative bound
+/// stays. `moraine db reclaim run --confirm` is the path for an operator who
+/// wants a drain faster and is watching.
 pub const RECLAIM_MAX_UNITS_PER_RUN: usize = 8;
 
 /// How long a unit may stay unsettled before a re-drive marks it `abandoned`.
@@ -1343,9 +1245,7 @@ pub const RECLAIM_MIN_FREE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 /// A **maintenance** run is a 60-second background tick with nobody watching.
 /// It consults free space first, because reclamation's first effect is to
 /// write `_row_exists` masks — it makes the disk fuller before any merge makes
-/// it emptier — and because on this host the delete it issues to
-/// `mcp_open_events` cannot be index-pruned at all
-/// (see [`RECLAIM_MAX_UNITS_PER_RUN`]).
+/// it emptier (see [`RECLAIM_MAX_UNITS_PER_RUN`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReclaimTrigger {
@@ -1430,23 +1330,8 @@ impl Eq for RegisteredExecutor {}
 /// The executor for `scope`, if one has been registered in this build.
 pub fn executor_for(scope: ReclaimScope) -> Option<RegisteredExecutor> {
     match scope {
-        // WI-05.
-        ReclaimScope::McpOpenOrphan => Some(RegisteredExecutor {
-            scope,
-            probe: |database, horizon, limit| {
-                crate::reclaim_mcp_open::orphan_candidate_sql(database, horizon, limit)
-            },
-            predicates: |_database, unit| crate::reclaim_mcp_open::mcp_open_unit_predicates(unit),
-        }),
-        // WI-05b (plan §0 F4).
-        ReclaimScope::McpOpenRetiredLineage => Some(RegisteredExecutor {
-            scope,
-            probe: |database, horizon, limit| {
-                crate::reclaim_mcp_open::retired_lineage_candidate_sql(database, horizon, limit)
-            },
-            predicates: |_database, unit| crate::reclaim_mcp_open::mcp_open_unit_predicates(unit),
-        }),
-        // WI-07.
+        // WI-07. (The WI-05 `mcp_open` executors were retired with their
+        // tables by WI-10 / migration 041; see `RETIRED_SCOPE_STRINGS`.)
         ReclaimScope::ReadIndexGeneration => Some(RegisteredExecutor {
             scope,
             probe: |database, horizon, limit| {
@@ -1475,8 +1360,8 @@ pub fn executor_for(scope: ReclaimScope) -> Option<RegisteredExecutor> {
     }
 }
 
-/// Every scope with a registered executor. All four as of WI-09; see
-/// [`executor_for`].
+/// Every scope with a registered executor. Both remaining scopes as of WI-10;
+/// see [`executor_for`].
 pub fn registered_executors() -> Vec<ReclaimScope> {
     ReclaimScope::ALL
         .into_iter()
@@ -1486,7 +1371,7 @@ pub fn registered_executors() -> Vec<ReclaimScope> {
 
 /// The refusal a `run` prints for a scope with no executor.
 ///
-/// Unreachable in this build — every scope has an executor as of WI-09 — but
+/// Unreachable in this build — every remaining scope has an executor — but
 /// kept, with [`pending_work_item`], for the build states that can reach it
 /// again: a downgrade past a work item, or a future scope landing its enum
 /// variant before its executor (the WI-04→WI-05 order this module was built
@@ -1505,8 +1390,6 @@ pub fn no_executor_message(scope: ReclaimScope) -> String {
 /// The work item that will register `scope`'s executor, for the refusal text.
 fn pending_work_item(scope: ReclaimScope) -> &'static str {
     match scope {
-        ReclaimScope::McpOpenOrphan => "WI-05",
-        ReclaimScope::McpOpenRetiredLineage => "WI-05b",
         ReclaimScope::ReadIndexGeneration => "WI-07",
         ReclaimScope::CanonicalGeneration => "WI-09",
     }
@@ -2008,8 +1891,9 @@ impl ClickHouseClient {
     /// Advance one claimed unit to `deleting`, issue its deletes **children
     /// first and the parent last**, then settle it to `done`.
     ///
-    /// The ordering is the inverse of `reclaim_superseded_mcp_open_snapshots`
-    /// and the inversion is the point: with the claim durable, a crash between
+    /// The ordering is the inverse of the retired `mcp_open` reclaimer's
+    /// parent-first order, and the inversion is the point: with the claim
+    /// durable, a crash between
     /// two deletes leaves an intact, still-authorizable snapshot that the next
     /// run finishes, rather than children no probe can ever see again. Reader
     /// safety comes from the horizon and the anti-join — the unit was already
@@ -2044,8 +1928,8 @@ impl ClickHouseClient {
     /// `retention` is the **caller's** config, never
     /// `RetentionConfig::default()`.
     ///
-    /// Re-deriving authority from a default was harmless for the two bucket-3
-    /// scopes — `DerivedOnly` needs no `[retention]` key — and fatal for every
+    /// Re-deriving authority from a default is harmless for a bucket-3 scope
+    /// — `DerivedOnly` needs no `[retention]` key — and fatal for every
     /// scope that does: `ReclaimAuthority::for_scope(CanonicalGeneration,
     /// &RetentionConfig::default())` always errors, so WI-09's executor would
     /// have been unable to execute a single unit the moment it was
@@ -2355,12 +2239,6 @@ mod tests {
             ReclaimPredicate::Generation => "(source_host, source_name, source_file, \
                  source_generation) IN (('host-a', 'codex', '/tmp/a.jsonl', 3))"
                 .to_string(),
-            ReclaimPredicate::SessionGeneration => {
-                "(session_id, candidate_generation) IN (('s-1', 99))".to_string()
-            }
-            ReclaimPredicate::SessionHeaderGeneration => {
-                "(session_id, generation) IN (('s-1', 99))".to_string()
-            }
             ReclaimPredicate::UidSet => "(source_host, source_name, event_uid) IN \
                  (('host-a', 'codex', 'u-1'), ('host-a', 'codex', 'u-2'))"
                 .to_string(),
@@ -2411,7 +2289,7 @@ mod tests {
         statements.push(ledger_summary_sql("moraine"));
         statements.push(ledger_redrive_sql(
             "moraine",
-            ReclaimScope::McpOpenOrphan,
+            ReclaimScope::ReadIndexGeneration,
             64,
         ));
         statements
@@ -2501,7 +2379,7 @@ mod tests {
             // Width: `OPTIMIZE` on a derived relation is legal — the shape is
             // not the violation, the relation is. Widening the detector to
             // "any OPTIMIZE" turns this red.
-            ("OPTIMIZE TABLE moraine.mcp_open_turns FINAL", None),
+            ("OPTIMIZE TABLE moraine.mcp_event_navigation FINAL", None),
             // Reads are not writes: the pending-mutation probe names every
             // scope table and must stay legal.
             (
@@ -2589,12 +2467,12 @@ mod tests {
         // test above would pass vacuously.
         let statement = emit_delete_statement(
             "moraine",
-            ReclaimTable::McpOpenEvents,
-            &sample_predicate(ReclaimTable::McpOpenEvents),
+            ReclaimTable::McpEventNavigation,
+            &sample_predicate(ReclaimTable::McpEventNavigation),
             &derived_only(),
         )
         .expect("derived tables emit under a derived-only token");
-        assert!(statement.starts_with("DELETE FROM `moraine`.mcp_open_events"));
+        assert!(statement.starts_with("DELETE FROM `moraine`.mcp_event_navigation"));
 
         // And with full authority the protected tables do emit, so the refusal
         // above is about the token and not about the table.
@@ -2745,14 +2623,14 @@ mod tests {
             }
         }
 
-        // An empty `IN ()` list — the shape a WI-05 executor produces on an
+        // An empty `IN ()` list — the shape a chunked executor produces on an
         // empty chunk — still names its columns and is therefore emittable;
         // it deletes nothing, which is correct. The refusal is about a
         // predicate that names no column at all.
         emit_delete_statement(
             "moraine",
-            ReclaimTable::McpOpenEvents,
-            "(session_id, candidate_generation) IN ()",
+            ReclaimTable::McpEventNavigation,
+            "(source_host, source_name, source_file, source_generation) IN ()",
             &authorities,
         )
         .expect("an empty key list is bound, just empty");
@@ -2791,10 +2669,6 @@ mod tests {
         assert_eq!(
             ReclaimPredicate::UidSet.required_columns(),
             &["source_host", "source_name", "event_uid"]
-        );
-        assert_eq!(
-            ReclaimPredicate::SessionGeneration.required_columns(),
-            &["session_id", "candidate_generation"]
         );
         assert_eq!(
             ReclaimPredicate::Generation.required_columns(),
@@ -2873,19 +2747,6 @@ mod tests {
                 table.name()
             );
         }
-        for table in [ReclaimTable::McpOpenEvents, ReclaimTable::McpOpenTurns] {
-            assert_eq!(table.predicate(), ReclaimPredicate::SessionGeneration);
-        }
-        // The header table is `(session_id, candidate_publication_id, slot,
-        // generation, …)` — it has no `candidate_generation` column at all
-        // (sql/033:16-60, and verified against the deployed schema
-        // 2026-07-28). Folding it in with its own children made every legal
-        // header delete unemittable, which is hazard H3 one table over.
-        assert_eq!(
-            ReclaimTable::McpOpenPublicationHeaders.predicate(),
-            ReclaimPredicate::SessionHeaderGeneration,
-            "mcp_open_publication_headers is keyed on `generation`, not `candidate_generation`"
-        );
     }
 
     /// **G-COLBOUND.** Fails for: the emitter's third check accepting a
@@ -2908,52 +2769,10 @@ mod tests {
     /// `false` unconditionally => FAILS on the positive case. **Width.**
     #[test]
     fn the_emitter_tells_generation_from_candidate_generation() {
-        let child_predicate = "(session_id, candidate_generation) IN (('s-1', toUInt64(9)))";
-        let header_predicate = "(session_id, generation) IN (('s-1', toUInt64(9)))";
-
-        let refusal = emit_delete_statement(
-            "moraine",
-            ReclaimTable::McpOpenPublicationHeaders,
-            child_predicate,
-            &derived_only(),
-        )
-        .expect_err("a header delete carrying the child predicate names no column of the table");
-        match refusal {
-            EmitRefusal::UnboundPredicate { missing, .. } => {
-                assert_eq!(missing, vec!["generation"]);
-            }
-            other => panic!("expected an unbound-predicate refusal, got {other:?}"),
-        }
-
-        emit_delete_statement(
-            "moraine",
-            ReclaimTable::McpOpenPublicationHeaders,
-            header_predicate,
-            &derived_only(),
-        )
-        .expect("the header's own predicate is emittable");
-
-        // …and the converse: `generation` alone does not satisfy the child
-        // tables' `candidate_generation`.
-        let refusal = emit_delete_statement(
-            "moraine",
-            ReclaimTable::McpOpenEvents,
-            header_predicate,
-            &derived_only(),
-        )
-        .expect_err("a child delete carrying the header predicate is not bound");
-        match refusal {
-            EmitRefusal::UnboundPredicate { missing, .. } => {
-                assert_eq!(missing, vec!["candidate_generation"]);
-            }
-            other => panic!("expected an unbound-predicate refusal, got {other:?}"),
-        }
-
-        assert!(
-            emit_delete_statement("moraine", ReclaimTable::McpOpenEvents, "1", &derived_only())
-                .is_err(),
-            "`WHERE 1` names no key column and must stay refused"
-        );
+        // The identifier-boundary rule itself, on the exact column pair the
+        // (since retired) mcp_open header/child tables disagreed on. The
+        // function is still the third emitter check for every remaining
+        // table, so a regression to substring matching is a regression here.
         assert!(predicate_names_column(
             "(session_id, generation) IN (())",
             "generation"
@@ -2966,6 +2785,33 @@ mod tests {
             "(session_id, candidate_generation) IN (())",
             "candidate_generation"
         ));
+
+        // And driven through the emitter on a live table: a predicate that
+        // names `source_generation` does not satisfy nothing, and one that
+        // names none of the tuple is refused with every column listed.
+        assert!(
+            emit_delete_statement(
+                "moraine",
+                ReclaimTable::McpEventNavigation,
+                "1",
+                &derived_only()
+            )
+            .is_err(),
+            "`WHERE 1` names no key column and must stay refused"
+        );
+        let refusal = emit_delete_statement(
+            "moraine",
+            ReclaimTable::McpEventNavigation,
+            "(source_host, source_name, source_file, generation) IN ()",
+            &derived_only(),
+        )
+        .expect_err("bare `generation` must not satisfy `source_generation`");
+        match refusal {
+            EmitRefusal::UnboundPredicate { missing, .. } => {
+                assert_eq!(missing, vec!["source_generation"]);
+            }
+            other => panic!("expected an unbound-predicate refusal, got {other:?}"),
+        }
     }
 
     #[test]
@@ -3019,9 +2865,6 @@ mod tests {
             vec![
                 "mcp_event_locator",
                 "mcp_event_navigation",
-                "mcp_open_events",
-                "mcp_open_publication_headers",
-                "mcp_open_turns",
                 "mcp_session_directory",
             ],
             "the stock-config reachable table set"
@@ -3056,7 +2899,7 @@ mod tests {
     ///
     /// `the_default_reachable_table_set_excludes_all_user_history` pins the
     /// reachable **tables**; nothing pinned the reachable **tokens**. Adding
-    /// `Self::Telemetry` to the `McpOpenOrphan | ReadIndexGeneration` arm was
+    /// `Self::Telemetry` to the `ReadIndexGeneration` arm was
     /// GREEN across the whole suite (executed 2026-07-27), because no scope's
     /// `tables()` currently names a bucket-4 relation — i.e. the emitter was
     /// safe only by virtue of the planner's table list, which is exactly the
@@ -3076,16 +2919,12 @@ mod tests {
         use std::collections::BTreeSet;
 
         let stock = RetentionConfig::default();
-        for scope in [
-            ReclaimScope::McpOpenOrphan,
-            ReclaimScope::ReadIndexGeneration,
-        ] {
-            assert_eq!(
-                ReclaimAuthority::for_scope(scope, &stock).expect("default-on scope"),
-                vec![ReclaimAuthority::DerivedOnly],
-                "`{scope}` must carry the derived token and nothing else"
-            );
-        }
+        let scope = ReclaimScope::ReadIndexGeneration;
+        assert_eq!(
+            ReclaimAuthority::for_scope(scope, &stock).expect("default-on scope"),
+            vec![ReclaimAuthority::DerivedOnly],
+            "`{scope}` must carry the derived token and nothing else"
+        );
 
         let configured = RetentionConfig {
             canonical_history_horizon_days: Some(365.0),
@@ -3185,7 +3024,7 @@ mod tests {
         }
         assert_eq!(ReclaimPhase::parse("deleted"), None);
 
-        let redrive = ledger_redrive_sql("moraine", ReclaimScope::McpOpenOrphan, 64);
+        let redrive = ledger_redrive_sql("moraine", ReclaimScope::ReadIndexGeneration, 64);
         assert!(redrive.contains("phase IN ('claimed', 'deleting')"));
         assert!(
             !redrive.contains("'done'") && !redrive.contains("'abandoned'"),
@@ -3196,7 +3035,7 @@ mod tests {
 
     #[test]
     fn ledger_writes_are_inserts_that_collapse_by_revision() {
-        let claimed = ledger_claim_statement("moraine", &unit(ReclaimScope::McpOpenOrphan));
+        let claimed = ledger_claim_statement("moraine", &unit(ReclaimScope::ReadIndexGeneration));
         assert!(claimed.starts_with("INSERT INTO `moraine`.storage_reclaim_ledger"));
         assert!(claimed.contains("generateSnowflakeID()"));
         assert!(claimed.contains("'claimed'"));
@@ -3207,7 +3046,7 @@ mod tests {
 
         let deleting = ledger_advance_statement(
             "moraine",
-            &unit(ReclaimScope::McpOpenOrphan),
+            &unit(ReclaimScope::ReadIndexGeneration),
             ReclaimPhase::Deleting,
         );
         assert!(deleting.starts_with("INSERT INTO `moraine`.storage_reclaim_ledger"));
@@ -3257,27 +3096,20 @@ mod tests {
             "a crash must leave derived data missing over intact canonical data, never the inverse"
         );
 
-        // The orphan scope deletes children before the header, the inverse of
-        // the existing reclaimer. That inversion is the stranded-child fix.
-        let orphan: Vec<&str> = ReclaimScope::McpOpenOrphan
+        // The read-index scope's pinned order: bulk first, per-session
+        // discovery scalars last.
+        let read_index: Vec<&str> = ReclaimScope::ReadIndexGeneration
             .tables()
             .iter()
             .map(|table| table.name())
             .collect();
         assert_eq!(
-            orphan,
+            read_index,
             vec![
-                "mcp_open_events",
-                "mcp_open_turns",
-                "mcp_open_publication_headers",
+                "mcp_event_navigation",
+                "mcp_event_locator",
+                "mcp_session_directory",
             ]
-        );
-        assert!(
-            orphan.iter().position(|name| *name == "mcp_open_events")
-                < orphan
-                    .iter()
-                    .position(|name| *name == "mcp_open_publication_headers"),
-            "children first, parent last"
         );
     }
 
@@ -3298,14 +3130,9 @@ mod tests {
 
     #[test]
     fn the_two_reclaim_paths_share_one_chunk_size() {
-        // The doc claims "the two paths have one shape". It is a definition,
-        // not a copy: `RECLAIM_DELETE_CHUNK` here IS the projection
-        // reclaimer's constant, so tuning one tunes both.
-        assert_eq!(
-            RECLAIM_DELETE_CHUNK,
-            crate::mcp_open_projection::RECLAIM_DELETE_CHUNK,
-            "the #603 driver and the existing mcp_open reclaimer must not drift to two chunk sizes"
-        );
+        // Until WI-10 retired the v1 projector this was defined AS its
+        // constant so the two paths could not drift; the literal lives here
+        // now and this pins it.
         assert_eq!(RECLAIM_DELETE_CHUNK, 1_000);
     }
 
@@ -3332,69 +3159,30 @@ mod tests {
         assert_eq!(registered_executors(), ReclaimScope::ALL.to_vec());
     }
 
-    /// The grain of every scope's unit, pinned per scope — not derived from
-    /// the subject. The grain drives the ledger identity and the claim-time
-    /// key validation, so a one-token change here re-keys a scope's ledger.
-    ///
-    /// MUTATION (executed 2026-07-31): map `ReadIndexGeneration` to
-    /// `SessionCandidateGeneration` => FAILS here and at
-    /// `a_candidate_row_must_carry_its_scopes_unit_key`. **Lower bound.**
-    #[test]
-    fn each_scopes_unit_grain_is_pinned() {
-        for (scope, grain) in [
-            (
-                ReclaimScope::McpOpenOrphan,
-                ReclaimUnitGrain::SessionCandidateGeneration,
-            ),
-            (
-                ReclaimScope::McpOpenRetiredLineage,
-                ReclaimUnitGrain::SessionCandidateGeneration,
-            ),
-            (
-                ReclaimScope::ReadIndexGeneration,
-                ReclaimUnitGrain::SourceGeneration,
-            ),
-            (
-                ReclaimScope::CanonicalGeneration,
-                ReclaimUnitGrain::SourceGeneration,
-            ),
-        ] {
-            assert_eq!(scope.unit_grain(), grain, "`{scope}`");
-        }
-    }
+    // `each_scopes_unit_grain_is_pinned` was deleted here by issue #603 WI-10.
+    // It enumerated its two scopes and asserted each mapped to
+    // `ReclaimUnitGrain::SourceGeneration`. WI-10 retired the `mcp_open_*`
+    // scopes and with them the session grain, so the enum now has ONE variant:
+    // `unit_grain` cannot return anything else, no mutation of it compiles,
+    // and the assertion is unfalsifiable. Its docstring cited a mutation
+    // mapping `ReadIndexGeneration` to a variant that no longer exists —
+    // an unrunnable row. What the grain still decides (the ledger identity and
+    // the claim-time key refusal) is executed by
+    // `a_candidate_row_must_carry_its_scopes_unit_key` below. If a second
+    // variant is ever added, restore a per-scope pin derived from
+    // `ReclaimScope::ALL` rather than from a hand-written list.
 
     /// **G-CANDKEY.** Fails for: a candidate row claiming a unit without its
     /// scope's own key — the all-default row a mis-shaped probe response
     /// deserializes into, whose deletes would bind `('', 0)`.
     /// Denomination: the returned error, and the exact `reclaim_id` of the
-    /// accepted rows (the session-grain format is WI-05's, unchanged — it is
-    /// the ledger key, and reformatting it would stop a re-claim from
-    /// collapsing onto its existing row).
+    /// accepted rows.
     ///
     /// MUTATION (executed 2026-07-31): delete the empty-key `bail!` from the
     /// `SourceGeneration` arm of `into_unit` => FAILS here on the refusal
     /// assertion. **Lower bound.**
-    ///
-    /// MUTATION (executed 2026-07-31): build the session-grain `reclaim_id`
-    /// with the source-grain format => FAILS here on the id pin. **Width: the
-    /// grain decides the identity.**
     #[test]
     fn a_candidate_row_must_carry_its_scopes_unit_key() {
-        let session_row = ReclaimCandidateRow {
-            session_id: "s-1".to_string(),
-            candidate_generation: 99,
-            event_rows: 2,
-            turn_rows: 1,
-            header_rows: 1,
-            ..empty_candidate_row()
-        };
-        let unit = session_row
-            .clone()
-            .into_unit(ReclaimScope::McpOpenOrphan)
-            .expect("a session-keyed row claims under a session-grained scope");
-        assert_eq!(unit.reclaim_id, "mcp_open_orphan:s-1:99");
-        assert_eq!(unit.estimated_rows, 4);
-
         let generation_row = ReclaimCandidateRow {
             source_host: "h".to_string(),
             source_name: "codex".to_string(),
@@ -3406,25 +3194,23 @@ mod tests {
             ..empty_candidate_row()
         };
         let unit = generation_row
-            .clone()
             .into_unit(ReclaimScope::ReadIndexGeneration)
             .expect("a generation-keyed row claims under a generation-grained scope");
         assert_eq!(unit.reclaim_id, "read_index_generation:h:codex:/a.jsonl:5");
         assert_eq!(unit.estimated_rows, 7);
 
-        // Cross-grain rows are refused, in both directions, naming the key.
-        let refused = session_row
-            .into_unit(ReclaimScope::ReadIndexGeneration)
-            .expect_err("a session-keyed row must not claim a generation-grained unit");
+        // A row without the generation key — the all-default row a mis-shaped
+        // probe response deserializes into — is refused, naming the key.
+        let refused = ReclaimCandidateRow {
+            session_id: "s-1".to_string(),
+            candidate_generation: 99,
+            event_rows: 2,
+            ..empty_candidate_row()
+        }
+        .into_unit(ReclaimScope::ReadIndexGeneration)
+        .expect_err("a row without the generation key must not claim a unit");
         assert!(
             refused.to_string().contains("source_generation"),
-            "{refused}"
-        );
-        let refused = generation_row
-            .into_unit(ReclaimScope::McpOpenOrphan)
-            .expect_err("a generation-keyed row must not claim a session-grained unit");
-        assert!(
-            refused.to_string().contains("candidate_generation"),
             "{refused}"
         );
     }
@@ -3438,8 +3224,6 @@ mod tests {
             source_file: String::new(),
             source_generation: 0,
             event_rows: 0,
-            turn_rows: 0,
-            header_rows: 0,
             navigation_rows: 0,
             locator_rows: 0,
             directory_rows: 0,
@@ -3561,8 +3345,6 @@ mod tests {
     #[test]
     fn the_no_executor_refusal_names_its_work_item_and_deletes_nothing() {
         for (scope, work_item) in [
-            (ReclaimScope::McpOpenOrphan, "WI-05"),
-            (ReclaimScope::McpOpenRetiredLineage, "WI-05b"),
             (ReclaimScope::ReadIndexGeneration, "WI-07"),
             (ReclaimScope::CanonicalGeneration, "WI-09"),
         ] {
@@ -3803,11 +3585,31 @@ mod tests {
         counts: [u64; 7],
     }
 
+    /// The read-index scope's delete order as **literals** — same rationale
+    /// as [`CANONICAL_TABLE_ORDER`].
+    const READ_INDEX_TABLE_ORDER: [&str; 3] = [
+        "mcp_event_navigation",
+        "mcp_event_locator",
+        "mcp_session_directory",
+    ];
+
+    /// One retired read-index generation the mock serves and deletes from.
+    /// `counts` is indexed by [`READ_INDEX_TABLE_ORDER`].
+    #[derive(Debug, Clone)]
+    struct MockReadIndexUnit {
+        source_host: String,
+        source_name: String,
+        source_file: String,
+        source_generation: u32,
+        counts: [u64; 3],
+    }
+
     #[derive(Debug)]
     struct ReclaimMockState {
         statements: Vec<String>,
-        /// `(session_id, candidate_generation) -> (event_rows, turn_rows, header_rows)`.
-        rows: BTreeMap<(String, u64), (u64, u64, u64)>,
+        /// Retired read-index generations, keyed by `source_generation`
+        /// (fixture generations are unique).
+        read_index: BTreeMap<u32, MockReadIndexUnit>,
         /// Retired canonical generations, keyed by `source_generation`
         /// (fixture generations are unique).
         canonical: BTreeMap<u32, MockCanonicalUnit>,
@@ -3843,7 +3645,7 @@ mod tests {
         fn default() -> Self {
             Self {
                 statements: Vec::new(),
-                rows: BTreeMap::new(),
+                read_index: BTreeMap::new(),
                 canonical: BTreeMap::new(),
                 ledger: BTreeMap::new(),
                 deleted: Vec::new(),
@@ -3862,14 +3664,25 @@ mod tests {
     struct ReclaimMock(Arc<Mutex<ReclaimMockState>>);
 
     impl ReclaimMock {
-        fn with_orphans(pairs: &[(&str, u64, u64, u64)]) -> Self {
+        /// Retired read-index generations, one per `(file, generation)` pair
+        /// with `(navigation, locator)` row counts (`mcp_session_directory`
+        /// rows deliberately zero, so the third delete is always the
+        /// zero-row case somewhere in every fixture).
+        fn with_retired_read_index(pairs: &[(&str, u32, u64, u64)]) -> Self {
             let mock = Self::default();
             {
                 let mut state = mock.lock();
-                for (session, generation, events, turns) in pairs {
-                    state
-                        .rows
-                        .insert((session.to_string(), *generation), (*events, *turns, 0));
+                for (file, generation, navigation, locator) in pairs {
+                    state.read_index.insert(
+                        *generation,
+                        MockReadIndexUnit {
+                            source_host: "h-1".to_string(),
+                            source_name: "codex".to_string(),
+                            source_file: file.to_string(),
+                            source_generation: *generation,
+                            counts: [*navigation, *locator, 0],
+                        },
+                    );
                 }
             }
             mock
@@ -3915,8 +3728,8 @@ mod tests {
             self.lock().ledger.clone()
         }
 
-        fn rows(&self) -> BTreeMap<(String, u64), (u64, u64, u64)> {
-            self.lock().rows.clone()
+        fn read_index_units(&self) -> BTreeMap<u32, MockReadIndexUnit> {
+            self.lock().read_index.clone()
         }
 
         fn deleted(&self) -> Vec<(String, u64)> {
@@ -4084,22 +3897,17 @@ mod tests {
                 state.deleted.push((table.to_string(), removed));
                 return (axum::http::StatusCode::OK, String::new());
             }
-            let literals = quoted_literals(&statement);
-            let session_id = literals.first().cloned().unwrap_or_default();
-            let candidate_generation = first_u64_arg(&statement).unwrap_or_default();
+            let read_index_position = READ_INDEX_TABLE_ORDER
+                .iter()
+                .position(|candidate| *candidate == table)
+                .unwrap_or_else(|| panic!("unexpected reclaim target `{table}`"));
+            let generation = first_u32_arg(&statement).unwrap_or_default();
             let mut state = mock.lock();
-            let removed = match state.rows.get_mut(&(session_id, candidate_generation)) {
-                Some(counts) => {
-                    let slot = match table {
-                        "mcp_open_events" => &mut counts.0,
-                        "mcp_open_turns" => &mut counts.1,
-                        "mcp_open_publication_headers" => &mut counts.2,
-                        _ => panic!("unexpected reclaim target `{table}`"),
-                    };
-                    std::mem::take(slot)
-                }
-                None => 0,
-            };
+            let removed = state
+                .read_index
+                .get_mut(&generation)
+                .map(|unit| std::mem::take(&mut unit.counts[read_index_position]))
+                .unwrap_or(0);
             state.deleted.push((table.to_string(), removed));
             return (axum::http::StatusCode::OK, String::new());
         }
@@ -4201,18 +4009,26 @@ mod tests {
                 .join("\n");
             return (axum::http::StatusCode::OK, format!("{body}\n"));
         }
-        // The orphan candidate probe: pairs with child rows and no header.
-        if statement.contains("mcp_open_publication_headers\n  )") {
+        // The read-index candidate probe: retired generations whose rollup
+        // still holds rows (R4).
+        if statement.contains("ri_rollup") {
             let body = mock
-                .rows()
-                .into_iter()
-                .filter(|(_, (events, turns, headers))| {
-                    *headers == 0 && (*events > 0 || *turns > 0)
-                })
-                .map(|((session_id, generation), (events, turns, _))| {
+                .read_index_units()
+                .into_values()
+                .filter(|unit| unit.counts.iter().sum::<u64>() > 0)
+                .map(|unit| {
                     format!(
-                        "{{\"session_id\":\"{session_id}\",\"candidate_generation\":{generation},\
-                         \"event_rows\":{events},\"turn_rows\":{turns},\"header_rows\":0}}"
+                        "{{\"source_host\":\"{}\",\"source_name\":\"{}\",\
+                         \"source_file\":\"{}\",\"source_generation\":{},\
+                         \"navigation_rows\":{},\"locator_rows\":{},\
+                         \"directory_rows\":{}}}",
+                        unit.source_host,
+                        unit.source_name,
+                        unit.source_file,
+                        unit.source_generation,
+                        unit.counts[0],
+                        unit.counts[1],
+                        unit.counts[2],
                     )
                 })
                 .collect::<Vec<_>>()
@@ -4254,17 +4070,17 @@ mod tests {
         .expect("mock client")
     }
 
-    async fn run_orphan_reclaim(client: &ClickHouseClient) -> Result<ReclaimOutcome> {
-        run_orphan_reclaim_as(client, ReclaimTrigger::Operator).await
+    async fn run_read_index_reclaim(client: &ClickHouseClient) -> Result<ReclaimOutcome> {
+        run_read_index_reclaim_as(client, ReclaimTrigger::Operator).await
     }
 
-    async fn run_orphan_reclaim_as(
+    async fn run_read_index_reclaim_as(
         client: &ClickHouseClient,
         trigger: ReclaimTrigger,
     ) -> Result<ReclaimOutcome> {
         crate::envelope::with_test_envelope(client.reclaim_run(
             &RetentionConfig::default(),
-            ReclaimScope::McpOpenOrphan,
+            ReclaimScope::ReadIndexGeneration,
             trigger,
             &crate::envelope::test_budget(30.0, 256, 1_000_000, 1_000_000_000),
             &crate::envelope::test_budget(30.0, 256, 1_000_000, 1_000_000_000),
@@ -4532,12 +4348,13 @@ mod tests {
     ///
     /// The interruption is applied to a **real claim**: the run below claims
     /// unit one, advances it to `deleting`, issues and completes the
-    /// `mcp_open_events` delete, and is then refused by the server on the
-    /// `mcp_open_turns` delete — exactly the window hazard H7 is about, and
-    /// exactly the window that produced the reference host's 11.17M stranded
-    /// child rows. There is no claim to interrupt in a build whose `run` never
-    /// claims, which is why the WI-04 phase-machine test could not make this
-    /// assertion and said so.
+    /// `mcp_event_navigation` delete, and is then refused by the server on
+    /// the `mcp_event_locator` delete — exactly the window hazard H7 is
+    /// about, and exactly the window that produced the reference host's
+    /// 11.17M stranded child rows on the (now retired) v1 projection. There
+    /// is no claim to interrupt in a build whose `run` never claims, which is
+    /// why the WI-04 phase-machine test could not make this assertion and
+    /// said so.
     ///
     /// MUTATION (executed 2026-07-28): delete `let redriven =
     /// self.reclaim_redrive(scope).await?;` from `reclaim_run` => FAILS: the
@@ -4557,11 +4374,14 @@ mod tests {
     /// set re-derivable.**
     #[tokio::test(flavor = "multi_thread")]
     async fn an_interrupted_claim_is_completed_by_the_next_runs_redrive() {
-        let mock = ReclaimMock::with_orphans(&[("s-1", 11, 40, 4), ("s-2", 22, 7, 1)]);
+        let mock = ReclaimMock::with_retired_read_index(&[
+            ("/s-1.jsonl", 11, 40, 4),
+            ("/s-2.jsonl", 22, 7, 1),
+        ]);
         let client = mock_client(spawn_reclaim_mock(mock.clone()).await);
-        mock.fail_once_on("DELETE FROM `moraine`.mcp_open_turns");
+        mock.fail_once_on("DELETE FROM `moraine`.mcp_event_locator");
 
-        let interrupted = run_orphan_reclaim(&client).await;
+        let interrupted = run_read_index_reclaim(&client).await;
         assert!(
             interrupted.is_err(),
             "the interrupted run must surface the failure, not report success: {interrupted:?}"
@@ -4571,24 +4391,23 @@ mod tests {
         let ledger = mock.ledger();
         assert_eq!(ledger.len(), 1, "only unit one was reached: {ledger:?}");
         let (reclaim_id, row) = ledger.iter().next().expect("one claimed unit");
-        assert_eq!(reclaim_id, "mcp_open_orphan:s-1:11");
+        assert_eq!(reclaim_id, "read_index_generation:h-1:codex:/s-1.jsonl:11");
         assert_eq!(row.phase, "deleting", "a crash mid-unit leaves `deleting`");
 
-        // Children first: the events rows are gone, the turns and the header
-        // are not. This is precisely the state the old reclaimer could never
-        // recover from, because it derived its set from the header it deleted
-        // first.
-        let rows = mock.rows();
-        assert_eq!(rows[&("s-1".to_string(), 11)], (0, 4, 0));
+        // First table first: the navigation rows are gone, the locator and
+        // directory rows are not. The durable claim is what makes this
+        // half-state recoverable.
+        let units = mock.read_index_units();
+        assert_eq!(units[&11].counts, [0, 4, 0]);
         assert_eq!(
-            rows[&("s-2".to_string(), 22)],
-            (7, 1, 0),
+            units[&22].counts,
+            [7, 1, 0],
             "unit two must not have been touched"
         );
 
         // Second run: the re-drive finishes unit one before planning anything.
         let statements_before = mock.statements().len();
-        let outcome = run_orphan_reclaim(&client)
+        let outcome = run_read_index_reclaim(&client)
             .await
             .expect("the recovery run completes");
 
@@ -4601,7 +4420,7 @@ mod tests {
         let probe = statements
             .iter()
             .skip(statements_before)
-            .position(|statement| statement.contains("mcp_open_publication_headers\n  )"))
+            .position(|statement| statement.contains("ri_rollup"))
             .expect("the recovery run probes for new candidates");
         assert!(
             redrive < probe,
@@ -4609,12 +4428,12 @@ mod tests {
              (re-drive at {redrive}, probe at {probe})"
         );
 
-        // Nothing is stranded: every pair is empty, and unit one settled.
-        for ((session_id, generation), counts) in mock.rows() {
+        // Nothing is stranded: every unit is empty, and unit one settled.
+        for (generation, unit) in mock.read_index_units() {
             assert_eq!(
-                counts,
-                (0, 0, 0),
-                "`{session_id}`/{generation} still holds rows after the recovery run"
+                unit.counts,
+                [0, 0, 0],
+                "generation {generation} still holds rows after the recovery run"
             );
         }
         let ledger = mock.ledger();
@@ -4627,39 +4446,41 @@ mod tests {
             "the re-driven unit and the new one both count: {outcome:?}"
         );
 
-        // Replay is a no-op: the re-driven unit's `mcp_open_events` delete ran
-        // a second time and removed nothing, because its predicate is over the
-        // key set the ledger names rather than over rows it re-derives.
-        let events_deletes: Vec<u64> = mock
+        // Replay is a no-op: the re-driven unit's `mcp_event_navigation`
+        // delete ran a second time and removed nothing, because its predicate
+        // is over the key the ledger names rather than over rows it
+        // re-derives.
+        let navigation_deletes: Vec<u64> = mock
             .deleted()
             .into_iter()
-            .filter(|(table, _)| table == "mcp_open_events")
+            .filter(|(table, _)| table == "mcp_event_navigation")
             .map(|(_, removed)| removed)
             .collect();
         assert_eq!(
-            events_deletes,
+            navigation_deletes,
             vec![40, 0, 7],
             "the replayed delete must remove zero additional rows"
         );
     }
 
-    /// **G-CLAIMORDER.** Fails for: a unit deleted before it is claimed, or a
-    /// header removed before its children.
+    /// **G-CLAIMORDER.** Fails for: a unit deleted before it is claimed, or
+    /// the scope's tables deleted out of their pinned order.
     /// Denomination: the recorded statement sequence for one unit.
     ///
-    /// MUTATION (executed 2026-07-28): reorder `ReclaimScope::tables` for
-    /// `McpOpenOrphan` to put `McpOpenPublicationHeaders` first => FAILS on the
-    /// children-before-header assertion.
+    /// MUTATION (executed 2026-07-28, against the then-registered orphan
+    /// scope; re-executed 2026-07-31 against this one): reorder
+    /// `ReclaimScope::tables` for `ReadIndexGeneration` to put
+    /// `McpSessionDirectory` first => FAILS on the order assertion.
     ///
     /// MUTATION (executed 2026-07-28): delete the
     /// `ledger_advance_statement(.., ReclaimPhase::Deleting)` write => FAILS on
     /// the phase-sequence assertion.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_settled_run_claims_before_it_deletes_and_deletes_children_first() {
-        let mock = ReclaimMock::with_orphans(&[("s-1", 11, 3, 2)]);
+        let mock = ReclaimMock::with_retired_read_index(&[("/s-1.jsonl", 11, 3, 2)]);
         let client = mock_client(spawn_reclaim_mock(mock.clone()).await);
 
-        let outcome = run_orphan_reclaim(&client).await.expect("run");
+        let outcome = run_read_index_reclaim(&client).await.expect("run");
         assert!(matches!(outcome, ReclaimOutcome::Settled { units: 1, .. }));
 
         let claim = mock
@@ -4668,29 +4489,32 @@ mod tests {
         let deleting = mock
             .first_phase_write(ReclaimPhase::Deleting)
             .expect("the unit advances to deleting");
-        let events = mock
-            .first_index("DELETE FROM `moraine`.mcp_open_events")
-            .expect("the events delete runs");
-        let turns = mock
-            .first_index("DELETE FROM `moraine`.mcp_open_turns")
-            .expect("the turns delete runs");
-        let header = mock
-            .first_index("DELETE FROM `moraine`.mcp_open_publication_headers")
-            .expect("the header delete runs");
+        let navigation = mock
+            .first_index("DELETE FROM `moraine`.mcp_event_navigation")
+            .expect("the navigation delete runs");
+        let locator = mock
+            .first_index("DELETE FROM `moraine`.mcp_event_locator")
+            .expect("the locator delete runs");
+        let directory = mock
+            .first_index("DELETE FROM `moraine`.mcp_session_directory")
+            .expect("the directory delete runs");
         let done = mock
             .first_phase_write(ReclaimPhase::Done)
             .expect("the unit settles");
 
         assert!(
-            claim < deleting && deleting < events,
+            claim < deleting && deleting < navigation,
             "the claim must be durable before the first delete: claim {claim}, deleting \
-             {deleting}, events {events}"
+             {deleting}, navigation {navigation}"
         );
         assert!(
-            events < turns && turns < header,
-            "children first, parent last: events {events}, turns {turns}, header {header}"
+            navigation < locator && locator < directory,
+            "the pinned order: navigation {navigation}, locator {locator}, directory {directory}"
         );
-        assert!(header < done, "settle last: header {header}, done {done}");
+        assert!(
+            directory < done,
+            "settle last: directory {directory}, done {done}"
+        );
 
         // And the H9 probe ran before any of it.
         let mutations = mock
@@ -4706,7 +4530,7 @@ mod tests {
     async fn an_empty_scope_is_idle_rather_than_a_zero_unit_settlement() {
         let mock = ReclaimMock::default();
         let client = mock_client(spawn_reclaim_mock(mock.clone()).await);
-        let outcome = run_orphan_reclaim(&client).await.expect("run");
+        let outcome = run_read_index_reclaim(&client).await.expect("run");
         assert!(
             matches!(outcome, ReclaimOutcome::Idle { .. }),
             "{outcome:?}"
@@ -4747,15 +4571,15 @@ mod tests {
         // One is the boundary, and it is the realistic case: hazard H9 is one
         // mutation that never finishes.
         for pending in [1_u64, 3] {
-            let mock = ReclaimMock::with_orphans(&[("s-1", 10, 3, 1)]);
+            let mock = ReclaimMock::with_retired_read_index(&[("/s-1.jsonl", 10, 3, 1)]);
             mock.lock().pending_mutations = pending;
             let client = mock_client(spawn_reclaim_mock(mock.clone()).await);
 
-            let outcome = run_orphan_reclaim(&client).await.expect("run");
+            let outcome = run_read_index_reclaim(&client).await.expect("run");
             assert_eq!(
                 outcome,
                 ReclaimOutcome::Blocked {
-                    scope: ReclaimScope::McpOpenOrphan,
+                    scope: ReclaimScope::ReadIndexGeneration,
                     pending_mutations: pending,
                 }
             );
@@ -4774,10 +4598,10 @@ mod tests {
         }
 
         // And zero does not block, or the gate would be a permanent refusal.
-        let mock = ReclaimMock::with_orphans(&[("s-1", 10, 3, 1)]);
+        let mock = ReclaimMock::with_retired_read_index(&[("/s-1.jsonl", 10, 3, 1)]);
         assert_eq!(mock.lock().pending_mutations, 0);
         let client = mock_client(spawn_reclaim_mock(mock.clone()).await);
-        let outcome = run_orphan_reclaim(&client).await.expect("run");
+        let outcome = run_read_index_reclaim(&client).await.expect("run");
         assert!(
             matches!(outcome, ReclaimOutcome::Settled { .. }),
             "no pending mutation must not block: {outcome:?}"
@@ -4800,16 +4624,16 @@ mod tests {
     /// `StatementCapExceeded`. **Lower bound.**
     #[tokio::test(flavor = "multi_thread")]
     async fn a_sweep_opens_one_envelope_per_unit_rather_than_one_per_run() {
-        let pairs: Vec<(String, u64, u64, u64)> = (0..8)
-            .map(|index| (format!("s-{index}"), 100 + index as u64, 3, 2))
+        let pairs: Vec<(String, u32, u64, u64)> = (0..8)
+            .map(|index| (format!("/s-{index}.jsonl"), 100 + index as u32, 3, 2))
             .collect();
-        let borrowed: Vec<(&str, u64, u64, u64)> = pairs
+        let borrowed: Vec<(&str, u32, u64, u64)> = pairs
             .iter()
-            .map(|(session, generation, events, turns)| {
-                (session.as_str(), *generation, *events, *turns)
+            .map(|(file, generation, navigation, locator)| {
+                (file.as_str(), *generation, *navigation, *locator)
             })
             .collect();
-        let mock = ReclaimMock::with_orphans(&borrowed);
+        let mock = ReclaimMock::with_retired_read_index(&borrowed);
         let client = mock_client(spawn_reclaim_mock(mock.clone()).await);
 
         // The caller's envelope is sized for the preamble only, and it is
@@ -4824,7 +4648,7 @@ mod tests {
         let outcome = run_preamble_envelope(&budget, &budget)
             .scope(client.reclaim_run(
                 &RetentionConfig::default(),
-                ReclaimScope::McpOpenOrphan,
+                ReclaimScope::ReadIndexGeneration,
                 ReclaimTrigger::Operator,
                 &budget,
                 &budget,
@@ -4838,8 +4662,8 @@ mod tests {
         );
         let deletes = mock.deleted().len();
         assert_eq!(deletes, 8 * 3, "three tables per unit: {deletes}");
-        for (_, counts) in mock.rows() {
-            assert_eq!(counts, (0, 0, 0));
+        for (_, unit) in mock.read_index_units() {
+            assert_eq!(unit.counts, [0, 0, 0]);
         }
     }
 
@@ -4947,7 +4771,7 @@ mod tests {
             ReclaimScope::ALL.len() as u32 - authorized_probing_scopes(&RetentionConfig::default());
 
         // ---- plan -------------------------------------------------------
-        let plan_mock = ReclaimMock::with_orphans(&[("s-plan", 100, 3, 2)]);
+        let plan_mock = ReclaimMock::with_retired_read_index(&[("/s-plan.jsonl", 100, 3, 2)]);
         let plan_client = mock_client(spawn_reclaim_mock(plan_mock.clone()).await);
         let plan_budget =
             crate::envelope::test_budget(30.0, PLAN_STATEMENT_CAP, 1_000_000, 1_000_000_000);
@@ -4971,7 +4795,7 @@ mod tests {
         );
 
         // ---- run preamble, and the unit envelope nested inside it -------
-        let run_mock = ReclaimMock::with_orphans(&[("s-run", 200, 3, 2)]);
+        let run_mock = ReclaimMock::with_retired_read_index(&[("/s-run.jsonl", 200, 3, 2)]);
         let run_client = mock_client(spawn_reclaim_mock(run_mock.clone()).await);
         let run_budget = crate::envelope::test_budget(
             30.0,
@@ -4984,7 +4808,7 @@ mod tests {
         run_preamble_envelope(&run_budget, &run_budget)
             .scope(run_client.reclaim_run(
                 &RetentionConfig::default(),
-                ReclaimScope::McpOpenOrphan,
+                ReclaimScope::ReadIndexGeneration,
                 ReclaimTrigger::Operator,
                 &unit_budget,
                 &unit_budget,
@@ -5009,7 +4833,7 @@ mod tests {
 
         // The driven scope deletes from three tables; the widest deletes from
         // more, and the cap has to cover that one.
-        let driven_tables = ReclaimScope::McpOpenOrphan.tables().len() as u32;
+        let driven_tables = ReclaimScope::ReadIndexGeneration.tables().len() as u32;
         let widest_tables = ReclaimScope::ALL
             .into_iter()
             .map(|scope| scope.tables().len() as u32)
@@ -5028,7 +4852,7 @@ mod tests {
         );
 
         // ---- status, which scopes its own envelope ----------------------
-        let status_mock = ReclaimMock::with_orphans(&[("s-status", 300, 3, 2)]);
+        let status_mock = ReclaimMock::with_retired_read_index(&[("/s-status.jsonl", 300, 3, 2)]);
         let status_client = mock_client(spawn_reclaim_mock(status_mock.clone()).await);
         let status_budget =
             crate::envelope::test_budget(30.0, STATUS_STATEMENT_CAP, 1_000_000, 1_000_000_000);
@@ -5084,23 +4908,34 @@ mod tests {
     /// A ledger row naming a scope this build cannot execute is left alone.
     /// Fails for: a downgrade settling units whose deletes never ran, or
     /// executing a unit whose predicate shape the running binary does not have.
+    ///
+    /// The two retired `mcp_open` scope strings are the live instance of this
+    /// case: migration 041 settles their unsettled units to `abandoned` at
+    /// drop time (settle-by-drop), so a redrive can only meet one on a ledger
+    /// written by a newer binary than the migrations that ran — and it must
+    /// skip it, never execute a delete against dropped tables.
     #[test]
     fn a_ledger_row_from_an_unknown_scope_is_not_resumable() {
-        let row = LedgerUnitRow {
-            reclaim_id: "r".to_string(),
-            scope: "search_generation".to_string(),
-            source_host: String::new(),
-            source_name: String::new(),
-            source_file: String::new(),
-            source_generation: 0,
-            session_id: "s".to_string(),
-            candidate_generation: 1,
-            phase: "claimed".to_string(),
-            estimated_rows: 0,
-            estimated_bytes: 0,
-            unsettled_seconds: 0,
-        };
-        assert!(row.into_unit().is_none());
+        let mut unknown_scopes = vec!["search_generation"];
+        unknown_scopes.extend(RETIRED_SCOPE_STRINGS);
+        for scope in unknown_scopes {
+            assert_eq!(ReclaimScope::parse(scope), None, "{scope}");
+            let row = LedgerUnitRow {
+                reclaim_id: "r".to_string(),
+                scope: scope.to_string(),
+                source_host: String::new(),
+                source_name: String::new(),
+                source_file: String::new(),
+                source_generation: 0,
+                session_id: "s".to_string(),
+                candidate_generation: 1,
+                phase: "claimed".to_string(),
+                estimated_rows: 0,
+                estimated_bytes: 0,
+                unsettled_seconds: 0,
+            };
+            assert!(row.into_unit().is_none(), "{scope}");
+        }
     }
 
     /// **G-DELETE-SETTINGS.** Fails for: a reclaim delete that inherits its
@@ -5135,9 +4970,11 @@ mod tests {
             &[("lightweight_deletes_sync", "2")]
         );
 
-        let mock = ReclaimMock::with_orphans(&[("s-1", 10, 3, 1)]);
+        let mock = ReclaimMock::with_retired_read_index(&[("/s-1.jsonl", 10, 3, 1)]);
         let client = mock_client(spawn_reclaim_mock(mock.clone()).await);
-        run_orphan_reclaim(&client).await.expect("run completes");
+        run_read_index_reclaim(&client)
+            .await
+            .expect("run completes");
 
         let sent = mock.params();
         let deletes: Vec<_> = sent
@@ -5169,10 +5006,10 @@ mod tests {
     /// one wedged scope starves every other scope's recovery.
     ///
     /// MUTATION (executed 2026-07-28): drop `AND scope = {}` from
-    /// `ledger_redrive_sql` => FAILS here. **Lower bound: with 64 wedged
-    /// `mcp_open_orphan` rows the unscoped page is entirely orphan rows, the
-    /// caller filters them all out in Rust, and `mcp_open_retired_lineage`
-    /// never re-drives a unit again.**
+    /// `ledger_redrive_sql` => FAILS here. **Lower bound: with 64 wedged rows
+    /// of one scope the unscoped page is entirely that scope's rows, the
+    /// caller filters them all out in Rust, and the other scope never
+    /// re-drives a unit again.**
     #[test]
     fn the_redrive_page_is_scoped_so_one_wedged_scope_cannot_starve_another() {
         for scope in ReclaimScope::ALL {
@@ -5187,8 +5024,8 @@ mod tests {
             );
         }
         assert_ne!(
-            ledger_redrive_sql("moraine", ReclaimScope::McpOpenOrphan, 64),
-            ledger_redrive_sql("moraine", ReclaimScope::McpOpenRetiredLineage, 64),
+            ledger_redrive_sql("moraine", ReclaimScope::ReadIndexGeneration, 64),
+            ledger_redrive_sql("moraine", ReclaimScope::CanonicalGeneration, 64),
         );
     }
 
@@ -5203,7 +5040,7 @@ mod tests {
     /// emit `now64(3)` => FAILS here. **Lower bound.**
     #[test]
     fn a_phase_advance_carries_the_original_claim_time_forward() {
-        let fresh = unit(ReclaimScope::McpOpenOrphan);
+        let fresh = unit(ReclaimScope::ReadIndexGeneration);
         assert_eq!(fresh.unsettled_seconds, 0);
         assert!(
             ledger_claim_statement("moraine", &fresh).contains("now64(3), generateSnowflakeID()"),
@@ -5266,11 +5103,13 @@ mod tests {
             {
                 let mut state = mock.lock();
                 state.ledger.insert(
-                    "mcp_open_orphan:wedged:1".to_string(),
+                    "read_index_generation:h-1:codex:/wedged.jsonl:1".to_string(),
                     MockLedgerRow {
-                        scope: ReclaimScope::McpOpenOrphan.as_str().to_string(),
-                        session_id: "wedged".to_string(),
-                        candidate_generation: 1,
+                        scope: ReclaimScope::ReadIndexGeneration.as_str().to_string(),
+                        source_host: "h-1".to_string(),
+                        source_name: "codex".to_string(),
+                        source_file: "/wedged.jsonl".to_string(),
+                        source_generation: 1,
                         phase: "deleting".to_string(),
                         ..MockLedgerRow::default()
                     },
@@ -5278,7 +5117,9 @@ mod tests {
                 state.unsettled_seconds = age;
             }
             let client = mock_client(spawn_reclaim_mock(mock.clone()).await);
-            let outcome = run_orphan_reclaim(&client).await.expect("run completes");
+            let outcome = run_read_index_reclaim(&client)
+                .await
+                .expect("run completes");
             (outcome, mock)
         }
 
@@ -5290,7 +5131,7 @@ mod tests {
         );
         assert_eq!(
             mock.ledger()
-                .get("mcp_open_orphan:wedged:1")
+                .get("read_index_generation:h-1:codex:/wedged.jsonl:1")
                 .map(|row| row.phase.as_str()),
             Some("abandoned"),
             "the terminal phase must be durable"
@@ -5319,7 +5160,7 @@ mod tests {
         );
         assert_eq!(
             mock.ledger()
-                .get("mcp_open_orphan:wedged:1")
+                .get("read_index_generation:h-1:codex:/wedged.jsonl:1")
                 .map(|row| row.phase.as_str()),
             Some("done"),
             "re-drive settles the unit rather than retiring it"
@@ -5353,24 +5194,26 @@ mod tests {
     /// wedged unit must not be reported as progress.**
     #[tokio::test(flavor = "multi_thread")]
     async fn a_poison_unit_does_not_wedge_its_scope() {
-        let mock = ReclaimMock::with_orphans(&[("fresh", 20, 2, 1)]);
+        let mock = ReclaimMock::with_retired_read_index(&[("/fresh.jsonl", 20, 2, 1)]);
         {
             let mut state = mock.lock();
             state.ledger.insert(
-                "mcp_open_orphan:poison:9".to_string(),
+                "read_index_generation:h-1:codex:poison:9".to_string(),
                 MockLedgerRow {
-                    scope: ReclaimScope::McpOpenOrphan.as_str().to_string(),
-                    session_id: "poison".to_string(),
-                    candidate_generation: 9,
+                    scope: ReclaimScope::ReadIndexGeneration.as_str().to_string(),
+                    source_host: "h-1".to_string(),
+                    source_name: "codex".to_string(),
+                    source_file: "poison".to_string(),
+                    source_generation: 9,
                     phase: "deleting".to_string(),
                     ..MockLedgerRow::default()
                 },
             );
-            // Every delete naming the poison unit is refused, forever.
+            // Every statement naming the poison unit is refused, forever.
             state.fail_always_on = Some("'poison'".to_string());
         }
         let client = mock_client(spawn_reclaim_mock(mock.clone()).await);
-        let outcome = run_orphan_reclaim(&client)
+        let outcome = run_read_index_reclaim(&client)
             .await
             .expect("a poison unit must not abort the run");
 
@@ -5385,7 +5228,7 @@ mod tests {
         // The fresh candidate really was collected.
         assert_eq!(
             mock.ledger()
-                .get("mcp_open_orphan:fresh:20")
+                .get("read_index_generation:h-1:codex:/fresh.jsonl:20")
                 .map(|row| row.phase.as_str()),
             Some("done"),
         );
@@ -5465,11 +5308,11 @@ mod tests {
 
         // A host with a gigabyte free: below the bound.
         let free_on_a_full_host = 1024 * 1024 * 1024;
-        let mock = ReclaimMock::with_orphans(&[("s-1", 10, 3, 1)]);
+        let mock = ReclaimMock::with_retired_read_index(&[("/s-1.jsonl", 10, 3, 1)]);
         mock.lock().free_bytes = free_on_a_full_host;
         let client = mock_client(spawn_reclaim_mock(mock.clone()).await);
 
-        let refused = run_orphan_reclaim_as(&client, ReclaimTrigger::Maintenance)
+        let refused = run_read_index_reclaim_as(&client, ReclaimTrigger::Maintenance)
             .await
             .expect("a low-disk refusal is an outcome, not an error");
         let ReclaimOutcome::LowDisk {
@@ -5498,7 +5341,7 @@ mod tests {
         );
 
         // The same host, the same disk, an operator who asked for it.
-        let allowed = run_orphan_reclaim_as(&client, ReclaimTrigger::Operator)
+        let allowed = run_read_index_reclaim_as(&client, ReclaimTrigger::Operator)
             .await
             .expect("an operator run proceeds");
         assert!(
@@ -5510,10 +5353,10 @@ mod tests {
         // the headroom that actually lets it start — replayed on both sides of
         // the figure the refusal itself reported.
         for (free, should_decline) in [(required_bytes - 1, true), (required_bytes, false)] {
-            let mock = ReclaimMock::with_orphans(&[("s-1", 10, 3, 1)]);
+            let mock = ReclaimMock::with_retired_read_index(&[("/s-1.jsonl", 10, 3, 1)]);
             mock.lock().free_bytes = free;
             let client = mock_client(spawn_reclaim_mock(mock.clone()).await);
-            let outcome = run_orphan_reclaim_as(&client, ReclaimTrigger::Maintenance)
+            let outcome = run_read_index_reclaim_as(&client, ReclaimTrigger::Maintenance)
                 .await
                 .expect("the gate returns an outcome");
             let declined = matches!(outcome, ReclaimOutcome::LowDisk { .. });
@@ -5525,68 +5368,42 @@ mod tests {
         }
     }
 
-    /// The per-run unit bound is defensible against the measured cost of one
-    /// unit.
+    /// The per-run unit bound is defensible against the cost of one unit.
     ///
-    /// One unit issues one **unprunable** delete against `mcp_open_events`
-    /// plus two deletes that prune to one partition of 64. Unprunable is the
-    /// date-independent part: `session_id` is in neither that table's
-    /// `PARTITION BY cityHash64(event_uid) % 64` nor its
-    /// `PRIMARY KEY (event_uid, slot)`, so `EXPLAIN indexes = 1` reports
-    /// `Condition: true` and reads every active part and every granule, on any
-    /// day. The size of that scan is not date-independent and is quoted here
-    /// only as a magnitude — of order 10 GiB; see
-    /// [`RECLAIM_MAX_UNITS_PER_RUN`] for the dated sample and why the counts
-    /// drift. At 64 units and two scopes on a 60 s tick that was up to 128 full
-    /// scans of the largest `mcp_open` table per minute.
+    /// The bound was derived for the retired `mcp_open_orphan` scope, whose
+    /// per-unit delete against `mcp_open_events` was unprunable (`Condition:
+    /// true`, every part, every granule — of order 10 GiB per unit). That
+    /// scope and its table are gone (issue #603 WI-10), but the shape of the
+    /// argument holds for what remains: the read-index scope's unit deletes
+    /// are unprunable too — none of the three tables leads its primary key or
+    /// partition key with any column of the generation tuple — over tables
+    /// totalling ~0.4 GiB, and it is the only scope the 60 s maintenance tick
+    /// drives (the canonical scope runs from the CLI alone).
     ///
-    /// MUTATION (executed 2026-07-28): restore `RECLAIM_MAX_UNITS_PER_RUN` to
-    /// 64 => FAILS here. **Upper bound.**
+    /// This reads the **constant**. What a run actually sends is a separate
+    /// fact, and this test cannot see it; that half is
+    /// `the_per_run_unit_bound_reaches_every_paged_statement`, which parses
+    /// the `LIMIT` off the statements a real run issued.
+    ///
+    /// MUTATION (executed 2026-07-28, at the orphan scope's ~10 GiB
+    /// denomination; the bound is unchanged): restore
+    /// `RECLAIM_MAX_UNITS_PER_RUN` to 64 => FAILS here. **Upper bound.**
     #[test]
     fn the_per_run_unit_bound_is_derived_from_the_measured_unit_cost() {
-        // `mcp_open_events` is unprunable for this unit key — `Condition:
-        // true`, every part, every granule, on any day — so one unit costs one
-        // full scan of it. Every registered scope that **names that table**
-        // shares the 60 s tick, so the per-minute ceiling is
-        // `mcp_open_scopes * bound` full scans of the largest `mcp_open`
-        // table. The multiplier is the scopes whose `tables()` include it —
-        // not `registered_executors().len()`, which as of WI-07 counts the
-        // read-index scope too, and that scope's deletes never touch a
-        // `mcp_open` table: multiplying by it would let shrinking the bound
-        // "pay for" a scope that costs a ~0.4 GiB sweep, not a ~10 GiB one.
-        // The read-index sweep gets its own ceiling below, in its own
-        // denomination.
-        //
-        // This reads the **constant**. What a run actually sends is a separate
-        // fact, and this test cannot see it: `reclaim_candidates` could pass a
-        // literal and nothing here would notice. That half is
-        // `the_per_run_unit_bound_reaches_every_paged_statement`, which parses
-        // the `LIMIT` off the statements a real run issued.
-        let mcp_open_scopes = registered_executors()
+        let tick_scopes = registered_executors()
             .into_iter()
-            .filter(|scope| scope.tables().contains(&ReclaimTable::McpOpenEvents))
+            .filter(|scope| scope.is_default_on())
             .count();
         assert_eq!(
-            mcp_open_scopes, 2,
-            "the two mcp_open scopes are the ones whose units scan the ~10 GiB table"
+            tick_scopes, 1,
+            "the read-index scope is the only one the maintenance tick drives"
         );
-        let full_scans_per_tick = mcp_open_scopes * RECLAIM_MAX_UNITS_PER_RUN;
+        let sweeps_per_tick = tick_scopes * RECLAIM_MAX_UNITS_PER_RUN;
         assert!(
-            (1..=16).contains(&full_scans_per_tick),
-            "an unattended tick may issue {full_scans_per_tick} unprunable full scans of the \
-             largest mcp_open table per minute; that is not a bound"
+            (1..=16).contains(&sweeps_per_tick),
+            "an unattended tick may issue {sweeps_per_tick} unprunable read-index sweeps per \
+             minute; that is not a bound"
         );
-        // The read-index scope's unit deletes are unprunable too — none of the
-        // three tables leads its primary key or partition key with any column
-        // of the generation tuple — but the tables total ~0.4 GiB, not
-        // ~10 GiB, so the same page bound holds it to a per-tick sweep two
-        // orders of magnitude smaller.
-        let read_index_scopes = registered_executors()
-            .into_iter()
-            .filter(|scope| scope.tables().contains(&ReclaimTable::McpEventNavigation))
-            .count();
-        assert_eq!(read_index_scopes, 1);
-        assert!((1..=16).contains(&(read_index_scopes * RECLAIM_MAX_UNITS_PER_RUN)));
     }
 
     /// The `LIMIT` a statement was sent with, if it carries one.
@@ -5649,9 +5466,11 @@ mod tests {
     /// `the_per_run_unit_bound_is_derived_from_the_measured_unit_cost`.
     #[tokio::test(flavor = "multi_thread")]
     async fn the_per_run_unit_bound_reaches_every_paged_statement() {
-        let mock = ReclaimMock::with_orphans(&[("s-1", 10, 3, 1)]);
+        let mock = ReclaimMock::with_retired_read_index(&[("/s-1.jsonl", 10, 3, 1)]);
         let client = mock_client(spawn_reclaim_mock(mock.clone()).await);
-        let outcome = run_orphan_reclaim(&client).await.expect("run completes");
+        let outcome = run_read_index_reclaim(&client)
+            .await
+            .expect("run completes");
         assert!(
             matches!(outcome, ReclaimOutcome::Settled { .. }),
             "{outcome:?}"
@@ -5678,43 +5497,40 @@ mod tests {
                 .any(|(statement, _)| statement.contains("ORDER BY claimed_at ASC")),
             "the run issued no re-drive page: {issued:?}"
         );
-        // Both candidate-probe orderings: the session-grained scopes' and the
-        // read-index scope's. A probe that matched neither would silently fall
-        // out of this count, which is why the expectation is exact.
+        // The generation-grained candidate-probe ordering both remaining
+        // scopes share. A probe that did not match would silently fall out of
+        // this count, which is why the expectation is exact.
         let probes = paged
             .iter()
             .filter(|(statement, _)| {
-                statement.contains("ORDER BY session_id ASC, candidate_generation ASC")
-                    || statement.contains(
-                        "ORDER BY source_host ASC, source_name ASC, source_file ASC, \
-                         source_generation ASC",
-                    )
+                statement.contains(
+                    "ORDER BY source_host ASC, source_name ASC, source_file ASC, \
+                     source_generation ASC",
+                )
             })
             .count();
         assert_eq!(
             probes as u32,
             1 + authorized_probing_scopes(&RetentionConfig::default()),
             "expected the run's candidate probe plus one per authorized scope from the plan \
-             (the stock config authorizes the three bucket-3 scopes and refuses the canonical \
+             (the stock config authorizes the read-index scope and refuses the canonical \
              one), or a call site this test cannot see stayed unbounded: {issued:?}"
         );
 
-        // The V4 mitigation, re-derived from the wire: one unit is one
-        // unprunable full scan of `mcp_open_events` for every scope that names
-        // that table, and each such scope gets its own page on the same 60 s
-        // tick. See `the_per_run_unit_bound_is_derived_from_the_measured_unit_cost`
-        // for why the multiplier is the mcp_open-naming scopes rather than the
-        // whole registry.
-        let mcp_open_scopes = registered_executors()
+        // The V4 mitigation, re-derived from the wire: each default-on scope
+        // gets its own page on the same 60 s tick, and every unit of the
+        // read-index scope is an unprunable sweep of its three tables. See
+        // `the_per_run_unit_bound_is_derived_from_the_measured_unit_cost`.
+        let tick_scopes = registered_executors()
             .into_iter()
-            .filter(|scope| scope.tables().contains(&ReclaimTable::McpOpenEvents))
+            .filter(|scope| scope.is_default_on())
             .count();
         for (statement, limit) in paged {
-            let full_scans_per_tick = mcp_open_scopes * limit;
+            let sweeps_per_tick = tick_scopes * limit;
             assert!(
-                (1..=16).contains(&full_scans_per_tick),
+                (1..=16).contains(&sweeps_per_tick),
                 "a paged statement reached the server bounded at {limit}, which is \
-                 {full_scans_per_tick} unprunable full scans per unattended tick: {statement}"
+                 {sweeps_per_tick} unprunable sweeps per unattended tick: {statement}"
             );
         }
     }
@@ -5724,18 +5540,15 @@ mod tests {
     /// Denomination: the `toIntervalSecond(…)` literal on the statements a
     /// real run and a real plan issued.
     ///
-    /// The horizon is the **only** thing standing between the orphan collector
-    /// and a prepare in flight: `prepare` writes children first and the header
-    /// last, so between those two writes a healthy session is
-    /// indistinguishable from an orphan by the anti-join alone. Age is what
-    /// tells them apart.
+    /// The horizon is what protects a freshly-superseded generation: a
+    /// request that captured its publication snapshot just before the new
+    /// head landed can still be executing with the old generation pinned, and
+    /// an operator noticing a bad publication needs time to roll back.
     ///
-    /// `reclaim_mcp_open`'s guards all hand a probe a literal and then look for
-    /// that literal, so they cannot see this; the round that added them named a
-    /// test here as the other half and **that test did not exist**, which left
-    /// `let horizon = 0;` in `reclaim_candidates` fully green — a collector
-    /// with no horizon at all, deleting the children of every prepare that had
-    /// not yet written its header.
+    /// `reclaim_read_index`'s own guards hand a probe a literal and then look
+    /// for that literal, so they cannot see this wiring; an earlier round
+    /// left `let horizon = 0;` in `reclaim_candidates` fully green — a
+    /// collector with no horizon at all.
     ///
     /// MUTATION (executed 2026-07-28): `let horizon = 0;` in
     /// `reclaim_candidates` => FAILS here. **Lower bound.**
@@ -5760,12 +5573,12 @@ mod tests {
             "the test horizon must differ from the default, or a hard-coded default passes"
         );
 
-        let mock = ReclaimMock::with_orphans(&[("s-1", 10, 3, 1)]);
+        let mock = ReclaimMock::with_retired_read_index(&[("/s-1.jsonl", 10, 3, 1)]);
         let client = mock_client(spawn_reclaim_mock(mock.clone()).await);
         let budget = crate::envelope::test_budget(30.0, 256, 1_000_000, 1_000_000_000);
         crate::envelope::with_test_envelope(client.reclaim_run(
             &retention,
-            ReclaimScope::McpOpenOrphan,
+            ReclaimScope::ReadIndexGeneration,
             ReclaimTrigger::Operator,
             &budget,
             &budget,
@@ -5784,8 +5597,8 @@ mod tests {
             .filter(|statement| statement.contains("toIntervalSecond("))
             .collect();
         assert!(
-            probes.len() >= 3,
-            "expected the run's probe plus one per registered scope from the plan: {issued:?}"
+            probes.len() >= 2,
+            "expected the run's probe plus one per authorized scope from the plan: {issued:?}"
         );
         for probe in probes {
             assert!(
@@ -5822,14 +5635,18 @@ mod tests {
     /// the unknown-scope half. **Width: both arms.**
     #[tokio::test(flavor = "multi_thread")]
     async fn a_pass_that_only_skipped_an_unresumable_unit_is_not_idle() {
-        // A phase this build cannot parse, and a scope it cannot execute:
-        // exactly what a downgrade past a work item leaves in the ledger.
+        // A phase this build cannot parse, and a scope it cannot execute —
+        // the latter is exactly what migration 041's settle-by-drop exists to
+        // prevent for the retired `mcp_open` scopes, so the retired string is
+        // the case driven here: a unit somehow left unsettled must be skipped
+        // and surfaced, never executed against dropped tables.
         for extra in [
-            "{\"reclaim_id\":\"r-quarantined\",\"scope\":\"mcp_open_orphan\",\"source_host\":\"\",\
-             \"source_name\":\"\",\"source_file\":\"\",\"source_generation\":0,\
-             \"session_id\":\"s\",\"candidate_generation\":1,\"phase\":\"quarantined\",\
+            "{\"reclaim_id\":\"r-quarantined\",\"scope\":\"read_index_generation\",\
+             \"source_host\":\"h\",\
+             \"source_name\":\"c\",\"source_file\":\"/f\",\"source_generation\":1,\
+             \"session_id\":\"\",\"candidate_generation\":0,\"phase\":\"quarantined\",\
              \"estimated_rows\":0,\"estimated_bytes\":0,\"unsettled_seconds\":0}",
-            "{\"reclaim_id\":\"r-future\",\"scope\":\"canonical_generation\",\"source_host\":\"\",\
+            "{\"reclaim_id\":\"r-retired\",\"scope\":\"mcp_open_orphan\",\"source_host\":\"\",\
              \"source_name\":\"\",\"source_file\":\"\",\"source_generation\":0,\
              \"session_id\":\"s\",\"candidate_generation\":1,\"phase\":\"claimed\",\
              \"estimated_rows\":0,\"estimated_bytes\":0,\"unsettled_seconds\":0}",
@@ -5837,7 +5654,9 @@ mod tests {
             let mock = ReclaimMock::default();
             mock.lock().redrive_extra_rows = vec![extra.to_string()];
             let client = mock_client(spawn_reclaim_mock(mock.clone()).await);
-            let outcome = run_orphan_reclaim(&client).await.expect("run completes");
+            let outcome = run_read_index_reclaim(&client)
+                .await
+                .expect("run completes");
 
             assert!(
                 !matches!(outcome, ReclaimOutcome::Idle { .. }),
@@ -5859,7 +5678,7 @@ mod tests {
     /// `reclaim_execute_unit` re-derives authority from the **caller's**
     /// config, not from `RetentionConfig::default()`.
     ///
-    /// Harmless for the two bucket-3 scopes — `DerivedOnly` needs no
+    /// Harmless for a bucket-3 scope — `DerivedOnly` needs no
     /// `[retention]` key — and fatal for every scope that does. This test
     /// states the consequence executably: a default config cannot authorize a
     /// bucket-1 scope, so a default-derived token means WI-09's executor could
@@ -5894,11 +5713,11 @@ mod tests {
         );
 
         // And the bucket-3 path really does run under the caller's config.
-        let mock = ReclaimMock::with_orphans(&[("s-1", 10, 1, 0)]);
+        let mock = ReclaimMock::with_retired_read_index(&[("/s-1.jsonl", 10, 1, 0)]);
         let client = mock_client(spawn_reclaim_mock(mock.clone()).await);
         let outcome = crate::envelope::with_test_envelope(client.reclaim_run(
             &configured,
-            ReclaimScope::McpOpenOrphan,
+            ReclaimScope::ReadIndexGeneration,
             ReclaimTrigger::Operator,
             &crate::envelope::test_budget(30.0, 256, 1_000_000, 1_000_000_000),
             &crate::envelope::test_budget(30.0, 256, 1_000_000, 1_000_000_000),

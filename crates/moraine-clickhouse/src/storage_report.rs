@@ -483,8 +483,8 @@ mod tests {
         let tables = vec![
             table("events", Some(TableClass::CanonicalHistory), 10, 100),
             table("raw_events", Some(TableClass::RawAudit), 20, 200),
-            table("mcp_open_turns", Some(TableClass::Derived), 30, 300),
-            table("mcp_open_events", Some(TableClass::Derived), 40, 400),
+            table("mcp_event_navigation", Some(TableClass::Derived), 30, 300),
+            table("mcp_event_locator", Some(TableClass::Derived), 40, 400),
             table("mystery_table", None, 50, 500),
         ];
         let buckets = fold_buckets(&tables);
