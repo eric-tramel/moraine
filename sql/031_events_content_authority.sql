@@ -17,7 +17,7 @@ DROP TABLE IF EXISTS moraine.search_conversation_terms;
 -- Create both names before the atomic exchange. Exactly one contains legacy
 -- rows on every replay: the original source on first execution, or whichever
 -- side retained the frozen rows after an interrupted execution.
-CREATE TABLE IF NOT EXISTS moraine.tool_io_events_content_authority_042_frozen (
+CREATE TABLE IF NOT EXISTS moraine.tool_io_events_content_authority_031_frozen (
   ingested_at DateTime64(3) DEFAULT now64(3),
   event_uid String,
   session_id String,
@@ -48,13 +48,13 @@ PARTITION BY toYYYYMM(ingested_at)
 ORDER BY (session_id, tool_call_id, event_uid);
 
 CREATE TABLE IF NOT EXISTS moraine.tool_io
-AS moraine.tool_io_events_content_authority_042_frozen;
+AS moraine.tool_io_events_content_authority_031_frozen;
 
 -- Supported migration commands quiesce tracked writers before this point;
 -- EXCHANGE only swaps names atomically and does not close either name to writes.
 -- The fold reads both sides so replay is correct whichever side retained rows.
 EXCHANGE TABLES moraine.tool_io
-AND moraine.tool_io_events_content_authority_042_frozen;
+AND moraine.tool_io_events_content_authority_031_frozen;
 
 -- Preserve tool detail on its canonical event before dropping the side table.
 INSERT INTO moraine.events
@@ -97,7 +97,7 @@ ALL INNER JOIN
     ) AS tool_json
   FROM
   (
-    SELECT * FROM moraine.tool_io_events_content_authority_042_frozen FINAL
+    SELECT * FROM moraine.tool_io_events_content_authority_031_frozen FINAL
     UNION ALL
     SELECT * FROM moraine.tool_io FINAL
   ) AS tool_source
@@ -424,4 +424,4 @@ DROP TABLE IF EXISTS moraine.mcp_open_generation_readiness;
 DROP TABLE IF EXISTS moraine.mcp_open_dirty_sessions;
 DROP TABLE IF EXISTS moraine.mcp_open_backfill_plans;
 DROP TABLE IF EXISTS moraine.mcp_open_projection_state;
-TRUNCATE TABLE IF EXISTS moraine.tool_io_events_content_authority_042_frozen;
+TRUNCATE TABLE IF EXISTS moraine.tool_io_events_content_authority_031_frozen;

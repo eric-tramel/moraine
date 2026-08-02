@@ -897,26 +897,16 @@ pub fn bundled_migrations() -> Vec<Migration> {
             sql: include_str!("../../../sql/030_refresh_omp_session_metadata.sql"),
         },
         Migration {
-            version: "042",
-            name: "042_events_content_authority.sql",
-            sql: include_str!("../../../sql/042_events_content_authority.sql"),
+            version: "031",
+            name: "031_events_content_authority.sql",
+            sql: include_str!("../../../sql/031_events_content_authority.sql"),
         },
         Migration {
-            version: "043",
-            name: "043_drop_frozen_tool_io.sql",
-            sql: include_str!("../../../sql/043_drop_frozen_tool_io.sql"),
+            version: "032",
+            name: "032_drop_frozen_tool_io.sql",
+            sql: include_str!("../../../sql/032_drop_frozen_tool_io.sql"),
         },
     ]
-}
-
-// Development briefly shipped 031 for the migration now bundled as 042.
-// Ignore only that exact ledger collision, and only when its replacement is known.
-const SUPERSEDED_DEVELOPMENT_MIGRATIONS: &[(&str, &str)] = &[("031", "042")];
-
-fn is_compatible_superseded_version(version: &str, bundled: &BTreeSet<&str>) -> bool {
-    SUPERSEDED_DEVELOPMENT_MIGRATIONS
-        .iter()
-        .any(|(superseded, replacement)| version == *superseded && bundled.contains(replacement))
 }
 
 /// Pure comparison of two migration-version lists; the basis of
@@ -935,7 +925,6 @@ pub fn compute_schema_skew<B: AsRef<str>, S: AsRef<str>>(
             .collect(),
         unknown_on_server: server
             .difference(&bundled)
-            .filter(|version| !is_compatible_superseded_version(version, &bundled))
             .map(|v| (*v).to_string())
             .collect(),
     }
@@ -1621,35 +1610,35 @@ mod tests {
     }
 
     #[test]
-    fn migration_042_freezes_and_replays_the_legacy_tool_source_safely() {
+    fn migration_031_freezes_and_replays_the_legacy_tool_source_safely() {
         let migration = bundled_migrations()
             .into_iter()
-            .find(|migration| migration.version == "042")
-            .expect("migration 042 must be registered");
+            .find(|migration| migration.version == "031")
+            .expect("migration 031 must be registered");
         let sql = materialize_migration_sql(migration.sql, "other_db")
-            .expect("materialize migration 042");
+            .expect("materialize migration 031");
         let statements = split_sql_statements(&sql);
         let position = |needle: &str| {
             statements
                 .iter()
                 .position(|statement| statement.contains(needle))
-                .unwrap_or_else(|| panic!("migration 042 must contain {needle}"))
+                .unwrap_or_else(|| panic!("migration 031 must contain {needle}"))
         };
 
         let frozen = position(
-            "CREATE TABLE IF NOT EXISTS other_db.tool_io_events_content_authority_042_frozen",
+            "CREATE TABLE IF NOT EXISTS other_db.tool_io_events_content_authority_031_frozen",
         );
         let staging = position(
-            "CREATE TABLE IF NOT EXISTS other_db.tool_io\nAS other_db.tool_io_events_content_authority_042_frozen",
+            "CREATE TABLE IF NOT EXISTS other_db.tool_io\nAS other_db.tool_io_events_content_authority_031_frozen",
         );
         let exchange = position(
-            "EXCHANGE TABLES other_db.tool_io\nAND other_db.tool_io_events_content_authority_042_frozen",
+            "EXCHANGE TABLES other_db.tool_io\nAND other_db.tool_io_events_content_authority_031_frozen",
         );
         let fold =
-            position("SELECT * FROM other_db.tool_io_events_content_authority_042_frozen FINAL");
+            position("SELECT * FROM other_db.tool_io_events_content_authority_031_frozen FINAL");
         let drop_staging = position("DROP TABLE IF EXISTS other_db.tool_io");
         let truncate = position(
-            "TRUNCATE TABLE IF EXISTS other_db.tool_io_events_content_authority_042_frozen",
+            "TRUNCATE TABLE IF EXISTS other_db.tool_io_events_content_authority_031_frozen",
         );
 
         assert!(
@@ -1663,7 +1652,7 @@ mod tests {
         assert!(sql.contains("WHERE NOT JSONHas(e.payload_json, 'moraine_tool_io')"));
         assert!(!sql.contains("RENAME TABLE IF EXISTS"));
         assert!(!sql
-            .contains("DROP TABLE IF EXISTS other_db.tool_io_events_content_authority_042_frozen"));
+            .contains("DROP TABLE IF EXISTS other_db.tool_io_events_content_authority_031_frozen"));
         assert!(sql.contains("DROP TABLE IF EXISTS other_db.mcp_session_directory"));
         assert!(!sql.contains("CREATE TABLE IF NOT EXISTS other_db.mcp_session_directory"));
         assert!(!sql.contains("INSERT INTO other_db.mcp_session_directory"));
@@ -1673,13 +1662,13 @@ mod tests {
     }
 
     #[test]
-    fn migration_042_uses_the_same_narrow_path_projection_for_live_and_backfill() {
+    fn migration_031_uses_the_same_narrow_path_projection_for_live_and_backfill() {
         let migration = bundled_migrations()
             .into_iter()
-            .find(|migration| migration.version == "042")
-            .expect("migration 042 must be registered");
+            .find(|migration| migration.version == "031")
+            .expect("migration 031 must be registered");
         let sql = materialize_migration_sql(migration.sql, "other_db")
-            .expect("materialize migration 042");
+            .expect("materialize migration 031");
         let statements = split_sql_statements(&sql);
         let live = statements
             .iter()
@@ -1715,18 +1704,18 @@ mod tests {
     }
 
     #[test]
-    fn migration_043_only_drops_the_empty_frozen_tool_source() {
+    fn migration_032_only_drops_the_empty_frozen_tool_source() {
         let migration = bundled_migrations()
             .into_iter()
-            .find(|migration| migration.version == "043")
-            .expect("migration 043 must be registered");
+            .find(|migration| migration.version == "032")
+            .expect("migration 032 must be registered");
         let sql = materialize_migration_sql(migration.sql, "other_db")
-            .expect("materialize migration 043");
+            .expect("materialize migration 032");
 
         assert_eq!(
             split_sql_statements(&sql),
             vec![
-                "DROP TABLE IF EXISTS other_db.tool_io_events_content_authority_042_frozen"
+                "DROP TABLE IF EXISTS other_db.tool_io_events_content_authority_031_frozen"
                     .to_string()
             ]
         );
@@ -1900,73 +1889,6 @@ mod tests {
         let skew = compute_schema_skew(&["001"], &["001".to_string(), "017".to_string()]);
         assert!(skew.missing_on_server.is_empty());
         assert_eq!(skew.unknown_on_server, vec!["017"]);
-    }
-
-    #[test]
-    fn schema_skew_accepts_superseded_031_with_current_bundle() {
-        let bundled: Vec<&str> = bundled_migrations()
-            .iter()
-            .map(|migration| migration.version)
-            .collect();
-        let mut server: Vec<String> = bundled
-            .iter()
-            .map(|version| (*version).to_string())
-            .collect();
-        server.push("031".to_string());
-
-        let skew = compute_schema_skew(&bundled, &server);
-
-        assert_eq!(skew, SchemaSkew::default());
-        assert!(enforce_remote_schema_policy("team-ch", &skew, false).is_ok());
-    }
-
-    #[test]
-    fn schema_skew_does_not_ignore_031_without_its_bundled_replacement() {
-        let skew = compute_schema_skew(&["001"], &["001".to_string(), "031".to_string()]);
-
-        assert!(skew.missing_on_server.is_empty());
-        assert_eq!(skew.unknown_on_server, vec!["031"]);
-    }
-
-    #[test]
-    fn schema_skew_rejects_unrelated_unknown_version_with_current_bundle() {
-        let bundled: Vec<&str> = bundled_migrations()
-            .iter()
-            .map(|migration| migration.version)
-            .collect();
-        let mut server: Vec<String> = bundled
-            .iter()
-            .map(|version| (*version).to_string())
-            .collect();
-        server.extend(["031".to_string(), "999".to_string()]);
-
-        let skew = compute_schema_skew(&bundled, &server);
-
-        assert!(skew.missing_on_server.is_empty());
-        assert_eq!(skew.unknown_on_server, vec!["999"]);
-        assert!(enforce_remote_schema_policy("team-ch", &skew, false).is_err());
-    }
-
-    #[test]
-    fn schema_skew_reports_missing_current_versions_despite_superseded_031() {
-        let bundled: Vec<&str> = bundled_migrations()
-            .iter()
-            .map(|migration| migration.version)
-            .collect();
-        let mut server: Vec<String> = bundled
-            .iter()
-            .filter(|version| !matches!(**version, "042" | "043"))
-            .map(|version| (*version).to_string())
-            .collect();
-        server.push("031".to_string());
-
-        let skew = compute_schema_skew(&bundled, &server);
-
-        assert_eq!(skew.missing_on_server, vec!["042", "043"]);
-        assert!(skew.unknown_on_server.is_empty());
-        let error = enforce_remote_schema_policy("team-ch", &skew, false)
-            .expect_err("missing current migrations must remain behind");
-        assert!(error.to_string().contains("042, 043"));
     }
 
     #[test]
@@ -2407,11 +2329,11 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn migration_progress_applies_042_and_043_after_superseded_031() {
+    async fn migration_progress_applies_031_and_032_after_v071() {
         let bundled = bundled_migrations();
         let pending = bundled
             .iter()
-            .filter(|migration| matches!(migration.version, "042" | "043"))
+            .filter(|migration| matches!(migration.version, "031" | "032"))
             .cloned()
             .collect::<Vec<_>>();
         assert_eq!(
@@ -2419,14 +2341,14 @@ mod tests {
                 .iter()
                 .map(|migration| migration.version)
                 .collect::<Vec<_>>(),
-            vec!["042", "043"]
+            vec!["031", "032"]
         );
-        let mut applied = bundled
+        let applied = bundled
             .iter()
-            .filter(|migration| !matches!(migration.version, "042" | "043"))
+            .filter(|migration| !matches!(migration.version, "031" | "032"))
             .map(|migration| migration.version.to_string())
             .collect::<Vec<_>>();
-        applied.push("031".to_string());
+        assert_eq!(applied.last().map(String::as_str), Some("030"));
         let queries = Arc::new(Mutex::new(Vec::new()));
         let base_url = spawn_migration_mock_server(MigrationMockState {
             applied: Arc::new(applied),
@@ -2440,9 +2362,9 @@ mod tests {
         let executed = client
             .run_migrations_with_progress(|event| events.push(event))
             .await
-            .expect("apply migrations 042 and 043");
+            .expect("apply migrations 031 and 032");
 
-        assert_eq!(executed, vec!["042", "043"]);
+        assert_eq!(executed, vec!["031", "032"]);
         assert_eq!(
             events,
             vec![

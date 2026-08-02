@@ -746,14 +746,14 @@ mod tests {
     }
 
     #[test]
-    fn content_cutover_barrier_runs_only_while_042_is_pending() {
+    fn content_cutover_barrier_runs_only_while_031_is_pending() {
         assert!(content_authority_writer_barrier_required(&[
             "030".to_string(),
-            "042".to_string(),
-            "043".to_string(),
+            "031".to_string(),
+            "032".to_string(),
         ]));
         assert!(!content_authority_writer_barrier_required(&[
-            "043".to_string()
+            "032".to_string()
         ]));
     }
 

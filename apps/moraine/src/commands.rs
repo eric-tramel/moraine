@@ -31,7 +31,7 @@ use crate::render::{
 };
 use crate::service::Service;
 
-pub(super) const CONTENT_AUTHORITY_MIGRATION: &str = "042";
+pub(super) const CONTENT_AUTHORITY_MIGRATION: &str = "031";
 pub(super) const CONTENT_AUTHORITY_WRITER_SERVICES: [Service; 2] =
     [Service::Backend, Service::Ingest];
 
@@ -244,7 +244,7 @@ where
         .collect::<Vec<_>>();
     if !active.is_empty() {
         bail!(
-            "cannot apply migration 042 while tracked Moraine services are running: {}; \
+            "cannot apply migration 031 while tracked Moraine services are running: {}; \
              run `moraine down` first so the content cutover snapshot is quiescent",
             active.join(", ")
         );
@@ -434,15 +434,15 @@ mod tests {
     }
 
     #[test]
-    fn standalone_migration_requires_quiescence_only_while_042_is_pending() {
-        ensure_standalone_migration_quiescent_with(&["043".to_string()], |_| {
-            panic!("current 042 must not inspect service PIDs")
+    fn standalone_migration_requires_quiescence_only_while_031_is_pending() {
+        ensure_standalone_migration_quiescent_with(&["032".to_string()], |_| {
+            panic!("current 031 must not inspect service PIDs")
         })
-        .expect("043 alone needs no writer barrier");
+        .expect("032 alone needs no writer barrier");
 
         let mut inspected = Vec::new();
         let error = ensure_standalone_migration_quiescent_with(
-            &["042".to_string(), "043".to_string()],
+            &["031".to_string(), "032".to_string()],
             |service| {
                 inspected.push(service);
                 match service {
@@ -452,7 +452,7 @@ mod tests {
                 }
             },
         )
-        .expect_err("live tracked services must block standalone 042");
+        .expect_err("live tracked services must block standalone 031");
 
         assert_eq!(inspected, vec![Service::Backend, Service::Ingest]);
         assert!(error.to_string().contains("backend (pid 41)"));
