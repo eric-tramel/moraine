@@ -16,7 +16,7 @@ pub(crate) enum OutputFormat {
 #[command(
     name = "moraine",
     about = "Unified runtime control plane for Moraine services",
-    version = env!("CARGO_PKG_VERSION")
+    version = moraine_config::BUILD_VERSION
 )]
 pub(crate) struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
@@ -250,6 +250,16 @@ pub(crate) struct RunArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn version_reports_the_build_commit() {
+        let rendered = Cli::command().render_version().to_string();
+        assert!(
+            rendered.contains(moraine_config::BUILD_VERSION),
+            "version output must identify the built revision: {rendered}"
+        );
+    }
 
     #[test]
     fn clap_parses_clickhouse_install_flags() {

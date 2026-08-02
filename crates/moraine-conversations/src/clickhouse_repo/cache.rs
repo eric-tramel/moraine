@@ -5,7 +5,6 @@ pub(super) const ANALYTICS_CACHE_TTL: Duration = Duration::from_secs(30);
 pub(super) const ANALYTICS_RANGE_COUNT: usize = AnalyticsRange::ALL.len();
 pub(super) const CORPUS_STATS_CACHE_TTL: Duration = Duration::from_secs(30);
 pub(super) const TERM_DF_CACHE_TTL: Duration = Duration::from_secs(300);
-pub(super) const SEARCH_SCHEMA_CACHE_TTL: Duration = Duration::from_secs(60);
 pub(super) const SEARCH_RESULT_CACHE_TTL: Duration = Duration::from_secs(15);
 pub(super) const SEARCH_RESULT_CACHE_MAX_ENTRIES: usize = 256;
 pub(super) const MCP_SEARCH_RESULT_CACHE_TTL: Duration = Duration::from_secs(15);
@@ -19,11 +18,11 @@ pub(super) const TERM_POSTINGS_FAST_PATH_MAX_ROWS_PER_TERM: u64 =
 pub(super) const TERM_POSTINGS_FAST_PATH_RATIO_MIN_DOCS: u64 = 10_000;
 pub(super) const TERM_POSTINGS_FAST_PATH_MAX_DOC_RATIO_NUMERATOR: u64 = 1;
 pub(super) const TERM_POSTINGS_FAST_PATH_MAX_DOC_RATIO_DENOMINATOR: u64 = 4;
-// 60s (issue #443): hydrated doc rows are near-immutable — an event_uid's
-// content only moves when a mutable source (cursor bubble) re-emits it — and
-// agents issue bursts of overlapping searches, so a short TTL re-reads the
-// same fat search_documents granules over and over. The cost of staleness is
-// a preview up to a minute old, never a wrong hit.
+// 60s (issue #443): hydrated rows are near-immutable — an event UID's
+// content only moves when a mutable source re-emits it. Agents issue bursts
+// of overlapping searches, so a short TTL avoids repeatedly hydrating the
+// same bounded winner set from canonical events. Staleness can affect a
+// preview for up to one minute, never winner identity.
 pub(super) const SEARCH_DOC_EXTRA_CACHE_TTL: Duration = Duration::from_secs(60);
 pub(super) const SEARCH_DOC_EXTRA_CACHE_MAX_ENTRIES: usize = 65536;
 
@@ -69,7 +68,6 @@ pub(super) struct TermDfCacheEntry {
 pub(super) struct SearchStatsCache {
     pub(super) corpus_stats: Option<CorpusStatsCacheEntry>,
     pub(super) term_df_by_term: HashMap<String, TermDfCacheEntry>,
-    pub(super) has_codex_flag_column: Option<(bool, Instant)>,
 }
 
 #[derive(Debug, Clone)]
@@ -386,8 +384,8 @@ impl ClickHouseConversationRepository {
         }
 
         let fallback_query = format!(
-            "SELECT toUInt64(count()) AS docs, toUInt64(ifNull(sum(doc_len), 0)) AS total_doc_len FROM {} FINAL WHERE doc_len > 0 FORMAT JSONEachRow",
-            self.table_ref("search_documents")
+            "SELECT toUInt64(count()) AS docs, toUInt64(ifNull(sum(doc_len), 0)) AS total_doc_len FROM (SELECT doc_id, any(doc_len) AS doc_len FROM {} FINAL WHERE doc_len > 0 GROUP BY doc_id) FORMAT JSONEachRow",
+            self.table_ref("search_postings")
         );
         let fallback: Vec<CorpusStatsRow> =
             self.map_backend(self.query_rows(&fallback_query, None).await)?;

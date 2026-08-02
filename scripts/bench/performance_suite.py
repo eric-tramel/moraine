@@ -143,9 +143,25 @@ def _clickhouse_query(url: str, sql: str, *, timeout_s: float = 600.0) -> str:
 def _seed_owned_sandbox(sandbox: Any, recipe: Mapping[str, Any]) -> None:
     url = f"http://127.0.0.1:{sandbox.clickhouse_port}"
     database = "moraine"
-    existing = _clickhouse_query(url, f"SELECT count() FROM {database}.search_documents")
-    if existing != "0":
-        raise SuiteFailure(f"fresh owned volume is not empty: observed {existing} documents")
+
+    def cardinalities() -> dict[str, str]:
+        return {
+            "events": _clickhouse_query(url, f"SELECT count() FROM {database}.events FINAL"),
+            "search_postings": _clickhouse_query(
+                url, f"SELECT uniqExact(doc_id) FROM {database}.search_postings FINAL"
+            ),
+            "mcp_event_locator": _clickhouse_query(
+                url, f"SELECT count() FROM {database}.mcp_event_locator FINAL"
+            ),
+            "mcp_event_navigation": _clickhouse_query(
+                url, f"SELECT count() FROM {database}.mcp_event_navigation FINAL"
+            ),
+        }
+
+    existing = cardinalities()
+    if any(count != "0" for count in existing.values()):
+        counts = ", ".join(f"{relation}={count}" for relation, count in existing.items())
+        raise SuiteFailure(f"fresh owned volume is not empty: observed {counts}")
     target = FreshSeedTarget(
         database=database,
         reset_id=sandbox.sandbox_id,
@@ -154,10 +170,11 @@ def _seed_owned_sandbox(sandbox: Any, recipe: Mapping[str, Any]) -> None:
         empty_database=True,
     )
     _clickhouse_query(url, seed_search_sql(target, recipe))
-    expected = recipe["corpus"]["document_count"]
-    observed = _clickhouse_query(url, f"SELECT count() FROM {database}.search_documents")
-    if observed != str(expected):
-        raise SuiteFailure(f"seed cardinality mismatch: expected {expected}, observed {observed}")
+    expected = str(recipe["corpus"]["document_count"])
+    observed = cardinalities()
+    if any(count != expected for count in observed.values()):
+        counts = ", ".join(f"{relation}={count}" for relation, count in observed.items())
+        raise SuiteFailure(f"seed cardinality mismatch: expected {expected}; observed {counts}")
     sandbox.checkpoint("seeded")
 
 

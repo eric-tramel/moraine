@@ -4,7 +4,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc, OnceLock,
 };
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use ahash::AHashMap as HashMap;
 use anyhow::Result as AnyResult;
@@ -107,10 +107,10 @@ use crate::repo::ConversationRepository;
 
 mod analytics;
 mod cache;
+mod canonical_open;
 mod file_attention;
 mod helpers;
 mod list;
-mod mcp_open_read;
 mod open;
 mod operations;
 mod repo_impl;

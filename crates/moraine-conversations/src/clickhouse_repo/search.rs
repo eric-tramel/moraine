@@ -1,10 +1,5 @@
 use super::*;
 
-pub(super) const CONVERSATION_CANDIDATE_MIN: usize = 512;
-pub(super) const CONVERSATION_CANDIDATE_MULTIPLIER: usize = 80;
-pub(super) const CONVERSATION_CANDIDATE_MAX: usize = 20_000;
-pub(super) const CONVERSATION_RECENT_WINDOW_MS: i64 = 45_000;
-pub(super) const CONVERSATION_RECENT_CANDIDATE_LIMIT: usize = 1024;
 pub(super) const MCP_SEARCH_MAX_CANDIDATE_PAGES: u16 = 16;
 pub(super) const CODEX_FINAL_ANSWER_MIRROR_MAX_TIMESTAMP_DELTA_MS: u64 = 10;
 
@@ -252,7 +247,6 @@ FORMAT JSONEachRow",
         include_tool_events: bool,
         event_kinds: Option<&[SearchEventKind]>,
         exclude_codex_mcp: bool,
-        use_document_codex_flag: bool,
         session_id: Option<&str>,
         session_ids: Option<&[String]>,
         min_should_match: u16,
@@ -264,159 +258,106 @@ FORMAT JSONEachRow",
                 "cannot build search query with empty terms",
             ));
         }
-
-        let postings_table = self.table_ref("search_postings");
-        let documents_table = self.table_ref("search_documents");
-        let terms_array_sql = sql_array_strings(terms);
-        let idf_vals: Vec<f64> = terms
-            .iter()
-            .map(|t| *idf_by_term.get(t).unwrap_or(&0.0))
-            .collect();
-        let idf_array_sql = sql_array_f64(&idf_vals);
-        let documents_join_sql = if use_document_codex_flag {
-            format!(
-                "(SELECT
-  t.event_uid AS event_uid,
-  any(t.session_id) AS session_id,
-  any(t.record_ts) AS event_time,
-  any(t.source_name) AS source_name,
-  any(t.harness) AS harness,
-  any(t.inference_provider) AS inference_provider,
-  any(t.event_class) AS event_class,
-  any(t.payload_type) AS payload_type,
-  any(t.actor_role) AS actor_role,
-  any(t.name) AS name,
-  any(t.phase) AS phase,
-  any(t.source_ref) AS source_ref,
-  any(t.doc_len) AS doc_len,
-  any(t.text_content) AS text_content,
-  any(t.payload_json) AS payload_json,
-  toUInt8(any(t.has_codex_mcp)) AS has_codex_mcp
-FROM {documents_table} AS t
-GROUP BY t.event_uid)"
-            )
-        } else {
-            format!(
-                "(SELECT
-  t.event_uid AS event_uid,
-  any(t.session_id) AS session_id,
-  any(t.record_ts) AS event_time,
-  any(t.source_name) AS source_name,
-  any(t.harness) AS harness,
-  any(t.inference_provider) AS inference_provider,
-  any(t.event_class) AS event_class,
-  any(t.payload_type) AS payload_type,
-  any(t.actor_role) AS actor_role,
-  any(t.name) AS name,
-  any(t.phase) AS phase,
-  any(t.source_ref) AS source_ref,
-  any(t.doc_len) AS doc_len,
-  any(t.text_content) AS text_content,
-  any(t.payload_json) AS payload_json,
-  toUInt8(0) AS has_codex_mcp
-FROM {documents_table} AS t
-GROUP BY t.event_uid)"
-            )
-        };
-
-        let mut where_clauses = vec![format!("p.term IN {}", terms_array_sql)];
-
-        if let Some(sid) = session_id {
-            where_clauses.push(format!("d.session_id = {}", sql_quote(sid)));
+        let postings = self.table_ref("search_postings");
+        let locator = self.table_ref("mcp_event_locator");
+        let events = self.table_ref("events");
+        let terms_sql = sql_array_strings(terms);
+        let idf_sql = sql_array_f64(
+            &terms
+                .iter()
+                .map(|term| *idf_by_term.get(term).unwrap_or(&0.0))
+                .collect::<Vec<_>>(),
+        );
+        let mut filters = vec![format!("p.term IN {terms_sql}")];
+        if let Some(session_id) = session_id {
+            filters.push(format!("p.session_id = {}", sql_quote(session_id)));
         }
-        if let Some(session_ids) = session_ids {
-            if !session_ids.is_empty() {
-                where_clauses.push(format!(
-                    "d.session_id IN {}",
-                    sql_array_strings(session_ids)
-                ));
-            }
+        if let Some(session_ids) = session_ids.filter(|ids| !ids.is_empty()) {
+            filters.push(format!(
+                "p.session_id IN {}",
+                sql_array_strings(session_ids)
+            ));
         }
-
         if let Some(event_kinds) = event_kinds {
-            where_clauses.push(Self::event_kind_filter_clause(
-                "d.event_class",
-                "d.payload_type",
+            filters.push(Self::event_kind_filter_clause(
+                "p.event_class",
+                "p.payload_type",
                 event_kinds,
             ));
         } else if include_tool_events {
-            where_clauses.push("d.payload_type != 'token_count'".to_string());
+            filters.push("p.payload_type != 'token_count'".to_string());
         } else {
-            where_clauses
-                .push("d.event_class IN ('message', 'reasoning', 'event_msg')".to_string());
-            where_clauses.push(
-                "d.payload_type NOT IN ('token_count', 'task_started', 'task_complete', 'turn_aborted', 'item_completed')"
-                    .to_string(),
-            );
+            filters.push("p.event_class IN ('message', 'reasoning', 'event_msg')".to_string());
+            filters.push("p.payload_type NOT IN ('token_count', 'task_started', 'task_complete', 'turn_aborted', 'item_completed')".to_string());
         }
-
         if exclude_codex_mcp {
-            if use_document_codex_flag {
-                where_clauses.push("toUInt8(d.has_codex_mcp) = 0".to_string());
-            } else {
-                where_clauses.push(
-                    "positionCaseInsensitiveUTF8(d.payload_json, 'codex-mcp') = 0".to_string(),
-                );
-            }
-            where_clauses.push(format!(
+            filters.push("l.has_codex_mcp = 0".to_string());
+            filters.push(format!(
                 "NOT {}",
-                moraine_clickhouse::mcp_tool_names::sql_predicate("d.name")
+                moraine_clickhouse::mcp_tool_names::sql_predicate("p.name")
             ));
         }
-
-        let where_sql = where_clauses.join("\n  AND ");
         let k1 = self.cfg.bm25_k1.max(0.01);
         let b = self.cfg.bm25_b.clamp(0.0, 1.0);
-        let text_content_limit = usize::from(self.cfg.preview_chars).saturating_mul(4);
-        let payload_json_limit = usize::from(self.cfg.preview_chars).saturating_mul(8);
-
+        let preview = self.cfg.preview_chars;
+        let text_limit = usize::from(preview).saturating_mul(4);
+        let payload_limit = usize::from(preview).saturating_mul(8);
         Ok(format!(
             "WITH
   {k1:.6} AS k1,
   {b:.6} AS b,
   greatest({avgdl:.6}, 1.0) AS avgdl,
-  {terms_array_sql} AS q_terms,
-  {idf_array_sql} AS q_idf
+  {terms_sql} AS q_terms,
+  {idf_sql} AS q_idf,
+  ranked AS (
+    SELECT
+      p.doc_id AS event_uid,
+      any(p.session_id) AS session_id,
+      any(p.source_name) AS source_name,
+      any(p.harness) AS harness,
+      any(p.inference_provider) AS inference_provider,
+      any(p.event_class) AS event_class,
+      any(p.payload_type) AS payload_type,
+      any(p.actor_role) AS actor_role,
+      any(p.name) AS name,
+      any(p.phase) AS phase,
+      any(p.source_ref) AS source_ref,
+      any(p.doc_len) AS doc_len,
+      sum(transform(toString(p.term), q_terms, q_idf, 0.0)
+        * ((toFloat64(p.tf) * (k1 + 1.0))
+          / (toFloat64(p.tf) + k1 * (1.0 - b + b * (toFloat64(p.doc_len) / avgdl))))) AS score,
+      uniqExact(p.term) AS matched_terms
+    FROM {postings} AS p FINAL
+    ALL INNER JOIN {locator} AS l FINAL
+      ON l.event_uid = p.doc_id AND l.event_version = p.post_version
+    PREWHERE p.term IN q_terms
+    WHERE {filters}
+    GROUP BY p.doc_id
+    HAVING matched_terms >= {min_should_match} AND score >= {min_score:.6}
+    ORDER BY score DESC, event_uid ASC
+    LIMIT {limit}
+  ),
+  hydrated AS (
+    SELECT
+      e.event_uid,
+      argMax(if(notEmpty(e.record_ts), e.record_ts, toString(e.ingested_at)), e.event_version) AS event_time,
+      argMax(leftUTF8(e.text_content, {preview}), e.event_version) AS text_preview,
+      argMax(leftUTF8(e.text_content, {text_limit}), e.event_version) AS text_content,
+      argMax(leftUTF8(e.payload_json, {payload_limit}), e.event_version) AS payload_json
+    FROM {events} AS e
+    WHERE e.event_uid IN (SELECT event_uid FROM ranked)
+    GROUP BY e.event_uid
+  )
 SELECT
-  p.doc_id AS event_uid,
-  any(d.session_id) AS session_id,
-  any(d.event_time) AS event_time,
-  any(d.source_name) AS source_name,
-  any(d.harness) AS harness,
-  any(d.inference_provider) AS inference_provider,
-  any(d.event_class) AS event_class,
-  any(d.payload_type) AS payload_type,
-  any(d.actor_role) AS actor_role,
-  any(d.name) AS name,
-  any(d.phase) AS phase,
-  any(d.source_ref) AS source_ref,
-  any(d.doc_len) AS doc_len,
-  leftUTF8(any(d.text_content), {preview}) AS text_preview,
-  leftUTF8(any(d.text_content), {text_content_limit}) AS text_content,
-  leftUTF8(any(d.payload_json), {payload_json_limit}) AS payload_json,
-  sum(
-    transform(toString(p.term), q_terms, q_idf, 0.0)
-    *
-    (
-      (toFloat64(p.tf) * (k1 + 1.0))
-      /
-      (toFloat64(p.tf) + k1 * (1.0 - b + b * (toFloat64(p.doc_len) / avgdl)))
-    )
-  ) AS score,
-  uniqExact(p.term) AS matched_terms
-FROM {postings_table} AS p
-INNER JOIN {documents_join_sql} AS d ON d.event_uid = p.doc_id
-WHERE {where_sql}
-GROUP BY p.doc_id
-HAVING matched_terms >= {min_should_match} AND score >= {min_score:.6}
-ORDER BY score DESC, event_uid ASC
-LIMIT {limit}
+  r.event_uid, r.session_id, h.event_time, r.source_name, r.harness,
+  r.inference_provider, r.event_class, r.payload_type, r.actor_role, r.name,
+  r.phase, r.source_ref, toUInt32(r.doc_len) AS doc_len, h.text_preview,
+  h.text_content, h.payload_json, r.score, toUInt64(r.matched_terms) AS matched_terms
+FROM ranked AS r
+ALL INNER JOIN hydrated AS h ON h.event_uid = r.event_uid
+ORDER BY r.score DESC, r.event_uid ASC
 FORMAT JSONEachRow",
-            preview = self.cfg.preview_chars,
-            text_content_limit = text_content_limit,
-            payload_json_limit = payload_json_limit,
-            postings_table = postings_table,
-            documents_join_sql = documents_join_sql,
+            filters = filters.join("\n      AND ")
         ))
     }
 
@@ -445,195 +386,138 @@ FORMAT JSONEachRow",
                 "event_types filter cannot be an empty list",
             ));
         }
+        if turn_seq.is_some() && session_id.is_none() {
+            return Err(RepoError::invalid_argument(
+                "turn-scoped search requires session_id",
+            ));
+        }
 
-        let postings_table = self.table_ref("search_postings");
-        let corpus_table = self.table_ref("search_corpus_stats");
-        let projection_state_table = self.table_ref("mcp_open_projection_state");
-        let sessions_table = self.table_ref("mcp_open_sessions");
-        let turns_table = self.table_ref("mcp_open_turns");
-        let events_table = self.table_ref("mcp_open_events");
-        let dirty_sessions_table = self.table_ref("mcp_open_dirty_sessions");
-        let terms_array_sql = sql_array_strings(terms);
+        let postings = self.table_ref("search_postings");
+        let corpus = self.table_ref("search_corpus_stats");
+        let locator = self.table_ref("mcp_event_locator");
+        let navigation = self.table_ref("mcp_event_navigation");
+        let terms_sql = sql_array_strings(terms);
         let corpus_stats_sql = match corpus_stats {
             Some((docs, total_doc_len)) => {
                 format!("tuple(toUInt64({docs}), toUInt64({total_doc_len}))")
             }
-            None => format!(
-                "(\n    SELECT tuple(toUInt64(docs), toUInt64(total_doc_len))\n    FROM {corpus_table}\n  )"
-            ),
+            None => {
+                format!("(SELECT tuple(toUInt64(docs), toUInt64(total_doc_len)) FROM {corpus})")
+            }
         };
-
-        let mut posting_clauses = Vec::new();
+        let mut filters = vec![
+            "p.source_name != 'codex-mcp'".to_string(),
+            format!(
+                "NOT {}",
+                moraine_clickhouse::mcp_tool_names::sql_predicate("p.name")
+            ),
+            Self::mcp_event_type_filter_clause(
+                "p.event_class",
+                "p.payload_type",
+                "p.actor_role",
+                event_types,
+            ),
+        ];
         if let Some(session_id) = session_id {
-            posting_clauses.push(format!("p.session_id = {}", sql_quote(session_id)));
-        }
-        let mut event_clauses = Vec::new();
-        if let Some(turn_seq) = turn_seq {
-            let Some(session_id) = session_id else {
-                return Err(RepoError::invalid_argument(
-                    "turn-scoped search requires session_id",
-                ));
-            };
-            event_clauses.push(format!(
-                "e.session_id = {} AND e.turn_seq = {}",
-                sql_quote(session_id),
-                turn_seq
-            ));
+            filters.push(format!("p.session_id = {}", sql_quote(session_id)));
         }
         if let Some(harness) = harness {
-            posting_clauses.push(format!("p.harness = {}", sql_quote(harness)));
+            filters.push(format!("p.harness = {}", sql_quote(harness)));
         }
         if let Some(source_name) = source_name {
-            posting_clauses.push(format!("p.source_name = {}", sql_quote(source_name)));
+            filters.push(format!("p.source_name = {}", sql_quote(source_name)));
         }
-        posting_clauses.push("p.source_name != 'codex-mcp'".to_string());
-        posting_clauses.push(format!(
-            "NOT {}",
-            moraine_clickhouse::mcp_tool_names::sql_predicate("p.name")
-        ));
-        posting_clauses.push(Self::mcp_event_type_filter_clause(
-            "p.event_class",
-            "p.payload_type",
-            "p.actor_role",
-            event_types,
-        ));
-
-        let projected_origin_clause = |alias: &str| {
-            self.cfg.session_scope.as_ref().map(|scope| {
-                let roots = scope
-                    .roots
-                    .iter()
-                    .map(|root| {
-                        format!(
-                        "{alias}.origin_cwd = {root} OR startsWith({alias}.origin_cwd, {prefix})",
-                        root = sql_quote(root),
-                        prefix = sql_quote(&format!("{root}/")),
-                    )
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" OR ");
-                format!("({roots})")
-            })
-        };
-        let posting_origin_clause = projected_origin_clause("s");
-        if let Some(scope_clause) = posting_origin_clause.as_ref() {
-            posting_clauses.push(scope_clause.clone());
+        if let Some(scope) = self.session_scope_clause("p.session_id") {
+            filters.push(scope);
         }
-        let posting_where_sql = posting_clauses.join("\n      AND ");
-        event_clauses.push("projection_ready = 1".to_string());
-        event_clauses.push("projection_clean = 1".to_string());
-        let event_where_sql = event_clauses.join("\n      AND ");
-        let scope_origin_filter = projected_origin_clause("scope_s")
-            .as_deref()
-            .map(|clause| format!(" AND {clause}"))
-            .unwrap_or_default();
-        let scope_state_sql = match (session_id, turn_seq) {
-            (Some(session_id), Some(turn_seq)) => format!(
-                "SELECT toUInt8(count() > 0) AS scope_exists
-FROM {sessions_table} AS scope_s FINAL
-ALL INNER JOIN {turns_table} AS scope_t FINAL
-  ON scope_t.session_id = scope_s.session_id
-  AND scope_t.slot = scope_s.slot
-  AND scope_t.generation = scope_s.generation
-WHERE scope_s.session_id = {session_id}
-  AND scope_t.turn_seq = {turn_seq}{scope_origin_filter}",
-                session_id = sql_quote(session_id),
+        let turn_cte = match (session_id, turn_seq) {
+            (Some(session_id), Some(turn_seq)) => {
+                filters
+                    .push("p.doc_id IN (SELECT event_uid FROM eligible_turn_events)".to_string());
+                format!(
+                    ",
+  eligible_turn_events AS (
+    SELECT event_uid
+    FROM (
+      SELECT
+        event_uid,
+        if(
+          turn_index > 0,
+          turn_index,
+          greatest(
+            sum(is_user_message) OVER (
+              PARTITION BY session_id
+              ORDER BY sort_time, source_file, source_generation, source_offset,
+                source_line_no, event_uid
+              ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
             ),
-            (Some(session_id), None) => format!(
-                "SELECT toUInt8(count() > 0) AS scope_exists
-FROM {sessions_table} AS scope_s FINAL
-WHERE scope_s.session_id = {session_id}{scope_origin_filter}",
-                session_id = sql_quote(session_id),
-            ),
-            (None, Some(_)) => {
-                return Err(RepoError::invalid_argument(
-                    "turn-scoped search requires session_id",
-                ));
+            1
+          )
+        ) AS derived_turn_seq
+      FROM {navigation} FINAL
+      WHERE session_id = {session_id}
+    )
+    WHERE derived_turn_seq = {turn_seq}
+  )",
+                    session_id = sql_quote(session_id)
+                )
             }
-            (None, None) => "SELECT toUInt8(1) AS scope_exists".to_string(),
+            _ => String::new(),
+        };
+        let scope_exists_sql = match (session_id, turn_seq) {
+            (Some(_), Some(_)) => {
+                "toUInt8((SELECT count() FROM eligible_turn_events) > 0)".to_string()
+            }
+            (Some(session_id), None) => {
+                let scope_filter = self
+                    .session_scope_clause("session_id")
+                    .map(|clause| format!(" AND {clause}"))
+                    .unwrap_or_default();
+                format!(
+                    "toUInt8((SELECT count() FROM {navigation} FINAL WHERE session_id = {}{}) > 0)",
+                    sql_quote(session_id),
+                    scope_filter
+                )
+            }
+            (None, None) => "toUInt8(1)".to_string(),
+            (None, Some(_)) => unreachable!("validated above"),
         };
         let k1 = self.cfg.bm25_k1.max(0.01);
         let b = self.cfg.bm25_b.clamp(0.0, 1.0);
-
         Ok(format!(
             "WITH
   {k1:.6} AS k1,
   {b:.6} AS b,
-  {terms_array_sql} AS q_terms,
+  {terms_sql} AS q_terms,
   {corpus_stats_sql} AS corpus_stats,
   tupleElement(corpus_stats, 1) AS corpus_docs,
   tupleElement(corpus_stats, 2) AS corpus_total_doc_len,
-  greatest(
-    if(corpus_docs = 0, 1.0, toFloat64(corpus_total_doc_len) / toFloat64(corpus_docs)),
-    1.0
-  ) AS avgdl,
-  (
-    SELECT toUInt8(if(count() = 0, 0, max(ready)))
-    FROM {projection_state_table} FINAL
-    WHERE state_key = 'global'
-  ) AS projection_ready,
-  (
-    SELECT tuple(
-      toUInt8(countIf(dirty.dirty_revision > ifNull(published.dirty_revision, 0)) = 0),
-      toUInt64(ifNull(max(dirty.dirty_revision), 0))
-    )
-    FROM (
-      SELECT session_id, dirty_revision
-      FROM {dirty_sessions_table} FINAL
-      WHERE notEmpty(session_id)
-    ) AS dirty
-    LEFT JOIN (
-      SELECT session_id, dirty_revision
-      FROM {sessions_table} FINAL
-    ) AS published ON published.session_id = dirty.session_id
-  ) AS projection_status,
-  tupleElement(projection_status, 1) AS projection_clean,
-  tupleElement(projection_status, 2) AS projection_revision,
-  ({scope_state_sql}) AS scope_exists,
+  greatest(if(corpus_docs = 0, 1.0,
+    toFloat64(corpus_total_doc_len) / toFloat64(corpus_docs)), 1.0) AS avgdl
+  {turn_cte},
   term_postings AS (
-    SELECT
-      p.*,
-      toUInt64(count() OVER (PARTITION BY p.term)) AS df
-    FROM {postings_table} AS p FINAL
+    SELECT p.*, toUInt64(count() OVER (PARTITION BY p.term)) AS df
+    FROM {postings} AS p FINAL
     PREWHERE p.term IN q_terms
-  ),
-  matching_doc_ids AS (
-    SELECT p.doc_id AS event_uid
-    FROM {postings_table} AS p FINAL
-    ALL INNER JOIN {sessions_table} AS s FINAL ON s.session_id = p.session_id
-    WHERE p.term IN q_terms
-      AND {posting_where_sql}
-      AND projection_ready = 1
-      AND projection_clean = 1
-  ),
-  projected_candidates AS (
-    SELECT event_uid, session_id, slot, generation, event_time, turn_seq
-    FROM {events_table} FINAL
-    WHERE event_uid IN (SELECT event_uid FROM matching_doc_ids)
   ),
   ranked AS (
     SELECT
       p.doc_id AS event_uid,
-      any(s.session_id) AS session_id,
-      toUInt8(any(s.slot)) AS slot,
-      toUInt64(any(s.generation)) AS generation,
+      any(p.session_id) AS session_id,
+      toUInt64(any(l.event_version)) AS event_version,
       sum(
         log(1.0 + ((greatest(toFloat64(corpus_docs), toFloat64(p.df))
           - toFloat64(p.df) + 0.5) / (toFloat64(p.df) + 0.5)))
         * ((toFloat64(p.tf) * (k1 + 1.0))
-          / (toFloat64(p.tf) + k1 * (1.0 - b + b * (toFloat64(p.doc_len) / avgdl))))
+          / (toFloat64(p.tf) + k1 * (1.0 - b
+            + b * (toFloat64(p.doc_len) / avgdl))))
       ) AS raw_score,
-      toUInt64(count()) AS matched_terms,
-      toInt64(toUnixTimestamp64Milli(any(e.event_time))) AS event_unix_ms
+      toUInt64(uniqExact(p.term)) AS matched_terms,
+      toInt64(toUnixTimestamp64Milli(any(l.sort_time))) AS event_unix_ms
     FROM term_postings AS p
-    ALL INNER JOIN {sessions_table} AS s FINAL ON s.session_id = p.session_id
-    ALL INNER JOIN projected_candidates AS e
-      ON e.event_uid = p.doc_id
-      AND e.session_id = s.session_id
-      AND e.slot = s.slot
-      AND e.generation = s.generation
-    WHERE {posting_where_sql}
-      AND {event_where_sql}
+    ALL INNER JOIN {locator} AS l FINAL
+      ON l.event_uid = p.doc_id AND l.event_version = p.post_version
+    WHERE {filters}
     GROUP BY p.doc_id
     HAVING matched_terms >= {min_should_match} AND raw_score >= {min_score:.6}
     ORDER BY raw_score DESC, event_unix_ms DESC, event_uid ASC
@@ -641,48 +525,22 @@ WHERE scope_s.session_id = {session_id}{scope_origin_filter}",
   )
 SELECT *
 FROM (
-SELECT
-  toUInt8(0) AS row_kind,
-  ranked.event_uid AS event_uid,
-  ranked.session_id AS session_id,
-  ranked.slot AS slot,
-  ranked.generation AS generation,
-  ranked.raw_score AS raw_score,
-  ranked.matched_terms AS matched_terms,
-  ranked.event_unix_ms AS event_unix_ms,
-  corpus_docs AS docs,
-  corpus_total_doc_len AS total_doc_len,
-  scope_exists AS scope_exists,
-  projection_ready AS projection_ready,
-  projection_clean AS projection_clean,
-  projection_revision AS projection_revision
-FROM ranked
-UNION ALL
-SELECT
-  toUInt8(1) AS row_kind,
-  '' AS event_uid,
-  '' AS session_id,
-  toUInt8(0) AS slot,
-  toUInt64(0) AS generation,
-  toFloat64(0) AS raw_score,
-  toUInt64(0) AS matched_terms,
-  toInt64(0) AS event_unix_ms,
-  corpus_docs AS docs,
-  corpus_total_doc_len AS total_doc_len,
-  scope_exists AS scope_exists,
-  projection_ready AS projection_ready,
-  projection_clean AS projection_clean,
-  projection_revision AS projection_revision
+  SELECT
+    toUInt8(0) AS row_kind, event_uid, session_id, event_version,
+    raw_score, matched_terms, event_unix_ms, corpus_docs AS docs,
+    corpus_total_doc_len AS total_doc_len, {scope_exists_sql} AS scope_exists
+  FROM ranked
+  UNION ALL
+  SELECT
+    toUInt8(1), '', '', toUInt64(0), toFloat64(0),
+    toUInt64(0), toInt64(0), corpus_docs, corpus_total_doc_len,
+    {scope_exists_sql}
 )
 ORDER BY row_kind ASC, raw_score DESC, event_unix_ms DESC, event_uid ASC
 SETTINGS max_bytes_before_external_group_by = 67108864,
   max_bytes_before_external_sort = 67108864
 FORMAT JSONEachRow",
-            postings_table = postings_table,
-            projection_state_table = projection_state_table,
-            sessions_table = sessions_table,
-            events_table = events_table,
-            dirty_sessions_table = dirty_sessions_table,
+            filters = filters.join("\n      AND ")
         ))
     }
 
@@ -695,236 +553,187 @@ FORMAT JSONEachRow",
                 "cannot hydrate MCP search rows for empty event_uids",
             ));
         }
-
-        let documents_table = self.table_ref("search_documents");
-        let sessions_table = self.table_ref("mcp_open_sessions");
-        let turns_table = self.table_ref("mcp_open_turns");
-        let projected_events_table = self.table_ref("mcp_open_events");
-        let events_table = self.table_ref("events");
+        let events = self.table_ref("events");
+        let locator = self.table_ref("mcp_event_locator");
+        let navigation = self.table_ref("mcp_event_navigation");
         let event_uids = candidates
             .iter()
             .map(|candidate| candidate.event_uid.clone())
             .collect::<Vec<_>>();
-        let event_uids_sql = sql_array_strings(&event_uids);
-        let candidate_heads_sql = candidates
+        let mut session_ids = candidates
             .iter()
-            .map(|candidate| {
-                format!(
-                    "({}, {}, toUInt8({}), toUInt64({}))",
-                    sql_quote(&candidate.event_uid),
-                    sql_quote(&candidate.session_id),
-                    candidate.slot,
-                    candidate.generation,
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(",");
+            .map(|candidate| candidate.session_id.clone())
+            .collect::<Vec<_>>();
+        session_ids.sort_unstable();
+        session_ids.dedup();
+        let event_uids_sql = sql_array_strings(&event_uids);
+        let session_ids_sql = sql_array_strings(&session_ids);
         let preview = self.cfg.preview_chars;
-        let text_content_limit = usize::from(preview).saturating_mul(4);
-        let payload_json_limit = usize::from(preview).saturating_mul(8);
-
+        let text_limit = usize::from(preview).saturating_mul(4);
+        let payload_limit = usize::from(preview).saturating_mul(8);
         Ok(format!(
             "WITH
   {event_uids_sql} AS event_uids,
-  candidate_heads AS (
+  nav_ranked AS (
     SELECT
-      tupleElement(candidate, 1) AS event_uid,
-      tupleElement(candidate, 2) AS session_id,
-      toUInt8(tupleElement(candidate, 3)) AS slot,
-      toUInt64(tupleElement(candidate, 4)) AS generation
-    FROM (SELECT arrayJoin([{candidate_heads_sql}]) AS candidate)
+      n.*,
+      toUInt64(row_number() OVER (
+        PARTITION BY n.session_id
+        ORDER BY n.sort_time, n.source_file, n.source_generation,
+          n.source_offset, n.source_line_no, n.event_uid
+      )) AS event_order,
+      toUInt32(sum(n.is_user_message) OVER (
+        PARTITION BY n.session_id
+        ORDER BY n.sort_time, n.source_file, n.source_generation,
+          n.source_offset, n.source_line_no, n.event_uid
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+      )) AS prefix_user_messages
+    FROM {navigation} AS n FINAL
+    WHERE n.session_id IN {session_ids_sql}
   ),
-  documents AS (
+  nav_turns AS (
     SELECT
-      document.event_uid AS event_uid,
-      argMax(document.session_id, document.doc_version) AS session_id,
-      argMax(document.source_name, document.doc_version) AS source_name,
-      argMax(document.harness, document.doc_version) AS harness,
-      argMax(document.inference_provider, document.doc_version) AS inference_provider,
-      argMax(document.event_class, document.doc_version) AS event_class,
-      argMax(document.payload_type, document.doc_version) AS payload_type,
-      argMax(document.actor_role, document.doc_version) AS actor_role,
-      argMax(document.name, document.doc_version) AS name,
-      argMax(document.phase, document.doc_version) AS phase,
-      argMax(JSONExtractString(document.payload_json, 'phase'), document.doc_version) AS payload_phase,
-      argMax(document.source_ref, document.doc_version) AS source_ref,
-      toUInt32(argMax(document.doc_len, document.doc_version)) AS doc_len,
-      argMax(leftUTF8(document.text_content, {preview}), document.doc_version) AS text_preview,
-      argMax(leftUTF8(document.text_content, {text_content_limit}), document.doc_version) AS text_content,
-      argMax(leftUTF8(document.payload_json, {payload_json_limit}), document.doc_version) AS payload_json
-    FROM {documents_table} AS document
-    WHERE document.event_uid IN event_uids
-    GROUP BY document.event_uid
+      *,
+      toUInt32(if(turn_index > 0, turn_index, greatest(prefix_user_messages, 1)))
+        AS derived_turn_seq
+    FROM nav_ranked
   ),
-  models AS (
-    SELECT source_event.event_uid AS event_uid,
-      argMax(source_event.model, source_event.event_version) AS model
-    FROM {events_table} AS source_event
-    WHERE source_event.event_uid IN event_uids
-    GROUP BY source_event.event_uid
+  nav_derived AS (
+    SELECT
+      *,
+      toUInt32(row_number() OVER (
+        PARTITION BY session_id, derived_turn_seq
+        ORDER BY sort_time, source_file, source_generation, source_offset,
+          source_line_no, event_uid
+      )) AS event_ordinal
+    FROM nav_turns
+  ),
+  turn_totals AS (
+    SELECT
+      session_id,
+      derived_turn_seq,
+      toUInt64(count()) AS turn_event_count,
+      toUInt8(countIf(payload_type = 'task_complete') > 0) AS turn_completed,
+      argMaxIf(
+        event_uid,
+        tuple(sort_time, source_file, source_generation, source_offset,
+          source_line_no, event_uid),
+        payload_type IN ('task_complete', 'turn_aborted')
+      ) AS turn_terminal_event_uid
+    FROM nav_derived
+    GROUP BY session_id, derived_turn_seq
+  ),
+  session_totals AS (
+    SELECT
+      session_id,
+      toInt64(toUnixTimestamp64Milli(min(display_time))) AS session_started_at_unix_ms,
+      toInt64(toUnixTimestamp64Milli(max(display_time))) AS session_updated_at_unix_ms,
+      toUInt8(countIf(payload_type = 'task_complete') > 0) AS session_completed
+    FROM nav_derived
+    GROUP BY session_id
+  ),
+  hydrated AS (
+    SELECT
+      e.event_uid,
+      argMax(e.session_id, e.event_version) AS session_id,
+      argMax(e.source_name, e.event_version) AS source_name,
+      argMax(e.harness, e.event_version) AS harness,
+      argMax(e.inference_provider, e.event_version) AS inference_provider,
+      argMax(e.endpoint_kind, e.event_version) AS endpoint_kind,
+      argMax(e.event_kind, e.event_version) AS event_class,
+      argMax(e.payload_type, e.event_version) AS payload_type,
+      argMax(e.actor_kind, e.event_version) AS actor_role,
+      argMax(e.tool_name, e.event_version) AS name,
+      argMax(if(notEmpty(e.tool_phase), e.tool_phase, e.op_status), e.event_version) AS phase,
+      argMax(e.source_ref, e.event_version) AS source_ref,
+      argMax(leftUTF8(e.text_content, {preview}), e.event_version) AS text_preview,
+      argMax(leftUTF8(e.text_content, {text_limit}), e.event_version) AS text_content,
+      argMax(leftUTF8(e.payload_json, {payload_limit}), e.event_version) AS payload_json,
+      argMax(e.model, e.event_version) AS model
+    FROM {events} AS e
+    WHERE e.event_uid IN event_uids
+    GROUP BY e.event_uid
   )
 SELECT
-  documents.event_uid AS event_uid,
-  documents.session_id AS session_id,
-  documents.source_name AS source_name,
-  documents.harness AS harness,
-  documents.inference_provider AS inference_provider,
-  projected_events.endpoint_kind AS endpoint_kind,
-  documents.event_class AS event_class,
-  documents.payload_type AS payload_type,
-  documents.actor_role AS actor_role,
-  documents.name AS name,
-  documents.phase AS phase,
-  documents.payload_phase AS payload_phase,
-  documents.source_ref AS source_ref,
-  documents.doc_len AS doc_len,
-  documents.text_preview AS text_preview,
-  documents.text_content AS text_content,
-  hex(SHA256(projected_events.text_content)) AS text_content_digest,
-  documents.payload_json AS payload_json,
-  projected_events.event_type AS mcp_event_type,
-  toFloat64(0) AS raw_score,
-  toUInt64(0) AS matched_terms,
-  toString(projected_events.event_time) AS event_time,
-  toInt64(toUnixTimestamp64Milli(projected_events.event_time)) AS event_unix_ms,
-  toUInt64(projected_events.event_order) AS event_order,
-  toUInt32(projected_events.turn_seq) AS turn_seq,
-  toUInt32(projected_events.event_ordinal) AS event_ordinal,
-  toUInt64(ifNull(turns.total_events, 0)) AS turn_event_count,
-  toUInt8(ifNull(turns.completed, 0)) AS turn_completed,
-  ifNull(turns.terminal_event_uid, '') AS turn_terminal_event_uid,
-  projected_events.call_id AS call_id,
-  projected_events.item_id AS item_id,
-  ifNull(models.model, '') AS model,
-  toInt64(toUnixTimestamp64Milli(sessions.first_event_time)) AS session_started_at_unix_ms,
-  toInt64(toUnixTimestamp64Milli(sessions.last_event_time)) AS session_updated_at_unix_ms,
-  sessions.title AS session_title,
-  sessions.session_slug AS session_slug,
-  sessions.session_summary AS session_summary,
-  toUInt8(sessions.completed) AS session_completed
-FROM documents
-ALL INNER JOIN candidate_heads AS candidate
-  ON candidate.event_uid = documents.event_uid
-ALL INNER JOIN {sessions_table} AS sessions FINAL
-  ON sessions.session_id = candidate.session_id
-  AND sessions.slot = candidate.slot
-  AND sessions.generation = candidate.generation
-ALL INNER JOIN {projected_events_table} AS projected_events FINAL
-  ON projected_events.event_uid = candidate.event_uid
-  AND projected_events.session_id = candidate.session_id
-  AND projected_events.slot = candidate.slot
-  AND projected_events.generation = candidate.generation
-ANY LEFT JOIN {turns_table} AS turns FINAL
-  ON turns.session_id = sessions.session_id
-  AND turns.slot = sessions.slot
-  AND turns.generation = sessions.generation
-  AND turns.turn_seq = projected_events.turn_seq
-ANY LEFT JOIN models ON models.event_uid = documents.event_uid
-ORDER BY indexOf(event_uids, documents.event_uid) ASC
-FORMAT JSONEachRow",
+  h.event_uid AS event_uid, h.session_id AS session_id,
+  toUInt64(l.event_version) AS event_version,
+  h.source_name AS source_name, h.harness AS harness,
+  h.inference_provider AS inference_provider, h.endpoint_kind AS endpoint_kind,
+  h.event_class AS event_class, h.payload_type AS payload_type,
+  h.actor_role AS actor_role, h.name AS name, h.phase AS phase,
+  l.payload_phase AS payload_phase, h.source_ref AS source_ref,
+  toUInt32(l.doc_len) AS doc_len, h.text_preview AS text_preview,
+  h.text_content AS text_content, l.text_digest AS text_content_digest,
+  h.payload_json AS payload_json, '' AS mcp_event_type,
+  toFloat64(0) AS raw_score, toUInt64(0) AS matched_terms,
+  toString(n.display_time) AS event_time,
+  toInt64(toUnixTimestamp64Milli(n.display_time)) AS event_unix_ms,
+  n.event_order AS event_order, n.derived_turn_seq AS turn_seq,
+  n.event_ordinal AS event_ordinal, t.turn_event_count AS turn_event_count,
+  t.turn_completed AS turn_completed,
+  t.turn_terminal_event_uid AS turn_terminal_event_uid,
+  n.tool_call_id AS call_id, n.item_id AS item_id, h.model AS model,
+  s.session_started_at_unix_ms AS session_started_at_unix_ms,
+  s.session_updated_at_unix_ms AS session_updated_at_unix_ms,
+  '' AS session_title, '' AS session_slug, '' AS session_summary,
+  s.session_completed AS session_completed
+FROM hydrated AS h
+ALL INNER JOIN {locator} AS l FINAL ON l.event_uid = h.event_uid
+ALL INNER JOIN nav_derived AS n ON n.event_uid = h.event_uid
+ANY LEFT JOIN turn_totals AS t
+  ON t.session_id = n.session_id AND t.derived_turn_seq = n.derived_turn_seq
+ANY LEFT JOIN session_totals AS s ON s.session_id = n.session_id
+ORDER BY indexOf(event_uids, h.event_uid) ASC
+FORMAT JSONEachRow"
         ))
     }
 
     pub(super) fn build_search_events_hydrate_sql(
         &self,
         event_uids: &[String],
-        use_document_codex_flag: bool,
     ) -> RepoResult<String> {
         if event_uids.is_empty() {
             return Err(RepoError::invalid_argument(
                 "cannot hydrate search rows for empty event_uids",
             ));
         }
-        let documents_table = self.table_ref("search_documents");
+        let events = self.table_ref("events");
+        let locator = self.table_ref("mcp_event_locator");
         let event_uids_array = sql_array_strings(event_uids);
-        let text_content_limit = usize::from(self.cfg.preview_chars).saturating_mul(4);
-        let payload_json_limit = usize::from(self.cfg.preview_chars).saturating_mul(8);
-        // Truncate the fat columns inside the aggregation (issue #443): the
-        // GROUP BY state then holds at most `*_limit` characters per uid
-        // instead of full multi-MB payload blobs. The codex fallback still
-        // scans every full payload value, but as a boolean aggregate rather
-        // than a held string.
-        let codex_inner_expr = if use_document_codex_flag {
-            "toUInt8(any(t.has_codex_mcp))"
-        } else {
-            "toUInt8(max(toUInt8(positionCaseInsensitiveUTF8(t.payload_json, 'codex-mcp') > 0)))"
-        };
-        let documents_source_sql = format!(
-            "(SELECT
-  t.event_uid AS event_uid,
-  any(t.session_id) AS session_id,
-  any(t.record_ts) AS event_time,
-  any(t.source_name) AS source_name,
-  any(t.harness) AS harness,
-  any(t.inference_provider) AS inference_provider,
-  any(t.event_class) AS event_class,
-  any(t.payload_type) AS payload_type,
-  any(t.actor_role) AS actor_role,
-  any(t.name) AS name,
-  any(t.phase) AS phase,
-  any(t.source_ref) AS source_ref,
-  any(t.doc_len) AS doc_len,
-  any(leftUTF8(t.text_content, {text_content_limit})) AS text_content,
-  any(leftUTF8(t.payload_json, {payload_json_limit})) AS payload_json,
-  {codex_inner_expr} AS has_codex_mcp
-FROM {documents_table} AS t
-WHERE t.event_uid IN {event_uids_array}
-GROUP BY t.event_uid)"
-        );
-
+        let preview = self.cfg.preview_chars;
+        let text_limit = usize::from(preview).saturating_mul(4);
+        let payload_limit = usize::from(preview).saturating_mul(8);
         Ok(format!(
-            "SELECT
-  d.event_uid AS event_uid,
-  d.session_id AS session_id,
-  d.event_time AS event_time,
-  d.source_name AS source_name,
-  d.harness AS harness,
-  d.inference_provider AS inference_provider,
-  d.event_class AS event_class,
-  d.payload_type AS payload_type,
-  d.actor_role AS actor_role,
-  d.name AS name,
-  d.phase AS phase,
-  d.source_ref AS source_ref,
-  d.doc_len AS doc_len,
-  leftUTF8(d.text_content, {preview}) AS text_preview,
-  d.text_content AS text_content,
-  d.payload_json AS payload_json,
-  d.has_codex_mcp AS has_codex_mcp
-FROM {documents_source_sql} AS d
-FORMAT JSONEachRow",
-            preview = self.cfg.preview_chars,
-            documents_source_sql = documents_source_sql,
+            "WITH hydrated AS (
+  SELECT
+    e.event_uid,
+    argMax(e.session_id, e.event_version) AS session_id,
+    argMax(if(notEmpty(e.record_ts), e.record_ts, toString(e.ingested_at)), e.event_version) AS event_time,
+    argMax(e.source_name, e.event_version) AS source_name,
+    argMax(e.harness, e.event_version) AS harness,
+    argMax(e.inference_provider, e.event_version) AS inference_provider,
+    argMax(e.event_kind, e.event_version) AS event_class,
+    argMax(e.payload_type, e.event_version) AS payload_type,
+    argMax(e.actor_kind, e.event_version) AS actor_role,
+    argMax(e.tool_name, e.event_version) AS name,
+    argMax(if(notEmpty(e.tool_phase), e.tool_phase, e.op_status), e.event_version) AS phase,
+    argMax(e.source_ref, e.event_version) AS source_ref,
+    argMax(leftUTF8(e.text_content, {preview}), e.event_version) AS text_preview,
+    argMax(leftUTF8(e.text_content, {text_limit}), e.event_version) AS text_content,
+    argMax(leftUTF8(e.payload_json, {payload_limit}), e.event_version) AS payload_json
+  FROM {events} AS e
+  WHERE e.event_uid IN {event_uids_array}
+  GROUP BY e.event_uid
+)
+SELECT
+  h.event_uid, h.session_id, h.event_time, h.source_name, h.harness,
+  h.inference_provider, h.event_class, h.payload_type, h.actor_role, h.name,
+  h.phase, h.source_ref, toUInt32(l.doc_len) AS doc_len, h.text_preview, h.text_content,
+  h.payload_json, toUInt8(l.has_codex_mcp) AS has_codex_mcp
+FROM hydrated AS h
+ANY INNER JOIN {locator} AS l FINAL ON l.event_uid = h.event_uid
+FORMAT JSONEachRow"
         ))
-    }
-
-    pub(super) async fn search_documents_has_codex_flag(&self) -> RepoResult<bool> {
-        let now = Instant::now();
-        {
-            let cache = self.stats_cache.read().await;
-            if let Some((value, fetched_at)) = cache.has_codex_flag_column {
-                if now.duration_since(fetched_at) <= SEARCH_SCHEMA_CACHE_TTL {
-                    return Ok(value);
-                }
-            }
-        }
-
-        let query = format!(
-            "SELECT
-  toUInt8(count() > 0) AS exists
-FROM system.columns
-WHERE database = {}
-  AND table = 'search_documents'
-  AND name = 'has_codex_mcp'
-FORMAT JSONEachRow",
-            sql_quote(&self.ch.config().database)
-        );
-        let rows: Vec<ColumnExistsRow> = self.map_backend(self.query_rows(&query, None).await)?;
-        let exists = rows.first().map(|row| row.exists != 0).unwrap_or(false);
-
-        let mut cache = self.stats_cache.write().await;
-        cache.has_codex_flag_column = Some((exists, now));
-        Ok(exists)
     }
 
     pub(super) fn passes_search_doc_filters(
@@ -1207,7 +1016,6 @@ FORMAT JSONEachRow",
     pub(super) async fn load_search_doc_extras(
         &self,
         event_uids: &[String],
-        use_document_codex_flag: bool,
     ) -> RepoResult<HashMap<String, SearchDocExtraCacheEntry>> {
         let now = Instant::now();
         let mut by_uid = HashMap::<String, SearchDocExtraCacheEntry>::new();
@@ -1227,8 +1035,7 @@ FORMAT JSONEachRow",
         }
 
         if !missing_uids.is_empty() {
-            let query =
-                self.build_search_events_hydrate_sql(&missing_uids, use_document_codex_flag)?;
+            let query = self.build_search_events_hydrate_sql(&missing_uids)?;
             let fetched_rows: Vec<SearchDocExtraRow> =
                 self.map_backend(self.query_rows(&query, None).await)?;
 
@@ -1347,7 +1154,6 @@ FORMAT JSONEachRow",
             idf_by_term.insert(term.clone(), Self::bm25_idf(docs, df));
         }
 
-        let use_document_codex_flag = self.search_documents_has_codex_flag().await?;
         let fallback_sql = self.build_search_events_sql(
             terms,
             &idf_by_term,
@@ -1355,7 +1161,6 @@ FORMAT JSONEachRow",
             include_tool_events,
             event_kinds,
             exclude_codex_mcp,
-            use_document_codex_flag,
             session_id,
             session_ids,
             min_should_match,
@@ -1444,7 +1249,7 @@ FORMAT JSONEachRow",
         let mut page_count = 0_u16;
         let mut rows = Vec::<SearchMcpEventRow>::with_capacity(target_rows);
         let mut corpus_stats = self.cached_corpus_stats().await;
-        let mut snapshot = None::<(u64, u64, bool, u64)>;
+        let mut snapshot = None::<(u64, u64, bool)>;
 
         loop {
             if page_count >= MCP_SEARCH_MAX_CANDIDATE_PAGES {
@@ -1480,20 +1285,11 @@ FORMAT JSONEachRow",
                     .await;
                 corpus_stats = Some(page_corpus_stats);
             }
-            if metadata.projection_ready == 0 {
-                return Err(RepoError::backend(
-                    "MCP search read model is not ready; run `moraine db migrate`",
-                ));
-            }
-            if metadata.projection_clean == 0 {
-                return Err(RepoError::ReadModelChanged);
-            }
 
             let page_snapshot = (
                 metadata.docs,
                 metadata.total_doc_len,
                 metadata.scope_exists != 0,
-                metadata.projection_revision,
             );
             match snapshot {
                 None => snapshot = Some(page_snapshot),
@@ -1524,10 +1320,13 @@ FORMAT JSONEachRow",
                 let Some(mut detail) = details_by_uid.remove(candidate.event_uid.as_str()) else {
                     return Err(RepoError::ReadModelChanged);
                 };
+                if detail.event_version != candidate.event_version {
+                    return Err(RepoError::ReadModelChanged);
+                }
                 detail.raw_score = candidate.raw_score;
                 detail.matched_terms = candidate.matched_terms;
                 // Ranking is defined by the candidate snapshot. Preserve its
-                // timestamp if the projection publishes between the two reads.
+                // timestamp if canonical content changes between the two reads.
                 detail.event_unix_ms = candidate.event_unix_ms;
                 rows.push(detail);
             }
@@ -1540,7 +1339,7 @@ FORMAT JSONEachRow",
             offset = offset.saturating_add(candidate_count as u64);
         }
 
-        let (docs, total_doc_len, scope_exists, _) = snapshot
+        let (docs, total_doc_len, scope_exists) = snapshot
             .ok_or_else(|| RepoError::backend("MCP search candidate query omitted metadata"))?;
         Ok((rows, docs, total_doc_len, scope_exists))
     }
@@ -1784,7 +1583,6 @@ FORMAT JSONEachRow",
         }
 
         let postings_by_term = self.load_term_postings_for_terms(terms).await?;
-        let use_document_codex_flag = self.search_documents_has_codex_flag().await?;
         let k1 = self.cfg.bm25_k1.max(0.01);
         let b = self.cfg.bm25_b.clamp(0.0, 1.0);
         let mut idf_by_term = HashMap::<&str, f64>::new();
@@ -1860,9 +1658,7 @@ FORMAT JSONEachRow",
                 .iter()
                 .map(|row| row.row.event_uid.clone())
                 .collect();
-            let doc_extras = self
-                .load_search_doc_extras(&event_uids, use_document_codex_flag)
-                .await?;
+            let doc_extras = self.load_search_doc_extras(&event_uids).await?;
 
             for row in &fast_candidates[offset..end] {
                 let Some(extra) = doc_extras.get(row.row.event_uid.as_str()) else {
@@ -1910,19 +1706,6 @@ FORMAT JSONEachRow",
         Ok((fast_rows, candidate_count))
     }
 
-    pub(super) fn conversation_candidate_limit(limit: u16) -> usize {
-        (limit as usize)
-            .saturating_mul(CONVERSATION_CANDIDATE_MULTIPLIER)
-            .clamp(CONVERSATION_CANDIDATE_MIN, CONVERSATION_CANDIDATE_MAX)
-    }
-
-    pub(super) fn now_unix_ms() -> i64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or_default()
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub(super) fn build_conversation_postings_filter_sql(
         &self,
@@ -1931,8 +1714,6 @@ FORMAT JSONEachRow",
         exclude_codex_mcp: bool,
         from_unix_ms: Option<i64>,
         to_unix_ms: Option<i64>,
-        recent_from_unix_ms: Option<i64>,
-        candidate_session_ids: Option<&[String]>,
     ) -> (String, String, String) {
         let terms_array_sql = sql_array_strings(terms);
         let mut postings_filters = vec![format!("p.term IN {}", terms_array_sql)];
@@ -1946,11 +1727,6 @@ FORMAT JSONEachRow",
         if let Some(to_unix_ms) = to_unix_ms {
             document_filters.push(format!(
                 "toUnixTimestamp64Milli(d.ingested_at) < {to_unix_ms}"
-            ));
-        }
-        if let Some(recent_from_unix_ms) = recent_from_unix_ms {
-            document_filters.push(format!(
-                "toUnixTimestamp64Milli(d.ingested_at) >= {recent_from_unix_ms}"
             ));
         }
 
@@ -1973,15 +1749,6 @@ FORMAT JSONEachRow",
             ));
         }
 
-        if let Some(candidate_session_ids) = candidate_session_ids {
-            if !candidate_session_ids.is_empty() {
-                postings_filters.push(format!(
-                    "p.session_id IN {}",
-                    sql_array_strings(candidate_session_ids)
-                ));
-            }
-        }
-
         let prewhere_sql = postings_filters.join("\n      AND ");
         let where_sql = if document_filters.is_empty() {
             String::new()
@@ -1991,284 +1758,10 @@ FORMAT JSONEachRow",
         let docs_join_sql = if document_filters.is_empty() {
             String::new()
         } else {
-            let documents_table = self.table_ref("search_documents");
-            format!("ANY INNER JOIN {documents_table} AS d ON d.event_uid = p.doc_id")
+            let documents_table = self.table_ref("mcp_event_locator");
+            format!("ANY INNER JOIN {documents_table} AS d FINAL ON d.event_uid = p.doc_id AND d.event_version = p.post_version")
         };
         (docs_join_sql, prewhere_sql, where_sql)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn build_search_conversation_candidates_sql(
-        &self,
-        terms: &[String],
-        idf_by_term: &HashMap<String, f64>,
-        include_tool_events: bool,
-        exclude_codex_mcp: bool,
-        min_should_match: u16,
-        limit: usize,
-        from_unix_ms: Option<i64>,
-        to_unix_ms: Option<i64>,
-        mode: Option<ConversationMode>,
-    ) -> RepoResult<String> {
-        if terms.is_empty() {
-            return Err(RepoError::invalid_argument(
-                "cannot build candidate query with empty terms",
-            ));
-        }
-
-        let postings_table = self.table_ref("search_postings");
-        let conversation_terms_table = self.table_ref("search_conversation_terms");
-        let terms_array_sql = sql_array_strings(terms);
-        let idf_vals: Vec<f64> = terms
-            .iter()
-            .map(|t| *idf_by_term.get(t).unwrap_or(&0.0))
-            .collect();
-        let idf_array_sql = sql_array_f64(&idf_vals);
-        let (docs_join_sql, prewhere_sql, where_sql) = self.build_conversation_postings_filter_sql(
-            terms,
-            include_tool_events,
-            exclude_codex_mcp,
-            from_unix_ms,
-            to_unix_ms,
-            None,
-            None,
-        );
-
-        let (mode_join_sql, mode_filter_sql) = if let Some(selected_mode) = mode {
-            let mode_subquery = self.mode_subquery();
-            let mode_filter_sql = Self::mode_filter_clause(Some(selected_mode))
-                .map(|clause| format!("AND {clause}"))
-                .unwrap_or_default();
-            (
-                format!("ANY LEFT JOIN ({mode_subquery}) AS m ON m.session_id = c.session_id"),
-                mode_filter_sql,
-            )
-        } else {
-            (String::new(), String::new())
-        };
-
-        Ok(format!(
-            "WITH
-  {terms_array_sql} AS q_terms,
-  {idf_array_sql} AS q_idf
-SELECT
-  c.session_id AS session_id,
-  c.score AS score,
-  toUInt16(c.matched_terms) AS matched_terms
-FROM (
-  SELECT
-    ct.session_id,
-    sum(transform(ct.term, q_terms, q_idf, 0.0) * log1p(toFloat64(ct.tf_sum))) AS score,
-    toUInt16(countDistinct(ct.term)) AS matched_terms
-  FROM {conversation_terms_table} AS ct
-  ANY INNER JOIN (
-    SELECT DISTINCT p.session_id
-    FROM {postings_table} AS p
-    {docs_join_sql}
-    PREWHERE {prewhere_sql}
-    {where_sql}
-  ) AS eligible ON eligible.session_id = ct.session_id
-  WHERE ct.term IN {terms_array_sql}
-  GROUP BY ct.session_id
-) AS c
-{mode_join_sql}
-WHERE c.matched_terms >= {min_should_match}
-  {mode_filter_sql}
-ORDER BY c.score DESC, c.session_id ASC
-LIMIT {limit}
-FORMAT JSONEachRow",
-            conversation_terms_table = conversation_terms_table,
-            postings_table = postings_table,
-            docs_join_sql = docs_join_sql,
-            prewhere_sql = prewhere_sql,
-            where_sql = where_sql,
-            mode_join_sql = mode_join_sql,
-            mode_filter_sql = mode_filter_sql,
-            min_should_match = min_should_match,
-            limit = limit,
-        ))
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn build_search_conversation_recent_candidates_sql(
-        &self,
-        terms: &[String],
-        idf_by_term: &HashMap<String, f64>,
-        include_tool_events: bool,
-        exclude_codex_mcp: bool,
-        min_should_match: u16,
-        limit: usize,
-        from_unix_ms: Option<i64>,
-        to_unix_ms: Option<i64>,
-        mode: Option<ConversationMode>,
-    ) -> RepoResult<String> {
-        if terms.is_empty() {
-            return Err(RepoError::invalid_argument(
-                "cannot build recent candidate query with empty terms",
-            ));
-        }
-
-        let postings_table = self.table_ref("search_postings");
-        let terms_array_sql = sql_array_strings(terms);
-        let idf_vals: Vec<f64> = terms
-            .iter()
-            .map(|t| *idf_by_term.get(t).unwrap_or(&0.0))
-            .collect();
-        let idf_array_sql = sql_array_f64(&idf_vals);
-        let now_unix_ms = Self::now_unix_ms();
-        let recent_floor = now_unix_ms.saturating_sub(CONVERSATION_RECENT_WINDOW_MS);
-        let recent_from_unix_ms = match from_unix_ms {
-            Some(from) => from.max(recent_floor),
-            None => recent_floor,
-        };
-        let (docs_join_sql, prewhere_sql, where_sql) = self.build_conversation_postings_filter_sql(
-            terms,
-            include_tool_events,
-            exclude_codex_mcp,
-            from_unix_ms,
-            to_unix_ms,
-            Some(recent_from_unix_ms),
-            None,
-        );
-
-        let (mode_join_sql, mode_filter_sql) = if let Some(selected_mode) = mode {
-            let mode_subquery = self.mode_subquery();
-            let mode_filter_sql = Self::mode_filter_clause(Some(selected_mode))
-                .map(|clause| format!("AND {clause}"))
-                .unwrap_or_default();
-            (
-                format!("ANY LEFT JOIN ({mode_subquery}) AS m ON m.session_id = c.session_id"),
-                mode_filter_sql,
-            )
-        } else {
-            (String::new(), String::new())
-        };
-
-        Ok(format!(
-            "WITH
-  {terms_array_sql} AS q_terms,
-  {idf_array_sql} AS q_idf
-SELECT
-  c.session_id AS session_id,
-  c.score AS score,
-  toUInt16(c.matched_terms) AS matched_terms
-FROM (
-  SELECT
-    p.session_id AS session_id,
-    sum(transform(toString(p.term), q_terms, q_idf, 0.0) * log1p(toFloat64(p.tf))) AS score,
-    toUInt16(countDistinct(p.term)) AS matched_terms
-  FROM {postings_table} AS p
-  {docs_join_sql}
-  PREWHERE {prewhere_sql}
-  {where_sql}
-  GROUP BY p.session_id
-) AS c
-{mode_join_sql}
-WHERE c.matched_terms >= {min_should_match}
-  {mode_filter_sql}
-ORDER BY c.score DESC, c.session_id ASC
-LIMIT {limit}
-FORMAT JSONEachRow",
-            postings_table = postings_table,
-            docs_join_sql = docs_join_sql,
-            prewhere_sql = prewhere_sql,
-            where_sql = where_sql,
-            mode_join_sql = mode_join_sql,
-            mode_filter_sql = mode_filter_sql,
-            min_should_match = min_should_match,
-            limit = limit,
-        ))
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(super) async fn fetch_conversation_candidates(
-        &self,
-        terms: &[String],
-        idf_by_term: &HashMap<String, f64>,
-        include_tool_events: bool,
-        exclude_codex_mcp: bool,
-        min_should_match: u16,
-        limit: u16,
-        from_unix_ms: Option<i64>,
-        to_unix_ms: Option<i64>,
-        mode: Option<ConversationMode>,
-    ) -> RepoResult<ConversationCandidateSet> {
-        let candidate_limit = Self::conversation_candidate_limit(limit);
-        let persistent_sql = self.build_search_conversation_candidates_sql(
-            terms,
-            idf_by_term,
-            include_tool_events,
-            exclude_codex_mcp,
-            min_should_match,
-            candidate_limit,
-            from_unix_ms,
-            to_unix_ms,
-            mode,
-        )?;
-        let mut persistent_rows: Vec<ConversationCandidateRow> =
-            self.map_backend(self.query_rows(&persistent_sql, None).await)?;
-        let truncated = persistent_rows.len() >= candidate_limit;
-        if truncated {
-            return Ok(ConversationCandidateSet {
-                rows: persistent_rows,
-                truncated: true,
-            });
-        }
-
-        let recent_sql = self.build_search_conversation_recent_candidates_sql(
-            terms,
-            idf_by_term,
-            include_tool_events,
-            exclude_codex_mcp,
-            min_should_match,
-            CONVERSATION_RECENT_CANDIDATE_LIMIT,
-            from_unix_ms,
-            to_unix_ms,
-            mode,
-        )?;
-        let recent_rows: Vec<ConversationCandidateRow> =
-            self.map_backend(self.query_rows(&recent_sql, None).await)?;
-
-        let mut by_session = HashMap::<String, (f64, u16)>::new();
-        for row in persistent_rows.drain(..) {
-            by_session.insert(row.session_id, (row.score, row.matched_terms));
-        }
-        for row in recent_rows {
-            let entry = by_session
-                .entry(row.session_id)
-                .or_insert((row.score, row.matched_terms));
-            if row.score > entry.0 {
-                entry.0 = row.score;
-            }
-            if row.matched_terms > entry.1 {
-                entry.1 = row.matched_terms;
-            }
-        }
-
-        let mut rows = by_session
-            .into_iter()
-            .map(
-                |(session_id, (score, matched_terms))| ConversationCandidateRow {
-                    session_id,
-                    score,
-                    matched_terms,
-                },
-            )
-            .collect::<Vec<_>>();
-        rows.sort_by(|a, b| {
-            b.score
-                .total_cmp(&a.score)
-                .then_with(|| a.session_id.cmp(&b.session_id))
-        });
-        let max_rows = candidate_limit.saturating_add(CONVERSATION_RECENT_CANDIDATE_LIMIT);
-        if rows.len() > max_rows {
-            rows.truncate(max_rows);
-        }
-
-        Ok(ConversationCandidateSet {
-            rows,
-            truncated: false,
-        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2285,7 +1778,6 @@ FORMAT JSONEachRow",
         from_unix_ms: Option<i64>,
         to_unix_ms: Option<i64>,
         mode: Option<ConversationMode>,
-        candidate_session_ids: Option<&[String]>,
     ) -> RepoResult<String> {
         if terms.is_empty() {
             return Err(RepoError::invalid_argument(
@@ -2307,8 +1799,6 @@ FORMAT JSONEachRow",
             exclude_codex_mcp,
             from_unix_ms,
             to_unix_ms,
-            None,
-            candidate_session_ids,
         );
         let (mode_join_sql, mode_filter_sql) = if let Some(selected_mode) = mode {
             let mode_subquery = self.mode_subquery();
@@ -2396,7 +1886,7 @@ FROM (
           (toFloat64(p.tf) + k1 * (1.0 - b + b * (toFloat64(p.doc_len) / avgdl)))
         )
       ) AS event_score
-    FROM {postings_table} AS p
+    FROM {postings_table} AS p FINAL
     {docs_join_sql}
     PREWHERE {prewhere_sql}
     {where_sql}
@@ -2436,7 +1926,7 @@ FORMAT JSONEachRow",
             return Ok(HashMap::new());
         }
 
-        let documents_table = self.table_ref("search_documents");
+        let events_table = self.table_ref("events");
         let event_uids_sql = sql_array_strings(event_uids);
         let text_content_limit = usize::from(self.cfg.preview_chars).saturating_mul(4);
         let payload_json_limit = usize::from(self.cfg.preview_chars).saturating_mul(8);
@@ -2453,11 +1943,11 @@ FORMAT JSONEachRow",
 FROM (
   SELECT
     event_uid,
-    any(leftUTF8(text_content, {text_content_limit})) AS text_content_raw,
-    any(leftUTF8(payload_json, {payload_json_limit})) AS payload_json_raw,
-    any(event_class) AS event_class_raw,
-    any(actor_role) AS actor_role_raw
-  FROM {documents_table}
+    argMax(leftUTF8(text_content, {text_content_limit}), event_version) AS text_content_raw,
+    argMax(leftUTF8(payload_json, {payload_json_limit}), event_version) AS payload_json_raw,
+    argMax(event_kind, event_version) AS event_class_raw,
+    argMax(actor_kind, event_version) AS actor_role_raw
+  FROM {events_table}
   WHERE event_uid IN {event_uids_sql}
   GROUP BY event_uid
 )
@@ -2465,7 +1955,7 @@ FORMAT JSONEachRow",
             preview = self.cfg.preview_chars,
             text_content_limit = text_content_limit,
             payload_json_limit = payload_json_limit,
-            documents_table = documents_table,
+            events_table = events_table,
             event_uids_sql = event_uids_sql,
         );
         let rows: Vec<ConversationSnippetRow> =
@@ -3218,42 +2708,6 @@ FORMAT JSONEachRow",
             idf_by_term.insert(term.clone(), idf.max(0.0));
         }
 
-        let candidate_set = match self
-            .fetch_conversation_candidates(
-                &terms,
-                &idf_by_term,
-                include_tool_events,
-                exclude_codex_mcp,
-                min_should_match,
-                limit,
-                query.from_unix_ms,
-                query.to_unix_ms,
-                query.mode,
-            )
-            .await
-        {
-            Ok(set) => set,
-            Err(err) => {
-                warn!("search_conversations candidate stage failed; falling back to exact path: {err}");
-                ConversationCandidateSet::default()
-            }
-        };
-        let candidate_limit = Self::conversation_candidate_limit(limit);
-        let candidate_session_ids = if candidate_set.truncated
-            || candidate_set.rows.is_empty()
-            || candidate_set.rows.len() >= candidate_limit
-        {
-            None
-        } else {
-            Some(
-                candidate_set
-                    .rows
-                    .into_iter()
-                    .map(|row| row.session_id)
-                    .collect::<Vec<_>>(),
-            )
-        };
-
         let sql = self.build_search_conversations_sql(
             &terms,
             &idf_by_term,
@@ -3266,7 +2720,6 @@ FORMAT JSONEachRow",
             query.from_unix_ms,
             query.to_unix_ms,
             query.mode,
-            candidate_session_ids.as_deref(),
         )?;
 
         let rows: Vec<ConversationSearchRow> =

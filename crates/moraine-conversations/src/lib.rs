@@ -46,7 +46,7 @@ pub fn build_clickhouse_repository(
 ) -> anyhow::Result<std::sync::Arc<dyn ConversationRepository>> {
     let user_agent = format!(
         "moraine-conversations/{} (pid={})",
-        env!("CARGO_PKG_VERSION"),
+        moraine_config::BUILD_VERSION,
         std::process::id()
     );
     build_clickhouse_repository_with_user_agent(clickhouse, config, user_agent)

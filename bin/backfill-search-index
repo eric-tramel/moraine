@@ -59,10 +59,63 @@ config_get() {
   "$PROJECT_ROOT/bin/moraine" --config "$CONFIG_PATH" config get "$key"
 }
 
+config_auth_get() {
+  local key="$1"
+  python3 - "$CONFIG_PATH" "$key" <<'PY'
+import os
+import re
+import sys
+import tomllib
+
+config_path, key = sys.argv[1:]
+try:
+    with open(config_path, "rb") as stream:
+        document = tomllib.load(stream)
+except (OSError, tomllib.TOMLDecodeError) as error:
+    print("invalid ClickHouse authentication configuration", file=sys.stderr)
+    raise SystemExit(1) from error
+
+clickhouse = document.get("clickhouse")
+backends = document.get("backends", {})
+if not isinstance(backends, dict):
+    print("invalid ClickHouse authentication configuration", file=sys.stderr)
+    raise SystemExit(1)
+default_backend = backends.get("default")
+if clickhouse is not None and default_backend is not None:
+    print("config declares both [clickhouse] and [backends.default]", file=sys.stderr)
+    raise SystemExit(1)
+section = default_backend if default_backend is not None else clickhouse
+if section is None:
+    section = {}
+if not isinstance(section, dict):
+    print("invalid ClickHouse authentication configuration", file=sys.stderr)
+    raise SystemExit(1)
+
+value = section.get(key, "default" if key == "username" else "")
+if isinstance(value, dict):
+    if set(value) != {"env"} or not isinstance(value["env"], str):
+        print("invalid ClickHouse authentication environment reference", file=sys.stderr)
+        raise SystemExit(1)
+    variable = value["env"]
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", variable) is None:
+        print("invalid ClickHouse authentication environment variable name", file=sys.stderr)
+        raise SystemExit(1)
+    try:
+        value = os.environ[variable]
+    except KeyError as error:
+        print(f"ClickHouse authentication environment variable `{variable}` is not set", file=sys.stderr)
+        raise SystemExit(1) from error
+if not isinstance(value, str):
+    print("invalid ClickHouse authentication configuration", file=sys.stderr)
+    raise SystemExit(1)
+sys.stdout.write(value)
+PY
+}
+
 CLICKHOUSE_URL="$(config_get "clickhouse.url")"
 CLICKHOUSE_DB="$(config_get "clickhouse.database")"
-CLICKHOUSE_USER="$(config_get "clickhouse.username")"
-CLICKHOUSE_PASSWORD="$(config_get "clickhouse.password")"
+CLICKHOUSE_USER="$(config_auth_get "username")"
+CLICKHOUSE_PASSWORD="$(config_auth_get "password")"
 CLICKHOUSE_URL="${CLICKHOUSE_URL:-http://127.0.0.1:8123}"
 CLICKHOUSE_DB="${CLICKHOUSE_DB:-moraine}"
 
@@ -86,20 +139,187 @@ run_sql() {
   local stmt="$1"
   clickhouse_curl --data-binary "$stmt" "$CLICKHOUSE_URL/?database=$CLICKHOUSE_DB" >/dev/null
 }
+run_sql_block() {
+  clickhouse_curl --data-binary @- "$CLICKHOUSE_URL/?database=$CLICKHOUSE_DB" >/dev/null
+}
 
-echo "backfilling search index tables in $CLICKHOUSE_DB"
+echo "backfilling canonical search index tables in $CLICKHOUSE_DB"
+
+run_sql "TRUNCATE TABLE ${CLICKHOUSE_DB}.mcp_event_locator"
+
+run_sql_block <<'SQL'
+INSERT INTO mcp_event_locator
+(
+  event_uid, event_version, ingested_at, session_id, source_name, source_file,
+  source_generation, source_offset, source_line_no, sort_time, doc_len,
+  text_digest, payload_phase, project_id, repo_rel_path, worktree_root,
+  path_tokens, has_codex_mcp
+)
+WITH JSONExtractString(payload_json, 'moraine_tool_io', 'input_json') AS tool_input
+SELECT
+  event_uid,
+  event_version,
+  ingested_at,
+  session_id,
+  source_name,
+  source_file,
+  source_generation,
+  source_offset,
+  source_line_no,
+  ifNull(
+    parseDateTime64BestEffortOrNull(record_ts),
+    toDateTime64('1970-01-01 00:00:00', 3)
+  ),
+  toUInt32(length(extractAll(lowerUTF8(text_content), '[a-z0-9_]+'))),
+  hex(SHA256(text_content)),
+  JSONExtractString(payload_json, 'phase'),
+  JSONExtractString(payload_json, 'moraine_tool_io', 'project_id'),
+  JSONExtractString(payload_json, 'moraine_tool_io', 'repo_rel_path'),
+  JSONExtractString(payload_json, 'moraine_tool_io', 'worktree_root'),
+  arrayFilter(path -> path != '', arrayDistinct(arrayConcat(
+    extractAll(
+      tool_input,
+      '"(?:file_path|notebook_path|path|target_file|relativeWorkspacePath|relative_workspace_path|filepath|file|filename)"[[:space:]]*:[[:space:]]*"((?:[^"\\\\]|\\\\.)*)"'
+    ),
+    extractAll(
+      if(JSONExtractString(tool_input, 'command') != '',
+         JSONExtractString(tool_input, 'command'),
+         JSONExtractString(tool_input, 'cmd')),
+      '(?:^|[[:space:]''"`=(])((?:/|\\./|\\.\\./)?[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+|[A-Za-z0-9_-]+\\.[A-Za-z0-9_.-]+)(?:[[:space:]''"`,;|&<>)]|$)'
+    ),
+    [
+      JSONExtractString(tool_input, 'file_path'),
+      JSONExtractString(tool_input, 'notebook_path'),
+      JSONExtractString(tool_input, 'path'),
+      JSONExtractString(tool_input, 'target_file'),
+      JSONExtractString(tool_input, 'relativeWorkspacePath'),
+      JSONExtractString(tool_input, 'relative_workspace_path'),
+      JSONExtractString(tool_input, 'filepath'),
+      JSONExtractString(tool_input, 'file'),
+      JSONExtractString(tool_input, 'filename')
+    ]
+  ))),
+  toUInt8(positionCaseInsensitiveUTF8(payload_json, 'codex-mcp') > 0)
+FROM events FINAL
+WHERE notEmpty(session_id)
+SQL
+
+run_sql "TRUNCATE TABLE ${CLICKHOUSE_DB}.mcp_event_navigation"
+
+run_sql_block <<'SQL'
+INSERT INTO mcp_event_navigation
+(
+  session_id, sort_time, source_file, source_generation, source_offset,
+  source_line_no, event_uid, event_version, source_name, event_ts, display_time,
+  event_kind, actor_kind, payload_type, turn_index, tool_call_id, tool_name,
+  tool_phase, op_status, item_id, harness, inference_provider, cwd,
+  is_user_message, is_metadata_bearing
+)
+SELECT
+  session_id,
+  ifNull(
+    parseDateTime64BestEffortOrNull(record_ts),
+    toDateTime64('1970-01-01 00:00:00', 3)
+  ),
+  source_file,
+  source_generation,
+  source_offset,
+  source_line_no,
+  event_uid,
+  event_version,
+  source_name,
+  event_ts,
+  ifNull(parseDateTime64BestEffortOrNull(record_ts), ingested_at),
+  event_kind,
+  actor_kind,
+  payload_type,
+  turn_index,
+  tool_call_id,
+  tool_name,
+  tool_phase,
+  op_status,
+  item_id,
+  harness,
+  inference_provider,
+  cwd,
+  toUInt8(actor_kind = 'user' AND event_kind = 'message'),
+  toUInt8(
+    event_kind = 'session_meta'
+    OR (
+      source_name = 'omp'
+      AND JSONExtractString(payload_json, 'type') IN ('title', 'title_change')
+    )
+  )
+FROM events FINAL
+WHERE notEmpty(session_id)
+SQL
 
 run_sql "TRUNCATE TABLE ${CLICKHOUSE_DB}.search_postings"
-run_sql "TRUNCATE TABLE ${CLICKHOUSE_DB}.search_documents"
 
-run_sql "INSERT INTO ${CLICKHOUSE_DB}.search_documents (doc_version, ingested_at, event_uid, compacted_parent_uid, session_id, session_date, source_name, harness, source_file, source_generation, source_line_no, source_offset, source_ref, record_ts, event_class, payload_type, actor_role, name, phase, text_content, payload_json, token_usage_json) SELECT event_version, ingested_at, event_uid, origin_event_id, session_id, session_date, source_name, harness, source_file, source_generation, source_line_no, source_offset, source_ref, record_ts, event_kind, payload_type, actor_kind, tool_name, if(tool_phase != '', tool_phase, op_status), text_content, payload_json, token_usage_json FROM ${CLICKHOUSE_DB}.events WHERE lengthUTF8(replaceRegexpAll(text_content, '\\\\s+', '')) > 0"
+run_sql_block <<'SQL'
+INSERT INTO search_postings
+(
+  post_version, term, doc_id, session_id, source_name, harness,
+  inference_provider, event_class, payload_type, actor_role, name, phase,
+  source_ref, doc_len, tf
+)
+SELECT
+  d.event_version,
+  d.term,
+  d.event_uid,
+  d.session_id,
+  d.source_name,
+  d.harness,
+  d.inference_provider,
+  d.event_class,
+  d.payload_type,
+  d.actor_role,
+  d.name,
+  d.phase,
+  d.source_ref,
+  d.doc_len,
+  toUInt16(count())
+FROM
+(
+  SELECT
+    event_version,
+    event_uid,
+    session_id,
+    source_name,
+    harness,
+    inference_provider,
+    event_kind AS event_class,
+    payload_type,
+    actor_kind AS actor_role,
+    tool_name AS name,
+    if(tool_phase != '', tool_phase, op_status) AS phase,
+    source_ref,
+    toUInt32(length(extractAll(lowerUTF8(text_content), '[a-z0-9_]+'))) AS doc_len,
+    arrayJoin(extractAll(lowerUTF8(text_content), '[a-z0-9_]+')) AS term
+  FROM events FINAL
+) AS d
+WHERE d.doc_len > 0 AND lengthUTF8(d.term) BETWEEN 2 AND 64
+GROUP BY
+  d.event_version, d.term, d.event_uid, d.session_id, d.source_name, d.harness,
+  d.inference_provider, d.event_class, d.payload_type, d.actor_role, d.name,
+  d.phase, d.source_ref, d.doc_len
+SETTINGS
+  max_bytes_before_external_group_by = 67108864,
+  max_bytes_before_external_sort = 67108864
+SQL
 
-DOCS="$(clickhouse_curl "$CLICKHOUSE_URL/?query=SELECT%20count()%20FROM%20${CLICKHOUSE_DB}.search_documents")"
-POSTINGS="$(clickhouse_curl "$CLICKHOUSE_URL/?query=SELECT%20count()%20FROM%20${CLICKHOUSE_DB}.search_postings")"
+EVENTS="$(clickhouse_curl "$CLICKHOUSE_URL/?query=SELECT%20count()%20FROM%20${CLICKHOUSE_DB}.events%20FINAL")"
+DOCS="$(clickhouse_curl "$CLICKHOUSE_URL/?query=SELECT%20uniqExact(doc_id)%20FROM%20${CLICKHOUSE_DB}.search_postings%20FINAL")"
+POSTINGS="$(clickhouse_curl "$CLICKHOUSE_URL/?query=SELECT%20count()%20FROM%20${CLICKHOUSE_DB}.search_postings%20FINAL")"
 TERMS="$(clickhouse_curl "$CLICKHOUSE_URL/?query=SELECT%20count()%20FROM%20${CLICKHOUSE_DB}.search_term_stats")"
 CORPUS_DOCS="$(clickhouse_curl "$CLICKHOUSE_URL/?query=SELECT%20sum(docs)%20FROM%20${CLICKHOUSE_DB}.search_corpus_stats")"
+LOCATORS="$(clickhouse_curl "$CLICKHOUSE_URL/?query=SELECT%20count()%20FROM%20${CLICKHOUSE_DB}.mcp_event_locator%20FINAL")"
+NAVIGATION="$(clickhouse_curl "$CLICKHOUSE_URL/?query=SELECT%20count()%20FROM%20${CLICKHOUSE_DB}.mcp_event_navigation%20FINAL")"
 
-echo "search_documents: $DOCS"
-echo "search_postings: $POSTINGS"
+echo "events: $EVENTS"
+echo "search_postings (documents): $DOCS"
+echo "search_postings (rows): $POSTINGS"
 echo "search_term_stats (terms): $TERMS"
 echo "search_corpus_stats (docs): $CORPUS_DOCS"
+echo "mcp_event_locator: $LOCATORS"
+echo "mcp_event_navigation: $NAVIGATION"

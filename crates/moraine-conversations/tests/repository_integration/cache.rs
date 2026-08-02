@@ -5,16 +5,13 @@ fn mcp_candidate_metadata(scope_exists: u8, docs: u64) -> serde_json::Value {
         "row_kind": 1_u8,
         "event_uid": "",
         "session_id": "",
-        "slot": 0_u8,
-        "generation": 0_u64,
+        "event_version": 0_u64,
         "raw_score": 0.0,
         "matched_terms": 0_u64,
         "event_unix_ms": 0_i64,
         "docs": docs,
         "total_doc_len": docs.saturating_mul(50),
         "scope_exists": scope_exists,
-        "projection_ready": 1_u8,
-        "projection_clean": 1_u8
     })
 }
 

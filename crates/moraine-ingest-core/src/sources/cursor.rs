@@ -215,7 +215,7 @@ fn normalize_cursor_sqlite_bubble(record: &Value, ctx: &RecordContext<'_>) -> No
 }
 
 /// Emits the tool-call (and, once the call reached a terminal status, the
-/// tool-result) events plus `tool_io` rows for one `toolFormerData` payload.
+/// tool-result) events plus tool metadata later folded into those events.
 fn normalize_cursor_tool_former(
     identity: &str,
     tool_data: &Value,

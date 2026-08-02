@@ -87,7 +87,7 @@ pub(crate) enum SinkMessage {
 fn build_ingest_clickhouse_client(config: ClickHouseConfig) -> Result<ClickHouseClient> {
     let user_agent = format!(
         "moraine-ingest/{} (pid={})",
-        env!("CARGO_PKG_VERSION"),
+        moraine_config::BUILD_VERSION,
         std::process::id()
     );
     ClickHouseClient::new_with_user_agent(config, user_agent)
@@ -557,7 +557,7 @@ mod tests {
                 .as_slice(),
             &[format!(
                 "moraine-ingest/{} (pid={})",
-                env!("CARGO_PKG_VERSION"),
+                moraine_config::BUILD_VERSION,
                 std::process::id()
             )]
         );

@@ -10,7 +10,6 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::io::Write;
 
-mod mcp_open_projection;
 pub mod mcp_tool_names;
 
 const MAX_INSERT_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
@@ -112,7 +111,7 @@ impl ClickHouseClient {
     pub fn new(cfg: ClickHouseConfig) -> Result<Self> {
         let user_agent = format!(
             "{DEFAULT_USER_AGENT_ROLE}/{} (pid={})",
-            env!("CARGO_PKG_VERSION"),
+            moraine_config::BUILD_VERSION,
             std::process::id()
         );
         Self::new_with_user_agent(cfg, user_agent)
@@ -657,23 +656,18 @@ impl ClickHouseClient {
             "raw_events",
             "events",
             "event_links",
-            "tool_io",
             "ingest_errors",
             "ingest_checkpoints",
             "ingest_heartbeats",
-            "search_documents",
+            "mcp_event_locator",
+            "mcp_event_navigation",
             "search_postings",
-            "search_conversation_terms",
             "search_term_stats",
             "search_corpus_stats",
             "search_query_log",
             "search_hit_log",
             "search_interaction_log",
-            "mcp_open_sessions",
-            "mcp_open_turns",
-            "mcp_open_events",
-            "mcp_open_dirty_sessions",
-            "mcp_open_projection_state",
+            "file_attention_project_roots",
             "schema_migrations",
         ];
 
@@ -901,6 +895,16 @@ pub fn bundled_migrations() -> Vec<Migration> {
             version: "030",
             name: "030_refresh_omp_session_metadata.sql",
             sql: include_str!("../../../sql/030_refresh_omp_session_metadata.sql"),
+        },
+        Migration {
+            version: "031",
+            name: "031_events_content_authority.sql",
+            sql: include_str!("../../../sql/031_events_content_authority.sql"),
+        },
+        Migration {
+            version: "032",
+            name: "032_drop_frozen_tool_io.sql",
+            sql: include_str!("../../../sql/032_drop_frozen_tool_io.sql"),
         },
     ]
 }
@@ -1606,6 +1610,118 @@ mod tests {
     }
 
     #[test]
+    fn migration_031_freezes_and_replays_the_legacy_tool_source_safely() {
+        let migration = bundled_migrations()
+            .into_iter()
+            .find(|migration| migration.version == "031")
+            .expect("migration 031 must be registered");
+        let sql = materialize_migration_sql(migration.sql, "other_db")
+            .expect("materialize migration 031");
+        let statements = split_sql_statements(&sql);
+        let position = |needle: &str| {
+            statements
+                .iter()
+                .position(|statement| statement.contains(needle))
+                .unwrap_or_else(|| panic!("migration 031 must contain {needle}"))
+        };
+
+        let frozen = position(
+            "CREATE TABLE IF NOT EXISTS other_db.tool_io_events_content_authority_031_frozen",
+        );
+        let staging = position(
+            "CREATE TABLE IF NOT EXISTS other_db.tool_io\nAS other_db.tool_io_events_content_authority_031_frozen",
+        );
+        let exchange = position(
+            "EXCHANGE TABLES other_db.tool_io\nAND other_db.tool_io_events_content_authority_031_frozen",
+        );
+        let fold =
+            position("SELECT * FROM other_db.tool_io_events_content_authority_031_frozen FINAL");
+        let drop_staging = position("DROP TABLE IF EXISTS other_db.tool_io");
+        let truncate = position(
+            "TRUNCATE TABLE IF EXISTS other_db.tool_io_events_content_authority_031_frozen",
+        );
+
+        assert!(
+            frozen < staging
+                && staging < exchange
+                && exchange < fold
+                && fold < drop_staging
+                && drop_staging < truncate
+        );
+        assert!(sql.contains("UNION ALL\n    SELECT * FROM other_db.tool_io FINAL"));
+        assert!(sql.contains("WHERE NOT JSONHas(e.payload_json, 'moraine_tool_io')"));
+        assert!(!sql.contains("RENAME TABLE IF EXISTS"));
+        assert!(!sql
+            .contains("DROP TABLE IF EXISTS other_db.tool_io_events_content_authority_031_frozen"));
+        assert!(sql.contains("DROP TABLE IF EXISTS other_db.mcp_session_directory"));
+        assert!(!sql.contains("CREATE TABLE IF NOT EXISTS other_db.mcp_session_directory"));
+        assert!(!sql.contains("INSERT INTO other_db.mcp_session_directory"));
+        assert!(!sql
+            .contains("CREATE MATERIALIZED VIEW IF NOT EXISTS other_db.mv_mcp_session_directory"));
+        assert!(!sql.contains("AggregatingMergeTree"));
+    }
+
+    #[test]
+    fn migration_031_uses_the_same_narrow_path_projection_for_live_and_backfill() {
+        let migration = bundled_migrations()
+            .into_iter()
+            .find(|migration| migration.version == "031")
+            .expect("migration 031 must be registered");
+        let sql = materialize_migration_sql(migration.sql, "other_db")
+            .expect("materialize migration 031");
+        let statements = split_sql_statements(&sql);
+        let live = statements
+            .iter()
+            .find(|statement| {
+                statement.contains("CREATE MATERIALIZED VIEW IF NOT EXISTS other_db.mv_mcp_event_locator_from_events")
+            })
+            .expect("live locator projection");
+        let backfill = statements
+            .iter()
+            .find(|statement| statement.starts_with("INSERT INTO other_db.mcp_event_locator"))
+            .expect("locator backfill");
+        fn path_expression(statement: &str) -> &str {
+            let start = statement
+                .find("arrayFilter(path ->")
+                .expect("path expression start");
+            let remainder = &statement[start..];
+            let end = remainder.find("\n  toUInt8(").expect("path expression end");
+            let expression = remainder[..end].trim_end_matches(',');
+            expression
+                .strip_suffix(" AS path_tokens")
+                .unwrap_or(expression)
+        }
+
+        let live_path_expression = path_expression(live);
+        let backfill_path_expression = path_expression(backfill);
+        assert_eq!(live_path_expression, backfill_path_expression);
+        assert!(live_path_expression.contains("file_path|notebook_path|path|target_file"));
+        assert!(live_path_expression.contains("JSONExtractString(tool_input, 'command')"));
+        assert!(live_path_expression.contains("JSONExtractString(tool_input, 'cmd')"));
+        assert_eq!(live_path_expression.matches("extractAll(").count(), 2);
+        assert!(!live_path_expression.contains("[A-Za-z0-9_./-]+"));
+        assert!(!live_path_expression.contains("\n      '\"((?:[^\""));
+    }
+
+    #[test]
+    fn migration_032_only_drops_the_empty_frozen_tool_source() {
+        let migration = bundled_migrations()
+            .into_iter()
+            .find(|migration| migration.version == "032")
+            .expect("migration 032 must be registered");
+        let sql = materialize_migration_sql(migration.sql, "other_db")
+            .expect("materialize migration 032");
+
+        assert_eq!(
+            split_sql_statements(&sql),
+            vec![
+                "DROP TABLE IF EXISTS other_db.tool_io_events_content_authority_031_frozen"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
     fn migration_020_purges_every_session_keyed_table() {
         let migration = bundled_migrations()
             .into_iter()
@@ -1896,7 +2012,7 @@ mod tests {
 
         let expected = format!(
             "{DEFAULT_USER_AGENT_ROLE}/{} (pid={})",
-            env!("CARGO_PKG_VERSION"),
+            moraine_config::BUILD_VERSION,
             std::process::id()
         );
         assert_eq!(
@@ -2213,13 +2329,26 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn migration_progress_applies_latest_after_ledger_write() {
+    async fn migration_progress_applies_031_and_032_after_v071() {
         let bundled = bundled_migrations();
-        let latest = bundled.last().expect("latest migration").clone();
-        let applied = bundled[..bundled.len() - 1]
+        let pending = bundled
             .iter()
+            .filter(|migration| matches!(migration.version, "031" | "032"))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pending
+                .iter()
+                .map(|migration| migration.version)
+                .collect::<Vec<_>>(),
+            vec!["031", "032"]
+        );
+        let applied = bundled
+            .iter()
+            .filter(|migration| !matches!(migration.version, "031" | "032"))
             .map(|migration| migration.version.to_string())
             .collect::<Vec<_>>();
+        assert_eq!(applied.last().map(String::as_str), Some("030"));
         let queries = Arc::new(Mutex::new(Vec::new()));
         let base_url = spawn_migration_mock_server(MigrationMockState {
             applied: Arc::new(applied),
@@ -2233,38 +2362,53 @@ mod tests {
         let executed = client
             .run_migrations_with_progress(|event| events.push(event))
             .await
-            .expect("apply latest migration");
+            .expect("apply migrations 031 and 032");
 
-        assert_eq!(executed, vec![latest.version.to_string()]);
+        assert_eq!(executed, vec!["031", "032"]);
         assert_eq!(
             events,
             vec![
                 MigrationProgress::Plan {
-                    applied: bundled.len() - 1,
-                    pending: 1,
+                    applied: bundled.len() - 2,
+                    pending: 2,
                 },
                 MigrationProgress::Started {
                     index: 1,
-                    total: 1,
-                    version: latest.version,
-                    name: latest.name,
+                    total: 2,
+                    version: pending[0].version,
+                    name: pending[0].name,
                 },
                 MigrationProgress::Applied {
                     index: 1,
-                    total: 1,
-                    version: latest.version,
-                    name: latest.name,
+                    total: 2,
+                    version: pending[0].version,
+                    name: pending[0].name,
+                },
+                MigrationProgress::Started {
+                    index: 2,
+                    total: 2,
+                    version: pending[1].version,
+                    name: pending[1].name,
+                },
+                MigrationProgress::Applied {
+                    index: 2,
+                    total: 2,
+                    version: pending[1].version,
+                    name: pending[1].name,
                 },
             ]
         );
         let queries = queries.lock().expect("migration query mutex poisoned");
-        let ledger_index = queries
+        let ledger_indices = queries
             .iter()
-            .position(|query| {
-                query.starts_with("INSERT INTO") && query.contains("schema_migrations")
+            .enumerate()
+            .filter_map(|(index, query)| {
+                (query.starts_with("INSERT INTO") && query.contains("schema_migrations"))
+                    .then_some(index)
             })
-            .expect("ledger insert query");
-        assert_eq!(ledger_index, queries.len() - 1);
+            .collect::<Vec<_>>();
+        assert_eq!(ledger_indices.len(), 2);
+        assert_eq!(ledger_indices.last().copied(), Some(queries.len() - 1));
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -385,7 +385,7 @@ impl AppState {
                     },
                     "serverInfo": {
                         "name": "moraine-mcp",
-                        "version": env!("CARGO_PKG_VERSION")
+                        "version": moraine_config::BUILD_VERSION
                     }
                 });
                 if let Some(scope) = self.repo.config().session_scope.as_ref() {

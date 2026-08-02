@@ -61,6 +61,7 @@ fn sample_search_row(
 
 fn sample_mcp_search_row(event_uid: &str, raw_score: f64, event_unix_ms: i64) -> SearchMcpEventRow {
     SearchMcpEventRow {
+        event_version: 1,
         event_uid: event_uid.to_string(),
         session_id: "session-1".to_string(),
         source_name: "source".to_string(),
@@ -197,6 +198,113 @@ fn mcp_search_sql_excludes_internal_tool_calls() {
     assert!(sql.contains("splitByString('__', lowerUTF8(trimBoth(p.name)))"));
     assert!(sql.contains("arrayElement"));
     assert!(sql.contains("= 'moraine'"));
+}
+
+#[test]
+fn canonical_open_and_search_classify_compaction_events_identically() {
+    for event_class in ["summary", "compacted_raw"] {
+        assert_eq!(
+            ClickHouseConversationRepository::mcp_event_type_for(event_class, "", "system"),
+            McpEventType::Compaction
+        );
+    }
+
+    let client = ClickHouseClient::new(moraine_config::ClickHouseConfig::default())
+        .expect("build ClickHouse client");
+    let repo = ClickHouseConversationRepository::new(client, RepoConfig::default());
+    let sql = repo
+        .build_search_mcp_events_sql(
+            &["needle".to_string()],
+            &[McpEventType::Compaction],
+            None,
+            None,
+            None,
+            None,
+            1,
+            0.0,
+            Some((1, 1)),
+            20,
+            0,
+        )
+        .expect("build MCP compaction search SQL");
+
+    assert!(sql.contains("p.event_class IN ('compacted_raw', 'summary')"));
+
+    let mut row = sample_mcp_search_row("compaction-event", 1.0, 1);
+    row.event_class = "summary".to_string();
+    row.actor_role = "system".to_string();
+    row.mcp_event_type.clear();
+    let hits = ClickHouseConversationRepository::map_search_mcp_rows_to_hits(vec![row]);
+    assert_eq!(hits[0].event_type, McpEventType::Compaction);
+}
+
+#[test]
+fn fast_and_exact_event_search_return_the_indexed_text_doc_len() {
+    let client = ClickHouseClient::new(moraine_config::ClickHouseConfig::default())
+        .expect("build ClickHouse client");
+    let repo = ClickHouseConversationRepository::new(client, RepoConfig::default());
+    let terms = vec!["needle".to_string()];
+    let mut idf_by_term = HashMap::new();
+    idf_by_term.insert("needle".to_string(), 1.0);
+
+    let fast_sql = repo
+        .build_search_events_hydrate_sql(&["event-1".to_string()])
+        .expect("build fast hydration SQL");
+    let exact_sql = repo
+        .build_search_events_sql(
+            &terms,
+            &idf_by_term,
+            10.0,
+            false,
+            None,
+            false,
+            None,
+            None,
+            1,
+            0.0,
+            20,
+        )
+        .expect("build exact event search SQL");
+
+    assert!(fast_sql.contains("toUInt32(l.doc_len) AS doc_len"));
+    assert!(!fast_sql.contains("extractAll"));
+    assert!(exact_sql.contains("any(p.doc_len) AS doc_len"));
+    assert!(exact_sql.contains("toUInt32(r.doc_len) AS doc_len"));
+}
+
+#[test]
+fn conversation_search_uses_one_bounded_canonical_postings_pass() {
+    let client = ClickHouseClient::new(moraine_config::ClickHouseConfig::default())
+        .expect("build ClickHouse client");
+    let repo = ClickHouseConversationRepository::new(client, RepoConfig::default());
+    let terms = vec!["hello".to_string(), "world".to_string()];
+    let mut idf_by_term = HashMap::new();
+    idf_by_term.insert("hello".to_string(), 2.0);
+    idf_by_term.insert("world".to_string(), 3.0);
+
+    let sql = repo
+        .build_search_conversations_sql(
+            &terms,
+            &idf_by_term,
+            10.0,
+            true,
+            false,
+            1,
+            0.0,
+            25,
+            None,
+            None,
+            None,
+        )
+        .expect("build conversation search SQL");
+
+    assert_eq!(
+        sql.matches("FROM `moraine`.`search_postings` AS p FINAL")
+            .count(),
+        1
+    );
+    assert!(sql.contains("LIMIT 25"));
+    assert!(!sql.contains("search_conversation_terms"));
 }
 
 #[test]

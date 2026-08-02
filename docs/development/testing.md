@@ -437,8 +437,9 @@ digests. Every measured sandbox mounts only those frozen binaries. The benchmark
 adapter and Compose overlay always come from the suite checkout—not from the
 baseline worktree—so an older baseline needs no benchmark-specific files. Before
 measurement, the arm's frozen `moraine` binary migrates its fresh database, the
-fixture seeds normalized `events`, and the production materialized view derives
-`search_documents`. Runtime evidence binds the exact image IDs and hashes each live
+fixture seeds normalized `events`, and the production materialized views derive
+`search_postings` plus the canonical event locator/navigation indexes. Runtime
+evidence binds the exact image IDs and hashes each live
 `/proc/<pid>/exe` for `moraine-ingest`, `moraine-mcp`, and load-generator processes.
 
 Every physical arm receives a new sandbox project, delegated cgroup, ClickHouse

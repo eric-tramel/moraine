@@ -946,36 +946,38 @@ def _fixture_database_sql(endpoint: ClickHouseEndpoint, recipe: Mapping[str, Any
   (SELECT uniqExact(session_id) FROM {database}.events FINAL) AS event_sessions,
   (SELECT min(event_uid) FROM {database}.events FINAL) AS event_min_uid,
   (SELECT max(event_uid) FROM {database}.events FINAL) AS event_max_uid,
-  (SELECT count() FROM {database}.search_documents FINAL) AS documents_count,
+  (SELECT uniqExact(doc_id) FROM {database}.search_postings FINAL) AS posting_documents,
+  (SELECT uniqExactIf(
+      doc_id,
+      source_name = {source_name}
+      AND harness = 'codex'
+      AND inference_provider = 'synthetic'
+      AND startsWith(source_ref, 'owned:')
+    ) FROM {database}.search_postings FINAL) AS posting_fixture_documents,
+  (SELECT count() FROM {database}.mcp_event_locator FINAL) AS locator_events,
+  (SELECT countIf(
+      source_name = {source_name}
+      AND source_file = {source_file}
+      AND startsWith(event_uid, 'perf-event-')
+    ) FROM {database}.mcp_event_locator FINAL) AS locator_fixture_events,
+  (SELECT uniqExact(event_uid) FROM {database}.mcp_event_locator FINAL) AS locator_unique_ids,
+  (SELECT uniqExact(session_id) FROM {database}.mcp_event_locator FINAL) AS locator_sessions,
+  (SELECT min(event_uid) FROM {database}.mcp_event_locator FINAL) AS locator_min_uid,
+  (SELECT max(event_uid) FROM {database}.mcp_event_locator FINAL) AS locator_max_uid,
+  (SELECT count() FROM {database}.mcp_event_navigation FINAL) AS navigation_events,
   (SELECT countIf(
       source_name = {source_name}
       AND source_file = {source_file}
       AND harness = 'codex'
       AND inference_provider = 'synthetic'
-      AND endpoint_kind = 'generation'
-      AND startsWith(source_ref, 'owned:')
-    ) FROM {database}.search_documents FINAL) AS documents_fixture_count,
-  (SELECT uniqExact(event_uid) FROM {database}.search_documents FINAL) AS documents_unique_ids,
-  (SELECT min(event_uid) FROM {database}.search_documents FINAL) AS document_min_uid,
-  (SELECT max(event_uid) FROM {database}.search_documents FINAL) AS document_max_uid,
-  (SELECT uniqExact(doc_id) FROM {database}.search_postings FINAL) AS posting_documents,
-  (SELECT docs FROM {database}.search_corpus_stats LIMIT 1) AS corpus_documents,
-  (SELECT count() FROM {database}.mcp_open_sessions FINAL) AS projected_sessions,
-  (SELECT ifNull(sum(total_events), 0) FROM {database}.mcp_open_sessions FINAL)
-    AS projected_session_events,
-  (SELECT count()
-   FROM {database}.mcp_open_events AS e FINAL
-   INNER JOIN {database}.mcp_open_sessions AS s FINAL
-     ON e.session_id = s.session_id
-     AND e.slot = s.slot
-     AND e.generation = s.generation) AS projected_events,
-  (SELECT count()
-   FROM {database}.mcp_open_dirty_sessions AS d FINAL
-   LEFT JOIN {database}.mcp_open_sessions AS s FINAL
-     ON d.session_id = s.session_id
-   WHERE d.dirty_revision > ifNull(s.dirty_revision, 0)) AS dirty_session_count,
-  (SELECT countIf(state_key = 'global' AND ready = 1 AND backfill_cursor = '')
-   FROM {database}.mcp_open_projection_state FINAL) AS projection_ready_rows
+      AND startsWith(event_uid, 'perf-event-')
+    ) FROM {database}.mcp_event_navigation FINAL) AS navigation_fixture_events,
+  (SELECT uniqExact(event_uid) FROM {database}.mcp_event_navigation FINAL)
+    AS navigation_unique_ids,
+  (SELECT uniqExact(session_id) FROM {database}.mcp_event_navigation FINAL)
+    AS navigation_sessions,
+  (SELECT min(event_uid) FROM {database}.mcp_event_navigation FINAL) AS navigation_min_uid,
+  (SELECT max(event_uid) FROM {database}.mcp_event_navigation FINAL) AS navigation_max_uid
 FORMAT JSONEachRow"""
 
 
@@ -997,18 +999,20 @@ def _validate_fixture_database_evidence(
         "event_sessions",
         "event_min_uid",
         "event_max_uid",
-        "documents_count",
-        "documents_fixture_count",
-        "documents_unique_ids",
-        "document_min_uid",
-        "document_max_uid",
         "posting_documents",
-        "corpus_documents",
-        "projected_sessions",
-        "projected_session_events",
-        "projected_events",
-        "dirty_session_count",
-        "projection_ready_rows",
+        "posting_fixture_documents",
+        "locator_events",
+        "locator_fixture_events",
+        "locator_unique_ids",
+        "locator_sessions",
+        "locator_min_uid",
+        "locator_max_uid",
+        "navigation_events",
+        "navigation_fixture_events",
+        "navigation_unique_ids",
+        "navigation_sessions",
+        "navigation_min_uid",
+        "navigation_max_uid",
         "pass",
     }
     if not isinstance(evidence, dict) or set(evidence) != expected_fields:
@@ -1022,8 +1026,10 @@ def _validate_fixture_database_evidence(
         "server_system",
         "event_min_uid",
         "event_max_uid",
-        "document_min_uid",
-        "document_max_uid",
+        "locator_min_uid",
+        "locator_max_uid",
+        "navigation_min_uid",
+        "navigation_max_uid",
         "pass",
     }
     if any(
@@ -1052,18 +1058,20 @@ def _validate_fixture_database_evidence(
         and evidence["event_sessions"] > 0
         and evidence["event_min_uid"] == expected_min_uid
         and evidence["event_max_uid"] == expected_max_uid
-        and evidence["documents_count"] == expected_documents
-        and evidence["documents_fixture_count"] == expected_documents
-        and evidence["documents_unique_ids"] == expected_documents
-        and evidence["document_min_uid"] == expected_min_uid
-        and evidence["document_max_uid"] == expected_max_uid
         and evidence["posting_documents"] == expected_documents
-        and evidence["corpus_documents"] == expected_documents
-        and evidence["projected_sessions"] == evidence["event_sessions"]
-        and evidence["projected_session_events"] == expected_documents
-        and evidence["projected_events"] == expected_documents
-        and evidence["dirty_session_count"] == 0
-        and evidence["projection_ready_rows"] == 1
+        and evidence["posting_fixture_documents"] == expected_documents
+        and evidence["locator_events"] == expected_documents
+        and evidence["locator_fixture_events"] == expected_documents
+        and evidence["locator_unique_ids"] == expected_documents
+        and evidence["locator_sessions"] == evidence["event_sessions"]
+        and evidence["locator_min_uid"] == expected_min_uid
+        and evidence["locator_max_uid"] == expected_max_uid
+        and evidence["navigation_events"] == expected_documents
+        and evidence["navigation_fixture_events"] == expected_documents
+        and evidence["navigation_unique_ids"] == expected_documents
+        and evidence["navigation_sessions"] == evidence["event_sessions"]
+        and evidence["navigation_min_uid"] == expected_min_uid
+        and evidence["navigation_max_uid"] == expected_max_uid
     )
     if evidence.get("pass") is not passed:
         raise NativeBurstFailure("native fixture database evidence status differs")
@@ -1094,22 +1102,24 @@ def _fixture_database_evidence(
         "events_fixture_count",
         "events_unique_ids",
         "event_sessions",
-        "documents_count",
-        "documents_fixture_count",
-        "documents_unique_ids",
         "posting_documents",
-        "corpus_documents",
-        "projected_sessions",
-        "projected_session_events",
-        "projected_events",
-        "dirty_session_count",
-        "projection_ready_rows",
+        "posting_fixture_documents",
+        "locator_events",
+        "locator_fixture_events",
+        "locator_unique_ids",
+        "locator_sessions",
+        "navigation_events",
+        "navigation_fixture_events",
+        "navigation_unique_ids",
+        "navigation_sessions",
     }
     string_fields = {
         "event_min_uid",
         "event_max_uid",
-        "document_min_uid",
-        "document_max_uid",
+        "locator_min_uid",
+        "locator_max_uid",
+        "navigation_min_uid",
+        "navigation_max_uid",
     }
     if set(row) != numeric_fields | string_fields:
         raise NativeBurstFailure("native fixture database query returned unexpected fields")
