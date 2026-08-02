@@ -186,6 +186,28 @@ fn codex_token_count_promotes_usage_fields() {
         .as_str()
         .unwrap()
         .is_empty());
+
+    let mut changed_usage = record;
+    changed_usage["payload"]["info"]["last_token_usage"]["input_tokens"] = json!(65324);
+    let changed = normalize_record(
+        &changed_usage,
+        "codex",
+        "codex",
+        "/Users/eric/.codex/sessions/2026/02/15/session-019c5f6a-49bd-7920-ac67-1dd8e33b0e95.jsonl",
+        1,
+        1,
+        2,
+        2,
+        "",
+        "",
+        "",
+    )
+    .expect("changed token accounting should normalize");
+    assert_ne!(
+        row.get("event_uid"),
+        changed.event_rows[0].get("event_uid"),
+        "changed accounting semantics must append a canonical event"
+    );
 }
 
 #[test]
@@ -415,6 +437,108 @@ fn claude_tool_use_and_result_blocks() {
         Some(19630)
     );
     assert!(out.error_rows.is_empty());
+}
+
+#[test]
+fn canonical_event_identity_ignores_replay_provenance_but_preserves_fanout() {
+    let record = json!({
+        "type": "assistant",
+        "sessionId": "stable-session",
+        "uuid": "assistant-stable",
+        "parentUuid": "user-stable",
+        "requestId": "req-stable",
+        "timestamp": "2026-01-19T15:58:41.421Z",
+        "message": {
+            "model": "claude-opus-4-5-20251101",
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_stable",
+                    "name": "Read",
+                    "input": {"path": "src/lib.rs"}
+                },
+                {"type": "text", "text": "done"}
+            ]
+        }
+    });
+
+    let first = normalize_record(
+        &record,
+        "claude",
+        "claude-code",
+        "/old/path/session.jsonl",
+        11,
+        1,
+        7,
+        100,
+        "",
+        "",
+        "",
+    )
+    .expect("first replay");
+    let replayed = normalize_record(
+        &record,
+        "renamed-claude-source",
+        "claude-code",
+        "/new/path/session.jsonl",
+        99,
+        42,
+        700,
+        10_000,
+        "",
+        "",
+        "",
+    )
+    .expect("replayed record");
+
+    let event_uids = |rows: &[Value]| {
+        rows.iter()
+            .map(|row| {
+                row.get("event_uid")
+                    .and_then(Value::as_str)
+                    .expect("event uid")
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        event_uids(&first.event_rows),
+        event_uids(&replayed.event_rows)
+    );
+    assert_eq!(first.event_rows.len(), 2);
+    assert_ne!(
+        first.event_rows[0].get("event_uid"),
+        first.event_rows[1].get("event_uid"),
+        "one source record's emitted parts must remain distinct"
+    );
+    assert_ne!(
+        first.event_rows[0].get("source_file"),
+        replayed.event_rows[0].get("source_file"),
+        "provenance must still record the latest transport coordinates"
+    );
+
+    let mut changed_record = record;
+    changed_record["message"]["content"][1]["text"] = json!("changed");
+    let changed = normalize_record(
+        &changed_record,
+        "claude",
+        "claude-code",
+        "/new/path/session.jsonl",
+        99,
+        42,
+        700,
+        10_000,
+        "",
+        "",
+        "",
+    )
+    .expect("content-changing replay");
+    assert_ne!(
+        first.event_rows[1].get("event_uid"),
+        changed.event_rows[1].get("event_uid"),
+        "content changes must append a new canonical event"
+    );
 }
 
 #[test]

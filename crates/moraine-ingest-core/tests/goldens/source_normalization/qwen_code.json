@@ -21,7 +21,7 @@
           "endpoint_kind": "generation",
           "event_kind": "message",
           "event_ts": "2026-07-18 12:00:00.000",
-          "event_uid": "b101cc0c35359599ce23a11d3281e35fe0a5c6c55f996db932f6023aeeef73b9",
+          "event_uid": "b92c706e9400c42d5e552e12b74488a116cf0d95818b600d588ecb7a876bd49d",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "has_reasoning": 0,
@@ -132,7 +132,7 @@
           "endpoint_kind": "generation",
           "event_kind": "reasoning",
           "event_ts": "2026-07-18 12:00:01.000",
-          "event_uid": "0000000071992d43db12d1641e046584beeddab7f07f466a38bbd63d35236c4d",
+          "event_uid": "c964ce754db75df27c2d0a5b832c3420292c3614fd46cbfbe7d6dcc0122d56e1",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "has_reasoning": 1,
@@ -148,7 +148,7 @@
           "origin_tool_call_id": "",
           "output_tokens": 80,
           "parent_tool_call_id": "",
-          "payload_json": "{\"parentUuid\":\"qwen-u1\",\"part\":{\"text\":\"I should inspect the indexed sessions.\",\"thought\":true},\"uuid\":\"qwen-a1\"}",
+          "payload_json": "{\"moraine_emission_index\":1,\"parentUuid\":\"qwen-u1\",\"part\":{\"text\":\"I should inspect the indexed sessions.\",\"thought\":true},\"uuid\":\"qwen-a1\"}",
           "payload_type": "thinking",
           "project_id": "",
           "record_ts": "2026-07-18T12:00:01.000Z",
@@ -214,7 +214,7 @@
           "endpoint_kind": "generation",
           "event_kind": "message",
           "event_ts": "2026-07-18 12:00:01.000",
-          "event_uid": "000000016c56e9f0b9fa56f369ca4605545a3a7a23ddadc59dcc19f217c9d500",
+          "event_uid": "81d2ce3261ffac1fc5fc007e84391abfbd1dee480587a0e5b07f6cacc70c22be",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "has_reasoning": 0,
@@ -230,7 +230,7 @@
           "origin_tool_call_id": "",
           "output_tokens": 0,
           "parent_tool_call_id": "",
-          "payload_json": "{\"parentUuid\":\"qwen-u1\",\"part\":{\"text\":\"I will search first.\"},\"uuid\":\"qwen-a1\"}",
+          "payload_json": "{\"moraine_emission_index\":2,\"parentUuid\":\"qwen-u1\",\"part\":{\"text\":\"I will search first.\"},\"uuid\":\"qwen-a1\"}",
           "payload_type": "agent_message",
           "project_id": "",
           "record_ts": "2026-07-18T12:00:01.000Z",
@@ -296,7 +296,7 @@
           "endpoint_kind": "generation",
           "event_kind": "tool_call",
           "event_ts": "2026-07-18 12:00:01.000",
-          "event_uid": "00000002c313fe79d6eca07ef91f5afc66529faea6e983f70858d14e008c12ae",
+          "event_uid": "6b46ff3c0846aeaa564f10a812a24eb782168aa770ff0c710378d443a1ba5e4b",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "has_reasoning": 0,
@@ -312,7 +312,7 @@
           "origin_tool_call_id": "",
           "output_tokens": 0,
           "parent_tool_call_id": "",
-          "payload_json": "{\"moraine_tool_io\":{\"inference_provider\":\"\",\"input_bytes\":38,\"input_json\":\"{\\\"limit\\\":3,\\\"query\\\":\\\"fixture behavior\\\"}\",\"input_preview\":\"{\\\"limit\\\":3,\\\"query\\\":\\\"fixture behavior\\\"}\",\"io_hash\":4595950823760457340,\"output_bytes\":0,\"output_json\":\"\",\"output_preview\":\"\",\"output_text\":\"\",\"parent_tool_call_id\":\"\",\"project_id\":\"\",\"repo_rel_path\":\"\",\"source_ref\":\"/fixtures/qwen-code/session.jsonl:1:2\",\"tool_call_id\":\"qwen-call-search\",\"tool_error\":0,\"tool_name\":\"mcp__moraine__search_sessions\",\"tool_phase\":\"request\",\"worktree_root\":\"\"},\"parentUuid\":\"qwen-u1\",\"part\":{\"functionCall\":{\"args\":{\"limit\":3,\"query\":\"fixture behavior\"},\"id\":\"qwen-call-search\",\"name\":\"mcp__moraine__search_sessions\"}},\"uuid\":\"qwen-a1\"}",
+          "payload_json": "{\"moraine_emission_index\":3,\"moraine_tool_io\":{\"inference_provider\":\"\",\"input_bytes\":38,\"input_json\":\"{\\\"limit\\\":3,\\\"query\\\":\\\"fixture behavior\\\"}\",\"input_preview\":\"{\\\"limit\\\":3,\\\"query\\\":\\\"fixture behavior\\\"}\",\"io_hash\":4595950823760457340,\"output_bytes\":0,\"output_json\":\"\",\"output_preview\":\"\",\"output_text\":\"\",\"parent_tool_call_id\":\"\",\"project_id\":\"\",\"repo_rel_path\":\"\",\"source_ref\":\"/fixtures/qwen-code/session.jsonl:1:2\",\"tool_call_id\":\"qwen-call-search\",\"tool_error\":0,\"tool_name\":\"mcp__moraine__search_sessions\",\"tool_phase\":\"request\",\"worktree_root\":\"\"},\"parentUuid\":\"qwen-u1\",\"part\":{\"functionCall\":{\"args\":{\"limit\":3,\"query\":\"fixture behavior\"},\"id\":\"qwen-call-search\",\"name\":\"mcp__moraine__search_sessions\"}},\"uuid\":\"qwen-a1\"}",
           "payload_type": "tool_use",
           "project_id": "",
           "record_ts": "2026-07-18T12:00:01.000Z",
@@ -378,7 +378,7 @@
           "endpoint_kind": "generation",
           "event_kind": "message",
           "event_ts": "2026-07-18 12:00:01.000",
-          "event_uid": "000000039acd399e09ebc22f5686b04dc1baec24230b4b097397c0e6019e9557",
+          "event_uid": "cfd04dc4c25915215e066f499a33d5298ef0b7e9b64f60d2991621406bf488aa",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "has_reasoning": 0,
@@ -394,7 +394,7 @@
           "origin_tool_call_id": "",
           "output_tokens": 0,
           "parent_tool_call_id": "",
-          "payload_json": "{\"parentUuid\":\"qwen-u1\",\"part\":{\"text\":\"The search request is ready.\"},\"uuid\":\"qwen-a1\"}",
+          "payload_json": "{\"moraine_emission_index\":4,\"parentUuid\":\"qwen-u1\",\"part\":{\"text\":\"The search request is ready.\"},\"uuid\":\"qwen-a1\"}",
           "payload_type": "agent_message",
           "project_id": "",
           "record_ts": "2026-07-18T12:00:01.000Z",
@@ -448,7 +448,7 @@
       ],
       "link_rows": [
         {
-          "event_uid": "0000000071992d43db12d1641e046584beeddab7f07f466a38bbd63d35236c4d",
+          "event_uid": "c964ce754db75df27c2d0a5b832c3420292c3614fd46cbfbe7d6dcc0122d56e1",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "inference_provider": "",
@@ -460,7 +460,7 @@
           "source_name": "golden-qwen-code"
         },
         {
-          "event_uid": "000000016c56e9f0b9fa56f369ca4605545a3a7a23ddadc59dcc19f217c9d500",
+          "event_uid": "81d2ce3261ffac1fc5fc007e84391abfbd1dee480587a0e5b07f6cacc70c22be",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "inference_provider": "",
@@ -472,7 +472,7 @@
           "source_name": "golden-qwen-code"
         },
         {
-          "event_uid": "00000002c313fe79d6eca07ef91f5afc66529faea6e983f70858d14e008c12ae",
+          "event_uid": "6b46ff3c0846aeaa564f10a812a24eb782168aa770ff0c710378d443a1ba5e4b",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "inference_provider": "",
@@ -484,7 +484,7 @@
           "source_name": "golden-qwen-code"
         },
         {
-          "event_uid": "000000039acd399e09ebc22f5686b04dc1baec24230b4b097397c0e6019e9557",
+          "event_uid": "cfd04dc4c25915215e066f499a33d5298ef0b7e9b64f60d2991621406bf488aa",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "inference_provider": "",
@@ -519,7 +519,7 @@
       "session_hint": "qwen-session-001",
       "tool_rows": [
         {
-          "event_uid": "00000002c313fe79d6eca07ef91f5afc66529faea6e983f70858d14e008c12ae",
+          "event_uid": "6b46ff3c0846aeaa564f10a812a24eb782168aa770ff0c710378d443a1ba5e4b",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "inference_provider": "",
@@ -564,7 +564,7 @@
           "endpoint_kind": "generation",
           "event_kind": "tool_result",
           "event_ts": "2026-07-18 12:00:02.000",
-          "event_uid": "b3d75e956a9d5afbd9b1d00ea474dcd97e5a5d236fa6c6d3c4a69ab26454beae",
+          "event_uid": "259d846f287855904ad9a37488a1bac4b82ac83046355222ef92ae5adefa7b0d",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "has_reasoning": 0,
@@ -634,7 +634,7 @@
       ],
       "link_rows": [
         {
-          "event_uid": "b3d75e956a9d5afbd9b1d00ea474dcd97e5a5d236fa6c6d3c4a69ab26454beae",
+          "event_uid": "259d846f287855904ad9a37488a1bac4b82ac83046355222ef92ae5adefa7b0d",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "inference_provider": "",
@@ -669,7 +669,7 @@
       "session_hint": "qwen-session-001",
       "tool_rows": [
         {
-          "event_uid": "b3d75e956a9d5afbd9b1d00ea474dcd97e5a5d236fa6c6d3c4a69ab26454beae",
+          "event_uid": "259d846f287855904ad9a37488a1bac4b82ac83046355222ef92ae5adefa7b0d",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "inference_provider": "",
@@ -714,7 +714,7 @@
           "endpoint_kind": "generation",
           "event_kind": "message",
           "event_ts": "2026-07-18 12:00:03.000",
-          "event_uid": "000000007e12f3a4767d9eb30215e21c99091b72bd8e17dc1d98ccd5017fddd2",
+          "event_uid": "6534ae2972d96e49536fee2895baaf92fba7585d50558d476e600cbcf649d458",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "has_reasoning": 0,
@@ -730,7 +730,7 @@
           "origin_tool_call_id": "",
           "output_tokens": 12,
           "parent_tool_call_id": "",
-          "payload_json": "{\"parentUuid\":\"qwen-r1\",\"part\":{\"text\":\"I will demonstrate a failed tool.\"},\"uuid\":\"qwen-a2\"}",
+          "payload_json": "{\"moraine_emission_index\":1,\"parentUuid\":\"qwen-r1\",\"part\":{\"text\":\"I will demonstrate a failed tool.\"},\"uuid\":\"qwen-a2\"}",
           "payload_type": "agent_message",
           "project_id": "",
           "record_ts": "2026-07-18T12:00:03.000Z",
@@ -796,7 +796,7 @@
           "endpoint_kind": "generation",
           "event_kind": "tool_call",
           "event_ts": "2026-07-18 12:00:03.000",
-          "event_uid": "000000010f4c24e507a49044ca0509196490c371121fca56f12de55dc42aad2a",
+          "event_uid": "ce51a93d23e2a374ab4bf034e52db2da141b586ba5f527311cc1ce4d04617c17",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "has_reasoning": 0,
@@ -812,7 +812,7 @@
           "origin_tool_call_id": "",
           "output_tokens": 0,
           "parent_tool_call_id": "",
-          "payload_json": "{\"moraine_tool_io\":{\"inference_provider\":\"\",\"input_bytes\":19,\"input_json\":\"{\\\"command\\\":\\\"false\\\"}\",\"input_preview\":\"{\\\"command\\\":\\\"false\\\"}\",\"io_hash\":931394445880735056,\"output_bytes\":0,\"output_json\":\"\",\"output_preview\":\"\",\"output_text\":\"\",\"parent_tool_call_id\":\"\",\"project_id\":\"\",\"repo_rel_path\":\"\",\"source_ref\":\"/fixtures/qwen-code/session.jsonl:1:4\",\"tool_call_id\":\"qwen-call-fail\",\"tool_error\":0,\"tool_name\":\"shell\",\"tool_phase\":\"request\",\"worktree_root\":\"\"},\"parentUuid\":\"qwen-r1\",\"part\":{\"functionCall\":{\"args\":{\"command\":\"false\"},\"id\":\"qwen-call-fail\",\"name\":\"shell\"}},\"uuid\":\"qwen-a2\"}",
+          "payload_json": "{\"moraine_emission_index\":2,\"moraine_tool_io\":{\"inference_provider\":\"\",\"input_bytes\":19,\"input_json\":\"{\\\"command\\\":\\\"false\\\"}\",\"input_preview\":\"{\\\"command\\\":\\\"false\\\"}\",\"io_hash\":931394445880735056,\"output_bytes\":0,\"output_json\":\"\",\"output_preview\":\"\",\"output_text\":\"\",\"parent_tool_call_id\":\"\",\"project_id\":\"\",\"repo_rel_path\":\"\",\"source_ref\":\"/fixtures/qwen-code/session.jsonl:1:4\",\"tool_call_id\":\"qwen-call-fail\",\"tool_error\":0,\"tool_name\":\"shell\",\"tool_phase\":\"request\",\"worktree_root\":\"\"},\"parentUuid\":\"qwen-r1\",\"part\":{\"functionCall\":{\"args\":{\"command\":\"false\"},\"id\":\"qwen-call-fail\",\"name\":\"shell\"}},\"uuid\":\"qwen-a2\"}",
           "payload_type": "tool_use",
           "project_id": "",
           "record_ts": "2026-07-18T12:00:03.000Z",
@@ -866,7 +866,7 @@
       ],
       "link_rows": [
         {
-          "event_uid": "000000007e12f3a4767d9eb30215e21c99091b72bd8e17dc1d98ccd5017fddd2",
+          "event_uid": "6534ae2972d96e49536fee2895baaf92fba7585d50558d476e600cbcf649d458",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "inference_provider": "",
@@ -878,7 +878,7 @@
           "source_name": "golden-qwen-code"
         },
         {
-          "event_uid": "000000010f4c24e507a49044ca0509196490c371121fca56f12de55dc42aad2a",
+          "event_uid": "ce51a93d23e2a374ab4bf034e52db2da141b586ba5f527311cc1ce4d04617c17",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "inference_provider": "",
@@ -913,7 +913,7 @@
       "session_hint": "qwen-session-001",
       "tool_rows": [
         {
-          "event_uid": "000000010f4c24e507a49044ca0509196490c371121fca56f12de55dc42aad2a",
+          "event_uid": "ce51a93d23e2a374ab4bf034e52db2da141b586ba5f527311cc1ce4d04617c17",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "inference_provider": "",
@@ -958,7 +958,7 @@
           "endpoint_kind": "generation",
           "event_kind": "tool_result",
           "event_ts": "2026-07-18 12:00:04.000",
-          "event_uid": "5093aa3aa9cfb2819575d90e851509e05c6d77aad3abaadf627575c312675db0",
+          "event_uid": "0fa0b3add8e5232f160e75dd0f842fae12a3f5801f855163d328c5678126d490",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "has_reasoning": 0,
@@ -1028,7 +1028,7 @@
       ],
       "link_rows": [
         {
-          "event_uid": "5093aa3aa9cfb2819575d90e851509e05c6d77aad3abaadf627575c312675db0",
+          "event_uid": "0fa0b3add8e5232f160e75dd0f842fae12a3f5801f855163d328c5678126d490",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "inference_provider": "",
@@ -1063,7 +1063,7 @@
       "session_hint": "qwen-session-001",
       "tool_rows": [
         {
-          "event_uid": "5093aa3aa9cfb2819575d90e851509e05c6d77aad3abaadf627575c312675db0",
+          "event_uid": "0fa0b3add8e5232f160e75dd0f842fae12a3f5801f855163d328c5678126d490",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "inference_provider": "",
@@ -1108,7 +1108,7 @@
           "endpoint_kind": "generation",
           "event_kind": "tool_call",
           "event_ts": "2026-07-18 12:00:04.250",
-          "event_uid": "000000007b9dd678167ccbccf49817eea66d9cd5cc4d24d01b61199a96f5f0f4",
+          "event_uid": "b6481458de91d868a4fb2a468cc8ed302e496d6f8f86f42aba80900b4f484622",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "has_reasoning": 0,
@@ -1124,7 +1124,7 @@
           "origin_tool_call_id": "",
           "output_tokens": 0,
           "parent_tool_call_id": "",
-          "payload_json": "{\"moraine_tool_io\":{\"inference_provider\":\"\",\"input_bytes\":29,\"input_json\":\"{\\\"command\\\":\\\"printf fallback\\\"}\",\"input_preview\":\"{\\\"command\\\":\\\"printf fallback\\\"}\",\"io_hash\":11412293196482192712,\"output_bytes\":0,\"output_json\":\"\",\"output_preview\":\"\",\"output_text\":\"\",\"parent_tool_call_id\":\"\",\"project_id\":\"\",\"repo_rel_path\":\"\",\"source_ref\":\"/fixtures/qwen-code/session.jsonl:1:6\",\"tool_call_id\":\"qwen-r3\",\"tool_error\":0,\"tool_name\":\"shell\",\"tool_phase\":\"request\",\"worktree_root\":\"\"},\"parentUuid\":\"qwen-r2\",\"part\":{\"functionCall\":{\"args\":{\"command\":\"printf fallback\"},\"id\":\"qwen-r3\",\"name\":\"shell\"}},\"uuid\":\"qwen-a3\"}",
+          "payload_json": "{\"moraine_emission_index\":1,\"moraine_tool_io\":{\"inference_provider\":\"\",\"input_bytes\":29,\"input_json\":\"{\\\"command\\\":\\\"printf fallback\\\"}\",\"input_preview\":\"{\\\"command\\\":\\\"printf fallback\\\"}\",\"io_hash\":11412293196482192712,\"output_bytes\":0,\"output_json\":\"\",\"output_preview\":\"\",\"output_text\":\"\",\"parent_tool_call_id\":\"\",\"project_id\":\"\",\"repo_rel_path\":\"\",\"source_ref\":\"/fixtures/qwen-code/session.jsonl:1:6\",\"tool_call_id\":\"qwen-r3\",\"tool_error\":0,\"tool_name\":\"shell\",\"tool_phase\":\"request\",\"worktree_root\":\"\"},\"parentUuid\":\"qwen-r2\",\"part\":{\"functionCall\":{\"args\":{\"command\":\"printf fallback\"},\"id\":\"qwen-r3\",\"name\":\"shell\"}},\"uuid\":\"qwen-a3\"}",
           "payload_type": "tool_use",
           "project_id": "",
           "record_ts": "2026-07-18T12:00:04.250Z",
@@ -1178,7 +1178,7 @@
       ],
       "link_rows": [
         {
-          "event_uid": "000000007b9dd678167ccbccf49817eea66d9cd5cc4d24d01b61199a96f5f0f4",
+          "event_uid": "b6481458de91d868a4fb2a468cc8ed302e496d6f8f86f42aba80900b4f484622",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "inference_provider": "",
@@ -1213,7 +1213,7 @@
       "session_hint": "qwen-session-001",
       "tool_rows": [
         {
-          "event_uid": "000000007b9dd678167ccbccf49817eea66d9cd5cc4d24d01b61199a96f5f0f4",
+          "event_uid": "b6481458de91d868a4fb2a468cc8ed302e496d6f8f86f42aba80900b4f484622",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "inference_provider": "",
@@ -1258,7 +1258,7 @@
           "endpoint_kind": "generation",
           "event_kind": "tool_result",
           "event_ts": "2026-07-18 12:00:04.500",
-          "event_uid": "cd5ca100025669a6264b1789ff5074ace9ff1994d3639a040e74e2bdf38d2da1",
+          "event_uid": "821f46adb41b1650ad85dc6b3698e9be3d702d34a2f0769b5e64f1325b7b16c4",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "has_reasoning": 0,
@@ -1328,7 +1328,7 @@
       ],
       "link_rows": [
         {
-          "event_uid": "cd5ca100025669a6264b1789ff5074ace9ff1994d3639a040e74e2bdf38d2da1",
+          "event_uid": "821f46adb41b1650ad85dc6b3698e9be3d702d34a2f0769b5e64f1325b7b16c4",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "inference_provider": "",
@@ -1363,7 +1363,7 @@
       "session_hint": "qwen-session-001",
       "tool_rows": [
         {
-          "event_uid": "cd5ca100025669a6264b1789ff5074ace9ff1994d3639a040e74e2bdf38d2da1",
+          "event_uid": "821f46adb41b1650ad85dc6b3698e9be3d702d34a2f0769b5e64f1325b7b16c4",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "inference_provider": "",
@@ -1406,7 +1406,7 @@
           "endpoint_kind": "generation",
           "event_kind": "session_meta",
           "event_ts": "2026-07-18 12:00:05.000",
-          "event_uid": "04d668109e2d150caaeb715da8c3090aa0ec9a3eb31c9bc15fce733bd7aae4c1",
+          "event_uid": "78e1551a32645df7663f2b5b92df0fe07b30c73f59e7699a06c2f2263d639263",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "has_reasoning": 0,
@@ -1476,7 +1476,7 @@
       ],
       "link_rows": [
         {
-          "event_uid": "04d668109e2d150caaeb715da8c3090aa0ec9a3eb31c9bc15fce733bd7aae4c1",
+          "event_uid": "78e1551a32645df7663f2b5b92df0fe07b30c73f59e7699a06c2f2263d639263",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "inference_provider": "",
@@ -1528,7 +1528,7 @@
           "endpoint_kind": "generation",
           "event_kind": "summary",
           "event_ts": "2026-07-18 12:00:06.000",
-          "event_uid": "4232c584c37d339e39165e370ed259c1d45a80ceac017329e3cd4bbb6c69cddc",
+          "event_uid": "972794d3a9ab9b1eef8da0253a8f0511adcf4a08b05b4c2dd80899d3f37cb1a8",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "has_reasoning": 0,
@@ -1598,7 +1598,7 @@
       ],
       "link_rows": [
         {
-          "event_uid": "4232c584c37d339e39165e370ed259c1d45a80ceac017329e3cd4bbb6c69cddc",
+          "event_uid": "972794d3a9ab9b1eef8da0253a8f0511adcf4a08b05b4c2dd80899d3f37cb1a8",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "inference_provider": "",
@@ -1652,7 +1652,7 @@
           "endpoint_kind": "generation",
           "event_kind": "system",
           "event_ts": "2026-07-18 12:00:07.000",
-          "event_uid": "18175fc4686e87828aec6a4f72e6152f546764b8de7d82a5136ff1fea9b60620",
+          "event_uid": "cbe3f70c1605ed6d4aef278873b50d5a3a5e6d4ab3f21a42d29ad4792cfb46bc",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "has_reasoning": 0,
@@ -1722,7 +1722,7 @@
       ],
       "link_rows": [
         {
-          "event_uid": "18175fc4686e87828aec6a4f72e6152f546764b8de7d82a5136ff1fea9b60620",
+          "event_uid": "cbe3f70c1605ed6d4aef278873b50d5a3a5e6d4ab3f21a42d29ad4792cfb46bc",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "inference_provider": "",
@@ -1776,7 +1776,7 @@
           "endpoint_kind": "generation",
           "event_kind": "system",
           "event_ts": "2026-07-18 12:00:08.000",
-          "event_uid": "6d6f680c507b1bf66212645899de4705443d442adcdc1f3d782ad267e1c01b7c",
+          "event_uid": "059f20b3107920a74b8e0fc74fc5e66355e955174b81de7178bf0aec3166c331",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "has_reasoning": 0,
@@ -1846,7 +1846,7 @@
       ],
       "link_rows": [
         {
-          "event_uid": "6d6f680c507b1bf66212645899de4705443d442adcdc1f3d782ad267e1c01b7c",
+          "event_uid": "059f20b3107920a74b8e0fc74fc5e66355e955174b81de7178bf0aec3166c331",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "inference_provider": "",
@@ -1900,7 +1900,7 @@
           "endpoint_kind": "generation",
           "event_kind": "message",
           "event_ts": "2026-07-18 12:00:09.000",
-          "event_uid": "875a4691f916adbb537a81d966e45e36023783594598d50a7e8d0418ef4cc67c",
+          "event_uid": "44a01580e30c94a21e66f37a8fd5d206276d59014fb34c3e13e418ca6b085caf",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "has_reasoning": 0,
@@ -1970,7 +1970,7 @@
       ],
       "link_rows": [
         {
-          "event_uid": "875a4691f916adbb537a81d966e45e36023783594598d50a7e8d0418ef4cc67c",
+          "event_uid": "44a01580e30c94a21e66f37a8fd5d206276d59014fb34c3e13e418ca6b085caf",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "inference_provider": "",
@@ -2024,7 +2024,7 @@
           "endpoint_kind": "generation",
           "event_kind": "message",
           "event_ts": "2026-07-18 12:00:10.000",
-          "event_uid": "000000006f4973c85884e974424f7a2a60953636d3dc426ec10b2afe2fa2b1fe",
+          "event_uid": "40e733a6739e590b4c9972a34c34dadc4b6eb0c9bafeacbddda93f94a31ed5d7",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "has_reasoning": 0,
@@ -2040,7 +2040,7 @@
           "origin_tool_call_id": "",
           "output_tokens": 8,
           "parent_tool_call_id": "",
-          "payload_json": "{\"parentUuid\":\"qwen-midturn\",\"part\":{\"text\":\"This answer belongs to the abandoned branch.\"},\"uuid\":\"qwen-abandoned\"}",
+          "payload_json": "{\"moraine_emission_index\":1,\"parentUuid\":\"qwen-midturn\",\"part\":{\"text\":\"This answer belongs to the abandoned branch.\"},\"uuid\":\"qwen-abandoned\"}",
           "payload_type": "agent_message",
           "project_id": "",
           "record_ts": "2026-07-18T12:00:10.000Z",
@@ -2094,7 +2094,7 @@
       ],
       "link_rows": [
         {
-          "event_uid": "000000006f4973c85884e974424f7a2a60953636d3dc426ec10b2afe2fa2b1fe",
+          "event_uid": "40e733a6739e590b4c9972a34c34dadc4b6eb0c9bafeacbddda93f94a31ed5d7",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "inference_provider": "",
@@ -2146,7 +2146,7 @@
           "endpoint_kind": "generation",
           "event_kind": "system",
           "event_ts": "2026-07-18 12:00:11.000",
-          "event_uid": "67e9ec7851d44a09c9dd590cade5e78223cf69d2e159227ccb3acb1d2f029912",
+          "event_uid": "9d78ac6dae8dc10627ce9ba730f9c4815ccb9e55eb7b7cecca924928b2897263",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "has_reasoning": 0,
@@ -2216,7 +2216,7 @@
       ],
       "link_rows": [
         {
-          "event_uid": "67e9ec7851d44a09c9dd590cade5e78223cf69d2e159227ccb3acb1d2f029912",
+          "event_uid": "9d78ac6dae8dc10627ce9ba730f9c4815ccb9e55eb7b7cecca924928b2897263",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "inference_provider": "",
@@ -2270,7 +2270,7 @@
           "endpoint_kind": "generation",
           "event_kind": "message",
           "event_ts": "2026-07-18 12:00:12.000",
-          "event_uid": "58e46d63a89f77be0d165e9bbc3271ff7b2e93798bec14710f955b0bbcf82500",
+          "event_uid": "35afded30e4229ed15d4ac02ac86a3b0525e0df3a9c99662b9b9c2744becd76f",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "has_reasoning": 0,
@@ -2340,7 +2340,7 @@
       ],
       "link_rows": [
         {
-          "event_uid": "58e46d63a89f77be0d165e9bbc3271ff7b2e93798bec14710f955b0bbcf82500",
+          "event_uid": "35afded30e4229ed15d4ac02ac86a3b0525e0df3a9c99662b9b9c2744becd76f",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "inference_provider": "",
@@ -2394,7 +2394,7 @@
           "endpoint_kind": "generation",
           "event_kind": "message",
           "event_ts": "2026-07-18 12:00:13.000",
-          "event_uid": "000000000e1debeccacf66c73eec2623c0e98f6f581ab5f9a372818f3b6d597c",
+          "event_uid": "ceb14d8c2cde7d405c932a4c4490bc01c0afcb7fd830d03a29462c4d643560a2",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "has_reasoning": 0,
@@ -2410,7 +2410,7 @@
           "origin_tool_call_id": "",
           "output_tokens": 9,
           "parent_tool_call_id": "",
-          "payload_json": "{\"parentUuid\":\"qwen-replacement-u\",\"part\":{\"text\":\"Replacement branch answer.\"},\"uuid\":\"qwen-replacement-a\"}",
+          "payload_json": "{\"moraine_emission_index\":1,\"parentUuid\":\"qwen-replacement-u\",\"part\":{\"text\":\"Replacement branch answer.\"},\"uuid\":\"qwen-replacement-a\"}",
           "payload_type": "agent_message",
           "project_id": "",
           "record_ts": "2026-07-18T12:00:13.000Z",
@@ -2464,7 +2464,7 @@
       ],
       "link_rows": [
         {
-          "event_uid": "000000000e1debeccacf66c73eec2623c0e98f6f581ab5f9a372818f3b6d597c",
+          "event_uid": "ceb14d8c2cde7d405c932a4c4490bc01c0afcb7fd830d03a29462c4d643560a2",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "inference_provider": "",
@@ -2644,7 +2644,7 @@
           "endpoint_kind": "generation",
           "event_kind": "message",
           "event_ts": "1970-01-01 00:00:00.000",
-          "event_uid": "46afbd0d144a7f6b6e6af1ecfe8731b40c118691763794fb7b12741b0596cbf2",
+          "event_uid": "3badf99af4b7313e92587dce2506cbf8393cfc6838043935e25ad6d562faa02f",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "has_reasoning": 0,
@@ -2714,7 +2714,7 @@
       ],
       "link_rows": [
         {
-          "event_uid": "46afbd0d144a7f6b6e6af1ecfe8731b40c118691763794fb7b12741b0596cbf2",
+          "event_uid": "3badf99af4b7313e92587dce2506cbf8393cfc6838043935e25ad6d562faa02f",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "inference_provider": "",

@@ -458,6 +458,7 @@ trace_events AS (
                source_generation,
                source_offset,
                source_line_no,
+               toUInt32(JSONExtractUInt(payload_json, 'moraine_emission_index')),
                event_uid
     ) AS event_order,
     if(
@@ -473,6 +474,7 @@ trace_events AS (
                      source_generation,
                      source_offset,
                      source_line_no,
+                     toUInt32(JSONExtractUInt(payload_json, 'moraine_emission_index')),
                      event_uid
             ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
           )

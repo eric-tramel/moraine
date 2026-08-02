@@ -573,6 +573,7 @@ main() {
   run_stamp="$(date +%s)_$$_$RANDOM"
   local codex_keyword="${base_keyword}_codex_${run_stamp}"
   local claude_keyword="${base_keyword}_claude_${run_stamp}"
+  local claude_semantic_change_keyword="${base_keyword}_claude_changed_${run_stamp}"
   local kimi_keyword="${base_keyword}_kimi_${run_stamp}"
   local qwen_keyword="${base_keyword}_qwen_${run_stamp}"
   local kiro_keyword="${base_keyword}_kiro_${run_stamp}"
@@ -1549,6 +1550,44 @@ EOF
   assert_clickhouse_count "$clickhouse_url" "claude model fields" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-claude' AND model = 'claude-opus-4-5-20251101'" "3"
   assert_clickhouse_count "$clickhouse_url" "claude token buckets" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-claude' AND actor_kind = 'assistant' AND input_tokens = 9 AND output_tokens = 5 AND token_usage_buckets['input_text'] = 9 AND token_usage_buckets['output_text'] = 5" "3"
 
+  # Replacing a source file with byte-identical content must advance raw/checkpoint
+  # provenance without multiplying canonical events or UID-keyed read indexes.
+  local claude_uids_before
+  local claude_docs_before
+  local claude_raw_coordinates_before
+  local claude_keyword_docs_before
+  claude_uids_before="$(clickhouse_scalar "$clickhouse_url" "SELECT arrayStringConcat(arraySort(groupUniqArray(event_uid)), ',') FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-claude'")"
+  claude_docs_before="$(clickhouse_scalar "$clickhouse_url" "SELECT uniqExact(doc_id) FROM ${clickhouse_database}.search_postings FINAL WHERE source_name = 'ci-claude'")"
+  claude_raw_coordinates_before="$(clickhouse_scalar "$clickhouse_url" "SELECT uniqExact(tuple(source_generation, source_line_no, source_offset, raw_json_hash)) FROM ${clickhouse_database}.raw_events WHERE source_name = 'ci-claude'")"
+  claude_keyword_docs_before="$(clickhouse_scalar "$clickhouse_url" "SELECT uniqExact(doc_id) FROM ${clickhouse_database}.search_postings FINAL WHERE source_name = 'ci-claude' AND term = '${claude_keyword}'")"
+  "$python_bin" - "$claude_fixture_file" <<'PY'
+import os
+import shutil
+import sys
+
+path = sys.argv[1]
+replacement = f"{path}.replacement"
+shutil.copyfile(path, replacement)
+os.replace(replacement, path)
+PY
+  wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.ingest_checkpoints FINAL WHERE source_name = 'ci-claude' AND source_generation = 2" 120
+  local claude_raw_coordinates_after_replay=$((claude_raw_coordinates_before + 3))
+  wait_for_clickhouse_count "$clickhouse_url" "SELECT uniqExact(tuple(source_generation, source_line_no, source_offset, raw_json_hash)) = ${claude_raw_coordinates_after_replay} FROM ${clickhouse_database}.raw_events WHERE source_name = 'ci-claude'" 120
+  assert_clickhouse_scalar "$clickhouse_url" "claude replay keeps canonical UID set stable" "SELECT arrayStringConcat(arraySort(groupUniqArray(event_uid)), ',') FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-claude'" "$claude_uids_before"
+  assert_clickhouse_scalar "$clickhouse_url" "claude replay keeps derived document set stable" "SELECT uniqExact(doc_id) FROM ${clickhouse_database}.search_postings FINAL WHERE source_name = 'ci-claude'" "$claude_docs_before"
+  assert_clickhouse_scalar "$clickhouse_url" "claude replay advances raw audit coordinates" "SELECT uniqExact(tuple(source_generation, source_line_no, source_offset, raw_json_hash)) FROM ${clickhouse_database}.raw_events WHERE source_name = 'ci-claude'" "$claude_raw_coordinates_after_replay"
+
+  cat >> "$claude_fixture_file" <<EOF
+{"type":"user","sessionId":"${claude_session_id}","uuid":"claude-semantic-change-${run_stamp}","cwd":"${claude_project_dir}","parentUuid":"claude-tool-result-${run_stamp}","timestamp":"2026-02-16T12:00:06.000Z","message":{"role":"user","content":[{"type":"text","text":"semantic change ${claude_semantic_change_keyword}"}]}}
+EOF
+  wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-claude' AND position(text_content, '${claude_semantic_change_keyword}') > 0" 120
+  local claude_docs_after_change=$((claude_docs_before + 1))
+  wait_for_clickhouse_count "$clickhouse_url" "SELECT uniqExact(doc_id) = ${claude_docs_after_change} FROM ${clickhouse_database}.search_postings FINAL WHERE source_name = 'ci-claude'" 120
+  assert_clickhouse_count "$clickhouse_url" "claude semantic change appends one event" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-claude'" "6"
+  assert_clickhouse_scalar "$clickhouse_url" "claude replay preserves old term documents" "SELECT uniqExact(doc_id) FROM ${clickhouse_database}.search_postings FINAL WHERE source_name = 'ci-claude' AND term = '${claude_keyword}'" "$claude_keyword_docs_before"
+  assert_clickhouse_count "$clickhouse_url" "claude semantic change owns one new term document" "SELECT uniqExact(doc_id) FROM ${clickhouse_database}.search_postings FINAL WHERE source_name = 'ci-claude' AND term = '${claude_semantic_change_keyword}'" "1"
+  assert_clickhouse_count "$clickhouse_url" "claude old and changed terms remain on distinct events" "SELECT count() FROM (SELECT doc_id FROM ${clickhouse_database}.search_postings FINAL WHERE source_name = 'ci-claude' AND term IN ('${claude_keyword}', '${claude_semantic_change_keyword}') GROUP BY doc_id HAVING uniqExact(term) = 2)" "0"
+
   assert_clickhouse_count "$clickhouse_url" "kimi unique raw rows" "SELECT uniqExact(raw_json_hash) FROM ${clickhouse_database}.raw_events WHERE source_name = 'ci-kimi'" "8"
   assert_clickhouse_count "$clickhouse_url" "kimi event rows" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-kimi'" "7"
   assert_clickhouse_count "$clickhouse_url" "kimi link rows" "SELECT count() FROM ${clickhouse_database}.event_links FINAL WHERE source_name = 'ci-kimi'" "0"
@@ -1610,8 +1649,8 @@ EOF
 
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-kiro' AND event_kind = 'session_meta' AND JSONExtractString(payload_json, 'title') = '${kiro_updated_session_title}' AND input_tokens = 31 AND output_tokens = 13 AND token_usage_native_units['credits'] = 1.25" 120
   assert_clickhouse_count "$clickhouse_url" "kiro unique raw rows after sidecar update" "SELECT uniqExact(raw_json_hash) FROM ${clickhouse_database}.raw_events WHERE source_name = 'ci-kiro'" "7"
-  assert_clickhouse_count "$clickhouse_url" "kiro event rows after sidecar update" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-kiro'" "8"
-  assert_clickhouse_count "$clickhouse_url" "kiro session_meta collapses on re-emit" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-kiro' AND event_kind = 'session_meta'" "1"
+  assert_clickhouse_count "$clickhouse_url" "kiro event rows after sidecar update" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-kiro'" "9"
+  assert_clickhouse_count "$clickhouse_url" "kiro session_meta archives changed metadata" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-kiro' AND event_kind = 'session_meta'" "2"
   assert_clickhouse_count "$clickhouse_url" "Kiro ingest errors after sidecar update" "SELECT count() FROM ${clickhouse_database}.ingest_errors WHERE source_name = 'ci-kiro'" "0"
 
   assert_clickhouse_count "$clickhouse_url" "cursor unique raw rows" "SELECT uniqExact(raw_json_hash) FROM ${clickhouse_database}.raw_events WHERE source_name = 'ci-cursor'" "5"
@@ -1633,9 +1672,9 @@ EOF
   assert_clickhouse_count "$clickhouse_url" "cursor sqlite session title" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'cursor-sqlite' AND event_kind = 'session_meta' AND JSONExtractString(payload_json, 'title') = '${cursor_sqlite_session_title}'" "1"
 
   # Live update: Cursor mutates state.vscdb in place while a conversation
-  # runs. Append an assistant bubble (growing the composer's header list) to
-  # prove the watcher/sidecar/reconcile path re-polls a changed database, and
-  # that the re-emitted composer collapses onto its stable event UID.
+  # runs. Append an assistant bubble and advance the composer's last-updated
+  # metadata to prove the watcher/sidecar/reconcile path archives both semantic
+  # changes instead of overwriting the prior session metadata.
   echo "[e2e] cursor sqlite live update: appending an assistant bubble"
   "$python_bin" - \
     "$cursor_sqlite_fixture_file" \
@@ -1677,13 +1716,11 @@ PY
 
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.events WHERE source_name = 'cursor-sqlite' AND positionCaseInsensitiveUTF8(text_content, '${cursor_sqlite_live_keyword}') > 0" 120
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.raw_events WHERE source_name = 'cursor-sqlite' AND positionCaseInsensitiveUTF8(raw_json, '${cursor_sqlite_live_keyword}') > 0" 120
-  # Two kv rows changed (new bubble + mutated composer), so two new raw rows;
-  # the events table gains only the assistant message because the composer's
-  # session_meta re-emits under the same event UID and ReplacingMergeTree
-  # collapses it.
+  # Two kv rows changed (new bubble + mutated composer), so two new raw rows
+  # and two new canonical events. The prior session metadata remains queryable.
   assert_clickhouse_count "$clickhouse_url" "cursor sqlite unique raw rows after live update" "SELECT uniqExact(raw_json_hash) FROM ${clickhouse_database}.raw_events WHERE source_name = 'cursor-sqlite'" "6"
-  assert_clickhouse_count "$clickhouse_url" "cursor sqlite event rows after live update" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'cursor-sqlite'" "6"
-  assert_clickhouse_count "$clickhouse_url" "cursor sqlite session_meta collapses on re-emit" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'cursor-sqlite' AND event_kind = 'session_meta'" "1"
+  assert_clickhouse_count "$clickhouse_url" "cursor sqlite event rows after live update" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'cursor-sqlite'" "7"
+  assert_clickhouse_count "$clickhouse_url" "cursor sqlite session_meta archives changed metadata" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'cursor-sqlite' AND event_kind = 'session_meta'" "2"
 
   assert_clickhouse_count "$clickhouse_url" "pi unique raw rows" "SELECT uniqExact(raw_json_hash) FROM ${clickhouse_database}.raw_events WHERE source_name = 'ci-pi'" "7"
   assert_clickhouse_count "$clickhouse_url" "pi event rows" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-pi'" "9"
@@ -1746,9 +1783,9 @@ connection.close()
 PY
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.events WHERE source_name = 'ci-nac' AND positionCaseInsensitiveUTF8(text_content, '${nac_live_keyword}') > 0" 120
   assert_clickhouse_count "$clickhouse_url" "nac unique raw rows after live update" "SELECT uniqExact(raw_json_hash) FROM ${clickhouse_database}.raw_events WHERE source_name = 'ci-nac'" "20"
-  assert_clickhouse_count "$clickhouse_url" "nac event rows after live update" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-nac'" "19"
-  assert_clickhouse_count "$clickhouse_url" "nac parent rows after live update" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-nac' AND session_id = '${nac_normalized_session_id}'" "8"
-  assert_clickhouse_count "$clickhouse_url" "nac parent metadata collapses on live update" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-nac' AND session_id = '${nac_normalized_session_id}' AND event_kind = 'session_meta'" "1"
+  assert_clickhouse_count "$clickhouse_url" "nac event rows after live update" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-nac'" "20"
+  assert_clickhouse_count "$clickhouse_url" "nac parent rows after live update" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-nac' AND session_id = '${nac_normalized_session_id}'" "9"
+  assert_clickhouse_count "$clickhouse_url" "nac parent metadata archives live update" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-nac' AND session_id = '${nac_normalized_session_id}' AND event_kind = 'session_meta'" "2"
 
   echo "[e2e] nac sqlite config-only update"
   "$python_bin" - "$nac_fixture_file" "$nac_session_id" <<'PY'
@@ -1764,7 +1801,7 @@ connection.commit()
 connection.close()
 PY
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-nac' AND session_id = '${nac_normalized_session_id}' AND event_kind = 'session_meta' AND JSONExtractString(payload_json, 'reasoning_effort') = 'low'" 120
-  assert_clickhouse_count "$clickhouse_url" "nac config-only update preserves canonical event count" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-nac'" "19"
+  assert_clickhouse_count "$clickhouse_url" "nac config-only update archives canonical metadata" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-nac'" "21"
 
   echo "[e2e] nac sqlite prior-message replacement"
   "$python_bin" - "$nac_fixture_file" "$nac_session_id" <<'PY'
@@ -1788,8 +1825,8 @@ connection.commit()
 connection.close()
 PY
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-nac' AND session_id = '${nac_normalized_session_id}' AND position(text_content, 'NAC_PRIOR_MESSAGE_REPLACED') > 0" 120
-  assert_clickhouse_count "$clickhouse_url" "nac prior-message replacement preserves canonical event count" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-nac'" "19"
-  assert_clickhouse_count "$clickhouse_url" "nac prior-message replacement reuses one coordinate" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-nac' AND session_id = '${nac_normalized_session_id}' AND source_offset = 1 AND position(text_content, 'NAC_PRIOR_MESSAGE_REPLACED') > 0" "1"
+  assert_clickhouse_count "$clickhouse_url" "nac prior-message replacement archives semantic content only" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-nac'" "22"
+  assert_clickhouse_count "$clickhouse_url" "nac prior-message replacement retains both revisions" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-nac' AND session_id = '${nac_normalized_session_id}' AND source_offset = 1" "2"
 
   echo "[e2e] nac sqlite truncation preserves archived history"
   "$python_bin" - "$nac_fixture_file" "$nac_session_id" <<'PY'
@@ -1814,7 +1851,7 @@ connection.close()
 PY
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-nac' AND session_id = '${nac_normalized_session_id}' AND event_kind = 'session_meta' AND JSONExtractString(payload_json, 'updated_at') = '2026-02-16T12:00:23.000000Z'" 120
   assert_clickhouse_count "$clickhouse_url" "nac truncated message remains archived" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-nac' AND positionCaseInsensitiveUTF8(text_content, '${nac_live_keyword}') > 0" "1"
-  assert_clickhouse_count "$clickhouse_url" "nac truncation preserves canonical event count" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-nac'" "19"
+  assert_clickhouse_count "$clickhouse_url" "nac truncation archives canonical metadata" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-nac'" "23"
   local nac_heartbeat_before_noop
   nac_heartbeat_before_noop="$(clickhouse_scalar "$clickhouse_url" "SELECT toString(max(ts)) FROM ${clickhouse_database}.ingest_heartbeats")"
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.ingest_heartbeats WHERE ts > parseDateTime64BestEffort('${nac_heartbeat_before_noop}') AND queue_depth = 0 AND files_active = 0" 120
@@ -2188,7 +2225,7 @@ PY
     --query "$kiro_keyword" \
     --expect-session-id "$kiro_session_id" \
     --expect-open-text "$kiro_trace_marker" \
-    --expect-event-count "8" \
+    --expect-event-count "9" \
     --file-attention-path "/workspace/kiro-e2e.txt"
 
   echo "[e2e] checking MCP initialize/tools/search_sessions/open/list_sessions (cursor)"
@@ -2217,7 +2254,7 @@ PY
     --query "$nac_keyword" \
     --expect-session-id "$nac_normalized_session_id" \
     --expect-open-text "NAC_PRIOR_MESSAGE_REPLACED" \
-    --expect-event-count "8" \
+    --expect-event-count "12" \
     --expect-updated-at "2026-02-16T12:00:05.000Z" \
     --expect-mode "mcp_internal" \
     --file-attention-path "Cargo.toml"
@@ -2230,7 +2267,7 @@ PY
     --query "$nac_mcp_sentinel" \
     --expect-no-results \
     --expect-session-id "$nac_normalized_session_id" \
-    --expect-event-count "8" \
+    --expect-event-count "12" \
     --expect-updated-at "2026-02-16T12:00:05.000Z" \
     --expect-mode "mcp_internal"
 

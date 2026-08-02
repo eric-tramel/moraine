@@ -448,7 +448,7 @@ FORMAT JSONEachRow",
             sum(is_user_message) OVER (
               PARTITION BY session_id
               ORDER BY sort_time, source_file, source_generation, source_offset,
-                source_line_no, event_uid
+                source_line_no, emission_index, event_uid
               ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
             ),
             1
@@ -580,12 +580,12 @@ FORMAT JSONEachRow",
       toUInt64(row_number() OVER (
         PARTITION BY n.session_id
         ORDER BY n.sort_time, n.source_file, n.source_generation,
-          n.source_offset, n.source_line_no, n.event_uid
+          n.source_offset, n.source_line_no, n.emission_index, n.event_uid
       )) AS event_order,
       toUInt32(sum(n.is_user_message) OVER (
         PARTITION BY n.session_id
         ORDER BY n.sort_time, n.source_file, n.source_generation,
-          n.source_offset, n.source_line_no, n.event_uid
+          n.source_offset, n.source_line_no, n.emission_index, n.event_uid
         ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
       )) AS prefix_user_messages
     FROM {navigation} AS n FINAL
@@ -604,7 +604,7 @@ FORMAT JSONEachRow",
       toUInt32(row_number() OVER (
         PARTITION BY session_id, derived_turn_seq
         ORDER BY sort_time, source_file, source_generation, source_offset,
-          source_line_no, event_uid
+          source_line_no, emission_index, event_uid
       )) AS event_ordinal
     FROM nav_turns
   ),
@@ -617,7 +617,7 @@ FORMAT JSONEachRow",
       argMaxIf(
         event_uid,
         tuple(sort_time, source_file, source_generation, source_offset,
-          source_line_no, event_uid),
+          source_line_no, emission_index, event_uid),
         payload_type IN ('task_complete', 'turn_aborted')
       ) AS turn_terminal_event_uid
     FROM nav_derived

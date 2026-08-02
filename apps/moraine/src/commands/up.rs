@@ -13,8 +13,8 @@ use crate::cli::UpArgs;
 use crate::managed_clickhouse::{start_clickhouse_with_progress, ClickHouseStartupProgress};
 use crate::paths::{ensure_runtime_dirs, runtime_paths, RuntimePaths};
 use crate::process::{
-    preflight_required_service_binaries, start_background_service, stop_service, StartOutcome,
-    StartState,
+    lock_storage_migration, preflight_required_service_binaries, start_background_service,
+    stop_service, StartOutcome, StartState,
 };
 #[cfg(test)]
 use crate::progress::ProgressStyle;
@@ -23,8 +23,8 @@ use crate::render::{render_up, CliOutput, MigrationOutcome, StatusSnapshot, UpSn
 use crate::service::Service;
 
 use super::{
-    content_authority_writer_barrier_required, conversation_repository, doctor_is_healthy,
-    migrate_database_for_up, status::cmd_status, CONTENT_AUTHORITY_WRITER_SERVICES,
+    conversation_repository, doctor_is_healthy, migrate_database_for_up, status::cmd_status,
+    writer_barrier_required, WRITER_BARRIER_SERVICES,
 };
 
 const PROGRESS_REFRESH: Duration = Duration::from_millis(250);
@@ -443,20 +443,25 @@ async fn start_selected_services<W: Write>(
     let schema_skew = ClickHouseClient::new(cfg.clickhouse.clone())?
         .schema_skew()
         .await?;
-    if content_authority_writer_barrier_required(&schema_skew.missing_on_server) {
+    let migration_gate = if writer_barrier_required(&schema_skew.missing_on_server) {
+        let gate = lock_storage_migration(paths)?;
         progress.phase(
-            "Content cutover",
-            "stopping tracked backend and ingest before snapshotting legacy tool rows",
+            "Storage cutover",
+            "stopping tracked writers before rebuilding canonical tables and UID logs",
         );
-        stop_content_authority_writers_with(|service| stop_service(paths, service))?;
+        stop_storage_writers_with(|service| stop_service(paths, service))?;
         progress.success_step(
             "Tracked cutover services stopped",
-            Some("backend and ingest are quiescent"),
+            Some("backend, ingest, and MCP are quiescent"),
         );
-    }
+        Some(gate)
+    } else {
+        None
+    };
 
     progress.database_start();
     let migrations = drive_database_progress(cfg, progress).await?;
+    drop(migration_gate);
 
     progress.phase("Services", "starting selected Moraine processes");
     let mut started_services = Vec::with_capacity(services_to_start.len());
@@ -488,11 +493,11 @@ async fn start_selected_services<W: Write>(
     })
 }
 
-fn stop_content_authority_writers_with<F>(mut stop: F) -> Result<()>
+fn stop_storage_writers_with<F>(mut stop: F) -> Result<()>
 where
     F: FnMut(Service) -> Result<bool>,
 {
-    for service in CONTENT_AUTHORITY_WRITER_SERVICES {
+    for service in WRITER_BARRIER_SERVICES {
         stop(service)?;
     }
     Ok(())
@@ -733,10 +738,10 @@ mod tests {
     }
 
     #[test]
-    fn content_cutover_stops_every_tracked_writer_before_migration() {
+    fn storage_cutover_stops_every_tracked_writer_before_migration() {
         let mut attempted = Vec::new();
 
-        stop_content_authority_writers_with(|service| {
+        stop_storage_writers_with(|service| {
             attempted.push(service);
             Ok(false)
         })
@@ -746,22 +751,21 @@ mod tests {
     }
 
     #[test]
-    fn content_cutover_barrier_runs_only_while_031_is_pending() {
-        assert!(content_authority_writer_barrier_required(&[
+    fn storage_cutover_barrier_runs_only_for_guarded_migrations() {
+        assert!(writer_barrier_required(&[
             "030".to_string(),
             "031".to_string(),
             "032".to_string(),
         ]));
-        assert!(!content_authority_writer_barrier_required(&[
-            "032".to_string()
-        ]));
+        assert!(writer_barrier_required(&["033".to_string()]));
+        assert!(!writer_barrier_required(&["032".to_string()]));
     }
 
     #[test]
     fn content_cutover_stop_failure_is_fail_closed() {
         let mut attempted = Vec::new();
 
-        let error = stop_content_authority_writers_with(|service| {
+        let error = stop_storage_writers_with(|service| {
             attempted.push(service);
             anyhow::bail!("stop failed")
         })

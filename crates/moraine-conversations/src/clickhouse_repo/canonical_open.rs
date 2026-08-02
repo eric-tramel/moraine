@@ -15,6 +15,7 @@ struct NavRow {
     source_generation: u32,
     source_offset: u64,
     source_line_no: u64,
+    emission_index: u32,
     event_time: String,
     event_unix_ms: i64,
     event_kind: String,
@@ -277,12 +278,13 @@ impl ClickHouseConversationRepository {
         loop {
             let after = cursor.as_ref().map(|row| {
                 format!(
-                    " AND (n.sort_time, n.source_file, n.source_generation, n.source_offset, n.source_line_no, n.event_uid) > (toDateTime64({}, 3), {}, {}, {}, {}, {})",
+                    " AND (n.sort_time, n.source_file, n.source_generation, n.source_offset, n.source_line_no, n.emission_index, n.event_uid) > (toDateTime64({}, 3), {}, {}, {}, {}, {}, {})",
                     sql_quote(&row.sort_time),
                     sql_quote(&row.source_file),
                     row.source_generation,
                     row.source_offset,
                     row.source_line_no,
+                    row.emission_index,
                     sql_quote(&row.event_uid)
                 )
             }).unwrap_or_default();
@@ -291,6 +293,7 @@ impl ClickHouseConversationRepository {
   session_id, event_uid, toUInt64(event_version) AS event_version,
   toString(n.sort_time) AS sort_time, source_file, toUInt32(source_generation) AS source_generation,
   toUInt64(source_offset) AS source_offset, toUInt64(source_line_no) AS source_line_no,
+  toUInt32(emission_index) AS emission_index,
   toString(display_time) AS event_time, toInt64(toUnixTimestamp64Milli(display_time)) AS event_unix_ms,
   event_kind, actor_kind, payload_type, toUInt32(turn_index) AS turn_index,
   tool_call_id, tool_name, if(tool_phase != '', tool_phase, op_status) AS phase,
@@ -298,7 +301,7 @@ impl ClickHouseConversationRepository {
   toUInt8(is_user_message) AS is_user_message, toUInt8(is_metadata_bearing) AS is_metadata_bearing
 FROM {navigation} AS n FINAL
 WHERE n.session_id = {}{after}
-ORDER BY n.sort_time, n.source_file, n.source_generation, n.source_offset, n.source_line_no, n.event_uid
+ORDER BY n.sort_time, n.source_file, n.source_generation, n.source_offset, n.source_line_no, n.emission_index, n.event_uid
 LIMIT {NAVIGATION_PAGE_SIZE}
 FORMAT JSONEachRow",
                 sql_quote(session_id)

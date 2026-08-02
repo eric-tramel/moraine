@@ -1826,7 +1826,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn mutated_tool_bubble_reemits_the_same_event_uid() {
+    async fn mutated_tool_bubble_archives_a_new_semantic_event() {
         let path = unique_db_path("mutate");
         let db = seed_fixture_db(&path);
         let work = sqlite_work(&path);
@@ -1848,9 +1848,9 @@ mod tests {
         let second_rows = all_event_rows(&second);
 
         let second_tool_uids = event_uid_by_kind(&second_rows, "tool_call");
-        assert_eq!(
+        assert_ne!(
             first_tool_uids, second_tool_uids,
-            "logical identity must survive payload mutation"
+            "changed tool content must archive rather than replace the prior event"
         );
         assert_eq!(
             event_uid_by_kind(&second_rows, "tool_result").len(),

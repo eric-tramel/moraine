@@ -2391,7 +2391,10 @@ mod tests {
             .filter_map(|row| row.get("event_uid").and_then(Value::as_str))
             .map(str::to_string)
             .collect::<Vec<_>>();
-        assert_eq!(replayed_event_uids, first_event_uids);
+        assert_ne!(
+            replayed_event_uids, first_event_uids,
+            "new sidecar semantics must archive rather than replace the prior events"
+        );
         let second_checkpoint = second[0].checkpoint.as_ref().expect("checkpoint").clone();
         let second_cursor = super::parse_kiro_checkpoint_cursor(&second_checkpoint.cursor_json);
         assert!(second_cursor.kiro_sidecar_valid);

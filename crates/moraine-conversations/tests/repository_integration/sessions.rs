@@ -652,7 +652,7 @@ async fn get_mcp_session_includes_turn_summaries_and_latest_completion() {
         })
         .expect("session open must read canonical navigation rows");
     assert!(open_navigation_query.contains(
-        "ORDER BY n.sort_time, n.source_file, n.source_generation, n.source_offset, n.source_line_no, n.event_uid"
+        "ORDER BY n.sort_time, n.source_file, n.source_generation, n.source_offset, n.source_line_no, n.emission_index, n.event_uid"
     ));
     assert!(!open_navigation_query.contains("v_conversation_trace"));
     assert!(!queries.iter().any(|query| {

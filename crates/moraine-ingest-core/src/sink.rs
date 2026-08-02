@@ -1,6 +1,7 @@
 use crate::checkpoint::merge_checkpoint;
 use crate::heartbeat::host_name;
 use crate::model::{Checkpoint, RowBatch};
+use crate::normalize::finalize_batch_event_identities;
 use crate::redaction::{RedactionAudit, SecretRedactor};
 use crate::sources::shared::truncate_chars;
 use crate::tee::{
@@ -21,6 +22,29 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct IdentityScope {
+    source_name: String,
+    source_file: String,
+    source_generation: u64,
+}
+
+fn batch_identity_scope(batch: &RowBatch) -> Option<IdentityScope> {
+    if let Some(checkpoint) = batch.checkpoint.as_ref() {
+        return Some(IdentityScope {
+            source_name: checkpoint.source_name.clone(),
+            source_file: checkpoint.source_file.clone(),
+            source_generation: u64::from(checkpoint.source_generation),
+        });
+    }
+    let event = batch.event_rows.first()?;
+    Some(IdentityScope {
+        source_name: event.get("source_name")?.as_str()?.to_string(),
+        source_file: event.get("source_file")?.as_str()?.to_string(),
+        source_generation: event.get("source_generation")?.as_u64()?,
+    })
+}
 use tokio::sync::{mpsc, Notify, RwLock};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
@@ -334,6 +358,7 @@ pub(crate) fn spawn_sink_task(
             config.ingest.ack_observation && matches!(&role, SinkRole::Default { .. }),
         );
         let mut pending_ack = PendingAckBatch::default();
+        let mut identity_maps = HashMap::<IdentityScope, HashMap<String, String>>::new();
 
         // Mirror sinks share one ingest_checkpoints table per team backend,
         // so their rows are scoped per host (migration 018; guaranteed
@@ -431,6 +456,30 @@ pub(crate) fn spawn_sink_task(
                                 SinkRole::Default { .. } => batch,
                             };
                             author.apply_to_batch(&mut batch);
+                            let identity_scope = batch_identity_scope(&batch);
+                            let scan_complete = batch.checkpoint.is_some();
+                            let finalization = if let Some(scope) = identity_scope.as_ref() {
+                                finalize_batch_event_identities(
+                                    &mut batch,
+                                    identity_maps.entry(scope.clone()).or_default(),
+                                )
+                            } else {
+                                finalize_batch_event_identities(
+                                    &mut batch,
+                                    &mut HashMap::new(),
+                                )
+                            };
+                            if scan_complete {
+                                if let Some(scope) = identity_scope.as_ref() {
+                                    identity_maps.remove(scope);
+                                }
+                            }
+                            if let Err(error) = finalization {
+                                warn!(
+                                    "rejecting malformed normalized batch before insert: {error:#}"
+                                );
+                                continue;
+                            }
                             pending_batch_bytes =
                                 pending_batch_bytes.saturating_add(batch.approx_bytes());
                             raw_rows.extend(batch.raw_rows);

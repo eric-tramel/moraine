@@ -19,7 +19,7 @@
           "endpoint_kind": "generation",
           "event_kind": "message",
           "event_ts": "2026-01-19 15:58:40.000",
-          "event_uid": "c14ed8798d0f1532c001794fcee69b1e5dd8d9917bb6d329912d97ca503295a6",
+          "event_uid": "31024943273a5370440b8ba49a7cd4063356d09155df9ecbfe4759100257bc49",
           "event_version": "<event_version>",
           "harness": "claude-code",
           "has_reasoning": 0,
@@ -130,7 +130,7 @@
           "endpoint_kind": "generation",
           "event_kind": "reasoning",
           "event_ts": "2026-01-19 15:58:41.421",
-          "event_uid": "d65646c86e60d1ac7d7722167ad992d2d60d16c7e73fcd1492fc5f11f18cc389",
+          "event_uid": "d8135503dd346d176ffc0ec973bc65da13188a3ba61d25b8fc6d63829be24a6a",
           "event_version": "<event_version>",
           "harness": "claude-code",
           "has_reasoning": 1,
@@ -212,7 +212,7 @@
           "endpoint_kind": "generation",
           "event_kind": "tool_call",
           "event_ts": "2026-01-19 15:58:41.421",
-          "event_uid": "c915d21ce2a09f164700a6084cb6bd0f16834d60c131fc652bd92e47fc18d187",
+          "event_uid": "0613f02121b4dbefa605e8f39bcfae2cc9429911f76d8c8ba1f19817f71a41a2",
           "event_version": "<event_version>",
           "harness": "claude-code",
           "has_reasoning": 0,
@@ -294,7 +294,7 @@
           "endpoint_kind": "generation",
           "event_kind": "message",
           "event_ts": "2026-01-19 15:58:41.421",
-          "event_uid": "1a2d94b41775e8813248874ae1e29d2e0564a141d984e572f21ff4dd06af8498",
+          "event_uid": "c05e81e60df6585d995766e0bb118361d879db1f967868f31d76e7284df89b59",
           "event_version": "<event_version>",
           "harness": "claude-code",
           "has_reasoning": 0,
@@ -364,7 +364,7 @@
       ],
       "link_rows": [
         {
-          "event_uid": "d65646c86e60d1ac7d7722167ad992d2d60d16c7e73fcd1492fc5f11f18cc389",
+          "event_uid": "d8135503dd346d176ffc0ec973bc65da13188a3ba61d25b8fc6d63829be24a6a",
           "event_version": "<event_version>",
           "harness": "claude-code",
           "inference_provider": "anthropic",
@@ -376,7 +376,7 @@
           "source_name": "golden-claude-code"
         },
         {
-          "event_uid": "c915d21ce2a09f164700a6084cb6bd0f16834d60c131fc652bd92e47fc18d187",
+          "event_uid": "0613f02121b4dbefa605e8f39bcfae2cc9429911f76d8c8ba1f19817f71a41a2",
           "event_version": "<event_version>",
           "harness": "claude-code",
           "inference_provider": "anthropic",
@@ -388,7 +388,7 @@
           "source_name": "golden-claude-code"
         },
         {
-          "event_uid": "1a2d94b41775e8813248874ae1e29d2e0564a141d984e572f21ff4dd06af8498",
+          "event_uid": "c05e81e60df6585d995766e0bb118361d879db1f967868f31d76e7284df89b59",
           "event_version": "<event_version>",
           "harness": "claude-code",
           "inference_provider": "anthropic",
@@ -423,7 +423,7 @@
       "session_hint": "7c666c01-d38e-4658-8650-854ffb5b626e",
       "tool_rows": [
         {
-          "event_uid": "c915d21ce2a09f164700a6084cb6bd0f16834d60c131fc652bd92e47fc18d187",
+          "event_uid": "0613f02121b4dbefa605e8f39bcfae2cc9429911f76d8c8ba1f19817f71a41a2",
           "event_version": "<event_version>",
           "harness": "claude-code",
           "inference_provider": "anthropic",
@@ -468,7 +468,7 @@
           "endpoint_kind": "generation",
           "event_kind": "tool_result",
           "event_ts": "2026-01-19 15:58:42.000",
-          "event_uid": "b3a1370847be7510e44dc5c44534bf0d6099fcd0e899b5a9cf25bdee14c75930",
+          "event_uid": "8f264dad3d1da64001a7fec6e3821bcb1893f1f6480b91ae9247b6273ed9e4b5",
           "event_version": "<event_version>",
           "harness": "claude-code",
           "has_reasoning": 0,
@@ -538,7 +538,7 @@
       ],
       "link_rows": [
         {
-          "event_uid": "b3a1370847be7510e44dc5c44534bf0d6099fcd0e899b5a9cf25bdee14c75930",
+          "event_uid": "8f264dad3d1da64001a7fec6e3821bcb1893f1f6480b91ae9247b6273ed9e4b5",
           "event_version": "<event_version>",
           "harness": "claude-code",
           "inference_provider": "anthropic",
@@ -550,7 +550,7 @@
           "source_name": "golden-claude-code"
         },
         {
-          "event_uid": "b3a1370847be7510e44dc5c44534bf0d6099fcd0e899b5a9cf25bdee14c75930",
+          "event_uid": "8f264dad3d1da64001a7fec6e3821bcb1893f1f6480b91ae9247b6273ed9e4b5",
           "event_version": "<event_version>",
           "harness": "claude-code",
           "inference_provider": "anthropic",
@@ -562,7 +562,7 @@
           "source_name": "golden-claude-code"
         },
         {
-          "event_uid": "b3a1370847be7510e44dc5c44534bf0d6099fcd0e899b5a9cf25bdee14c75930",
+          "event_uid": "8f264dad3d1da64001a7fec6e3821bcb1893f1f6480b91ae9247b6273ed9e4b5",
           "event_version": "<event_version>",
           "harness": "claude-code",
           "inference_provider": "anthropic",
@@ -597,7 +597,7 @@
       "session_hint": "7c666c01-d38e-4658-8650-854ffb5b626e",
       "tool_rows": [
         {
-          "event_uid": "b3a1370847be7510e44dc5c44534bf0d6099fcd0e899b5a9cf25bdee14c75930",
+          "event_uid": "8f264dad3d1da64001a7fec6e3821bcb1893f1f6480b91ae9247b6273ed9e4b5",
           "event_version": "<event_version>",
           "harness": "claude-code",
           "inference_provider": "anthropic",
@@ -640,7 +640,7 @@
           "endpoint_kind": "generation",
           "event_kind": "progress",
           "event_ts": "2026-01-19 15:58:43.000",
-          "event_uid": "fcd0abbf73c3ed9071b8863c3ecf5e79bc4c3700c13563c926077e999d6088a4",
+          "event_uid": "17afa098dd3914281f5052a58a673c03573b7ed0e2f3e6143c90c1620d187d15",
           "event_version": "<event_version>",
           "harness": "claude-code",
           "has_reasoning": 0,
@@ -710,7 +710,7 @@
       ],
       "link_rows": [
         {
-          "event_uid": "fcd0abbf73c3ed9071b8863c3ecf5e79bc4c3700c13563c926077e999d6088a4",
+          "event_uid": "17afa098dd3914281f5052a58a673c03573b7ed0e2f3e6143c90c1620d187d15",
           "event_version": "<event_version>",
           "harness": "claude-code",
           "inference_provider": "anthropic",

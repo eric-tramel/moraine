@@ -13,6 +13,47 @@ use crate::service::Service;
 
 pub(crate) const LEGACY_MONITOR_PID_FILE: &str = "monitor.pid";
 pub(crate) const LEGACY_MCP_PID_FILE: &str = "mcp.pid";
+const STORAGE_WRITER_GATE_FILE: &str = "storage-writer-migration.lock";
+
+pub(crate) struct StorageGateGuard {
+    _file: File,
+}
+
+fn open_storage_gate(paths: &RuntimePaths) -> Result<File> {
+    fs::create_dir_all(&paths.pids_dir).with_context(|| {
+        format!(
+            "failed to create storage writer gate directory {}",
+            paths.pids_dir.display()
+        )
+    })?;
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(paths.pids_dir.join(STORAGE_WRITER_GATE_FILE))
+        .context("failed to open storage writer migration gate")
+}
+
+pub(crate) fn lock_storage_writer_launch(
+    paths: &RuntimePaths,
+    service: Service,
+) -> Result<Option<StorageGateGuard>> {
+    if !matches!(service, Service::Backend | Service::Ingest | Service::Mcp) {
+        return Ok(None);
+    }
+    let file = open_storage_gate(paths)?;
+    file.lock_shared()
+        .context("failed to acquire storage writer launch gate")?;
+    Ok(Some(StorageGateGuard { _file: file }))
+}
+
+pub(crate) fn lock_storage_migration(paths: &RuntimePaths) -> Result<StorageGateGuard> {
+    let file = open_storage_gate(paths)?;
+    file.lock()
+        .context("failed to acquire storage migration gate")?;
+    Ok(StorageGateGuard { _file: file })
+}
 
 #[derive(Debug, Clone, Copy, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -366,12 +407,58 @@ fn read_pid(path: &Path) -> Option<u32> {
     text.trim().parse::<u32>().ok()
 }
 
+fn pid_lock_path(path: &Path) -> PathBuf {
+    let mut lock_path = path.as_os_str().to_os_string();
+    lock_path.push(".lock");
+    PathBuf::from(lock_path)
+}
+
+fn lock_pid_path(path: &Path) -> Result<File> {
+    let lock_path = pid_lock_path(path);
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("failed to open pid lock {}", lock_path.display()))?;
+    file.lock()
+        .with_context(|| format!("failed to acquire pid lock {}", lock_path.display()))?;
+    Ok(file)
+}
+
 pub(crate) fn write_pid(path: &Path, pid: u32) -> Result<()> {
     fs::write(path, format!("{}\n", pid))
         .with_context(|| format!("failed to write pid file {}", path.display()))
 }
 
+pub(crate) fn write_pid_exclusive(path: &Path, pid: u32) -> Result<()> {
+    let _lock = lock_pid_path(path)?;
+    ensure_pid_fresh_unlocked(path);
+    let mut file = match OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            bail!(
+                "refusing to replace existing pid file {}; another launcher owns this service",
+                path.display()
+            )
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to create pid file {}", path.display()));
+        }
+    };
+    if let Err(error) = writeln!(file, "{pid}").and_then(|_| file.sync_data()) {
+        let _ = fs::remove_file(path);
+        return Err(error).with_context(|| format!("failed to write pid file {}", path.display()));
+    }
+    Ok(())
+}
+
 pub(crate) fn remove_pid_if_matches(path: &Path, expected_pid: u32) {
+    let Ok(_lock) = lock_pid_path(path) else {
+        return;
+    };
     if read_pid(path) == Some(expected_pid) {
         let _ = fs::remove_file(path);
     }
@@ -389,16 +476,24 @@ fn is_pid_running(pid: u32) -> bool {
 }
 
 fn pid_if_running(path: &Path) -> Option<u32> {
+    let _lock = lock_pid_path(path).ok()?;
     let pid = read_pid(path)?;
     is_pid_running(pid).then_some(pid)
 }
 
-fn ensure_pid_fresh(path: &Path) {
+fn ensure_pid_fresh_unlocked(path: &Path) {
     if let Some(pid) = read_pid(path) {
         if !is_pid_running(pid) {
             let _ = fs::remove_file(path);
         }
     }
+}
+
+fn ensure_pid_fresh(path: &Path) {
+    let Ok(_lock) = lock_pid_path(path) else {
+        return;
+    };
+    ensure_pid_fresh_unlocked(path);
 }
 
 pub(crate) fn service_running(paths: &RuntimePaths, service: Service) -> Option<u32> {
@@ -497,6 +592,7 @@ pub(crate) fn backend_endpoint_status(cfg: &AppConfig) -> BackendEndpointStatus 
 }
 
 fn stop_pid_path(path: &Path, wait_attempts: usize) -> Result<bool> {
+    let _lock = lock_pid_path(path)?;
     let Some(pid) = read_pid(path) else {
         return Ok(false);
     };
@@ -795,6 +891,7 @@ pub(crate) fn start_background_service(
     if service == Service::ClickHouse {
         bail!("clickhouse is not managed by service launcher; use `moraine up`");
     }
+    let _writer_gate = lock_storage_writer_launch(paths, service)?;
 
     if let Some(pid) = service_running(paths, service) {
         return Ok(StartOutcome {
@@ -855,7 +952,7 @@ pub(crate) fn start_background_service(
     if let Some((key, value)) = cfg_path.child_origin_environment() {
         command.env(key, value);
     }
-    let child = command
+    let mut child = command
         // Background services never read stdin; closing it avoids inheriting the
         // launcher's terminal or pipe descriptors.
         .stdin(Stdio::null())
@@ -864,7 +961,11 @@ pub(crate) fn start_background_service(
         .spawn()
         .with_context(|| format!("failed to start {}", service.name()))?;
 
-    write_pid(&pid_path(paths, service), child.id())?;
+    if let Err(error) = write_pid_exclusive(&pid_path(paths, service), child.id()) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
     Ok(StartOutcome {
         service,
         state: StartState::Started,
@@ -878,7 +979,7 @@ mod tests {
     use super::*;
     use moraine_config::AppConfig;
     use std::ffi::OsString;
-    use std::sync::{Mutex, MutexGuard};
+    use std::sync::{Arc, Barrier, Mutex, MutexGuard};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     static ENV_VAR_LOCK: Mutex<()> = Mutex::new(());
@@ -1166,6 +1267,101 @@ mod tests {
 
         remove_pid_if_matches(&path, 42);
         assert!(!path.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn exclusive_pid_registration_never_replaces_a_live_owner() {
+        let root = temp_dir("exclusive-service-pid");
+        let path = root.join("service.pid");
+        let owner = std::process::id();
+        write_pid_exclusive(&path, owner).expect("claim PID file");
+
+        let error = write_pid_exclusive(&path, owner.saturating_add(1))
+            .expect_err("second launcher must not replace the owner");
+        assert!(error.to_string().contains("another launcher owns"));
+        assert_eq!(
+            fs::read_to_string(&path).expect("preserved pid").trim(),
+            owner.to_string()
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn concurrent_stale_pid_claims_have_one_winner() {
+        const CONTENDERS: usize = 8;
+        let root = temp_dir("contended-service-pid");
+        let path = root.join("service.pid");
+        write_pid(&path, i32::MAX as u32).expect("write stale PID");
+        let barrier = Arc::new(Barrier::new(CONTENDERS));
+        let owner = std::process::id();
+        let claims = (0..CONTENDERS)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    write_pid_exclusive(&path, owner)
+                })
+            })
+            .collect::<Vec<_>>();
+        let successes = claims
+            .into_iter()
+            .map(|claim| claim.join().expect("join PID contender").is_ok())
+            .filter(|succeeded| *succeeded)
+            .count();
+
+        assert_eq!(successes, 1);
+        assert_eq!(
+            fs::read_to_string(&path).expect("winning pid").trim(),
+            owner.to_string()
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn storage_migration_gate_excludes_writer_launches_in_both_directions() {
+        let root = temp_dir("storage-migration-gate");
+        let mut cfg = AppConfig::default();
+        cfg.runtime.pids_dir = root.join("run").to_string_lossy().to_string();
+        let paths = crate::paths::runtime_paths(&cfg);
+
+        let launch_gate = lock_storage_writer_launch(&paths, Service::Ingest)
+            .expect("acquire launch gate")
+            .expect("ingest is a storage writer");
+        let migration_paths = paths.clone();
+        let (migration_tx, migration_rx) = std::sync::mpsc::channel();
+        let migration = std::thread::spawn(move || {
+            let gate = lock_storage_migration(&migration_paths).expect("acquire migration gate");
+            migration_tx.send(()).expect("report migration gate");
+            drop(gate);
+        });
+        assert!(migration_rx
+            .recv_timeout(Duration::from_millis(50))
+            .is_err());
+        drop(launch_gate);
+        migration_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("migration must proceed after launch registration");
+        migration.join().expect("join migration contender");
+
+        let migration_gate = lock_storage_migration(&paths).expect("reacquire migration gate");
+        let launch_paths = paths.clone();
+        let (launch_tx, launch_rx) = std::sync::mpsc::channel();
+        let launch = std::thread::spawn(move || {
+            let gate = lock_storage_writer_launch(&launch_paths, Service::Mcp)
+                .expect("acquire MCP launch gate")
+                .expect("MCP can write through its embedded repository");
+            launch_tx.send(()).expect("report launch gate");
+            drop(gate);
+        });
+        assert!(launch_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        drop(migration_gate);
+        launch_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("writer launch must proceed after migration");
+        launch.join().expect("join launch contender");
+
         let _ = fs::remove_dir_all(root);
     }
 

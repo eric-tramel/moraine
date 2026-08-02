@@ -927,6 +927,10 @@ fn canonicalize_link_type(value: &str) -> &str {
     }
 }
 
+/// Builds a record-local provisional key for adapters and their emitted links.
+///
+/// `normalize_record` replaces this transport-coordinate key with the
+/// replay-stable canonical event UID after tool payload folding.
 pub(crate) fn event_uid(
     source_file: &str,
     source_generation: u32,

@@ -4,8 +4,8 @@ use moraine_config::{AppConfig, ClickHouseConfig, DEFAULT_BACKEND_NAME};
 use moraine_conversations::{
     with_repository_query_id, AnalyticsRange, BackendRepositoryRouter,
     ClickHouseConversationRepository, ConversationListSort, ConversationRepository,
-    McpSessionListFilter, PageRequest, RepoConfig, SessionAnalyticsQuery, SessionLookback,
-    TurnListFilter,
+    McpSessionListFilter, PageRequest, RepoConfig, SearchEventsQuery, SearchStrategyHint,
+    SessionAnalyticsQuery, SessionLookback, TurnListFilter,
 };
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
@@ -707,6 +707,403 @@ FORMAT JSONEachRow",
         .collect())
 }
 
+fn strip_uid_fields(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            object.retain(|key, _| !key.ends_with("uid") && key != "snapshot");
+            for child in object.values_mut() {
+                strip_uid_fields(child);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                strip_uid_fields(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+async fn listed_session_snapshot(
+    repository: &ClickHouseConversationRepository,
+    session_id: &str,
+) -> Result<Value> {
+    let page = repository
+        .list_mcp_sessions(
+            McpSessionListFilter {
+                start_unix_ms: 0,
+                end_unix_ms: 4_102_444_800_000,
+                mode: None,
+                sort: ConversationListSort::Asc,
+                harness: None,
+                source_name: None,
+            },
+            PageRequest {
+                limit: 1000,
+                cursor: None,
+            },
+        )
+        .await
+        .context("replay-stability list failed")?;
+    let item = page
+        .items
+        .iter()
+        .find(|item| item.session_id == session_id)
+        .context("replay-stability list item missing")?;
+    serde_json::to_value(item).context("failed to serialize replay-stability list item")
+}
+
+async fn migrate_fixture_to_exact_schema_032(
+    clickhouse: &ClickHouseClient,
+    database: &OwnedDatabaseName,
+) -> Result<()> {
+    let db = database.as_str();
+    clickhouse
+        .request_text(
+            &format!("CREATE DATABASE IF NOT EXISTS `{db}`"),
+            None,
+            None,
+            false,
+            None,
+        )
+        .await
+        .context("failed to create schema-032 fixture database")?;
+    clickhouse
+        .request_text(
+            &format!(
+                "CREATE TABLE `{db}`.`schema_migrations` (\
+                 version String, name String, applied_at DateTime64(3) DEFAULT now64(3)\
+                 ) ENGINE = ReplacingMergeTree(applied_at) ORDER BY version"
+            ),
+            None,
+            Some(db),
+            false,
+            None,
+        )
+        .await
+        .context("failed to create schema-032 fixture ledger")?;
+    clickhouse
+        .request_text(
+            &format!(
+                "INSERT INTO `{db}`.`schema_migrations` (version, name) \
+                 VALUES ('033', 'replay_stable_events')"
+            ),
+            None,
+            Some(db),
+            false,
+            None,
+        )
+        .await
+        .context("failed to defer migration 033 for the schema fixture")?;
+    clickhouse
+        .run_migrations()
+        .await
+        .context("failed to materialize bundled migrations through schema 032")?;
+    clickhouse
+        .request_text(
+            &format!(
+                "ALTER TABLE `{db}`.`schema_migrations` DELETE WHERE version = '033' \
+                 SETTINGS mutations_sync = 2"
+            ),
+            None,
+            Some(db),
+            false,
+            None,
+        )
+        .await
+        .context("failed to expose migration 033 after building schema 032")?;
+    assert_eq!(
+        clickhouse.pending_migration_versions().await?,
+        vec!["033".to_string()],
+        "fixture must contain the exact bundled schema immediately before migration 033"
+    );
+    Ok(())
+}
+
+async fn assert_replay_stable_migration(
+    clickhouse: &ClickHouseClient,
+    database: &OwnedDatabaseName,
+) -> Result<()> {
+    let db = database.as_str();
+    let baseline_repository =
+        ClickHouseConversationRepository::new(clickhouse.clone(), RepoConfig::default());
+    let baseline_list =
+        listed_session_snapshot(&baseline_repository, "issue532-order-session").await?;
+    let mut baseline_open = serde_json::to_value(
+        baseline_repository
+            .get_mcp_session("issue532-order-session")
+            .await
+            .context("baseline replay-stability open failed")?
+            .context("baseline replay-stability session missing")?,
+    )?;
+    strip_uid_fields(&mut baseline_open);
+    let baseline_search = baseline_repository
+        .search_events(SearchEventsQuery {
+            query: "replacement user input".to_string(),
+            session_id: Some("issue532-order-session".to_string()),
+            bypass_cache: Some(true),
+            strategy_hint: Some(SearchStrategyHint::Exact),
+            ..SearchEventsQuery::default()
+        })
+        .await
+        .context("baseline replay-stability search failed")?;
+    let baseline_hits = baseline_search
+        .hits
+        .iter()
+        .map(|hit| {
+            json!({
+                "rank": hit.rank,
+                "session_id": hit.session_id,
+                "event_time": hit.event_time,
+                "source_name": hit.source_name,
+                "harness": hit.harness,
+                "event_class": hit.event_class,
+                "payload_type": hit.payload_type,
+                "actor_role": hit.actor_role,
+                "name": hit.name,
+                "phase": hit.phase,
+                "source_ref": hit.source_ref,
+                "text_content": hit.text_content,
+            })
+        })
+        .collect::<Vec<_>>();
+    clickhouse
+        .request_text(
+            &format!(
+                r#"INSERT INTO `{db}`.`events`
+(event_uid, session_id, session_date, source_name, harness, source_file,
+ source_generation, source_line_no, source_offset, source_ref, record_ts, event_ts,
+ event_kind, actor_kind, payload_type, tool_call_id, tool_name, tool_phase,
+ text_content, text_preview, payload_json, origin_event_id, event_version)
+VALUES
+('replay-old-request-1', 'replay-stable-session', toDate('2026-01-01'), 'nac', 'nac',
+ '/old/store.db', 1, 10, 100, '/old/store.db:10', '2026-01-01T00:00:00.000Z',
+ toDateTime64('2026-01-01 00:00:00', 3), 'tool_call', 'assistant', 'tool_use',
+ 'call-stable', 'Read', 'request', 'read src/lib.rs', 'read src/lib.rs',
+ '{{"logical_id":"request-stable","moraine_tool_io":{{"tool_call_id":"call-stable","parent_tool_call_id":"","tool_name":"Read","tool_phase":"request","tool_error":0,"input_json":"","output_json":"","output_text":"","project_id":"git:first","repo_rel_path":"src/lib.rs","worktree_root":"/old","source_ref":"/old/store.db:1:10"}},"type":"tool_request"}}', '', 1001),
+('replay-old-request-2', 'replay-stable-session', toDate('2026-01-01'), 'nac', 'nac',
+ '/new/store.db', 2, 40, 400, '/new/store.db:40', '2026-01-01T00:00:00.000Z',
+ toDateTime64('2026-01-01 00:00:00', 3), 'tool_call', 'assistant', 'tool_use',
+ 'call-stable', 'Read', 'request', 'read src/lib.rs', 'read src/lib.rs',
+ '{{"logical_id":"request-stable","moraine_tool_io":{{"tool_call_id":"call-stable","parent_tool_call_id":"","tool_name":"Read","tool_phase":"request","tool_error":0,"input_json":"","output_json":"","output_text":"","project_id":"git:second","repo_rel_path":"src/lib.rs","worktree_root":"/new","source_ref":"/new/store.db:2:40"}},"type":"tool_request"}}', '', 1002),
+('replay-old-response', 'replay-stable-session', toDate('2026-01-01'), 'nac', 'nac',
+ '/new/store.db', 2, 41, 401, '/new/store.db:41', '2026-01-01T00:00:01.000Z',
+ toDateTime64('2026-01-01 00:00:01', 3), 'tool_result', 'tool', 'tool_result',
+ 'call-stable', 'Read', 'response', 'done', 'done',
+ '{{"logical_id":"response-stable","request_event_uid":"replay-old-request-2","type":"tool_response"}}',
+ 'replay-old-request-2', 1003)"#
+            ),
+            None,
+            Some(db),
+            false,
+            None,
+        )
+        .await
+        .context("failed to insert replay-stability event fixture")?;
+    for statement in [
+        format!(
+            "INSERT INTO `{db}`.`event_links` \
+             (event_uid, linked_event_uid, linked_external_id, link_type, session_id, harness, source_name, metadata_json, event_version) \
+             VALUES ('replay-old-response','replay-old-request-2','','tool_use_id','replay-stable-session','nac','nac','{{}}',1003)"
+        ),
+        format!(
+            "INSERT INTO `{db}`.`raw_events` \
+             (source_name,harness,source_file,source_generation,source_line_no,source_offset,record_ts,top_type,session_id,raw_json,raw_json_hash,event_uid) \
+             VALUES ('nac','nac','/old/store.db',1,10,100,'2026-01-01T00:00:00.000Z','tool_request','replay-stable-session','{{}}',1,'replay-old-request-1'), \
+                    ('nac','nac','/new/store.db',2,40,400,'2026-01-01T00:00:00.000Z','tool_request','replay-stable-session','{{}}',1,'replay-old-request-2')"
+        ),
+    ] {
+        clickhouse
+            .request_text(&statement, None, Some(db), false, None)
+            .await
+            .context("failed to insert replay-stability reference fixture")?;
+    }
+
+    clickhouse
+        .request_text(
+            &format!(
+                "ALTER TABLE `{db}`.`schema_migrations` DELETE WHERE version = '033' \
+                 SETTINGS mutations_sync = 2"
+            ),
+            None,
+            Some(db),
+            false,
+            None,
+        )
+        .await
+        .context("failed to reset migration 033 ledger on first pass")?;
+    clickhouse
+        .run_migrations()
+        .await
+        .context("replay-stability migration first pass failed")?;
+
+    // Simulate interruption after the links-first EXCHANGE but before events
+    // cut over: links contain v2 UIDs while the live events table contains v1
+    // UIDs. The next migration must recover using the still-old events map.
+    for statement in [
+        format!(
+            "CREATE TABLE `{db}`.`events_replay_stable_033` AS `{db}`.`events` \
+             ENGINE = ReplacingMergeTree(event_version) \
+             PARTITION BY cityHash64(session_id) % 64 ORDER BY (session_id, event_uid)"
+        ),
+        format!(
+            r#"INSERT INTO `{db}`.`events_replay_stable_033`
+SELECT e.* REPLACE (
+  multiIf(
+    session_id = 'replay-stable-session' AND event_kind = 'tool_call',
+      'replay-old-request-2',
+    session_id = 'replay-stable-session' AND event_kind = 'tool_result',
+      'replay-old-response',
+    event_uid
+  ) AS event_uid,
+  if(
+    session_id = 'replay-stable-session' AND event_kind = 'tool_result',
+    'replay-old-request-2',
+    origin_event_id
+  ) AS origin_event_id
+)
+FROM `{db}`.`events` AS e FINAL"#
+        ),
+        format!("EXCHANGE TABLES `{db}`.`events` AND `{db}`.`events_replay_stable_033`"),
+        format!(
+            "ALTER TABLE `{db}`.`schema_migrations` DELETE WHERE version = '033' \
+             SETTINGS mutations_sync = 2"
+        ),
+    ] {
+        clickhouse
+            .request_text(&statement, None, Some(db), false, None)
+            .await
+            .context("failed to prepare migration-033 partial-cutover recovery")?;
+    }
+    clickhouse
+        .run_migrations()
+        .await
+        .context("migration 033 failed to recover a links-first partial cutover")?;
+
+    #[derive(Deserialize)]
+    struct ReplayCounts {
+        event_rows: u64,
+        event_uids: u64,
+        old_event_uids: u64,
+        latest_generation: u32,
+        locator_rows: u64,
+        navigation_rows: u64,
+        raw_rows: u64,
+        raw_event_uids: u64,
+        old_raw_uids: u64,
+    }
+    let counts: Vec<ReplayCounts> = clickhouse
+        .query_rows(
+            &format!(
+                r#"SELECT
+  (SELECT count() FROM `{db}`.`events` FINAL WHERE session_id = 'replay-stable-session') AS event_rows,
+  (SELECT uniqExact(event_uid) FROM `{db}`.`events` FINAL WHERE session_id = 'replay-stable-session') AS event_uids,
+  (SELECT countIf(startsWith(event_uid, 'replay-old-')) FROM `{db}`.`events` FINAL WHERE session_id = 'replay-stable-session') AS old_event_uids,
+  (SELECT max(source_generation) FROM `{db}`.`events` FINAL WHERE session_id = 'replay-stable-session') AS latest_generation,
+  (SELECT count() FROM `{db}`.`mcp_event_locator` FINAL WHERE session_id = 'replay-stable-session') AS locator_rows,
+  (SELECT count() FROM `{db}`.`mcp_event_navigation` FINAL WHERE session_id = 'replay-stable-session') AS navigation_rows,
+  (SELECT count() FROM `{db}`.`raw_events` WHERE session_id = 'replay-stable-session') AS raw_rows,
+  (SELECT uniqExact(event_uid) FROM `{db}`.`raw_events` WHERE session_id = 'replay-stable-session') AS raw_event_uids,
+  (SELECT countIf(startsWith(event_uid, 'replay-old-')) FROM `{db}`.`raw_events` WHERE session_id = 'replay-stable-session') AS old_raw_uids
+FORMAT JSONEachRow"#
+            ),
+            Some(db),
+        )
+        .await
+        .context("failed to read replay-stability counts")?;
+    let counts = counts.first().context("missing replay-stability counts")?;
+    assert_eq!(counts.event_rows, 2);
+    assert_eq!(counts.event_uids, 2);
+    assert_eq!(counts.old_event_uids, 0);
+    assert_eq!(counts.latest_generation, 2);
+    assert_eq!(counts.locator_rows, 2);
+    assert_eq!(counts.navigation_rows, 2);
+    assert_eq!(counts.raw_rows, 2);
+    assert_eq!(counts.raw_event_uids, 2);
+    assert_eq!(counts.old_raw_uids, 2);
+
+    #[derive(Deserialize)]
+    struct ReplayLink {
+        request_uid: String,
+        origin_event_id: String,
+        linked_event_uid: String,
+    }
+    let links: Vec<ReplayLink> = clickhouse
+        .query_rows(
+            &format!(
+                r#"SELECT request.event_uid AS request_uid,
+  response.origin_event_id AS origin_event_id,
+  link.linked_event_uid AS linked_event_uid
+FROM `{db}`.`events` AS request FINAL
+CROSS JOIN `{db}`.`events` AS response FINAL
+INNER JOIN `{db}`.`event_links` AS link FINAL ON link.event_uid = response.event_uid
+WHERE request.session_id = 'replay-stable-session'
+  AND request.event_kind = 'tool_call'
+  AND response.session_id = 'replay-stable-session'
+  AND response.event_kind = 'tool_result'
+FORMAT JSONEachRow"#
+            ),
+            Some(db),
+        )
+        .await
+        .context("failed to read replay-stability links")?;
+    let link = links.first().context("missing replay-stability link")?;
+    assert_eq!(
+        link.request_uid,
+        "9e4f03ed718cc58482613c6cea7f65435f15cd26c46c87291a16431ad310c3f6"
+    );
+    assert_eq!(link.origin_event_id, link.request_uid);
+    assert_eq!(link.linked_event_uid, link.request_uid);
+
+    let candidate_repository =
+        ClickHouseConversationRepository::new(clickhouse.clone(), RepoConfig::default());
+    let candidate_list =
+        listed_session_snapshot(&candidate_repository, "issue532-order-session").await?;
+    assert_eq!(candidate_list, baseline_list);
+    let mut candidate_open = serde_json::to_value(
+        candidate_repository
+            .get_mcp_session("issue532-order-session")
+            .await
+            .context("candidate replay-stability open failed")?
+            .context("candidate replay-stability session missing")?,
+    )?;
+    strip_uid_fields(&mut candidate_open);
+    assert_eq!(candidate_open, baseline_open);
+
+    let candidate_search = candidate_repository
+        .search_events(SearchEventsQuery {
+            query: "replacement user input".to_string(),
+            session_id: Some("issue532-order-session".to_string()),
+            bypass_cache: Some(true),
+            strategy_hint: Some(SearchStrategyHint::Exact),
+            ..SearchEventsQuery::default()
+        })
+        .await
+        .context("candidate replay-stability search failed")?;
+    let candidate_hits = candidate_search
+        .hits
+        .iter()
+        .map(|hit| {
+            json!({
+                "rank": hit.rank,
+                "session_id": hit.session_id,
+                "event_time": hit.event_time,
+                "source_name": hit.source_name,
+                "harness": hit.harness,
+                "event_class": hit.event_class,
+                "payload_type": hit.payload_type,
+                "actor_role": hit.actor_role,
+                "name": hit.name,
+                "phase": hit.phase,
+                "source_ref": hit.source_ref,
+                "text_content": hit.text_content,
+            })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(candidate_hits, baseline_hits);
+    Ok(())
+}
+
 #[tokio::test]
 #[ignore = "requires wrapper-owned live ClickHouse and destructive opt-in"]
 async fn live_schema_semantics_and_teardown() -> Result<()> {
@@ -714,8 +1111,14 @@ async fn live_schema_semantics_and_teardown() -> Result<()> {
     let database = prepare_owned_database_identity(&prerequisites.sandbox_id)?;
     let clickhouse = live_client(&prerequisites, &database)?;
     assert_owned_database_census_empty(&clickhouse, "before mutation").await?;
-
     let outcome = async {
+        assert_live_schema_032_replay_stable_upgrade(&clickhouse, &database).await?;
+        cleanup_database(&clickhouse, &database)
+            .await
+            .context("failed to reset database after schema-032 upgrade proof")?;
+        assert_owned_database_census_empty(&clickhouse, "after schema-032 upgrade proof").await?;
+
+
         clickhouse
             .run_migrations()
             .await
@@ -1088,6 +1491,7 @@ VALUES
             .context("reordered MCP session missing")?;
         assert_eq!(reordered_session.turns.len(), 2);
         assert!(reordered_session.completed);
+        assert_replay_stable_migration(&clickhouse, &database).await?;
         Ok(())
     }
     .await;
@@ -1095,6 +1499,170 @@ VALUES
     let cleanup = cleanup_database(&clickhouse, &database).await;
     let census = assert_owned_database_census_empty(&clickhouse, "after cleanup").await;
     finish_with_cleanup(outcome, finish_with_cleanup(cleanup, census))
+}
+
+async fn assert_live_schema_032_replay_stable_upgrade(
+    clickhouse: &ClickHouseClient,
+    database: &OwnedDatabaseName,
+) -> Result<()> {
+    let db = database.as_str();
+    migrate_fixture_to_exact_schema_032(clickhouse, database).await?;
+
+    clickhouse
+            .request_text(
+                &format!(
+                    r#"INSERT INTO `{db}`.`events`
+(event_uid, session_id, session_date, source_name, harness, source_file,
+ source_generation, source_line_no, source_offset, source_ref, record_ts, event_ts,
+ event_kind, actor_kind, payload_type, tool_call_id, tool_name, tool_phase,
+ text_content, text_preview, payload_json, origin_event_id, event_version)
+VALUES
+('schema32-request-old', 'schema32-session', toDate('2026-01-01'), 'nac', 'nac',
+ '/old/store.db', 1, 10, 100, '/old/store.db:10', '2026-01-01T00:00:00.000Z',
+ toDateTime64('2026-01-01 00:00:00', 3), 'tool_call', 'assistant', 'tool_use',
+ 'call-stable', 'Read', 'request', 'same request', 'same request',
+ '{{"cwd":"/old","logical_id":"request-stable","message":"same request","moraine_tool_io":{{"source_ref":"/old/store.db:1:10","tool_call_id":"call-stable","tool_name":"Read","tool_phase":"request"}},"timestamp":"2026-01-01T00:00:00Z"}}', '', 1001),
+('schema32-request-new', 'schema32-session', toDate('2026-01-01'), 'nac', 'nac',
+ '/new/store.db', 9, 40, 400, '/new/store.db:40', '2026-07-01T00:00:00.000Z',
+ toDateTime64('2026-07-01 00:00:00', 3), 'tool_call', 'assistant', 'tool_use',
+ 'call-stable', 'Read', 'request', 'same request', 'same request',
+ '{{"cwd":"/new","logical_id":"request-stable","message":"same request","moraine_tool_io":{{"source_ref":"/new/store.db:9:40","tool_call_id":"call-stable","tool_name":"Read","tool_phase":"request"}},"timestamp":"2026-07-01T00:00:00Z"}}', '', 1002),
+('schema32-response', 'schema32-session', toDate('2026-01-01'), 'nac', 'nac',
+ '/new/store.db', 9, 41, 401, '/new/store.db:41', '2026-07-01T00:00:01.000Z',
+ toDateTime64('2026-07-01 00:00:01', 3), 'tool_result', 'tool', 'tool_result',
+ 'call-stable', 'Read', 'response', 'done', 'done',
+ '{{"logical_id":"response-stable","request_event_uid":"schema32-request-new","type":"tool_response"}}',
+ 'schema32-request-new', 1003),
+('00000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'schema32-qwen', toDate('2026-01-01'), 'custom-qwen-source', 'qwen-code',
+ '/old/qwen.jsonl', 1, 50, 500, '/old/qwen.jsonl:50', '2026-01-01T00:00:02.000Z',
+ toDateTime64('2026-01-01 00:00:02', 3), 'reasoning', 'assistant', 'thinking',
+ '', '', '', 'first', 'first', '{{"uuid":"assistant-1","parentUuid":null,"part":{{"text":"first","thought":true}}}}', '', 1004),
+('00000001bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', 'schema32-qwen', toDate('2026-01-01'), 'custom-qwen-source', 'qwen-code',
+ '/old/qwen.jsonl', 1, 50, 500, '/old/qwen.jsonl:50', '2026-01-01T00:00:02.000Z',
+ toDateTime64('2026-01-01 00:00:02', 3), 'message', 'assistant', 'agent_message',
+ '', '', '', 'second', 'second', '{{"uuid":"assistant-1","parentUuid":null,"part":{{"text":"second"}}}}', '', 1005)"#
+                ),
+                None,
+                Some(db),
+                false,
+                None,
+            )
+            .await
+            .context("failed to insert schema-032 event fixture")?;
+    clickhouse
+            .request_text(
+                &format!(
+                    "INSERT INTO `{db}`.`event_links` \
+                     (event_uid, linked_event_uid, linked_external_id, link_type, session_id, harness, source_name, metadata_json, event_version) \
+                     VALUES ('schema32-response','schema32-request-new','','tool_use_id','schema32-session','nac','nac','{{}}',1003)"
+                ),
+                None,
+                Some(db),
+                false,
+                None,
+            )
+            .await
+            .context("failed to insert schema-032 link fixture")?;
+
+    clickhouse
+        .run_migrations()
+        .await
+        .context("failed to upgrade exact schema 032 through migration 033")?;
+    let first_qwen_uids = clickhouse
+        .request_text(
+            &format!(
+                "SELECT arrayStringConcat(groupArray(event_uid), ',') FROM (\
+                   SELECT event_uid FROM `{db}`.`events` FINAL \
+                   WHERE session_id = 'schema32-qwen' \
+                   ORDER BY source_offset, JSONExtractUInt(payload_json, 'moraine_emission_index')\
+                 )"
+            ),
+            None,
+            Some(db),
+            false,
+            None,
+        )
+        .await
+        .context("failed to capture first-pass Qwen UIDs")?;
+    clickhouse
+        .request_text(
+            &format!(
+                "ALTER TABLE `{db}`.`schema_migrations` DELETE WHERE version = '033' \
+                 SETTINGS mutations_sync = 2"
+            ),
+            None,
+            Some(db),
+            false,
+            None,
+        )
+        .await
+        .context("failed to expose migration 033 for Qwen replay")?;
+    clickhouse
+        .run_migrations()
+        .await
+        .context("failed to rerun migration 033 over upgraded Qwen payloads")?;
+
+    #[derive(Deserialize)]
+    struct UpgradeResult {
+        event_rows: u64,
+        event_uids: u64,
+        locator_rows: u64,
+        navigation_rows: u64,
+        request_uid: String,
+        response_origin_uid: String,
+        linked_uid: String,
+        qwen_emission_indexes: String,
+        qwen_uids: String,
+        qwen_trace_text: String,
+    }
+    let rows: Vec<UpgradeResult> = clickhouse
+            .query_rows(
+                &format!(
+                    r#"SELECT
+  (SELECT count() FROM `{db}`.`events` FINAL WHERE session_id = 'schema32-session') AS event_rows,
+  (SELECT uniqExact(event_uid) FROM `{db}`.`events` FINAL WHERE session_id = 'schema32-session') AS event_uids,
+  (SELECT count() FROM `{db}`.`mcp_event_locator` FINAL WHERE session_id = 'schema32-session') AS locator_rows,
+  (SELECT count() FROM `{db}`.`mcp_event_navigation` FINAL WHERE session_id = 'schema32-session') AS navigation_rows,
+  (SELECT arrayStringConcat(groupArray(toString(emission_index)), ',') FROM (
+    SELECT emission_index FROM `{db}`.`mcp_event_navigation` FINAL
+    WHERE session_id = 'schema32-qwen'
+    ORDER BY sort_time, source_file, source_generation, source_offset,
+      source_line_no, emission_index, event_uid
+  )) AS qwen_emission_indexes,
+  (SELECT arrayStringConcat(groupArray(event_uid), ',') FROM (
+    SELECT event_uid FROM `{db}`.`events` FINAL
+    WHERE session_id = 'schema32-qwen'
+    ORDER BY source_offset, JSONExtractUInt(payload_json, 'moraine_emission_index')
+  )) AS qwen_uids,
+  (SELECT arrayStringConcat(groupArray(text_content), ',') FROM (
+    SELECT text_content FROM `{db}`.`v_conversation_trace`
+    WHERE session_id = 'schema32-qwen' ORDER BY event_order
+  )) AS qwen_trace_text,
+  request.event_uid AS request_uid,
+  response.origin_event_id AS response_origin_uid,
+  link.linked_event_uid AS linked_uid
+FROM `{db}`.`events` AS request FINAL
+CROSS JOIN `{db}`.`events` AS response FINAL
+INNER JOIN `{db}`.`event_links` AS link FINAL ON link.event_uid = response.event_uid
+WHERE request.session_id = 'schema32-session' AND request.event_kind = 'tool_call'
+  AND response.session_id = 'schema32-session' AND response.event_kind = 'tool_result'
+FORMAT JSONEachRow"#
+                ),
+                Some(db),
+            )
+            .await
+            .context("failed to verify schema-032 upgrade")?;
+    let row = rows.first().context("missing schema-032 upgrade result")?;
+    assert_eq!(row.event_rows, 2);
+    assert_eq!(row.event_uids, 2);
+    assert_eq!(row.locator_rows, 2);
+    assert_eq!(row.navigation_rows, 2);
+    assert_eq!(row.response_origin_uid, row.request_uid);
+    assert_eq!(row.linked_uid, row.request_uid);
+    assert_eq!(row.qwen_emission_indexes, "1,2");
+    assert_eq!(row.qwen_uids, first_qwen_uids.trim());
+    assert_eq!(row.qwen_trace_text, "first,second");
+    Ok(())
 }
 
 #[tokio::test]

@@ -906,6 +906,11 @@ pub fn bundled_migrations() -> Vec<Migration> {
             name: "032_drop_frozen_tool_io.sql",
             sql: include_str!("../../../sql/032_drop_frozen_tool_io.sql"),
         },
+        Migration {
+            version: "033",
+            name: "033_replay_stable_events.sql",
+            sql: include_str!("../../../sql/033_replay_stable_events.sql"),
+        },
     ]
 }
 
@@ -1662,6 +1667,58 @@ mod tests {
     }
 
     #[test]
+    fn migration_033_uses_restart_safe_atomic_cutovers() {
+        let migration = bundled_migrations()
+            .into_iter()
+            .find(|migration| migration.version == "033")
+            .expect("migration 033 must be registered");
+        let sql = materialize_migration_sql(migration.sql, "other_db")
+            .expect("materialize migration 033");
+        let statements = split_sql_statements(&sql);
+        let link_exchange = statements
+            .iter()
+            .position(|statement| {
+                statement.contains(
+                    "EXCHANGE TABLES\n  other_db.event_links AND other_db.event_links_replay_stable_033",
+                )
+            })
+            .expect("link cutover must use EXCHANGE");
+        let event_exchange = statements
+            .iter()
+            .position(|statement| {
+                statement.contains(
+                    "EXCHANGE TABLES\n  other_db.events AND other_db.events_replay_stable_033",
+                )
+            })
+            .expect("event cutover must use EXCHANGE");
+        let final_link_drop = statements
+            .iter()
+            .rposition(|statement| {
+                statement == "DROP TABLE IF EXISTS other_db.event_links_replay_stable_033"
+            })
+            .expect("old link table must be dropped after cutover");
+        let final_event_drop = statements
+            .iter()
+            .rposition(|statement| {
+                statement == "DROP TABLE IF EXISTS other_db.events_replay_stable_033"
+            })
+            .expect("old event table must be dropped after cutover");
+
+        assert!(link_exchange < event_exchange);
+        assert!(event_exchange < final_link_drop);
+        assert!(event_exchange < final_event_drop);
+        assert_eq!(
+            statements
+                .iter()
+                .filter(|statement| statement.starts_with("EXCHANGE TABLES"))
+                .count(),
+            2
+        );
+        assert!(!sql.contains("RENAME TABLE"));
+        assert!(!sql.contains("_frozen"));
+    }
+
+    #[test]
     fn migration_031_uses_the_same_narrow_path_projection_for_live_and_backfill() {
         let migration = bundled_migrations()
             .into_iter()
@@ -2329,11 +2386,11 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn migration_progress_applies_031_and_032_after_v071() {
+    async fn migration_progress_applies_post_v071_storage_cutovers() {
         let bundled = bundled_migrations();
         let pending = bundled
             .iter()
-            .filter(|migration| matches!(migration.version, "031" | "032"))
+            .filter(|migration| matches!(migration.version, "031" | "032" | "033"))
             .cloned()
             .collect::<Vec<_>>();
         assert_eq!(
@@ -2341,11 +2398,11 @@ mod tests {
                 .iter()
                 .map(|migration| migration.version)
                 .collect::<Vec<_>>(),
-            vec!["031", "032"]
+            vec!["031", "032", "033"]
         );
         let applied = bundled
             .iter()
-            .filter(|migration| !matches!(migration.version, "031" | "032"))
+            .filter(|migration| !matches!(migration.version, "031" | "032" | "033"))
             .map(|migration| migration.version.to_string())
             .collect::<Vec<_>>();
         assert_eq!(applied.last().map(String::as_str), Some("030"));
@@ -2362,42 +2419,28 @@ mod tests {
         let executed = client
             .run_migrations_with_progress(|event| events.push(event))
             .await
-            .expect("apply migrations 031 and 032");
+            .expect("apply post-v0.7.1 storage migrations");
 
-        assert_eq!(executed, vec!["031", "032"]);
-        assert_eq!(
-            events,
-            vec![
-                MigrationProgress::Plan {
-                    applied: bundled.len() - 2,
-                    pending: 2,
-                },
-                MigrationProgress::Started {
-                    index: 1,
-                    total: 2,
-                    version: pending[0].version,
-                    name: pending[0].name,
-                },
-                MigrationProgress::Applied {
-                    index: 1,
-                    total: 2,
-                    version: pending[0].version,
-                    name: pending[0].name,
-                },
-                MigrationProgress::Started {
-                    index: 2,
-                    total: 2,
-                    version: pending[1].version,
-                    name: pending[1].name,
-                },
-                MigrationProgress::Applied {
-                    index: 2,
-                    total: 2,
-                    version: pending[1].version,
-                    name: pending[1].name,
-                },
-            ]
-        );
+        assert_eq!(executed, vec!["031", "032", "033"]);
+        let mut expected_events = vec![MigrationProgress::Plan {
+            applied: bundled.len() - pending.len(),
+            pending: pending.len(),
+        }];
+        for (index, migration) in pending.iter().enumerate() {
+            expected_events.push(MigrationProgress::Started {
+                index: index + 1,
+                total: pending.len(),
+                version: migration.version,
+                name: migration.name,
+            });
+            expected_events.push(MigrationProgress::Applied {
+                index: index + 1,
+                total: pending.len(),
+                version: migration.version,
+                name: migration.name,
+            });
+        }
+        assert_eq!(events, expected_events);
         let queries = queries.lock().expect("migration query mutex poisoned");
         let ledger_indices = queries
             .iter()
@@ -2407,7 +2450,7 @@ mod tests {
                     .then_some(index)
             })
             .collect::<Vec<_>>();
-        assert_eq!(ledger_indices.len(), 2);
+        assert_eq!(ledger_indices.len(), 3);
         assert_eq!(ledger_indices.last().copied(), Some(queries.len() - 1));
     }
 
