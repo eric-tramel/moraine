@@ -1667,6 +1667,125 @@ FORMAT JSONEachRow"#
 
 #[tokio::test]
 #[ignore = "requires wrapper-owned live ClickHouse, destructive opt-in, and ~2 GB free"]
+async fn live_schema_032_replay_stable_upgrade_stays_within_memory_budget() -> Result<()> {
+    const EVENT_ROWS: u64 = 200_000;
+    const PAYLOAD_BYTES: usize = 2_048;
+
+    let prerequisites = LivePrerequisites::load()?;
+    let database = prepare_owned_database_identity(&prerequisites.sandbox_id)?;
+    let clickhouse = live_client(&prerequisites, &database)?;
+    assert_owned_database_census_empty(&clickhouse, "before memory-bounded upgrade").await?;
+
+    let outcome = async {
+        migrate_fixture_to_exact_schema_032(&clickhouse, &database).await?;
+        let db = database.as_str();
+        for view in [
+            "mv_mcp_event_locator_from_events",
+            "mv_mcp_event_navigation_from_events",
+            "mv_search_postings",
+            "mv_file_attention_project_roots_from_events",
+        ] {
+            clickhouse
+                .request_text(
+                    &format!("DROP VIEW IF EXISTS `{db}`.`{view}`"),
+                    None,
+                    Some(db),
+                    false,
+                    None,
+                )
+                .await
+                .with_context(|| format!("failed to suspend {view} while seeding fixture"))?;
+        }
+        const SEED_BATCH_ROWS: u64 = 10_000;
+        for offset in (0..EVENT_ROWS).step_by(SEED_BATCH_ROWS as usize) {
+            let rows = SEED_BATCH_ROWS.min(EVENT_ROWS - offset);
+            clickhouse
+                .request_text(
+                    &format!(
+                        r#"INSERT INTO `{db}`.`events`
+(event_uid, session_id, session_date, source_name, harness, source_file,
+ source_generation, source_line_no, source_offset, source_ref, record_ts, event_ts,
+ event_kind, actor_kind, payload_type, text_content, text_preview, payload_json,
+ event_version)
+SELECT
+  lower(hex(SHA256(toString(number)))),
+  concat('memory-session-', toString(number % 1000)),
+  toDate('2026-01-01'),
+  'memory-fixture',
+  'codex',
+  '/memory/fixture.jsonl',
+  toUInt32(1),
+  number + 1,
+  number * 4096,
+  concat('/memory/fixture.jsonl:', toString(number + 1)),
+  '2026-01-01T00:00:00.000Z',
+  toDateTime64('2026-01-01 00:00:00', 3),
+  'message',
+  'assistant',
+  'agent_message',
+  'bounded migration fixture',
+  'bounded migration fixture',
+  concat('{{"blob":"', repeat('x', {PAYLOAD_BYTES}), '","ordinal":', toString(number), '}}'),
+  number + 1
+FROM numbers({offset}, {rows})
+SETTINGS max_block_size = 8192,
+  min_insert_block_size_rows = 8192,
+  min_insert_block_size_bytes = 16777216,
+  max_threads = 4,
+  max_memory_usage = 536870912"#
+                    ),
+                    None,
+                    Some(db),
+                    false,
+                    None,
+                )
+                .await
+                .with_context(|| format!("failed to seed fixture rows {offset}..{}", offset + rows))?;
+        }
+
+        clickhouse
+            .run_migrations()
+            .await
+            .context("migration 033 exceeded its bounded rewrite budget")?;
+
+        #[derive(Deserialize)]
+        struct Counts {
+            rows: u64,
+            uids: u64,
+            locator_rows: u64,
+            navigation_rows: u64,
+        }
+        let counts: Vec<Counts> = clickhouse
+            .query_rows(
+                &format!(
+                    r#"SELECT
+  (SELECT count() FROM `{db}`.`events` FINAL WHERE source_name = 'memory-fixture') AS rows,
+  (SELECT uniqExact(event_uid) FROM `{db}`.`events` FINAL WHERE source_name = 'memory-fixture') AS uids,
+  (SELECT count() FROM `{db}`.`mcp_event_locator` FINAL WHERE source_name = 'memory-fixture') AS locator_rows,
+  (SELECT count() FROM `{db}`.`mcp_event_navigation` FINAL WHERE source_name = 'memory-fixture') AS navigation_rows
+FORMAT JSONEachRow"#
+                ),
+                Some(db),
+            )
+            .await
+            .context("failed to verify memory-bounded migration output")?;
+        let counts = counts.first().context("missing memory-bounded counts")?;
+        assert_eq!(counts.rows, EVENT_ROWS);
+        assert_eq!(counts.uids, EVENT_ROWS);
+        assert_eq!(counts.locator_rows, EVENT_ROWS);
+        assert_eq!(counts.navigation_rows, EVENT_ROWS);
+        Ok(())
+    }
+    .await;
+
+    let cleanup = cleanup_database(&clickhouse, &database).await;
+    let census =
+        assert_owned_database_census_empty(&clickhouse, "after memory-bounded upgrade").await;
+    finish_with_cleanup(outcome, finish_with_cleanup(cleanup, census))
+}
+
+#[tokio::test]
+#[ignore = "requires wrapper-owned live ClickHouse, destructive opt-in, and ~2 GB free"]
 async fn live_mcp_open_boundedness_benchmark() -> Result<()> {
     const UNRELATED_EVENTS: u64 = 1_000_000;
     const UNRELATED_SESSIONS: u64 = 100_000;

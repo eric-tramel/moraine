@@ -123,7 +123,14 @@ SELECT
     identity_fields
   ))))) AS new_event_uid
 FROM moraine.events FINAL
-GROUP BY event_uid, new_event_uid;
+GROUP BY event_uid, new_event_uid
+SETTINGS max_bytes_before_external_group_by = 67108864,
+  max_bytes_before_external_sort = 67108864,
+  max_block_size = 8192,
+  min_insert_block_size_rows = 8192,
+  min_insert_block_size_bytes = 16777216,
+  max_threads = 4,
+  max_memory_usage = 1073741824;
 
 CREATE TABLE moraine.events_replay_stable_033
 AS moraine.events
@@ -155,7 +162,15 @@ FROM moraine.events AS e FINAL
 INNER JOIN moraine.event_uid_map_033 AS own
   ON own.old_event_uid = e.event_uid
 LEFT JOIN moraine.event_uid_map_033 AS origin
-  ON origin.old_event_uid = e.origin_event_id;
+  ON origin.old_event_uid = e.origin_event_id
+SETTINGS join_algorithm = 'partial_merge',
+  max_bytes_before_external_sort = 67108864,
+  partial_merge_join_rows_in_right_blocks = 8192,
+  max_block_size = 8192,
+  min_insert_block_size_rows = 8192,
+  min_insert_block_size_bytes = 16777216,
+  max_threads = 4,
+  max_memory_usage = 1073741824;
 
 CREATE TABLE moraine.event_links_replay_stable_033
 AS moraine.event_links
@@ -172,7 +187,15 @@ FROM moraine.event_links AS l FINAL
 LEFT JOIN moraine.event_uid_map_033 AS own
   ON own.old_event_uid = l.event_uid
 LEFT JOIN moraine.event_uid_map_033 AS target
-  ON target.old_event_uid = l.linked_event_uid;
+  ON target.old_event_uid = l.linked_event_uid
+SETTINGS join_algorithm = 'partial_merge',
+  max_bytes_before_external_sort = 67108864,
+  partial_merge_join_rows_in_right_blocks = 8192,
+  max_block_size = 8192,
+  min_insert_block_size_rows = 8192,
+  min_insert_block_size_bytes = 16777216,
+  max_threads = 4,
+  max_memory_usage = 1073741824;
 
 
 
@@ -256,7 +279,12 @@ SELECT event_uid, event_version, ingested_at, session_id, source_name, source_fi
   ))),
   toUInt8(positionCaseInsensitiveUTF8(payload_json, 'codex-mcp') > 0)
 FROM moraine.events FINAL
-WHERE notEmpty(session_id);
+WHERE notEmpty(session_id)
+SETTINGS max_block_size = 8192,
+  min_insert_block_size_rows = 8192,
+  min_insert_block_size_bytes = 16777216,
+  max_threads = 4,
+  max_memory_usage = 1073741824;
 
 INSERT INTO moraine.mcp_event_navigation
 SELECT session_id,
@@ -270,7 +298,12 @@ SELECT session_id,
   toUInt8(actor_kind = 'user' AND event_kind = 'message'),
   toUInt8(event_kind = 'session_meta' OR (source_name = 'omp' AND JSONExtractString(payload_json, 'type') IN ('title', 'title_change')))
 FROM moraine.events FINAL
-WHERE notEmpty(session_id);
+WHERE notEmpty(session_id)
+SETTINGS max_block_size = 8192,
+  min_insert_block_size_rows = 8192,
+  min_insert_block_size_bytes = 16777216,
+  max_threads = 4,
+  max_memory_usage = 1073741824;
 
 INSERT INTO moraine.search_postings
 SELECT d.event_version, d.term, d.event_uid, d.session_id, d.source_name,
@@ -291,7 +324,12 @@ GROUP BY d.event_version, d.term, d.event_uid, d.session_id, d.source_name,
   d.harness, d.inference_provider, d.event_class, d.payload_type, d.actor_role,
   d.name, d.phase, d.source_ref, d.doc_len
 SETTINGS max_bytes_before_external_group_by = 67108864,
-  max_bytes_before_external_sort = 67108864;
+  max_bytes_before_external_sort = 67108864,
+  max_block_size = 8192,
+  min_insert_block_size_rows = 8192,
+  min_insert_block_size_bytes = 16777216,
+  max_threads = 4,
+  max_memory_usage = 1073741824;
 
 CREATE MATERIALIZED VIEW moraine.mv_mcp_event_locator_from_events
 TO moraine.mcp_event_locator AS

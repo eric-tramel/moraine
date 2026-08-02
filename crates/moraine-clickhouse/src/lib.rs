@@ -1703,6 +1703,22 @@ mod tests {
                 statement == "DROP TABLE IF EXISTS other_db.events_replay_stable_033"
             })
             .expect("old event table must be dropped after cutover");
+        let uid_map = statements
+            .iter()
+            .find(|statement| statement.starts_with("INSERT INTO other_db.event_uid_map_033"))
+            .expect("UID map build must be registered");
+        let event_rewrite = statements
+            .iter()
+            .find(|statement| {
+                statement.starts_with("INSERT INTO other_db.events_replay_stable_033")
+            })
+            .expect("event rewrite must be registered");
+        let link_rewrite = statements
+            .iter()
+            .find(|statement| {
+                statement.starts_with("INSERT INTO other_db.event_links_replay_stable_033")
+            })
+            .expect("link rewrite must be registered");
 
         assert!(link_exchange < event_exchange);
         assert!(event_exchange < final_link_drop);
@@ -1716,6 +1732,23 @@ mod tests {
         );
         assert!(!sql.contains("RENAME TABLE"));
         assert!(!sql.contains("_frozen"));
+        assert!(uid_map.contains("GROUP BY event_uid, new_event_uid"));
+        assert!(uid_map.contains("max_bytes_before_external_group_by = 67108864"));
+        for rewrite in [event_rewrite, link_rewrite] {
+            assert!(rewrite.contains("join_algorithm = 'partial_merge'"));
+            assert!(rewrite.contains("max_bytes_before_external_sort = 67108864"));
+            assert!(rewrite.contains("partial_merge_join_rows_in_right_blocks = 8192"));
+            assert!(rewrite.contains("min_insert_block_size_bytes = 16777216"));
+            assert!(rewrite.contains("max_memory_usage = 1073741824"));
+        }
+        assert!(
+            statements
+                .iter()
+                .filter(|statement| statement.contains("max_memory_usage = 1073741824"))
+                .count()
+                >= 6,
+            "every bulk migration insert must have a fixed memory budget"
+        );
     }
 
     #[test]
