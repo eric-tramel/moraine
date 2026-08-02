@@ -14,11 +14,20 @@ use crate::service::Service;
 use anyhow::{bail, Context, Result};
 use moraine_clickhouse::DoctorReport;
 use moraine_config::AppConfig;
-use moraine_conversations::{ConversationRepository, IngestHeartbeatRead, StoreDiagnostics};
-use std::time::Duration;
+use moraine_conversations::{
+    ConversationRepository, IngestHeartbeatRead, IngestStatus, StoreDiagnostics,
+};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const STATUS_API_TIMEOUT: Duration = Duration::from_secs(2);
 const STATUS_API_MAX_RESPONSE_BYTES: usize = 256 * 1024;
+fn unix_now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+        .unwrap_or(0)
+}
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(transparent)]
@@ -30,6 +39,8 @@ struct DaemonStatusResponse {
     clickhouse: DaemonClickhouseStatus,
     database: DaemonDatabaseStatus,
     ingestor: DaemonIngestorStatus,
+    #[serde(default)]
+    ingest_status: Option<IngestStatus>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -62,6 +73,7 @@ struct DaemonHeartbeat {
 struct StatusData {
     report: DoctorReport,
     heartbeat: HeartbeatSnapshot,
+    ingest_status: Option<IngestStatus>,
     source: StatusDataSource,
     fallback_note: Option<String>,
     clickhouse_health_url: String,
@@ -129,7 +141,7 @@ fn monitor_runtime_url(cfg: &AppConfig) -> String {
 }
 fn monitor_api_status_url(cfg: &AppConfig) -> String {
     format!(
-        "{}/api/v1/status",
+        "{}/api/v1/status?history=120",
         format_http_url(
             backend_http_connect_host(&cfg.monitor.host),
             cfg.monitor.port
@@ -181,6 +193,7 @@ fn daemon_status_data(payload: DaemonStatusResponse) -> Result<StatusData> {
     Ok(StatusData {
         report,
         heartbeat,
+        ingest_status: payload.ingest_status,
         source: StatusDataSource::DaemonApi,
         fallback_note: None,
         clickhouse_health_url: payload.clickhouse.url,
@@ -304,15 +317,21 @@ fn heartbeat_snapshot(read: IngestHeartbeatRead) -> HeartbeatSnapshot {
 
 async fn read_repository_status(
     repository: &dyn ConversationRepository,
-) -> Result<(DoctorReport, HeartbeatSnapshot)> {
+) -> Result<(DoctorReport, HeartbeatSnapshot, Option<IngestStatus>)> {
     let report = doctor_report(repository.read_store_diagnostics().await?);
-    let heartbeat = match repository.latest_ingest_heartbeat().await {
-        Ok(read) => heartbeat_snapshot(read),
-        Err(err) => HeartbeatSnapshot::Error {
-            message: err.to_string(),
-        },
+    let (heartbeat, ingest_status) = match repository.ingest_status(120).await {
+        Ok(read) => {
+            let heartbeat = heartbeat_snapshot(read.heartbeat.clone());
+            (heartbeat, Some(read.derive(unix_now_ms())))
+        }
+        Err(err) => (
+            HeartbeatSnapshot::Error {
+                message: err.to_string(),
+            },
+            None,
+        ),
     };
-    Ok((report, heartbeat))
+    Ok((report, heartbeat, ingest_status))
 }
 async fn read_preferred_status(
     cfg: &AppConfig,
@@ -324,10 +343,11 @@ async fn read_preferred_status(
         match read_daemon_status(cfg, timeout).await {
             Ok(status) => return Ok(status),
             Err(error) => {
-                let (report, heartbeat) = read_repository_status(repository).await?;
+                let (report, heartbeat, ingest_status) = read_repository_status(repository).await?;
                 return Ok(StatusData {
                     report,
                     heartbeat,
+                    ingest_status,
                     source: StatusDataSource::DirectDb,
                     fallback_note: Some(format!(
                         "daemon status API failed ({error:#}); using direct DB fallback"
@@ -338,10 +358,11 @@ async fn read_preferred_status(
         }
     }
 
-    let (report, heartbeat) = read_repository_status(repository).await?;
+    let (report, heartbeat, ingest_status) = read_repository_status(repository).await?;
     Ok(StatusData {
         report,
         heartbeat,
+        ingest_status,
         source: StatusDataSource::DirectDb,
         fallback_note: None,
         clickhouse_health_url: cfg.clickhouse.url.clone(),
@@ -374,6 +395,7 @@ pub(super) async fn cmd_status(
         report,
         heartbeat,
         source: data_source,
+        ingest_status,
         fallback_note,
         clickhouse_health_url,
     } = read_preferred_status(
@@ -414,6 +436,7 @@ pub(super) async fn cmd_status(
         clickhouse_health_url,
         status_notes,
         doctor: report,
+        ingest_status,
         heartbeat,
     })
 }
@@ -568,6 +591,7 @@ mod tests {
             watcher_reset_count: None,
             watcher_last_reset_unix_ms: None,
             backend_sinks: None,
+            progress: None,
         }
     }
 
@@ -602,9 +626,10 @@ mod tests {
         let calls = repository.calls();
         assert_eq!(calls.read_store_diagnostics, 0);
         assert_eq!(calls.latest_ingest_heartbeat, 0);
+        assert!(calls.ingest_status.is_empty());
         let request = worker.join().expect("daemon API worker");
         assert!(
-            request.starts_with("GET /api/v1/status HTTP/1.1"),
+            request.starts_with("GET /api/v1/status?history=120 HTTP/1.1"),
             "{request}"
         );
         assert!(request.contains("accept: application/json"), "{request}");
@@ -637,8 +662,9 @@ mod tests {
             let calls = repository.calls();
             assert_eq!(calls.read_store_diagnostics, 1);
             assert_eq!(calls.latest_ingest_heartbeat, 1);
+            assert_eq!(calls.ingest_status, vec![120]);
             let request = worker.join().expect("daemon API worker");
-            assert!(request.starts_with("GET /api/v1/status HTTP/1.1"));
+            assert!(request.starts_with("GET /api/v1/status?history=120 HTTP/1.1"));
         }
     }
     #[tokio::test]
@@ -669,6 +695,7 @@ mod tests {
             let calls = repository.calls();
             assert_eq!(calls.read_store_diagnostics, 1);
             assert_eq!(calls.latest_ingest_heartbeat, 1);
+            assert_eq!(calls.ingest_status, vec![120]);
             worker.join().expect("daemon API worker");
         }
     }
@@ -699,6 +726,7 @@ mod tests {
         let calls = repository.calls();
         assert_eq!(calls.read_store_diagnostics, 1);
         assert_eq!(calls.latest_ingest_heartbeat, 1);
+        assert_eq!(calls.ingest_status, vec![120]);
         worker.join().expect("daemon API worker");
     }
 
@@ -726,6 +754,7 @@ mod tests {
         let calls = repository.calls();
         assert_eq!(calls.read_store_diagnostics, 1);
         assert_eq!(calls.latest_ingest_heartbeat, 1);
+        assert_eq!(calls.ingest_status, vec![120]);
         worker.join().expect("daemon API worker");
     }
 
@@ -746,6 +775,7 @@ mod tests {
         let calls = repository.calls();
         assert_eq!(calls.read_store_diagnostics, 1);
         assert_eq!(calls.latest_ingest_heartbeat, 1);
+        assert_eq!(calls.ingest_status, vec![120]);
     }
 
     #[tokio::test]

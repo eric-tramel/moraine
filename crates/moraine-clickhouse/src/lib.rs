@@ -955,6 +955,11 @@ pub fn bundled_migrations() -> Vec<Migration> {
             name: "033_replay_stable_events.sql",
             sql: include_str!("../../../sql/033_replay_stable_events.sql"),
         },
+        Migration {
+            version: "034",
+            name: "034_ingest_progress.sql",
+            sql: include_str!("../../../sql/034_ingest_progress.sql"),
+        },
     ]
 }
 
@@ -2553,11 +2558,11 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn migration_progress_applies_post_v071_storage_cutovers() {
+    async fn migration_progress_applies_post_v071_migrations() {
         let bundled = bundled_migrations();
         let pending = bundled
             .iter()
-            .filter(|migration| matches!(migration.version, "031" | "032" | "033"))
+            .filter(|migration| matches!(migration.version, "031" | "032" | "033" | "034"))
             .cloned()
             .collect::<Vec<_>>();
         assert_eq!(
@@ -2565,11 +2570,11 @@ mod tests {
                 .iter()
                 .map(|migration| migration.version)
                 .collect::<Vec<_>>(),
-            vec!["031", "032", "033"]
+            vec!["031", "032", "033", "034"]
         );
         let applied = bundled
             .iter()
-            .filter(|migration| !matches!(migration.version, "031" | "032" | "033"))
+            .filter(|migration| !matches!(migration.version, "031" | "032" | "033" | "034"))
             .map(|migration| migration.version.to_string())
             .collect::<Vec<_>>();
         assert_eq!(applied.last().map(String::as_str), Some("030"));
@@ -2586,9 +2591,9 @@ mod tests {
         let executed = client
             .run_migrations_with_progress(|event| events.push(event))
             .await
-            .expect("apply post-v0.7.1 storage migrations");
+            .expect("apply post-v0.7.1 migrations");
 
-        assert_eq!(executed, vec!["031", "032", "033"]);
+        assert_eq!(executed, vec!["031", "032", "033", "034"]);
         let mut expected_events = vec![MigrationProgress::Plan {
             applied: bundled.len() - pending.len(),
             pending: pending.len(),
@@ -2617,7 +2622,7 @@ mod tests {
                     .then_some(index)
             })
             .collect::<Vec<_>>();
-        assert_eq!(ledger_indices.len(), 3);
+        assert_eq!(ledger_indices.len(), pending.len());
         assert_eq!(ledger_indices.last().copied(), Some(queries.len() - 1));
     }
 

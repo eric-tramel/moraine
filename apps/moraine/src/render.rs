@@ -1,5 +1,6 @@
 use anyhow::Result;
 use moraine_clickhouse::DoctorReport;
+use moraine_conversations::{IngestAlertCode, IngestConditionState, IngestStatus};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -102,6 +103,8 @@ pub(crate) struct StatusSnapshot {
     pub(crate) status_notes: Vec<String>,
     pub(crate) doctor: DoctorReport,
     pub(crate) heartbeat: HeartbeatSnapshot,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) ingest_status: Option<IngestStatus>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -387,6 +390,57 @@ fn format_start_pid(outcome: &StartOutcome) -> String {
     }
 }
 
+fn ingest_condition_summary(status: &IngestStatus) -> String {
+    status
+        .conditions
+        .iter()
+        .map(|condition| {
+            let state = match condition.state {
+                IngestConditionState::True => "ok",
+                IngestConditionState::False => "degraded",
+                IngestConditionState::Unknown => "unknown",
+            };
+            format!(
+                "{:?}={state} ({})",
+                condition.condition_type, condition.reason
+            )
+            .to_lowercase()
+        })
+        .collect::<Vec<_>>()
+        .join("  |  ")
+}
+
+fn ingest_progress_summaries(status: &IngestStatus) -> Option<Vec<String>> {
+    let progress = status.heartbeat.latest.as_ref()?.progress.as_ref()?;
+    let discovery_suffix = if progress.discovery_complete {
+        ""
+    } else {
+        " (discovering)"
+    };
+    let file_percent = (progress.files_total > 0)
+        .then(|| progress.files_completed as f64 * 100.0 / progress.files_total as f64);
+    let byte_percent = (progress.bytes_total > 0)
+        .then(|| progress.bytes_completed as f64 * 100.0 / progress.bytes_total as f64);
+    Some(vec![
+        format!(
+            "historical files: {}/{} ({}){discovery_suffix}",
+            progress.files_completed,
+            progress.files_total,
+            file_percent
+                .map(|percent| format!("{percent:.1}%"))
+                .unwrap_or_else(|| "n/a".to_string())
+        ),
+        format!(
+            "historical bytes: {}/{} ({}){discovery_suffix}",
+            progress.bytes_completed,
+            progress.bytes_total,
+            byte_percent
+                .map(|percent| format!("{percent:.1}%"))
+                .unwrap_or_else(|| "n/a".to_string())
+        ),
+    ])
+}
+
 pub(crate) fn render_status(output: &CliOutput, snapshot: &StatusSnapshot) -> Result<()> {
     if output.is_json() {
         println!("{}", serde_json::to_string_pretty(snapshot)?);
@@ -465,6 +519,9 @@ pub(crate) fn render_status(output: &CliOutput, snapshot: &StatusSnapshot) -> Re
     output.section("Database", &doctor_lines);
 
     // -- Ingest activity (only show when there is something to report) --
+    let mut ingest_lines = Vec::new();
+    let mut pressure = None;
+    let mut watcher = None;
     match &snapshot.heartbeat {
         HeartbeatSnapshot::Available {
             latest,
@@ -475,32 +532,104 @@ pub(crate) fn render_status(output: &CliOutput, snapshot: &StatusSnapshot) -> Re
             watcher_reset_count,
             watcher_last_reset_unix_ms,
         } => {
-            let mut lines = vec![
-                format!("last event: {latest}"),
-                format!("queue: {queue_depth}  |  active files: {files_active}"),
-            ];
-            if *watcher_error_count > 0 || *watcher_reset_count > 0 {
-                lines.push(format!(
-                    "watcher: {watcher_backend}  (errors: {watcher_error_count}, resets: {watcher_reset_count})"
-                ));
-            } else if output.verbose {
-                lines.push(format!("watcher: {watcher_backend}"));
-            }
-            if output.verbose {
-                lines.push(format!(
-                    "watcher last reset unix ms: {watcher_last_reset_unix_ms}"
-                ));
-            }
-            output.section("Ingest", &lines);
+            ingest_lines.push(format!("last event: {latest}"));
+            pressure = Some((*queue_depth, *files_active));
+            watcher = Some((
+                watcher_backend.as_str(),
+                *watcher_error_count,
+                *watcher_reset_count,
+                *watcher_last_reset_unix_ms,
+            ));
         }
         HeartbeatSnapshot::Unavailable => {
             if output.verbose {
-                output.section("Ingest", &["no heartbeat data".to_string()]);
+                ingest_lines.push("no heartbeat data".to_string());
             }
         }
         HeartbeatSnapshot::Error { message } => {
-            output.section("Ingest", &[format!("heartbeat error: {message}")]);
+            ingest_lines.push(format!("heartbeat error: {message}"));
         }
+    }
+
+    if let Some(status) = &snapshot.ingest_status {
+        ingest_lines.push(ingest_condition_summary(status));
+        if let Some(progress) = status
+            .heartbeat
+            .latest
+            .as_ref()
+            .and_then(|heartbeat| heartbeat.progress.as_ref())
+        {
+            if let Some((queue_depth, files_active)) = pressure {
+                ingest_lines.push(format!(
+                    "queue pressure: {queue_depth}/{}  |  active files: {files_active}",
+                    progress.queue_capacity
+                ));
+            }
+            if let Some(summaries) = ingest_progress_summaries(status) {
+                ingest_lines.extend(summaries);
+            }
+            ingest_lines.push(format!(
+                "sink pressure: {} rows  |  {} bytes  |  retry pressure: {}",
+                progress.sink_pending_rows,
+                progress.sink_pending_bytes,
+                if progress.sink_retrying {
+                    "active"
+                } else {
+                    "clear"
+                }
+            ));
+        } else if let Some((queue_depth, files_active)) = pressure {
+            ingest_lines.push(format!(
+                "queue pressure: {queue_depth}/unknown  |  active files: {files_active}"
+            ));
+        }
+        if let Some(rate) = &status.rate {
+            ingest_lines.push(format!(
+                "durable rate: {:.0} bytes/s over {}s",
+                rate.bytes_per_second, rate.sample_seconds
+            ));
+        }
+        if let Some(eta) = &status.eta {
+            ingest_lines.push(format!(
+                "ETA ({}): {}-{}s",
+                eta.scope, eta.low_seconds, eta.high_seconds
+            ));
+        }
+        if !status.alerts.is_empty() {
+            let codes = status
+                .alerts
+                .iter()
+                .map(|alert| match alert.code {
+                    IngestAlertCode::HeartbeatStale => "heartbeat_stale",
+                    IngestAlertCode::ProgressStalled => "progress_stalled",
+                    IngestAlertCode::QueueSaturated => "queue_saturated",
+                    IngestAlertCode::SinkRetrying => "sink_retrying",
+                    IngestAlertCode::CoverageDegraded => "coverage_degraded",
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            ingest_lines.push(format!("active alerts: {codes}"));
+        }
+    } else if let Some((queue_depth, files_active)) = pressure {
+        ingest_lines.push(format!(
+            "queue pressure: {queue_depth}/unknown  |  active files: {files_active}"
+        ));
+    }
+
+    if let Some((watcher_backend, watcher_error_count, watcher_reset_count, last_reset)) = watcher {
+        if watcher_error_count > 0 || watcher_reset_count > 0 {
+            ingest_lines.push(format!(
+                "watcher: {watcher_backend}  (errors: {watcher_error_count}, resets: {watcher_reset_count})"
+            ));
+        } else if output.verbose {
+            ingest_lines.push(format!("watcher: {watcher_backend}"));
+        }
+        if output.verbose {
+            ingest_lines.push(format!("watcher last reset unix ms: {last_reset}"));
+        }
+    }
+    if !ingest_lines.is_empty() {
+        output.section("Ingest", &ingest_lines);
     }
 
     // -- ClickHouse runtime details (verbose only) --

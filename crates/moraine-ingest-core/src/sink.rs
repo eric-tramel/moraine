@@ -184,6 +184,8 @@ pub(crate) enum SinkRole {
         /// Whether `ingest_heartbeats` carries the `redactions_total` column
         /// (migration 022). Redaction still runs without this audit surface.
         redactions_column: bool,
+        /// Whether `ingest_heartbeats` carries migration 034 progress payloads.
+        progress_column: bool,
         redactions: Arc<RedactionAudit>,
     },
     /// A mirror sink for one named backend: filters intake down to the
@@ -492,6 +494,12 @@ pub(crate) fn spawn_sink_task(
 
                             let total_rows =
                                 raw_rows.len() + event_rows.len() + link_rows.len() + error_rows.len();
+                            metrics
+                                .sink_pending_rows
+                                .store(total_rows as u64, Ordering::Relaxed);
+                            metrics
+                                .sink_pending_bytes
+                                .store(pending_batch_bytes as u64, Ordering::Relaxed);
                             if total_rows >= config.ingest.batch_size
                                 || pending_batch_bytes >= config.ingest.max_batch_bytes.max(1)
                             {
@@ -880,25 +888,34 @@ fn clear_pending_sink_data(
 async fn commit_checkpoint_updates(
     clickhouse: &ClickHouseClient,
     checkpoints: &Arc<RwLock<HashMap<String, Checkpoint>>>,
+    metrics: &Arc<Metrics>,
     checkpoint_rows: &[Value],
     checkpoint_updates: &HashMap<String, Checkpoint>,
+    sqlite_cursor_durable: bool,
 ) -> anyhow::Result<()> {
     if checkpoint_rows.is_empty() {
         return Ok(());
     }
 
     clickhouse
-        .insert_json_rows("ingest_checkpoints", checkpoint_rows)
+        .insert_json_rows_sync("ingest_checkpoints", checkpoint_rows)
         .await
         .context("failed to insert ingest checkpoint rows")?;
 
     // Offset-monotone merge, not a blind insert: a backend map has two
     // producers (live router batches and catch-up replay), so an out-of-order
     // flush must never regress what the map already committed.
-    let mut state = checkpoints.write().await;
-    for cp in checkpoint_updates.values() {
-        merge_checkpoint(&mut state, cp.clone());
+    {
+        let mut state = checkpoints.write().await;
+        for cp in checkpoint_updates.values() {
+            merge_checkpoint(&mut state, cp.clone());
+        }
     }
+    metrics
+        .progress
+        .lock()
+        .expect("ingest progress mutex poisoned")
+        .acknowledge(checkpoint_updates, sqlite_cursor_durable);
     Ok(())
 }
 
@@ -911,15 +928,24 @@ async fn emit_heartbeat(clickhouse: &ClickHouseClient, metrics: &Arc<Metrics>, r
         backends,
         backend_sinks_column,
         redactions_column,
+        progress_column,
         redactions,
     } = role
     else {
         return;
     };
 
-    let files_active = {
+    let (files_active, oldest_pending_unix_ms) = {
         let state = dispatch.lock().expect("dispatch mutex poisoned");
-        state.inflight.len() as u32
+        (
+            state.inflight.len() as u32,
+            state
+                .pending_since_unix_ms
+                .values()
+                .copied()
+                .min()
+                .unwrap_or(0),
+        )
     };
     let files_watched = metrics.watcher_registrations.load(Ordering::Relaxed) as u32;
     let last_error = {
@@ -968,6 +994,21 @@ async fn emit_heartbeat(clickhouse: &ClickHouseClient, metrics: &Arc<Metrics>, r
                 let counts_json = serde_json::to_string(&counts).unwrap_or_default();
                 obj.insert("redactions_total".to_string(), Value::String(counts_json));
             }
+        }
+    }
+    if *progress_column {
+        let progress_json = metrics
+            .progress
+            .lock()
+            .expect("ingest progress mutex poisoned")
+            .to_json(
+                oldest_pending_unix_ms,
+                metrics.sink_pending_rows.load(Ordering::Relaxed),
+                metrics.sink_pending_bytes.load(Ordering::Relaxed),
+                metrics.sink_retrying.load(Ordering::Relaxed),
+            );
+        if let Some(obj) = heartbeat.as_object_mut() {
+            obj.insert("progress_json".to_string(), Value::String(progress_json));
         }
     }
 
@@ -1028,6 +1069,10 @@ async fn flush_pending_with_ack(
     pending_ack: &mut PendingAckBatch,
 ) -> bool {
     let started = Instant::now();
+    metrics.sink_pending_rows.store(
+        (raw_rows.len() + event_rows.len() + link_rows.len() + error_rows.len()) as u64,
+        Ordering::Relaxed,
+    );
 
     let checkpoint_rows: Vec<Value> = checkpoint_updates
         .values()
@@ -1150,8 +1195,10 @@ async fn flush_pending_with_ack(
             commit_checkpoint_updates(
                 clickhouse,
                 checkpoints,
+                metrics,
                 &checkpoint_rows,
                 checkpoint_updates,
+                checkpoint_cursor_columns,
             )
             .await
             .map_err(|error| SinkFlushFailure::new(SinkStage::IngestCheckpoints, error))?;
@@ -1167,11 +1214,15 @@ async fn flush_pending_with_ack(
 
     match flush_result {
         Ok(()) => {
+            metrics.sink_pending_rows.store(0, Ordering::Relaxed);
+            metrics.sink_pending_bytes.store(0, Ordering::Relaxed);
+            metrics.sink_retrying.store(false, Ordering::Relaxed);
             ack_observer.observe(&pending_ack.event_identity_digests);
             pending_ack.clear();
             true
         }
         Err(failure) => {
+            metrics.sink_retrying.store(true, Ordering::Relaxed);
             metrics.flush_failures.fetch_add(1, Ordering::Relaxed);
             let error_text = failure.error.to_string();
             if is_oversized_json_each_row_insert_error(&failure.error) {
@@ -1221,8 +1272,10 @@ async fn flush_pending_with_ack(
                 if let Err(error) = commit_checkpoint_updates(
                     clickhouse,
                     checkpoints,
+                    metrics,
                     &checkpoint_rows,
                     checkpoint_updates,
+                    checkpoint_cursor_columns,
                 )
                 .await
                 {
@@ -1252,6 +1305,9 @@ async fn flush_pending_with_ack(
                     checkpoint_updates,
                 );
                 pending_ack.clear();
+                metrics.sink_pending_rows.store(0, Ordering::Relaxed);
+                metrics.sink_pending_bytes.store(0, Ordering::Relaxed);
+                metrics.sink_retrying.store(false, Ordering::Relaxed);
                 return true;
             }
 
@@ -1483,6 +1539,7 @@ mod tests {
             backends: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
             backend_sinks_column: false,
             redactions_column: false,
+            progress_column: false,
             redactions: test_redaction_audit(),
         }
     }

@@ -35,7 +35,7 @@ export function fetchHealth(): Promise<HealthResponse> {
 }
 
 export function fetchStatus(): Promise<StatusResponse> {
-  return requestJson<StatusResponse>('/api/v1/status');
+  return requestJson<StatusResponse>('/api/v1/status?history=120');
 }
 
 export function fetchAnalytics(range: AnalyticsRangeKey): Promise<AnalyticsResponse> {

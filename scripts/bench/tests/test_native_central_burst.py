@@ -130,7 +130,9 @@ class FakeLifecycle:
         self.concurrency = concurrency
         self.started = False
         self.closed = False
-        self.tool_surfaces = [("search_sessions", "open", "list_sessions", "file_attention")]
+        self.tool_surfaces = [
+            ("search_sessions", "open", "list_sessions", "file_attention", "get_ingest_status")
+        ]
 
     def start(self) -> None:
         self.started = True

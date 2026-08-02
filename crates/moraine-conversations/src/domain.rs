@@ -1225,6 +1225,614 @@ pub struct IngestHeartbeat {
     pub watcher_last_reset_unix_ms: Option<u64>,
     #[serde(default)]
     pub backend_sinks: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<IngestProgressSnapshot>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct IngestProgressSnapshot {
+    pub schema_version: u16,
+    pub instance_id: String,
+    pub run_started_unix_ms: u64,
+    pub snapshot_unix_ms: u64,
+    pub discovery_complete: bool,
+    pub queue_capacity: u64,
+    pub sink_pending_rows: u64,
+    pub sink_pending_bytes: u64,
+    pub sink_retrying: bool,
+    pub oldest_pending_unix_ms: u64,
+    pub last_durable_progress_unix_ms: u64,
+    pub files_total: u64,
+    pub files_completed: u64,
+    pub bytes_total: u64,
+    pub bytes_completed: u64,
+    #[serde(default)]
+    pub sources: Vec<IngestSourceProgress>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IngestSourceProgress {
+    pub source_name: String,
+    pub format: String,
+    pub coverage_basis: IngestCoverageBasis,
+    pub files_total: u64,
+    pub files_completed: u64,
+    pub bytes_total: u64,
+    pub bytes_completed: u64,
+    pub coverage_degraded: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IngestCoverageBasis {
+    Bytes,
+    Files,
+    #[default]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IngestConditionType {
+    Health,
+    Coverage,
+    Freshness,
+    Readiness,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IngestConditionState {
+    True,
+    False,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IngestCondition {
+    pub condition_type: IngestConditionType,
+    pub state: IngestConditionState,
+    pub reason: String,
+    pub observed_at_unix_ms: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IngestAlertCode {
+    HeartbeatStale,
+    ProgressStalled,
+    QueueSaturated,
+    SinkRetrying,
+    CoverageDegraded,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IngestAlert {
+    pub code: IngestAlertCode,
+    pub observed_at_unix_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IngestRate {
+    pub bytes_per_second: f64,
+    pub sample_seconds: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IngestEta {
+    pub scope: String,
+    pub low_seconds: u64,
+    pub high_seconds: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct IngestStatusRead {
+    pub heartbeat: IngestHeartbeatRead,
+    pub history: Vec<IngestHeartbeat>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IngestHistoryPoint {
+    pub ts_unix_ms: i64,
+    pub queue_depth: u64,
+    pub files_active: u32,
+    pub queue_capacity: u64,
+    pub sink_pending_rows: u64,
+    pub sink_retrying: bool,
+    pub discovery_complete: bool,
+    pub files_total: u64,
+    pub files_completed: u64,
+    pub bytes_total: u64,
+    pub bytes_completed: u64,
+}
+
+impl IngestHistoryPoint {
+    fn from_heartbeat(heartbeat: &IngestHeartbeat) -> Self {
+        let (
+            queue_capacity,
+            sink_pending_rows,
+            sink_retrying,
+            discovery_complete,
+            files_total,
+            files_completed,
+            bytes_total,
+            bytes_completed,
+        ) = match heartbeat.progress.as_ref() {
+            Some(progress) => (
+                progress.queue_capacity,
+                progress.sink_pending_rows,
+                progress.sink_retrying,
+                progress.discovery_complete,
+                progress.files_total,
+                progress.files_completed,
+                progress.bytes_total,
+                progress.bytes_completed,
+            ),
+            None => (0, 0, false, false, 0, 0, 0, 0),
+        };
+        Self {
+            ts_unix_ms: heartbeat.ts_unix_ms,
+            queue_depth: heartbeat.queue_depth,
+            files_active: heartbeat.files_active,
+            queue_capacity,
+            sink_pending_rows,
+            sink_retrying,
+            discovery_complete,
+            files_total,
+            files_completed,
+            bytes_total,
+            bytes_completed,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IngestStatus {
+    pub observed_at_unix_ms: i64,
+    pub heartbeat: IngestHeartbeatRead,
+    pub conditions: Vec<IngestCondition>,
+    pub alerts: Vec<IngestAlert>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate: Option<IngestRate>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub eta: Option<IngestEta>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub history: Vec<IngestHistoryPoint>,
+}
+
+impl IngestStatusRead {
+    pub fn derive(self, now_unix_ms: i64) -> IngestStatus {
+        let IngestStatusRead { heartbeat, history } = self;
+        let latest = heartbeat.latest.as_ref();
+        let health = heartbeat_health_condition(latest, now_unix_ms);
+        let coverage = coverage_condition(latest, now_unix_ms);
+        let freshness = freshness_condition(latest, &health, now_unix_ms);
+        let readiness = readiness_condition(&health, &coverage, &freshness, now_unix_ms);
+        let (rate, eta) = ingest_rate_and_eta(latest, &history);
+        let alerts = ingest_alerts(
+            latest,
+            &history,
+            &health,
+            &coverage,
+            &freshness,
+            now_unix_ms,
+        );
+        let history_start_unix_ms =
+            latest.map(|heartbeat| heartbeat.ts_unix_ms.saturating_sub(300_000));
+        let history_end_unix_ms = latest.map(|heartbeat| heartbeat.ts_unix_ms);
+        let mut history = history
+            .iter()
+            .filter(|heartbeat| {
+                history_start_unix_ms
+                    .zip(history_end_unix_ms)
+                    .is_some_and(|(start, end)| (start..=end).contains(&heartbeat.ts_unix_ms))
+            })
+            .map(IngestHistoryPoint::from_heartbeat)
+            .collect::<Vec<_>>();
+        history.sort_by_key(|point| point.ts_unix_ms);
+        if history.len() > 120 {
+            let excess = history.len() - 120;
+            drop(history.drain(..excess));
+        }
+
+        IngestStatus {
+            observed_at_unix_ms: now_unix_ms,
+            heartbeat,
+            conditions: vec![health, coverage, freshness, readiness],
+            alerts,
+            rate,
+            eta,
+            history,
+        }
+    }
+}
+
+fn heartbeat_health_condition(
+    latest: Option<&IngestHeartbeat>,
+    now_unix_ms: i64,
+) -> IngestCondition {
+    let (state, reason) = match latest {
+        None => (IngestConditionState::Unknown, "heartbeat_missing"),
+        Some(latest) if latest.ts_unix_ms > now_unix_ms.saturating_add(5_000) => {
+            (IngestConditionState::Unknown, "heartbeat_clock_skew")
+        }
+        Some(latest) if now_unix_ms.saturating_sub(latest.ts_unix_ms) > 30_000 => {
+            (IngestConditionState::False, "heartbeat_stale")
+        }
+        Some(_) => (IngestConditionState::True, "heartbeat_recent"),
+    };
+    ingest_condition(IngestConditionType::Health, state, reason, now_unix_ms)
+}
+
+fn coverage_condition(latest: Option<&IngestHeartbeat>, now_unix_ms: i64) -> IngestCondition {
+    let Some(progress) = latest.and_then(|heartbeat| heartbeat.progress.as_ref()) else {
+        return ingest_condition(
+            IngestConditionType::Coverage,
+            IngestConditionState::Unknown,
+            "progress_unavailable",
+            now_unix_ms,
+        );
+    };
+    if progress
+        .sources
+        .iter()
+        .any(|source| source.coverage_degraded)
+    {
+        return ingest_condition(
+            IngestConditionType::Coverage,
+            IngestConditionState::False,
+            "coverage_degraded",
+            now_unix_ms,
+        );
+    }
+    if !progress.discovery_complete {
+        return ingest_condition(
+            IngestConditionType::Coverage,
+            IngestConditionState::False,
+            "discovery_incomplete",
+            now_unix_ms,
+        );
+    }
+    if progress.files_completed < progress.files_total
+        || progress.bytes_completed < progress.bytes_total
+    {
+        return ingest_condition(
+            IngestConditionType::Coverage,
+            IngestConditionState::False,
+            "backfill_partial",
+            now_unix_ms,
+        );
+    }
+    ingest_condition(
+        IngestConditionType::Coverage,
+        IngestConditionState::True,
+        "backfill_complete",
+        now_unix_ms,
+    )
+}
+
+fn freshness_condition(
+    latest: Option<&IngestHeartbeat>,
+    health: &IngestCondition,
+    now_unix_ms: i64,
+) -> IngestCondition {
+    if health.state != IngestConditionState::True {
+        return ingest_condition(
+            IngestConditionType::Freshness,
+            IngestConditionState::Unknown,
+            health.reason.as_str(),
+            now_unix_ms,
+        );
+    }
+    let Some(latest) = latest else {
+        unreachable!("healthy status requires a heartbeat")
+    };
+    let Some(progress) = latest.progress.as_ref() else {
+        return ingest_condition(
+            IngestConditionType::Freshness,
+            IngestConditionState::Unknown,
+            "progress_unavailable",
+            now_unix_ms,
+        );
+    };
+    let has_pressure = latest.queue_depth > 0
+        || latest.files_active > 0
+        || progress.sink_pending_rows > 0
+        || progress.sink_retrying;
+    let last_progress_unix_ms = progress
+        .last_durable_progress_unix_ms
+        .max(progress.run_started_unix_ms);
+    if snapshot_work_remaining(progress)
+        && has_pressure
+        && now_unix_ms.saturating_sub(last_progress_unix_ms as i64) >= 60_000
+    {
+        return ingest_condition(
+            IngestConditionType::Freshness,
+            IngestConditionState::False,
+            "progress_stalled",
+            now_unix_ms,
+        );
+    }
+    ingest_condition(
+        IngestConditionType::Freshness,
+        IngestConditionState::True,
+        if has_pressure {
+            "progress_recent"
+        } else {
+            "idle"
+        },
+        now_unix_ms,
+    )
+}
+
+fn snapshot_work_remaining(progress: &IngestProgressSnapshot) -> bool {
+    progress.files_completed < progress.files_total
+        || progress.bytes_completed < progress.bytes_total
+}
+
+fn readiness_condition(
+    health: &IngestCondition,
+    coverage: &IngestCondition,
+    freshness: &IngestCondition,
+    now_unix_ms: i64,
+) -> IngestCondition {
+    let conditions = [health, coverage, freshness];
+    if conditions
+        .iter()
+        .any(|condition| condition.state == IngestConditionState::False)
+    {
+        return ingest_condition(
+            IngestConditionType::Readiness,
+            IngestConditionState::False,
+            "retrieval_may_be_incomplete",
+            now_unix_ms,
+        );
+    }
+    if conditions
+        .iter()
+        .any(|condition| condition.state == IngestConditionState::Unknown)
+    {
+        return ingest_condition(
+            IngestConditionType::Readiness,
+            IngestConditionState::Unknown,
+            "readiness_unknown",
+            now_unix_ms,
+        );
+    }
+    ingest_condition(
+        IngestConditionType::Readiness,
+        IngestConditionState::True,
+        "ready",
+        now_unix_ms,
+    )
+}
+
+fn ingest_condition(
+    condition_type: IngestConditionType,
+    state: IngestConditionState,
+    reason: &str,
+    observed_at_unix_ms: i64,
+) -> IngestCondition {
+    IngestCondition {
+        condition_type,
+        state,
+        reason: reason.to_string(),
+        observed_at_unix_ms,
+    }
+}
+
+fn ingest_rate_and_eta(
+    latest: Option<&IngestHeartbeat>,
+    history: &[IngestHeartbeat],
+) -> (Option<IngestRate>, Option<IngestEta>) {
+    let Some(latest) = latest else {
+        return (None, None);
+    };
+    let Some(latest_progress) = latest.progress.as_ref() else {
+        return (None, None);
+    };
+    if !latest_progress.discovery_complete
+        || latest_progress.sink_retrying
+        || latest_progress.bytes_completed >= latest_progress.bytes_total
+    {
+        return (None, None);
+    }
+
+    let window_start = latest.ts_unix_ms.saturating_sub(300_000);
+    let mut samples = history
+        .iter()
+        .filter(|heartbeat| {
+            (window_start..=latest.ts_unix_ms).contains(&heartbeat.ts_unix_ms)
+                && heartbeat
+                    .progress
+                    .as_ref()
+                    .is_some_and(|progress| progress.instance_id == latest_progress.instance_id)
+        })
+        .collect::<Vec<_>>();
+    samples.sort_by_key(|heartbeat| heartbeat.ts_unix_ms);
+    if samples.len() < 6
+        || samples.last().map(|sample| sample.ts_unix_ms) != Some(latest.ts_unix_ms)
+        || samples.iter().any(|sample| {
+            let progress = sample.progress.as_ref().expect("filtered progress");
+            !progress.discovery_complete || progress.sink_retrying
+        })
+        || samples.iter().any(|sample| {
+            !same_snapshot_target(
+                sample.progress.as_ref().expect("filtered progress"),
+                latest_progress,
+            )
+        })
+        || samples.windows(2).any(|pair| {
+            !snapshot_progress_is_monotonic(
+                pair[0].progress.as_ref().expect("filtered progress"),
+                pair[1].progress.as_ref().expect("filtered progress"),
+            )
+        })
+    {
+        return (None, None);
+    }
+
+    let first = samples[0];
+    let latest_sample = *samples.last().expect("sample count checked");
+    if latest_sample.ts_unix_ms.saturating_sub(first.ts_unix_ms) < 30_000 {
+        return (None, None);
+    }
+    let short_start = latest_sample.ts_unix_ms.saturating_sub(60_000);
+    let short_first = samples
+        .iter()
+        .copied()
+        .find(|heartbeat| heartbeat.ts_unix_ms >= short_start)
+        .expect("latest sample is in short window");
+    let Some(long_rate) = sample_byte_rate(first, latest_sample) else {
+        return (None, None);
+    };
+    let Some(short_rate) = sample_byte_rate(short_first, latest_sample) else {
+        return (None, None);
+    };
+    let ratio = short_rate / long_rate;
+    if !(0.5..=2.0).contains(&ratio) {
+        return (None, None);
+    }
+    let sample_seconds = (latest_sample.ts_unix_ms.saturating_sub(first.ts_unix_ms) as u64) / 1_000;
+    let remaining = latest_progress
+        .bytes_total
+        .saturating_sub(latest_progress.bytes_completed) as f64;
+    let low_seconds = (remaining / short_rate.max(long_rate)).ceil() as u64;
+    let high_seconds = (remaining / short_rate.min(long_rate)).ceil() as u64;
+    (
+        Some(IngestRate {
+            bytes_per_second: long_rate,
+            sample_seconds,
+        }),
+        Some(IngestEta {
+            scope: "file_backfill".to_string(),
+            low_seconds,
+            high_seconds,
+        }),
+    )
+}
+
+fn same_snapshot_target(left: &IngestProgressSnapshot, right: &IngestProgressSnapshot) -> bool {
+    left.instance_id == right.instance_id
+        && left.snapshot_unix_ms == right.snapshot_unix_ms
+        && left.files_total == right.files_total
+        && left.bytes_total == right.bytes_total
+        && left.sources.len() == right.sources.len()
+        && left
+            .sources
+            .iter()
+            .zip(&right.sources)
+            .all(|(left, right)| {
+                left.source_name == right.source_name
+                    && left.format == right.format
+                    && left.coverage_basis == right.coverage_basis
+                    && left.files_total == right.files_total
+                    && left.bytes_total == right.bytes_total
+            })
+}
+
+fn snapshot_progress_is_monotonic(
+    previous: &IngestProgressSnapshot,
+    current: &IngestProgressSnapshot,
+) -> bool {
+    same_snapshot_target(previous, current)
+        && previous.files_completed <= current.files_completed
+        && previous.bytes_completed <= current.bytes_completed
+        && previous
+            .sources
+            .iter()
+            .zip(&current.sources)
+            .all(|(previous, current)| {
+                previous.files_completed <= current.files_completed
+                    && previous.bytes_completed <= current.bytes_completed
+            })
+}
+
+fn sample_byte_rate(first: &IngestHeartbeat, last: &IngestHeartbeat) -> Option<f64> {
+    let first_progress = first.progress.as_ref()?;
+    let last_progress = last.progress.as_ref()?;
+    let elapsed_ms = last.ts_unix_ms.checked_sub(first.ts_unix_ms)?;
+    let completed = last_progress
+        .bytes_completed
+        .checked_sub(first_progress.bytes_completed)?;
+    if elapsed_ms <= 0 || completed == 0 {
+        return None;
+    }
+    Some(completed as f64 / (elapsed_ms as f64 / 1_000.0))
+}
+
+fn ingest_alerts(
+    latest: Option<&IngestHeartbeat>,
+    history: &[IngestHeartbeat],
+    health: &IngestCondition,
+    coverage: &IngestCondition,
+    freshness: &IngestCondition,
+    now_unix_ms: i64,
+) -> Vec<IngestAlert> {
+    let mut alerts = Vec::new();
+    if health.state == IngestConditionState::False {
+        alerts.push(ingest_alert(IngestAlertCode::HeartbeatStale, now_unix_ms));
+    }
+    if freshness.reason == "progress_stalled" {
+        alerts.push(ingest_alert(IngestAlertCode::ProgressStalled, now_unix_ms));
+    }
+    if coverage.reason == "coverage_degraded" {
+        alerts.push(ingest_alert(IngestAlertCode::CoverageDegraded, now_unix_ms));
+    }
+    if health.state == IngestConditionState::True {
+        let Some(latest) = latest else {
+            unreachable!("healthy status requires a heartbeat")
+        };
+        let Some(instance_id) = latest
+            .progress
+            .as_ref()
+            .map(|progress| progress.instance_id.as_str())
+        else {
+            return alerts;
+        };
+        let window_start = latest.ts_unix_ms.saturating_sub(300_000);
+        let mut same_instance = history
+            .iter()
+            .filter(|heartbeat| {
+                (window_start..=latest.ts_unix_ms).contains(&heartbeat.ts_unix_ms)
+                    && heartbeat
+                        .progress
+                        .as_ref()
+                        .is_some_and(|progress| progress.instance_id == instance_id)
+            })
+            .collect::<Vec<_>>();
+        same_instance.sort_by_key(|heartbeat| heartbeat.ts_unix_ms);
+        if same_instance.last().map(|heartbeat| heartbeat.ts_unix_ms) != Some(latest.ts_unix_ms) {
+            return alerts;
+        }
+        if same_instance.len() >= 3
+            && same_instance.iter().rev().take(3).all(|heartbeat| {
+                heartbeat.progress.as_ref().is_some_and(|progress| {
+                    progress.queue_capacity > 0 && heartbeat.queue_depth >= progress.queue_capacity
+                })
+            })
+        {
+            alerts.push(ingest_alert(IngestAlertCode::QueueSaturated, now_unix_ms));
+        }
+        if same_instance.len() >= 2
+            && same_instance.iter().rev().take(2).all(|heartbeat| {
+                heartbeat
+                    .progress
+                    .as_ref()
+                    .is_some_and(|progress| progress.sink_retrying)
+            })
+        {
+            alerts.push(ingest_alert(IngestAlertCode::SinkRetrying, now_unix_ms));
+        }
+    }
+    alerts
+}
+
+fn ingest_alert(code: IngestAlertCode, observed_at_unix_ms: i64) -> IngestAlert {
+    IngestAlert {
+        code,
+        observed_at_unix_ms,
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -1381,7 +1989,9 @@ fn default_page_limit() -> u16 {
 #[cfg(test)]
 mod tests {
     use super::{
-        AnalyticsRange, SearchEventKind, SearchEventsQuery, SearchStrategyHint,
+        AnalyticsRange, IngestAlertCode, IngestConditionState, IngestCoverageBasis, IngestEta,
+        IngestHeartbeat, IngestHeartbeatRead, IngestProgressSnapshot, IngestSourceProgress,
+        IngestStatusRead, SearchEventKind, SearchEventsQuery, SearchStrategyHint,
         SessionAnalyticsQuery, SessionLookback, SessionOriginScope, SessionStep, TablePreviewQuery,
     };
 
@@ -1524,5 +2134,432 @@ mod tests {
                 "text": "hello",
             })
         );
+    }
+    fn heartbeat_with_progress(
+        ts_unix_ms: i64,
+        bytes_completed: u64,
+        bytes_total: u64,
+    ) -> IngestHeartbeat {
+        IngestHeartbeat {
+            ts: String::new(),
+            ts_unix_ms,
+            host: "host-a".to_string(),
+            service_version: "test".to_string(),
+            queue_depth: u64::from(bytes_completed < bytes_total),
+            files_active: u32::from(bytes_completed < bytes_total),
+            files_watched: 1,
+            rows_raw_written: 0,
+            rows_events_written: 0,
+            rows_errors_written: 0,
+            flush_latency_ms: 0,
+            append_to_visible_p50_ms: 0,
+            append_to_visible_p95_ms: 0,
+            last_error: String::new(),
+            watcher_backend: None,
+            watcher_error_count: None,
+            watcher_reset_count: None,
+            watcher_last_reset_unix_ms: None,
+            backend_sinks: None,
+            progress: Some(IngestProgressSnapshot {
+                schema_version: 1,
+                instance_id: "run-a".to_string(),
+                run_started_unix_ms: 1_000_000,
+                snapshot_unix_ms: 1_000_000,
+                discovery_complete: true,
+                queue_capacity: 1_024,
+                sink_pending_rows: 0,
+                sink_pending_bytes: 0,
+                sink_retrying: false,
+                oldest_pending_unix_ms: 0,
+                last_durable_progress_unix_ms: ts_unix_ms as u64,
+                files_total: 1,
+                files_completed: u64::from(bytes_completed >= bytes_total),
+                bytes_total,
+                bytes_completed,
+                sources: vec![IngestSourceProgress {
+                    source_name: "codex".to_string(),
+                    format: "jsonl".to_string(),
+                    coverage_basis: IngestCoverageBasis::Bytes,
+                    files_total: 1,
+                    files_completed: u64::from(bytes_completed >= bytes_total),
+                    bytes_total,
+                    bytes_completed,
+                    coverage_degraded: false,
+                }],
+            }),
+        }
+    }
+
+    #[test]
+    fn status_separates_health_from_partial_coverage() {
+        let latest = heartbeat_with_progress(1_060_000, 500, 1_000);
+        let status = IngestStatusRead {
+            heartbeat: IngestHeartbeatRead {
+                table_present: true,
+                latest: Some(latest.clone()),
+            },
+            history: vec![latest],
+        }
+        .derive(1_061_000);
+
+        assert_eq!(
+            status.conditions[0].state,
+            IngestConditionState::True,
+            "recent heartbeat remains healthy"
+        );
+        assert_eq!(status.conditions[1].reason, "backfill_partial");
+        assert_eq!(status.conditions[3].reason, "retrieval_may_be_incomplete");
+    }
+
+    #[test]
+    fn completed_file_based_coverage_is_ready_without_alert() {
+        let mut latest = heartbeat_with_progress(1_060_000, 0, 0);
+        let progress = latest.progress.as_mut().expect("progress snapshot");
+        let source = progress.sources.first_mut().expect("source progress");
+        source.source_name = "cursor-sqlite".to_string();
+        source.format = "cursor_sqlite".to_string();
+        source.coverage_basis = IngestCoverageBasis::Files;
+
+        let status = IngestStatusRead {
+            heartbeat: IngestHeartbeatRead {
+                table_present: true,
+                latest: Some(latest.clone()),
+            },
+            history: vec![latest],
+        }
+        .derive(1_061_000);
+
+        assert_eq!(status.conditions[1].state, IngestConditionState::True);
+        assert_eq!(status.conditions[1].reason, "backfill_complete");
+        assert_eq!(status.conditions[3].state, IngestConditionState::True);
+        assert_eq!(status.conditions[3].reason, "ready");
+        assert!(status.alerts.is_empty());
+    }
+
+    #[test]
+    fn stable_durable_history_produces_bounded_eta() {
+        let history = (0..=6)
+            .map(|sample| {
+                heartbeat_with_progress(
+                    1_000_000 + sample * 10_000,
+                    100 + sample as u64 * 100,
+                    1_000,
+                )
+            })
+            .collect::<Vec<_>>();
+        let latest = history.last().cloned().expect("latest sample");
+        let status = IngestStatusRead {
+            heartbeat: IngestHeartbeatRead {
+                table_present: true,
+                latest: Some(latest),
+            },
+            history,
+        }
+        .derive(1_061_000);
+
+        assert_eq!(
+            status.rate.as_ref().map(|rate| rate.bytes_per_second),
+            Some(10.0)
+        );
+        assert_eq!(
+            status.eta,
+            Some(IngestEta {
+                scope: "file_backfill".to_string(),
+                low_seconds: 30,
+                high_seconds: 30,
+            })
+        );
+    }
+
+    #[test]
+    fn eta_requires_six_samples_inside_the_five_minute_window() {
+        let history = [
+            (600_000, 100),
+            (620_000, 200),
+            (640_000, 300),
+            (680_000, 400),
+            (950_000, 500),
+            (1_000_000, 600),
+        ]
+        .into_iter()
+        .map(|(ts, completed)| heartbeat_with_progress(ts, completed, 1_000))
+        .collect::<Vec<_>>();
+        let latest = history.last().cloned().expect("latest sample");
+
+        let status = IngestStatusRead {
+            heartbeat: IngestHeartbeatRead {
+                table_present: true,
+                latest: Some(latest),
+            },
+            history,
+        }
+        .derive(1_001_000);
+
+        assert!(status.rate.is_none());
+        assert!(status.eta.is_none());
+        assert_eq!(status.history.len(), 2);
+    }
+
+    #[test]
+    fn eta_rejects_adjacent_completion_and_target_regressions() {
+        let mutations: [fn(&mut IngestHeartbeat); 2] = [
+            |sample: &mut IngestHeartbeat| {
+                let progress = sample.progress.as_mut().expect("progress");
+                progress.bytes_completed = 150;
+                progress.sources[0].bytes_completed = 150;
+            },
+            |sample: &mut IngestHeartbeat| {
+                let progress = sample.progress.as_mut().expect("progress");
+                progress.bytes_total = 900;
+                progress.sources[0].bytes_total = 900;
+            },
+        ];
+        for mutate in mutations {
+            let mut history = (0..=6)
+                .map(|sample| {
+                    heartbeat_with_progress(
+                        1_000_000 + sample * 10_000,
+                        100 + sample as u64 * 100,
+                        1_000,
+                    )
+                })
+                .collect::<Vec<_>>();
+            mutate(&mut history[3]);
+            let latest = history.last().cloned().expect("latest sample");
+
+            let status = IngestStatusRead {
+                heartbeat: IngestHeartbeatRead {
+                    table_present: true,
+                    latest: Some(latest),
+                },
+                history,
+            }
+            .derive(1_061_000);
+
+            assert!(status.rate.is_none());
+            assert!(status.eta.is_none());
+        }
+    }
+
+    #[test]
+    fn completed_snapshot_with_live_work_is_not_stalled() {
+        let mut latest = heartbeat_with_progress(1_060_000, 1_000, 1_000);
+        latest.queue_depth = 1;
+        latest.files_active = 1;
+        latest
+            .progress
+            .as_mut()
+            .expect("progress")
+            .last_durable_progress_unix_ms = 1_000_000;
+
+        let status = IngestStatusRead {
+            heartbeat: IngestHeartbeatRead {
+                table_present: true,
+                latest: Some(latest.clone()),
+            },
+            history: vec![latest],
+        }
+        .derive(1_061_000);
+
+        assert_eq!(status.conditions[2].reason, "progress_recent");
+        assert!(!status
+            .alerts
+            .iter()
+            .any(|alert| alert.code == IngestAlertCode::ProgressStalled));
+    }
+
+    #[test]
+    fn current_heartbeat_emits_sustained_live_pressure_alerts() {
+        let history = (0..3)
+            .map(|sample| {
+                let mut heartbeat =
+                    heartbeat_with_progress(1_000_000 + sample * 10_000, 100, 1_000);
+                heartbeat.queue_depth = 1_024;
+                heartbeat.progress.as_mut().expect("progress").sink_retrying = true;
+                heartbeat
+            })
+            .collect::<Vec<_>>();
+        let latest = history.last().cloned().expect("latest sample");
+
+        let status = IngestStatusRead {
+            heartbeat: IngestHeartbeatRead {
+                table_present: true,
+                latest: Some(latest),
+            },
+            history,
+        }
+        .derive(1_021_000);
+
+        assert!(status
+            .alerts
+            .iter()
+            .any(|alert| alert.code == IngestAlertCode::QueueSaturated));
+        assert!(status
+            .alerts
+            .iter()
+            .any(|alert| alert.code == IngestAlertCode::SinkRetrying));
+    }
+
+    #[test]
+    fn live_pressure_alerts_observe_hold_counts_and_recovery() {
+        let mut history = (0..2)
+            .map(|sample| {
+                let mut heartbeat =
+                    heartbeat_with_progress(1_000_000 + sample * 10_000, 100, 1_000);
+                heartbeat.queue_depth = 1_024;
+                heartbeat.progress.as_mut().expect("progress").sink_retrying = true;
+                heartbeat
+            })
+            .collect::<Vec<_>>();
+        let held_latest = history.last().cloned().expect("held latest");
+        let held = IngestStatusRead {
+            heartbeat: IngestHeartbeatRead {
+                table_present: true,
+                latest: Some(held_latest),
+            },
+            history: history.clone(),
+        }
+        .derive(1_011_000);
+        assert!(!held
+            .alerts
+            .iter()
+            .any(|alert| alert.code == IngestAlertCode::QueueSaturated));
+        assert!(held
+            .alerts
+            .iter()
+            .any(|alert| alert.code == IngestAlertCode::SinkRetrying));
+
+        let recovered = heartbeat_with_progress(1_020_000, 200, 1_000);
+        history.push(recovered.clone());
+        let recovered = IngestStatusRead {
+            heartbeat: IngestHeartbeatRead {
+                table_present: true,
+                latest: Some(recovered),
+            },
+            history,
+        }
+        .derive(1_021_000);
+        assert!(!recovered.alerts.iter().any(|alert| {
+            matches!(
+                alert.code,
+                IngestAlertCode::QueueSaturated | IngestAlertCode::SinkRetrying
+            )
+        }));
+    }
+    #[test]
+    fn stale_heartbeat_suppresses_live_pressure_alerts() {
+        let history = (0..3)
+            .map(|sample| {
+                let mut heartbeat =
+                    heartbeat_with_progress(1_000_000 + sample * 10_000, 100, 1_000);
+                heartbeat.queue_depth = 1_024;
+                heartbeat.progress.as_mut().expect("progress").sink_retrying = true;
+                heartbeat
+            })
+            .collect::<Vec<_>>();
+        let latest = history.last().cloned().expect("latest sample");
+
+        let status = IngestStatusRead {
+            heartbeat: IngestHeartbeatRead {
+                table_present: true,
+                latest: Some(latest),
+            },
+            history,
+        }
+        .derive(1_051_000);
+
+        assert!(status
+            .alerts
+            .iter()
+            .any(|alert| alert.code == IngestAlertCode::HeartbeatStale));
+        assert!(!status.alerts.iter().any(|alert| {
+            matches!(
+                alert.code,
+                IngestAlertCode::QueueSaturated | IngestAlertCode::SinkRetrying
+            )
+        }));
+    }
+
+    #[test]
+    fn derived_history_is_a_narrow_serializable_projection() {
+        let mut latest = heartbeat_with_progress(1_060_000, 500, 1_000);
+        latest.last_error = "/private/source/path".to_string();
+        latest.backend_sinks = Some(serde_json::json!({"credential": "secret"}));
+        let status = IngestStatusRead {
+            heartbeat: IngestHeartbeatRead {
+                table_present: true,
+                latest: Some(latest.clone()),
+            },
+            history: vec![latest],
+        }
+        .derive(1_061_000);
+
+        assert_eq!(
+            serde_json::to_value(&status.history[0]).expect("serialize history point"),
+            serde_json::json!({
+                "ts_unix_ms": 1_060_000,
+
+                "queue_depth": 1,
+                "files_active": 1,
+                "queue_capacity": 1_024,
+                "sink_pending_rows": 0,
+                "sink_retrying": false,
+                "discovery_complete": true,
+                "files_total": 1,
+                "files_completed": 0,
+                "bytes_total": 1_000,
+                "bytes_completed": 500,
+            })
+        );
+    }
+
+    #[test]
+    fn derived_history_preserves_missing_progress_as_a_gap() {
+        let mut gap = heartbeat_with_progress(1_050_000, 400, 1_000);
+        gap.queue_depth = 7;
+        gap.files_active = 2;
+        gap.progress = None;
+        let latest = heartbeat_with_progress(1_060_000, 500, 1_000);
+
+        let status = IngestStatusRead {
+            heartbeat: IngestHeartbeatRead {
+                table_present: true,
+                latest: Some(latest.clone()),
+            },
+            history: vec![gap, latest],
+        }
+        .derive(1_061_000);
+
+        assert_eq!(status.history.len(), 2);
+        let gap = &status.history[0];
+        assert_eq!(gap.ts_unix_ms, 1_050_000);
+        assert_eq!(gap.queue_depth, 7);
+        assert_eq!(gap.files_active, 2);
+        assert_eq!(gap.queue_capacity, 0);
+        assert!(!gap.discovery_complete);
+        assert_eq!(gap.files_total, 0);
+        assert_eq!(gap.bytes_total, 0);
+    }
+    #[test]
+    fn derived_history_retains_at_most_120_points() {
+        let history = (0..130)
+            .map(|sample| {
+                heartbeat_with_progress(1_000_000 + sample * 1_000, 100 + sample as u64, 1_000)
+            })
+            .collect::<Vec<_>>();
+        let latest = history.last().cloned().expect("latest sample");
+
+        let status = IngestStatusRead {
+            heartbeat: IngestHeartbeatRead {
+                table_present: true,
+                latest: Some(latest),
+            },
+            history,
+        }
+        .derive(1_130_000);
+
+        assert_eq!(status.history.len(), 120);
+        assert_eq!(status.history[0].ts_unix_ms, 1_010_000);
+        assert_eq!(status.history[119].ts_unix_ms, 1_129_000);
     }
 }

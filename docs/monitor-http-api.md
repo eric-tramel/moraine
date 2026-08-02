@@ -15,7 +15,7 @@ All canonical routes are `GET` routes and successful responses use JSON.
 | --- | --- | --- |
 | `/api/v1/capabilities` | none | Describe this server build, its observed schema migration level, and available HTTP feature groups. |
 | `/api/v1/health` | none | Probe ClickHouse health and report a compact ingest heartbeat summary. |
-| `/api/v1/status` | none | Return the diagnostic ClickHouse, database, table, connection, and ingestor snapshot used by the status dashboard. |
+| `/api/v1/status` | `history` | Return ClickHouse/database diagnostics plus typed ingestion health, finite historical coverage, optional durable progress history, conservative ETA, and active alerts. |
 | `/api/v1/analytics` | `range` | Return token, turn, and concurrent-session time series for a supported window. |
 | `/api/v1/tables` | none | List tables with engine, temporary-table marker, and estimated row count. |
 | `/api/v1/tables/:table` | `limit` | Return the named table's schema and a bounded row preview. `:table` is a path parameter. |
@@ -82,6 +82,7 @@ unsigned integer is a malformed query and returns HTTP `400`.
 
 | Route | Parameter | Default | Accepted or effective values |
 | --- | --- | --- | --- |
+| `/api/v1/status` | `history` | `0` | clamped to `0..=120`; omitted or `0` performs no history read |
 | `/api/v1/analytics` | `range` | `24h` | `15m`, `1h`, `6h`, `24h`, `7d`, or `30d` |
 | `/api/v1/sessions` | `since` | `30d` | `1h`, `6h`, `24h`, `7d`, `30d`, `90d`, or `all` |
 | `/api/v1/sessions` | `limit` | `50` | clamped to `1..=200` |
@@ -92,6 +93,11 @@ An unknown `range` does not produce an error; it resolves to `24h`. An unknown
 `since` similarly resolves to `30d`. Responses report or embody the resolved
 window, so clients should treat the supported values above as the request
 contract rather than relying on fallback behavior.
+
+Status history is the exception to positive collection limits: zero is meaningful
+and preserves the cheap latest-only status poll. When requested, history contains
+at most 120 oldest-to-newest narrow checkpoint points for the selected ingestor
+run; it does not repeat host data, source paths, errors, or backend sink payloads.
 
 The table path parameter must match the strict ASCII identifier pattern
 `[A-Za-z_][A-Za-z0-9_]*`. A rejected identifier returns HTTP `400`. A
@@ -119,6 +125,22 @@ rows. They do not use `null` to mean an empty collection.
 - When no ingest heartbeat is available, `ingestor.present` and
   `ingestor.alive` are `false`, while `ingestor.latest` and
   `ingestor.age_seconds` are `null`.
+- `ingest_status` is `null` when the status repository read fails. When present,
+  its independent `health`, `coverage`, `freshness`, and `readiness` conditions
+  use `true`, `false`, or `unknown` states with stable reason codes.
+- `ingest_status.heartbeat.latest.progress` is absent on pre-034 heartbeat rows.
+  A present progress snapshot freezes the startup file/byte denominator for one
+  ingestor instance and advances only after checkpoint rows are durably
+  committed. SQLite sources without a byte watermark report completed-file
+  coverage; `coverage_basis: "files"` identifies that measurement without
+  degrading an otherwise complete, healthy ingest run.
+- `ingest_status.history` is omitted when `history` is omitted or zero. Requested
+  history points contain timestamp, queue/active pressure, queue capacity, sink
+  row/retry pressure, discovery state, and durable file/byte completion counters.
+- `ingest_status.rate` and `ingest_status.eta` are `null` until at least six
+  same-instance observations cover 30 seconds with stable throughput. ETA is
+  also suppressed during discovery, sink retries, zero progress, and excessive
+  short/long-window variance.
 
 Clients must distinguish a diagnostic value inside an HTTP `200` response from
 an endpoint failure represented by a non-2xx status.

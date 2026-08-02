@@ -1,6 +1,6 @@
 use super::*;
 use crate::domain::{
-    AnalyticsRange, AnalyticsSnapshot, IngestHeartbeatRead, SessionAnalytics,
+    AnalyticsRange, AnalyticsSnapshot, IngestHeartbeatRead, IngestStatusRead, SessionAnalytics,
     SessionAnalyticsQuery, StoreDiagnostics, StoreHealth, TablePreview, TablePreviewQuery,
     TableSummaries, WebSearchEvent,
 };
@@ -31,6 +31,9 @@ impl ConversationRepository for ClickHouseConversationRepository {
 
     async fn latest_ingest_heartbeat(&self) -> RepoResult<IngestHeartbeatRead> {
         self.latest_ingest_heartbeat_impl().await
+    }
+    async fn ingest_status(&self, history_limit: u16) -> RepoResult<IngestStatusRead> {
+        self.ingest_status_impl(history_limit).await
     }
 
     async fn list_table_summaries(&self) -> RepoResult<TableSummaries> {

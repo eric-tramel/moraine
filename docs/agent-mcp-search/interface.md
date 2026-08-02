@@ -13,7 +13,7 @@ plain text `content` and machine-readable `structuredContent`. See the
 [MCP tools specification](https://modelcontextprotocol.io/specification/2025-06-18/server/tools)
 for the protocol-level model.
 
-Moraine advertises one read-only server, `moraine-mcp`, with four tools:
+Moraine advertises one read-only server, `moraine-mcp`, with five tools:
 
 | Tool | Use it for |
 | --- | --- |
@@ -21,10 +21,33 @@ Moraine advertises one read-only server, `moraine-mcp`, with four tools:
 | `open` | Expanding an event, turn, or session ID into structured context. |
 | `list_sessions` | Time-window browsing over sessions and active work. |
 | `file_attention` | Every session that touched a file, across every worktree. |
+| `get_ingest_status` | Ingestion health, historical coverage, durable progress, freshness, alerts, and conservative ETA. |
 
-All four tools return a short text summary for clients that display text, and
+All five tools return a short text summary for clients that display text, and
 the same result as JSON in `structuredContent` for clients that can inspect
 structured tool output.
+
+`search_sessions`, `list_sessions`, `open`, and `file_attention` also attach a
+compact `data.coverage` object. When historical coverage is partial or unknown,
+they add a stable `coverage_partial` or `coverage_unknown` warning so an agent
+does not interpret a missing result as proof that an event never existed.
+
+## `get_ingest_status`
+
+Call `get_ingest_status` with an empty object:
+
+```json
+{}
+```
+
+The response keeps process health separate from finite historical coverage and
+live freshness. `conditions` contains `health`, `coverage`, `freshness`, and
+`readiness` entries with three-state values and stable reason codes. The latest
+heartbeat may include the frozen startup denominator, durable file/byte
+completion, queue capacity, sink pressure, and per-source progress. `rate` and
+`eta` remain absent until a stable same-instance checkpoint history supports a
+bounded estimate. Source names are included; source file paths and raw ingest
+errors are not.
 
 ## Record Model
 

@@ -1,7 +1,8 @@
 use super::*;
 use crate::domain::{
-    IngestHeartbeat, IngestHeartbeatRead, StoreConnectionMetrics, StoreDiagnostics, StoreHealth,
-    StoreProbe, TableColumn, TablePreview, TablePreviewQuery, TableSummaries, TableSummary,
+    IngestHeartbeat, IngestHeartbeatRead, IngestProgressSnapshot, IngestStatusRead,
+    StoreConnectionMetrics, StoreDiagnostics, StoreHealth, StoreProbe, TableColumn, TablePreview,
+    TablePreviewQuery, TableSummaries, TableSummary,
 };
 
 #[derive(Deserialize)]
@@ -30,6 +31,41 @@ struct HeartbeatRow {
     watcher_reset_count: Option<u64>,
     watcher_last_reset_unix_ms: Option<u64>,
     backend_sinks: Option<String>,
+    progress_json: Option<String>,
+}
+fn heartbeat_from_row(row: HeartbeatRow) -> IngestHeartbeat {
+    IngestHeartbeat {
+        ts: row.ts,
+        ts_unix_ms: row.ts_unix_ms,
+        host: row.host,
+        service_version: row.service_version,
+        queue_depth: row.queue_depth,
+        files_active: row.files_active,
+        files_watched: row.files_watched,
+        rows_raw_written: row.rows_raw_written,
+        rows_events_written: row.rows_events_written,
+        rows_errors_written: row.rows_errors_written,
+        flush_latency_ms: row.flush_latency_ms,
+        append_to_visible_p50_ms: row.append_to_visible_p50_ms,
+        append_to_visible_p95_ms: row.append_to_visible_p95_ms,
+        last_error: row.last_error,
+        watcher_backend: row.watcher_backend,
+        watcher_error_count: row.watcher_error_count,
+        watcher_reset_count: row.watcher_reset_count,
+        watcher_last_reset_unix_ms: row.watcher_last_reset_unix_ms,
+        backend_sinks: decode_backend_sinks(row.backend_sinks),
+        progress: decode_ingest_progress(row.progress_json),
+    }
+}
+
+fn decode_ingest_progress(raw: Option<String>) -> Option<IngestProgressSnapshot> {
+    let raw = raw?;
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let progress = serde_json::from_str::<IngestProgressSnapshot>(raw).ok()?;
+    (progress.schema_version == 1).then_some(progress)
 }
 
 #[derive(Deserialize)]
@@ -101,6 +137,7 @@ impl ClickHouseConversationRepository {
         let watcher_last_reset_unix_ms =
             optional_projection("watcher_last_reset_unix_ms", "Nullable(UInt64)");
         let backend_sinks = optional_projection("backend_sinks", "Nullable(String)");
+        let progress_json = optional_projection("progress_json", "Nullable(String)");
         let heartbeats = self.table_ref("ingest_heartbeats");
         let heartbeat_query = format!(
             "SELECT\n\
@@ -122,7 +159,8 @@ impl ClickHouseConversationRepository {
                {watcher_error_count},\n\
                {watcher_reset_count},\n\
                {watcher_last_reset_unix_ms},\n\
-               {backend_sinks}\n\
+               {backend_sinks},\n\
+               {progress_json}\n\
              FROM {heartbeats}\n\
              ORDER BY `ts` DESC, `host` DESC\n\
              LIMIT 1\n\
@@ -130,32 +168,67 @@ impl ClickHouseConversationRepository {
         );
         let rows: Vec<HeartbeatRow> =
             self.map_backend(self.query_rows(&heartbeat_query, None).await)?;
-        let latest = rows.into_iter().next().map(|row| IngestHeartbeat {
-            ts: row.ts,
-            ts_unix_ms: row.ts_unix_ms,
-            host: row.host,
-            service_version: row.service_version,
-            queue_depth: row.queue_depth,
-            files_active: row.files_active,
-            files_watched: row.files_watched,
-            rows_raw_written: row.rows_raw_written,
-            rows_events_written: row.rows_events_written,
-            rows_errors_written: row.rows_errors_written,
-            flush_latency_ms: row.flush_latency_ms,
-            append_to_visible_p50_ms: row.append_to_visible_p50_ms,
-            append_to_visible_p95_ms: row.append_to_visible_p95_ms,
-            last_error: row.last_error,
-            watcher_backend: row.watcher_backend,
-            watcher_error_count: row.watcher_error_count,
-            watcher_reset_count: row.watcher_reset_count,
-            watcher_last_reset_unix_ms: row.watcher_last_reset_unix_ms,
-            backend_sinks: decode_backend_sinks(row.backend_sinks),
-        });
+        let latest = rows.into_iter().next().map(heartbeat_from_row);
 
         Ok(IngestHeartbeatRead {
             table_present: true,
             latest,
         })
+    }
+    pub(super) async fn ingest_status_impl(
+        &self,
+        history_limit: u16,
+    ) -> RepoResult<IngestStatusRead> {
+        let heartbeat = self.latest_ingest_heartbeat_impl().await?;
+        let Some(latest) = heartbeat.latest.as_ref() else {
+            return Ok(IngestStatusRead {
+                heartbeat,
+                history: Vec::new(),
+            });
+        };
+        let Some(progress) = latest.progress.as_ref() else {
+            return Ok(IngestStatusRead {
+                heartbeat,
+                history: Vec::new(),
+            });
+        };
+        let limit = history_limit.min(120);
+        if limit == 0 {
+            return Ok(IngestStatusRead {
+                heartbeat,
+                history: Vec::new(),
+            });
+        }
+
+        let heartbeats = self.table_ref("ingest_heartbeats");
+        let host = sql_quote(&latest.host);
+        let instance_id = sql_quote(&progress.instance_id);
+        let history_to_unix_ms = latest.ts_unix_ms;
+        let history_from_unix_ms = history_to_unix_ms.saturating_sub(300_000);
+        let query = format!(
+            "SELECT\n\
+               `ts`, toUnixTimestamp64Milli(`ts`) AS `ts_unix_ms`, `host`, `service_version`,\n\
+               `queue_depth`, `files_active`, `files_watched`, `rows_raw_written`,\n\
+               `rows_events_written`, `rows_errors_written`, `flush_latency_ms`,\n\
+               `append_to_visible_p50_ms`, `append_to_visible_p95_ms`, `last_error`,\n\
+               `watcher_backend`, `watcher_error_count`, `watcher_reset_count`,\n\
+               `watcher_last_reset_unix_ms`, `backend_sinks`, `progress_json`\n\
+             FROM {heartbeats}\n\
+             WHERE `host` = {host}\n\
+               AND `ts` >= fromUnixTimestamp64Milli({history_from_unix_ms})\n\
+               AND `ts` <= fromUnixTimestamp64Milli({history_to_unix_ms})\n\
+               AND JSONExtractString(`progress_json`, 'instance_id') = {instance_id}\n\
+             ORDER BY `ts` DESC, `progress_json` DESC, `queue_depth` DESC, `files_active` DESC\n\
+             LIMIT {limit}\n\
+             FORMAT JSONEachRow"
+        );
+        let mut history = self
+            .map_backend(self.query_rows::<HeartbeatRow>(&query, None).await)?
+            .into_iter()
+            .map(heartbeat_from_row)
+            .collect::<Vec<_>>();
+        history.reverse();
+        Ok(IngestStatusRead { heartbeat, history })
     }
 
     pub(super) async fn list_table_summaries_impl(&self) -> RepoResult<TableSummaries> {

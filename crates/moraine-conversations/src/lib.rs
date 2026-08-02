@@ -25,10 +25,13 @@ pub use domain::{
 };
 pub use domain::{
     AnalyticsConcurrencyPoint, AnalyticsRange, AnalyticsSnapshot, AnalyticsTokenPoint,
-    AnalyticsTurnPoint, AnalyticsWindow, IngestHeartbeat, IngestHeartbeatRead, SessionAnalytics,
-    SessionAnalyticsQuery, SessionLookback, SessionStep, SessionTurn, StoreConnectionMetrics,
-    StoreDiagnostics, StoreHealth, StoreProbe, TableColumn, TablePreview, TablePreviewQuery,
-    TableSummaries, TableSummary, ToolResult, WebSearchEvent,
+    AnalyticsTurnPoint, AnalyticsWindow, IngestAlert, IngestAlertCode, IngestCondition,
+    IngestConditionState, IngestConditionType, IngestCoverageBasis, IngestEta, IngestHeartbeat,
+    IngestHeartbeatRead, IngestHistoryPoint, IngestProgressSnapshot, IngestRate,
+    IngestSourceProgress, IngestStatus, IngestStatusRead, SessionAnalytics, SessionAnalyticsQuery,
+    SessionLookback, SessionStep, SessionTurn, StoreConnectionMetrics, StoreDiagnostics,
+    StoreHealth, StoreProbe, TableColumn, TablePreview, TablePreviewQuery, TableSummaries,
+    TableSummary, ToolResult, WebSearchEvent,
 };
 pub use error::{RepoError, RepoResult};
 pub use in_memory_repo::{
