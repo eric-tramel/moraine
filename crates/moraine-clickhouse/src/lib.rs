@@ -16,6 +16,7 @@ const MAX_INSERT_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
 use std::collections::{BTreeSet, HashSet};
 use std::time::Duration;
 const DEFAULT_USER_AGENT_ROLE: &str = "moraine-clickhouse";
+const MIGRATION_REQUEST_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Clone)]
 pub struct ClickHouseClient {
@@ -248,6 +249,28 @@ impl ClickHouseClient {
         default_format: Option<&str>,
         params: &[(&str, &str)],
     ) -> Result<String> {
+        self.request_text_with_options(
+            query,
+            body,
+            database,
+            async_insert,
+            default_format,
+            params,
+            None,
+        )
+        .await
+    }
+
+    async fn request_text_with_options(
+        &self,
+        query: &str,
+        body: Option<Vec<u8>>,
+        database: Option<&str>,
+        async_insert: bool,
+        default_format: Option<&str>,
+        params: &[(&str, &str)],
+        request_timeout: Option<Duration>,
+    ) -> Result<String> {
         let req = self
             .request_builder(
                 query,
@@ -257,7 +280,7 @@ impl ClickHouseClient {
                     async_insert,
                     default_format,
                     params,
-                    request_timeout: None,
+                    request_timeout,
                 },
             )
             .await?;
@@ -504,15 +527,23 @@ impl ClickHouseClient {
 
             let sql = materialize_migration_sql(migration.sql, &self.cfg.database)?;
             for statement in split_sql_statements(&sql) {
-                self.request_text(&statement, None, Some(&self.cfg.database), false, None)
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "failed migration {} statement: {}",
-                            migration.name,
-                            truncate_for_error(&statement)
-                        )
-                    })?;
+                self.request_text_with_options(
+                    &statement,
+                    None,
+                    Some(&self.cfg.database),
+                    false,
+                    None,
+                    &[],
+                    Some(MIGRATION_REQUEST_TIMEOUT),
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed migration {} statement: {}",
+                        migration.name,
+                        truncate_for_error(&statement)
+                    )
+                })?;
             }
 
             let log_stmt = format!(
@@ -521,9 +552,17 @@ impl ClickHouseClient {
                 escape_literal(migration.version),
                 escape_literal(migration.name)
             );
-            self.request_text(&log_stmt, None, Some(&self.cfg.database), false, None)
-                .await
-                .with_context(|| format!("failed to record migration {}", migration.name))?;
+            self.request_text_with_options(
+                &log_stmt,
+                None,
+                Some(&self.cfg.database),
+                false,
+                None,
+                &[],
+                Some(MIGRATION_REQUEST_TIMEOUT),
+            )
+            .await
+            .with_context(|| format!("failed to record migration {}", migration.name))?;
 
             executed.push(migration.version.to_string());
             on_progress(MigrationProgress::Applied {
@@ -1691,6 +1730,22 @@ mod tests {
                 )
             })
             .expect("event cutover must use EXCHANGE");
+        let event_optimize = statements
+            .iter()
+            .position(|statement| {
+                statement.starts_with("OPTIMIZE TABLE other_db.events_replay_stable_033 FINAL")
+            })
+            .expect("event replacement must converge before cutover");
+        let link_optimize = statements
+            .iter()
+            .position(|statement| {
+                statement.starts_with("OPTIMIZE TABLE other_db.event_links_replay_stable_033 FINAL")
+            })
+            .expect("link replacement must converge before cutover");
+        let uid_lookup_drop = statements
+            .iter()
+            .position(|statement| statement == "DROP TABLE other_db.event_uid_lookup_033")
+            .expect("UID lookup must be released before cutover");
         let final_link_drop = statements
             .iter()
             .rposition(|statement| {
@@ -1707,19 +1762,44 @@ mod tests {
             .iter()
             .find(|statement| statement.starts_with("INSERT INTO other_db.event_uid_map_033"))
             .expect("UID map build must be registered");
-        let event_rewrite = statements
+        let uid_lookup = statements
+            .iter()
+            .find(|statement| statement.starts_with("CREATE TABLE other_db.event_uid_lookup_033"))
+            .expect("bounded UID lookup must be registered");
+        let event_source = statements
             .iter()
             .find(|statement| {
+                statement.starts_with("CREATE VIEW other_db.events_replay_source_033")
+            })
+            .expect("event rewrite source must be registered");
+        let event_rewrites = statements
+            .iter()
+            .filter(|statement| {
                 statement.starts_with("INSERT INTO other_db.events_replay_stable_033")
             })
-            .expect("event rewrite must be registered");
+            .collect::<Vec<_>>();
         let link_rewrite = statements
             .iter()
             .find(|statement| {
                 statement.starts_with("INSERT INTO other_db.event_links_replay_stable_033")
             })
             .expect("link rewrite must be registered");
+        let locator_rebuild = statements
+            .iter()
+            .find(|statement| statement.starts_with("INSERT INTO other_db.mcp_event_locator"))
+            .expect("locator rebuild must be registered");
+        let navigation_rebuild = statements
+            .iter()
+            .find(|statement| statement.starts_with("INSERT INTO other_db.mcp_event_navigation"))
+            .expect("navigation rebuild must be registered");
+        let search_rewrites = statements
+            .iter()
+            .filter(|statement| statement.starts_with("INSERT INTO other_db.search_postings"))
+            .collect::<Vec<_>>();
 
+        assert!(event_optimize < link_exchange);
+        assert!(link_optimize < link_exchange);
+        assert!(uid_lookup_drop < link_exchange);
         assert!(link_exchange < event_exchange);
         assert!(event_exchange < final_link_drop);
         assert!(event_exchange < final_event_drop);
@@ -1732,14 +1812,52 @@ mod tests {
         );
         assert!(!sql.contains("RENAME TABLE"));
         assert!(!sql.contains("_frozen"));
-        assert!(uid_map.contains("GROUP BY event_uid, new_event_uid"));
-        assert!(uid_map.contains("max_bytes_before_external_group_by = 67108864"));
-        for rewrite in [event_rewrite, link_rewrite] {
-            assert!(rewrite.contains("join_algorithm = 'partial_merge'"));
-            assert!(rewrite.contains("max_bytes_before_external_sort = 67108864"));
-            assert!(rewrite.contains("partial_merge_join_rows_in_right_blocks = 8192"));
-            assert!(rewrite.contains("min_insert_block_size_bytes = 16777216"));
+        assert!(!uid_map.contains("GROUP BY"));
+        assert!(uid_lookup.contains("ENGINE = Join(ANY, LEFT, old_event_uid)"));
+        assert!(event_source
+            .contains("joinGet('other_db.event_uid_lookup_033', 'new_event_uid', e.event_uid)"));
+        assert!(link_rewrite
+            .contains("joinGet('other_db.event_uid_lookup_033', 'new_event_uid', l.event_uid)"));
+        assert_eq!(event_rewrites.len(), 8);
+        assert!(!locator_rebuild.contains("events FINAL"));
+        assert!(!navigation_rebuild.contains("events FINAL"));
+        assert_eq!(search_rewrites.len(), 16);
+        for (bucket, rewrite) in search_rewrites.iter().enumerate() {
+            assert!(rewrite.contains(&format!(
+                "AND intDiv(cityHash64(d.session_id) % 64, 4) = {bucket}"
+            )));
+            assert!(rewrite.contains("max_bytes_before_external_group_by = 67108864"));
             assert!(rewrite.contains("max_memory_usage = 1073741824"));
+        }
+        for (bucket, rewrite) in event_rewrites.iter().enumerate() {
+            assert!(rewrite.contains(&format!(
+                "WHERE intDiv(cityHash64(session_id) % 64, 8) = {bucket}"
+            )));
+            for setting in [
+                "max_block_size = 1024",
+                "preferred_max_column_in_block_size_bytes = 33554432",
+                "min_insert_block_size_rows = 0",
+                "min_insert_block_size_bytes = 0",
+                "max_insert_threads = 1",
+                "max_threads = 1",
+                "max_memory_usage = 1073741824",
+            ] {
+                assert!(rewrite.contains(setting));
+            }
+        }
+        for setting in [
+            "max_block_size = 1024",
+            "preferred_max_column_in_block_size_bytes = 33554432",
+            "max_threads = 1",
+        ] {
+            assert!(
+                statements
+                    .iter()
+                    .filter(|statement| statement.contains(setting))
+                    .count()
+                    >= 6,
+                "every bulk migration insert must bound payload-heavy reads with {setting}"
+            );
         }
         assert!(
             statements

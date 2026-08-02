@@ -10,12 +10,15 @@ DROP VIEW IF EXISTS moraine.mv_mcp_event_locator_from_events;
 DROP VIEW IF EXISTS moraine.mv_mcp_event_navigation_from_events;
 DROP VIEW IF EXISTS moraine.mv_search_postings;
 DROP VIEW IF EXISTS moraine.mv_file_attention_project_roots_from_events;
+DROP VIEW IF EXISTS moraine.events_replay_source_033;
+DROP VIEW IF EXISTS moraine.search_postings_source_033;
 
 ALTER TABLE moraine.mcp_event_navigation
   ADD COLUMN IF NOT EXISTS emission_index UInt32 AFTER source_line_no;
 
 
 DROP TABLE IF EXISTS moraine.event_uid_map_033;
+DROP TABLE IF EXISTS moraine.event_uid_lookup_033;
 DROP TABLE IF EXISTS moraine.events_replay_stable_033;
 DROP TABLE IF EXISTS moraine.event_links_replay_stable_033;
 
@@ -122,14 +125,28 @@ SELECT
     value -> concat(toString(length(value)), ':', value),
     identity_fields
   ))))) AS new_event_uid
+-- event_uid is the v1 canonical identity; FINAL therefore yields one mapping
+-- per logical event. ANY joins below also prevent malformed duplicate source
+-- rows from multiplying the rebuilt canonical tables.
 FROM moraine.events FINAL
-GROUP BY event_uid, new_event_uid
-SETTINGS max_bytes_before_external_group_by = 67108864,
-  max_bytes_before_external_sort = 67108864,
-  max_block_size = 8192,
+SETTINGS max_block_size = 1024,
+  preferred_max_column_in_block_size_bytes = 33554432,
   min_insert_block_size_rows = 8192,
   min_insert_block_size_bytes = 16777216,
-  max_threads = 4,
+  max_threads = 1,
+  max_memory_usage = 1073741824;
+
+CREATE TABLE moraine.event_uid_lookup_033 (
+  old_event_uid String,
+  new_event_uid String
+)
+ENGINE = Join(ANY, LEFT, old_event_uid);
+
+INSERT INTO moraine.event_uid_lookup_033
+SELECT old_event_uid, new_event_uid
+FROM moraine.event_uid_map_033
+SETTINGS max_block_size = 1024,
+  max_threads = 1,
   max_memory_usage = 1073741824;
 
 CREATE TABLE moraine.events_replay_stable_033
@@ -138,10 +155,13 @@ ENGINE = ReplacingMergeTree(event_version)
 PARTITION BY cityHash64(session_id) % 64
 ORDER BY (session_id, event_uid);
 
-INSERT INTO moraine.events_replay_stable_033
+CREATE VIEW moraine.events_replay_source_033 AS
 SELECT e.* REPLACE (
-  own.new_event_uid AS event_uid,
-  if(origin.new_event_uid = '', e.origin_event_id, origin.new_event_uid) AS origin_event_id,
+  joinGet('moraine.event_uid_lookup_033', 'new_event_uid', e.event_uid) AS event_uid,
+  coalesce(
+    nullIf(joinGet('moraine.event_uid_lookup_033', 'new_event_uid', e.origin_event_id), ''),
+    e.origin_event_id
+  ) AS origin_event_id,
   if(
     toString(e.harness) = 'qwen-code'
       AND e.actor_kind = 'assistant'
@@ -158,18 +178,113 @@ SELECT e.* REPLACE (
     e.payload_json
   ) AS payload_json
 )
-FROM moraine.events AS e FINAL
-INNER JOIN moraine.event_uid_map_033 AS own
-  ON own.old_event_uid = e.event_uid
-LEFT JOIN moraine.event_uid_map_033 AS origin
-  ON origin.old_event_uid = e.origin_event_id
-SETTINGS join_algorithm = 'partial_merge',
-  max_bytes_before_external_sort = 67108864,
-  partial_merge_join_rows_in_right_blocks = 8192,
-  max_block_size = 8192,
-  min_insert_block_size_rows = 8192,
-  min_insert_block_size_bytes = 16777216,
-  max_threads = 4,
+FROM moraine.events AS e FINAL;
+
+-- Rebuild target partitions in bounded groups. A single INSERT spanning all 64
+-- partitions retains one MergeTree write stream per partition and grows with
+-- the corpus even when the SELECT side is streamed.
+INSERT INTO moraine.events_replay_stable_033
+SELECT *
+FROM moraine.events_replay_source_033
+WHERE intDiv(cityHash64(session_id) % 64, 8) = 0
+SETTINGS max_block_size = 1024,
+  preferred_max_column_in_block_size_bytes = 33554432,
+  min_insert_block_size_rows = 0,
+  min_insert_block_size_bytes = 0,
+  max_insert_threads = 1,
+  max_threads = 1,
+  max_memory_usage = 1073741824;
+
+INSERT INTO moraine.events_replay_stable_033
+SELECT *
+FROM moraine.events_replay_source_033
+WHERE intDiv(cityHash64(session_id) % 64, 8) = 1
+SETTINGS max_block_size = 1024,
+  preferred_max_column_in_block_size_bytes = 33554432,
+  min_insert_block_size_rows = 0,
+  min_insert_block_size_bytes = 0,
+  max_insert_threads = 1,
+  max_threads = 1,
+  max_memory_usage = 1073741824;
+
+INSERT INTO moraine.events_replay_stable_033
+SELECT *
+FROM moraine.events_replay_source_033
+WHERE intDiv(cityHash64(session_id) % 64, 8) = 2
+SETTINGS max_block_size = 1024,
+  preferred_max_column_in_block_size_bytes = 33554432,
+  min_insert_block_size_rows = 0,
+  min_insert_block_size_bytes = 0,
+  max_insert_threads = 1,
+  max_threads = 1,
+  max_memory_usage = 1073741824;
+
+INSERT INTO moraine.events_replay_stable_033
+SELECT *
+FROM moraine.events_replay_source_033
+WHERE intDiv(cityHash64(session_id) % 64, 8) = 3
+SETTINGS max_block_size = 1024,
+  preferred_max_column_in_block_size_bytes = 33554432,
+  min_insert_block_size_rows = 0,
+  min_insert_block_size_bytes = 0,
+  max_insert_threads = 1,
+  max_threads = 1,
+  max_memory_usage = 1073741824;
+
+INSERT INTO moraine.events_replay_stable_033
+SELECT *
+FROM moraine.events_replay_source_033
+WHERE intDiv(cityHash64(session_id) % 64, 8) = 4
+SETTINGS max_block_size = 1024,
+  preferred_max_column_in_block_size_bytes = 33554432,
+  min_insert_block_size_rows = 0,
+  min_insert_block_size_bytes = 0,
+  max_insert_threads = 1,
+  max_threads = 1,
+  max_memory_usage = 1073741824;
+
+INSERT INTO moraine.events_replay_stable_033
+SELECT *
+FROM moraine.events_replay_source_033
+WHERE intDiv(cityHash64(session_id) % 64, 8) = 5
+SETTINGS max_block_size = 1024,
+  preferred_max_column_in_block_size_bytes = 33554432,
+  min_insert_block_size_rows = 0,
+  min_insert_block_size_bytes = 0,
+  max_insert_threads = 1,
+  max_threads = 1,
+  max_memory_usage = 1073741824;
+
+INSERT INTO moraine.events_replay_stable_033
+SELECT *
+FROM moraine.events_replay_source_033
+WHERE intDiv(cityHash64(session_id) % 64, 8) = 6
+SETTINGS max_block_size = 1024,
+  preferred_max_column_in_block_size_bytes = 33554432,
+  min_insert_block_size_rows = 0,
+  min_insert_block_size_bytes = 0,
+  max_insert_threads = 1,
+  max_threads = 1,
+  max_memory_usage = 1073741824;
+
+INSERT INTO moraine.events_replay_stable_033
+SELECT *
+FROM moraine.events_replay_source_033
+WHERE intDiv(cityHash64(session_id) % 64, 8) = 7
+SETTINGS max_block_size = 1024,
+  preferred_max_column_in_block_size_bytes = 33554432,
+  min_insert_block_size_rows = 0,
+  min_insert_block_size_bytes = 0,
+  max_insert_threads = 1,
+  max_threads = 1,
+  max_memory_usage = 1073741824;
+
+DROP VIEW moraine.events_replay_source_033;
+
+-- Make replacement deterministic before the cutover so downstream rebuilds
+-- and canonical readers do not need FINAL to hide transient duplicate parts.
+OPTIMIZE TABLE moraine.events_replay_stable_033 FINAL
+SETTINGS max_threads = 1,
   max_memory_usage = 1073741824;
 
 CREATE TABLE moraine.event_links_replay_stable_033
@@ -180,22 +295,29 @@ ORDER BY (session_id, event_uid, link_type, linked_event_uid, linked_external_id
 
 INSERT INTO moraine.event_links_replay_stable_033
 SELECT l.* REPLACE (
-  if(own.new_event_uid = '', l.event_uid, own.new_event_uid) AS event_uid,
-  if(target.new_event_uid = '', l.linked_event_uid, target.new_event_uid) AS linked_event_uid
+  coalesce(
+    nullIf(joinGet('moraine.event_uid_lookup_033', 'new_event_uid', l.event_uid), ''),
+    l.event_uid
+  ) AS event_uid,
+  coalesce(
+    nullIf(joinGet('moraine.event_uid_lookup_033', 'new_event_uid', l.linked_event_uid), ''),
+    l.linked_event_uid
+  ) AS linked_event_uid
 )
 FROM moraine.event_links AS l FINAL
-LEFT JOIN moraine.event_uid_map_033 AS own
-  ON own.old_event_uid = l.event_uid
-LEFT JOIN moraine.event_uid_map_033 AS target
-  ON target.old_event_uid = l.linked_event_uid
-SETTINGS join_algorithm = 'partial_merge',
-  max_bytes_before_external_sort = 67108864,
-  partial_merge_join_rows_in_right_blocks = 8192,
-  max_block_size = 8192,
-  min_insert_block_size_rows = 8192,
-  min_insert_block_size_bytes = 16777216,
-  max_threads = 4,
+SETTINGS max_block_size = 1024,
+  preferred_max_column_in_block_size_bytes = 33554432,
+  min_insert_block_size_rows = 0,
+  min_insert_block_size_bytes = 0,
+  max_insert_threads = 1,
+  max_threads = 1,
   max_memory_usage = 1073741824;
+
+OPTIMIZE TABLE moraine.event_links_replay_stable_033 FINAL
+SETTINGS max_threads = 1,
+  max_memory_usage = 1073741824;
+
+DROP TABLE moraine.event_uid_lookup_033;
 
 
 
@@ -278,12 +400,14 @@ SELECT event_uid, event_version, ingested_at, session_id, source_name, source_fi
     [JSONExtractString(tool_input, 'file_path'), JSONExtractString(tool_input, 'notebook_path'), JSONExtractString(tool_input, 'path'), JSONExtractString(tool_input, 'target_file'), JSONExtractString(tool_input, 'relativeWorkspacePath'), JSONExtractString(tool_input, 'relative_workspace_path'), JSONExtractString(tool_input, 'filepath'), JSONExtractString(tool_input, 'file'), JSONExtractString(tool_input, 'filename')]
   ))),
   toUInt8(positionCaseInsensitiveUTF8(payload_json, 'codex-mcp') > 0)
-FROM moraine.events FINAL
+FROM moraine.events
 WHERE notEmpty(session_id)
-SETTINGS max_block_size = 8192,
-  min_insert_block_size_rows = 8192,
-  min_insert_block_size_bytes = 16777216,
-  max_threads = 4,
+SETTINGS max_block_size = 1024,
+  preferred_max_column_in_block_size_bytes = 33554432,
+  min_insert_block_size_rows = 0,
+  min_insert_block_size_bytes = 0,
+  max_insert_threads = 1,
+  max_threads = 1,
   max_memory_usage = 1073741824;
 
 INSERT INTO moraine.mcp_event_navigation
@@ -297,39 +421,266 @@ SELECT session_id,
   op_status, item_id, harness, inference_provider, cwd,
   toUInt8(actor_kind = 'user' AND event_kind = 'message'),
   toUInt8(event_kind = 'session_meta' OR (source_name = 'omp' AND JSONExtractString(payload_json, 'type') IN ('title', 'title_change')))
-FROM moraine.events FINAL
+FROM moraine.events
 WHERE notEmpty(session_id)
-SETTINGS max_block_size = 8192,
-  min_insert_block_size_rows = 8192,
-  min_insert_block_size_bytes = 16777216,
-  max_threads = 4,
+SETTINGS max_block_size = 1024,
+  preferred_max_column_in_block_size_bytes = 33554432,
+  min_insert_block_size_rows = 0,
+  min_insert_block_size_bytes = 0,
+  max_insert_threads = 1,
+  max_threads = 1,
+  max_memory_usage = 1073741824;
+
+CREATE VIEW moraine.search_postings_source_033 AS
+SELECT event_version, arrayJoin(extractAll(lowerUTF8(text_content), '[a-z0-9_]+')) AS term,
+  event_uid, session_id, source_name, harness, inference_provider,
+  event_kind AS event_class, payload_type, actor_kind AS actor_role,
+  tool_name AS name, if(tool_phase != '', tool_phase, op_status) AS phase,
+  source_ref,
+  toUInt32(length(extractAll(lowerUTF8(text_content), '[a-z0-9_]+'))) AS doc_len
+FROM moraine.events;
+
+INSERT INTO moraine.search_postings
+SELECT d.*, toUInt16(count())
+FROM moraine.search_postings_source_033 AS d
+WHERE d.doc_len > 0 AND lengthUTF8(d.term) BETWEEN 2 AND 64
+  AND intDiv(cityHash64(d.session_id) % 64, 4) = 0
+GROUP BY ALL
+SETTINGS max_bytes_before_external_group_by = 67108864,
+  max_bytes_before_external_sort = 67108864,
+  max_block_size = 1024,
+  min_insert_block_size_rows = 0,
+  min_insert_block_size_bytes = 0,
+  max_insert_threads = 1,
+  max_threads = 1,
   max_memory_usage = 1073741824;
 
 INSERT INTO moraine.search_postings
-SELECT d.event_version, d.term, d.event_uid, d.session_id, d.source_name,
-  d.harness, d.inference_provider, d.event_class, d.payload_type, d.actor_role,
-  d.name, d.phase, d.source_ref, d.doc_len, toUInt16(count())
-FROM
-(
-  SELECT event_version, event_uid, session_id, source_name, harness,
-    inference_provider, event_kind AS event_class, payload_type,
-    actor_kind AS actor_role, tool_name AS name,
-    if(tool_phase != '', tool_phase, op_status) AS phase, source_ref,
-    toUInt32(length(extractAll(lowerUTF8(text_content), '[a-z0-9_]+'))) AS doc_len,
-    arrayJoin(extractAll(lowerUTF8(text_content), '[a-z0-9_]+')) AS term
-  FROM moraine.events FINAL
-) AS d
+SELECT d.*, toUInt16(count())
+FROM moraine.search_postings_source_033 AS d
 WHERE d.doc_len > 0 AND lengthUTF8(d.term) BETWEEN 2 AND 64
-GROUP BY d.event_version, d.term, d.event_uid, d.session_id, d.source_name,
-  d.harness, d.inference_provider, d.event_class, d.payload_type, d.actor_role,
-  d.name, d.phase, d.source_ref, d.doc_len
+  AND intDiv(cityHash64(d.session_id) % 64, 4) = 1
+GROUP BY ALL
 SETTINGS max_bytes_before_external_group_by = 67108864,
   max_bytes_before_external_sort = 67108864,
-  max_block_size = 8192,
-  min_insert_block_size_rows = 8192,
-  min_insert_block_size_bytes = 16777216,
-  max_threads = 4,
+  max_block_size = 1024,
+  min_insert_block_size_rows = 0,
+  min_insert_block_size_bytes = 0,
+  max_insert_threads = 1,
+  max_threads = 1,
   max_memory_usage = 1073741824;
+
+INSERT INTO moraine.search_postings
+SELECT d.*, toUInt16(count())
+FROM moraine.search_postings_source_033 AS d
+WHERE d.doc_len > 0 AND lengthUTF8(d.term) BETWEEN 2 AND 64
+  AND intDiv(cityHash64(d.session_id) % 64, 4) = 2
+GROUP BY ALL
+SETTINGS max_bytes_before_external_group_by = 67108864,
+  max_bytes_before_external_sort = 67108864,
+  max_block_size = 1024,
+  min_insert_block_size_rows = 0,
+  min_insert_block_size_bytes = 0,
+  max_insert_threads = 1,
+  max_threads = 1,
+  max_memory_usage = 1073741824;
+
+INSERT INTO moraine.search_postings
+SELECT d.*, toUInt16(count())
+FROM moraine.search_postings_source_033 AS d
+WHERE d.doc_len > 0 AND lengthUTF8(d.term) BETWEEN 2 AND 64
+  AND intDiv(cityHash64(d.session_id) % 64, 4) = 3
+GROUP BY ALL
+SETTINGS max_bytes_before_external_group_by = 67108864,
+  max_bytes_before_external_sort = 67108864,
+  max_block_size = 1024,
+  min_insert_block_size_rows = 0,
+  min_insert_block_size_bytes = 0,
+  max_insert_threads = 1,
+  max_threads = 1,
+  max_memory_usage = 1073741824;
+
+INSERT INTO moraine.search_postings
+SELECT d.*, toUInt16(count())
+FROM moraine.search_postings_source_033 AS d
+WHERE d.doc_len > 0 AND lengthUTF8(d.term) BETWEEN 2 AND 64
+  AND intDiv(cityHash64(d.session_id) % 64, 4) = 4
+GROUP BY ALL
+SETTINGS max_bytes_before_external_group_by = 67108864,
+  max_bytes_before_external_sort = 67108864,
+  max_block_size = 1024,
+  min_insert_block_size_rows = 0,
+  min_insert_block_size_bytes = 0,
+  max_insert_threads = 1,
+  max_threads = 1,
+  max_memory_usage = 1073741824;
+
+INSERT INTO moraine.search_postings
+SELECT d.*, toUInt16(count())
+FROM moraine.search_postings_source_033 AS d
+WHERE d.doc_len > 0 AND lengthUTF8(d.term) BETWEEN 2 AND 64
+  AND intDiv(cityHash64(d.session_id) % 64, 4) = 5
+GROUP BY ALL
+SETTINGS max_bytes_before_external_group_by = 67108864,
+  max_bytes_before_external_sort = 67108864,
+  max_block_size = 1024,
+  min_insert_block_size_rows = 0,
+  min_insert_block_size_bytes = 0,
+  max_insert_threads = 1,
+  max_threads = 1,
+  max_memory_usage = 1073741824;
+
+INSERT INTO moraine.search_postings
+SELECT d.*, toUInt16(count())
+FROM moraine.search_postings_source_033 AS d
+WHERE d.doc_len > 0 AND lengthUTF8(d.term) BETWEEN 2 AND 64
+  AND intDiv(cityHash64(d.session_id) % 64, 4) = 6
+GROUP BY ALL
+SETTINGS max_bytes_before_external_group_by = 67108864,
+  max_bytes_before_external_sort = 67108864,
+  max_block_size = 1024,
+  min_insert_block_size_rows = 0,
+  min_insert_block_size_bytes = 0,
+  max_insert_threads = 1,
+  max_threads = 1,
+  max_memory_usage = 1073741824;
+
+INSERT INTO moraine.search_postings
+SELECT d.*, toUInt16(count())
+FROM moraine.search_postings_source_033 AS d
+WHERE d.doc_len > 0 AND lengthUTF8(d.term) BETWEEN 2 AND 64
+  AND intDiv(cityHash64(d.session_id) % 64, 4) = 7
+GROUP BY ALL
+SETTINGS max_bytes_before_external_group_by = 67108864,
+  max_bytes_before_external_sort = 67108864,
+  max_block_size = 1024,
+  min_insert_block_size_rows = 0,
+  min_insert_block_size_bytes = 0,
+  max_insert_threads = 1,
+  max_threads = 1,
+  max_memory_usage = 1073741824;
+
+INSERT INTO moraine.search_postings
+SELECT d.*, toUInt16(count())
+FROM moraine.search_postings_source_033 AS d
+WHERE d.doc_len > 0 AND lengthUTF8(d.term) BETWEEN 2 AND 64
+  AND intDiv(cityHash64(d.session_id) % 64, 4) = 8
+GROUP BY ALL
+SETTINGS max_bytes_before_external_group_by = 67108864,
+  max_bytes_before_external_sort = 67108864,
+  max_block_size = 1024,
+  min_insert_block_size_rows = 0,
+  min_insert_block_size_bytes = 0,
+  max_insert_threads = 1,
+  max_threads = 1,
+  max_memory_usage = 1073741824;
+
+INSERT INTO moraine.search_postings
+SELECT d.*, toUInt16(count())
+FROM moraine.search_postings_source_033 AS d
+WHERE d.doc_len > 0 AND lengthUTF8(d.term) BETWEEN 2 AND 64
+  AND intDiv(cityHash64(d.session_id) % 64, 4) = 9
+GROUP BY ALL
+SETTINGS max_bytes_before_external_group_by = 67108864,
+  max_bytes_before_external_sort = 67108864,
+  max_block_size = 1024,
+  min_insert_block_size_rows = 0,
+  min_insert_block_size_bytes = 0,
+  max_insert_threads = 1,
+  max_threads = 1,
+  max_memory_usage = 1073741824;
+
+INSERT INTO moraine.search_postings
+SELECT d.*, toUInt16(count())
+FROM moraine.search_postings_source_033 AS d
+WHERE d.doc_len > 0 AND lengthUTF8(d.term) BETWEEN 2 AND 64
+  AND intDiv(cityHash64(d.session_id) % 64, 4) = 10
+GROUP BY ALL
+SETTINGS max_bytes_before_external_group_by = 67108864,
+  max_bytes_before_external_sort = 67108864,
+  max_block_size = 1024,
+  min_insert_block_size_rows = 0,
+  min_insert_block_size_bytes = 0,
+  max_insert_threads = 1,
+  max_threads = 1,
+  max_memory_usage = 1073741824;
+
+INSERT INTO moraine.search_postings
+SELECT d.*, toUInt16(count())
+FROM moraine.search_postings_source_033 AS d
+WHERE d.doc_len > 0 AND lengthUTF8(d.term) BETWEEN 2 AND 64
+  AND intDiv(cityHash64(d.session_id) % 64, 4) = 11
+GROUP BY ALL
+SETTINGS max_bytes_before_external_group_by = 67108864,
+  max_bytes_before_external_sort = 67108864,
+  max_block_size = 1024,
+  min_insert_block_size_rows = 0,
+  min_insert_block_size_bytes = 0,
+  max_insert_threads = 1,
+  max_threads = 1,
+  max_memory_usage = 1073741824;
+
+INSERT INTO moraine.search_postings
+SELECT d.*, toUInt16(count())
+FROM moraine.search_postings_source_033 AS d
+WHERE d.doc_len > 0 AND lengthUTF8(d.term) BETWEEN 2 AND 64
+  AND intDiv(cityHash64(d.session_id) % 64, 4) = 12
+GROUP BY ALL
+SETTINGS max_bytes_before_external_group_by = 67108864,
+  max_bytes_before_external_sort = 67108864,
+  max_block_size = 1024,
+  min_insert_block_size_rows = 0,
+  min_insert_block_size_bytes = 0,
+  max_insert_threads = 1,
+  max_threads = 1,
+  max_memory_usage = 1073741824;
+
+INSERT INTO moraine.search_postings
+SELECT d.*, toUInt16(count())
+FROM moraine.search_postings_source_033 AS d
+WHERE d.doc_len > 0 AND lengthUTF8(d.term) BETWEEN 2 AND 64
+  AND intDiv(cityHash64(d.session_id) % 64, 4) = 13
+GROUP BY ALL
+SETTINGS max_bytes_before_external_group_by = 67108864,
+  max_bytes_before_external_sort = 67108864,
+  max_block_size = 1024,
+  min_insert_block_size_rows = 0,
+  min_insert_block_size_bytes = 0,
+  max_insert_threads = 1,
+  max_threads = 1,
+  max_memory_usage = 1073741824;
+
+INSERT INTO moraine.search_postings
+SELECT d.*, toUInt16(count())
+FROM moraine.search_postings_source_033 AS d
+WHERE d.doc_len > 0 AND lengthUTF8(d.term) BETWEEN 2 AND 64
+  AND intDiv(cityHash64(d.session_id) % 64, 4) = 14
+GROUP BY ALL
+SETTINGS max_bytes_before_external_group_by = 67108864,
+  max_bytes_before_external_sort = 67108864,
+  max_block_size = 1024,
+  min_insert_block_size_rows = 0,
+  min_insert_block_size_bytes = 0,
+  max_insert_threads = 1,
+  max_threads = 1,
+  max_memory_usage = 1073741824;
+
+INSERT INTO moraine.search_postings
+SELECT d.*, toUInt16(count())
+FROM moraine.search_postings_source_033 AS d
+WHERE d.doc_len > 0 AND lengthUTF8(d.term) BETWEEN 2 AND 64
+  AND intDiv(cityHash64(d.session_id) % 64, 4) = 15
+GROUP BY ALL
+SETTINGS max_bytes_before_external_group_by = 67108864,
+  max_bytes_before_external_sort = 67108864,
+  max_block_size = 1024,
+  min_insert_block_size_rows = 0,
+  min_insert_block_size_bytes = 0,
+  max_insert_threads = 1,
+  max_threads = 1,
+  max_memory_usage = 1073741824;
+
+DROP VIEW moraine.search_postings_source_033;
 
 CREATE MATERIALIZED VIEW moraine.mv_mcp_event_locator_from_events
 TO moraine.mcp_event_locator AS
@@ -399,4 +750,5 @@ WHERE startsWith(JSONExtractString(payload_json, 'moraine_tool_io', 'project_id'
 
 DROP TABLE IF EXISTS moraine.events_replay_stable_033;
 DROP TABLE IF EXISTS moraine.event_links_replay_stable_033;
+DROP TABLE IF EXISTS moraine.event_uid_lookup_033;
 DROP TABLE IF EXISTS moraine.event_uid_map_033;
