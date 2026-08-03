@@ -1558,6 +1558,35 @@ VALUES
             .await
             .context("failed to insert schema-032 event fixture")?;
     clickhouse
+        .request_text(
+            &format!(
+                r#"INSERT INTO `{db}`.`events`
+(ingested_at, event_uid, session_id, session_date, source_name, harness,
+ source_file, source_generation, source_line_no, source_offset, source_ref,
+ record_ts, event_ts, event_kind, actor_kind, payload_type, text_content,
+ text_preview, payload_json, event_version)
+VALUES
+(toDateTime64('2026-01-01 00:00:00', 3), 'schema32-cross-month-old',
+ 'schema32-cross-month', toDate('2026-01-01'), 'claude', 'claude-code',
+ '/old/cross-month.jsonl', 1, 70, 700, '/old/cross-month.jsonl:70',
+ '2026-01-01T00:00:04.000Z', toDateTime64('2026-01-01 00:00:04', 3),
+ 'message', 'assistant', 'agent_message', 'old version', 'old version',
+ '{{"type":"text","text":"old version"}}', 1008),
+(toDateTime64('2026-07-01 00:00:00', 3), 'schema32-cross-month-old',
+ 'schema32-cross-month', toDate('2026-01-01'), 'claude', 'claude-code',
+ '/old/cross-month.jsonl', 1, 70, 700, '/old/cross-month.jsonl:70',
+ '2026-01-01T00:00:04.000Z', toDateTime64('2026-01-01 00:00:04', 3),
+ 'message', 'assistant', 'agent_message', 'new version', 'new version',
+ '{{"type":"text","text":"new version"}}', 2008)"#
+            ),
+            None,
+            Some(db),
+            false,
+            None,
+        )
+        .await
+        .context("failed to insert cross-month replacement fixture")?;
+    clickhouse
             .request_text(
                 &format!(
                     "INSERT INTO `{db}`.`event_links` \
@@ -1633,6 +1662,9 @@ VALUES
         event_uids: u64,
         locator_rows: u64,
         navigation_rows: u64,
+        cross_month_rows: u64,
+        cross_month_text: String,
+        cross_month_occurrence: u64,
         request_uid: String,
         response_origin_uid: String,
         linked_uid: String,
@@ -1653,6 +1685,13 @@ VALUES
   (SELECT uniqExact(event_uid) FROM `{db}`.`events` FINAL WHERE session_id = 'schema32-session') AS event_uids,
   (SELECT count() FROM `{db}`.`mcp_event_locator` FINAL WHERE session_id = 'schema32-session') AS locator_rows,
   (SELECT count() FROM `{db}`.`mcp_event_navigation` FINAL WHERE session_id = 'schema32-session') AS navigation_rows,
+  (SELECT count() FROM `{db}`.`events` FINAL
+    WHERE session_id = 'schema32-cross-month') AS cross_month_rows,
+  (SELECT any(text_content) FROM `{db}`.`events` FINAL
+    WHERE session_id = 'schema32-cross-month') AS cross_month_text,
+  (SELECT any(JSONExtractUInt(payload_json, 'moraine_semantic_occurrence'))
+    FROM `{db}`.`events` FINAL
+    WHERE session_id = 'schema32-cross-month') AS cross_month_occurrence,
   (SELECT arrayStringConcat(groupArray(toString(emission_index)), ',') FROM (
     SELECT emission_index FROM `{db}`.`mcp_event_navigation` FINAL
     WHERE session_id = 'schema32-qwen'
@@ -1701,6 +1740,9 @@ FORMAT JSONEachRow"#
     assert_eq!(row.event_uids, 2);
     assert_eq!(row.locator_rows, 2);
     assert_eq!(row.navigation_rows, 2);
+    assert_eq!(row.cross_month_rows, 1);
+    assert_eq!(row.cross_month_text, "new version");
+    assert_eq!(row.cross_month_occurrence, 0);
     assert_eq!(row.response_origin_uid, row.request_uid);
     assert_eq!(row.request_payload_uid, row.request_uid);
     assert_eq!(row.linked_uid, row.request_uid);

@@ -1763,6 +1763,10 @@ mod tests {
                 statement == "DROP TABLE IF EXISTS other_db.events_replay_stable_033"
             })
             .expect("old event table must be dropped after cutover");
+        let uid_base_rewrites = statements
+            .iter()
+            .filter(|statement| statement.starts_with("INSERT INTO other_db.event_uid_base_033"))
+            .collect::<Vec<_>>();
         let uid_map = statements
             .iter()
             .find(|statement| statement.starts_with("INSERT INTO other_db.event_uid_map_033"))
@@ -1819,6 +1823,13 @@ mod tests {
         assert!(!sql.contains("_frozen"));
         assert!(!uid_map.contains("GROUP BY"));
         assert!(uid_lookup.contains("ENGINE = Join(ANY, LEFT, old_event_uid)"));
+        assert_eq!(uid_base_rewrites.len(), 8);
+        assert!(sql.contains("FROM other_db.events FINAL"));
+        for (bucket, rewrite) in uid_base_rewrites.iter().enumerate() {
+            assert!(rewrite.contains(&format!("WHERE source_bucket = {bucket}")));
+            assert!(rewrite.contains("max_memory_usage = 1073741824"));
+        }
+        assert!(event_source.contains("FROM other_db.events AS e FINAL"));
         assert!(event_source
             .contains("joinGet('other_db.event_uid_lookup_033', 'new_event_uid', e.event_uid)"));
         assert!(link_rewrite

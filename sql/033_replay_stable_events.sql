@@ -18,16 +18,11 @@ ALTER TABLE moraine.mcp_event_navigation
   ADD COLUMN IF NOT EXISTS emission_index UInt32 AFTER source_line_no;
 
 
+DROP TABLE IF EXISTS moraine.event_uid_base_033;
 DROP TABLE IF EXISTS moraine.event_uid_map_033;
 DROP TABLE IF EXISTS moraine.event_uid_lookup_033;
 DROP TABLE IF EXISTS moraine.events_replay_stable_033;
 DROP TABLE IF EXISTS moraine.event_links_replay_stable_033;
-
--- Writers are quiesced by the CLI. Compact the source replacement keys once
--- so every subsequent rebuild can stream physical rows without SELECT FINAL.
-OPTIMIZE TABLE moraine.events FINAL
-SETTINGS max_threads = 1,
-  max_memory_usage = 1073741824;
 
 CREATE VIEW moraine.event_uid_base_source_033 AS
 WITH
@@ -133,10 +128,76 @@ SELECT
   lower(hex(SHA256(arrayStringConcat(arrayMap(
     value -> concat(toString(length(value)), ':', value),
     identity_fields
-  ))))) AS base_event_uid
--- The source table was compacted above, so each physical row is one event
--- occurrence observed before this migration.
-FROM moraine.events;
+  ))))) AS base_event_uid,
+  toUInt8(cityHash64(session_id) % 8) AS source_bucket
+-- FINAL must resolve a schema-032 key even when its replacement versions span
+-- ingested_at month partitions. Each consumer below filters one source bucket.
+FROM moraine.events FINAL;
+    
+CREATE TABLE moraine.event_uid_base_033 (
+  old_event_uid String,
+  source_name String,
+  source_file String,
+  source_generation UInt32,
+  source_line_no UInt64,
+  source_offset UInt64,
+  existing_occurrence UInt32,
+  base_event_uid String,
+  source_bucket UInt8
+)
+ENGINE = MergeTree
+PARTITION BY source_bucket
+ORDER BY (source_bucket, old_event_uid);
+
+INSERT INTO moraine.event_uid_base_033
+SELECT * FROM moraine.event_uid_base_source_033 WHERE source_bucket = 0
+SETTINGS max_block_size = 1024, preferred_max_column_in_block_size_bytes = 33554432,
+  min_insert_block_size_rows = 8192, min_insert_block_size_bytes = 16777216,
+  max_insert_threads = 1, max_threads = 1, max_memory_usage = 1073741824;
+
+INSERT INTO moraine.event_uid_base_033
+SELECT * FROM moraine.event_uid_base_source_033 WHERE source_bucket = 1
+SETTINGS max_block_size = 1024, preferred_max_column_in_block_size_bytes = 33554432,
+  min_insert_block_size_rows = 8192, min_insert_block_size_bytes = 16777216,
+  max_insert_threads = 1, max_threads = 1, max_memory_usage = 1073741824;
+
+INSERT INTO moraine.event_uid_base_033
+SELECT * FROM moraine.event_uid_base_source_033 WHERE source_bucket = 2
+SETTINGS max_block_size = 1024, preferred_max_column_in_block_size_bytes = 33554432,
+  min_insert_block_size_rows = 8192, min_insert_block_size_bytes = 16777216,
+  max_insert_threads = 1, max_threads = 1, max_memory_usage = 1073741824;
+
+INSERT INTO moraine.event_uid_base_033
+SELECT * FROM moraine.event_uid_base_source_033 WHERE source_bucket = 3
+SETTINGS max_block_size = 1024, preferred_max_column_in_block_size_bytes = 33554432,
+  min_insert_block_size_rows = 8192, min_insert_block_size_bytes = 16777216,
+  max_insert_threads = 1, max_threads = 1, max_memory_usage = 1073741824;
+
+INSERT INTO moraine.event_uid_base_033
+SELECT * FROM moraine.event_uid_base_source_033 WHERE source_bucket = 4
+SETTINGS max_block_size = 1024, preferred_max_column_in_block_size_bytes = 33554432,
+  min_insert_block_size_rows = 8192, min_insert_block_size_bytes = 16777216,
+  max_insert_threads = 1, max_threads = 1, max_memory_usage = 1073741824;
+
+INSERT INTO moraine.event_uid_base_033
+SELECT * FROM moraine.event_uid_base_source_033 WHERE source_bucket = 5
+SETTINGS max_block_size = 1024, preferred_max_column_in_block_size_bytes = 33554432,
+  min_insert_block_size_rows = 8192, min_insert_block_size_bytes = 16777216,
+  max_insert_threads = 1, max_threads = 1, max_memory_usage = 1073741824;
+
+INSERT INTO moraine.event_uid_base_033
+SELECT * FROM moraine.event_uid_base_source_033 WHERE source_bucket = 6
+SETTINGS max_block_size = 1024, preferred_max_column_in_block_size_bytes = 33554432,
+  min_insert_block_size_rows = 8192, min_insert_block_size_bytes = 16777216,
+  max_insert_threads = 1, max_threads = 1, max_memory_usage = 1073741824;
+
+INSERT INTO moraine.event_uid_base_033
+SELECT * FROM moraine.event_uid_base_source_033 WHERE source_bucket = 7
+SETTINGS max_block_size = 1024, preferred_max_column_in_block_size_bytes = 33554432,
+  min_insert_block_size_rows = 8192, min_insert_block_size_bytes = 16777216,
+  max_insert_threads = 1, max_threads = 1, max_memory_usage = 1073741824;
+
+DROP VIEW moraine.event_uid_base_source_033;
 
 CREATE TABLE moraine.event_uid_map_033 (
   old_event_uid String,
@@ -157,7 +218,7 @@ SELECT
     toString(length(toString(existing_occurrence))), ':', toString(existing_occurrence)
   )))) AS new_event_uid,
   existing_occurrence AS semantic_occurrence
-FROM moraine.event_uid_base_source_033
+FROM moraine.event_uid_base_033
 WHERE existing_occurrence > 0
 SETTINGS max_block_size = 1024,
   preferred_max_column_in_block_size_bytes = 33554432,
@@ -193,7 +254,7 @@ FROM (
         source_offset, base_event_uid
       ORDER BY old_event_uid
     ) AS occurrence
-  FROM moraine.event_uid_base_source_033
+  FROM moraine.event_uid_base_033
   WHERE existing_occurrence = 0
 )
 SETTINGS max_block_size = 1024,
@@ -204,7 +265,7 @@ SETTINGS max_block_size = 1024,
   max_threads = 1,
   max_memory_usage = 1073741824;
 
-DROP VIEW moraine.event_uid_base_source_033;
+DROP TABLE moraine.event_uid_base_033;
 
 CREATE TABLE moraine.event_uid_lookup_033 (
   old_event_uid String,
