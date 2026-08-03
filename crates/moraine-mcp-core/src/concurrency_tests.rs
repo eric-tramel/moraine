@@ -2,9 +2,9 @@ use super::*;
 use moraine_conversations::{
     AnalyticsRange, AnalyticsSnapshot, Conversation, ConversationDetailOptions,
     ConversationListFilter, ConversationSearchQuery, ConversationSearchResults, FileAttentionQuery,
-    FileAttentionTouch, InMemoryConversationRepository, IngestHeartbeatRead, McpEventOpen,
-    McpSessionListFilter, McpSessionListItem, McpSessionOpen, McpTurnOpen, OpenContext,
-    OpenEventRequest, Page, PageRequest, RepoConfig, RepoResult, SearchEventsQuery,
+    FileAttentionTouch, InMemoryConversationRepository, IngestHeartbeatRead, IngestStatusRead,
+    McpEventOpen, McpSessionListFilter, McpSessionListItem, McpSessionOpen, McpTurnOpen,
+    OpenContext, OpenEventRequest, Page, PageRequest, RepoConfig, RepoResult, SearchEventsQuery,
     SearchEventsResult, SearchMcpEventsQuery, SearchMcpEventsResult, SessionAnalytics,
     SessionAnalyticsQuery, SessionEventsQuery, SessionMetadata, SessionMetadataSearchQuery,
     SessionMetadataSearchResults, StoreDiagnostics, StoreHealth, TablePreview, TablePreviewQuery,
@@ -20,6 +20,7 @@ const DELAY_SEARCH: u8 = 3;
 const PANIC_SEARCH: u8 = 4;
 const BLOCK_LIST: u8 = 5;
 const BLOCK_OPEN: u8 = 6;
+const BLOCK_STATUS: u8 = 7;
 const TEST_MAX_PARALLEL_REQUESTS: usize = 2;
 
 struct BlockingRepository {
@@ -141,6 +142,13 @@ impl ConversationRepository for BlockingRepository {
 
     async fn latest_ingest_heartbeat(&self) -> RepoResult<IngestHeartbeatRead> {
         self.inner.latest_ingest_heartbeat().await
+    }
+
+    async fn ingest_status(&self, history_limit: u16) -> RepoResult<IngestStatusRead> {
+        if self.mode.load(Ordering::Acquire) == BLOCK_STATUS {
+            self.block_forever().await
+        }
+        self.inner.ingest_status(history_limit).await
     }
 
     async fn list_table_summaries(&self) -> RepoResult<TableSummaries> {
@@ -496,6 +504,104 @@ async fn full_queue_returns_structured_overload_within_one_hundred_milliseconds(
 }
 
 #[tokio::test]
+async fn ingest_status_obeys_shared_execution_and_queue_limits() {
+    let repository = Arc::new(BlockingRepository::new(BLOCK_STATUS));
+    let state = test_state_with_admission(repository.clone(), 1, 1);
+    let admission = state.request_admission.clone();
+    let (mut reader, mut writer, server) = start_connection_with_state(state);
+    let burst = ["status-1", "status-2", "status-3"]
+        .into_iter()
+        .map(|id| tool_request(id, "get_ingest_status", json!({})))
+        .collect::<String>();
+
+    writer
+        .write_all(burst.as_bytes())
+        .await
+        .expect("send status burst");
+    let overloaded = read_response(&mut reader).await;
+    assert_eq!(overloaded["id"], json!("status-3"));
+    assert_eq!(overloaded["result"]["isError"], json!(true));
+    assert_eq!(
+        overloaded["result"]["structuredContent"]["error"]["details"]["reason"],
+        json!("queue_full")
+    );
+    repository.wait_for_started(1).await;
+    assert_eq!(admission.execution.available_permits(), 0);
+    assert_eq!(admission.slots.available_permits(), 0);
+
+    for id in ["status-1", "status-2"] {
+        writer
+            .write_all(
+                format!(
+                    "{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{{\"requestId\":\"{id}\"}}}}\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("cancel admitted status request");
+    }
+    writer.shutdown().await.expect("half-close request stream");
+    drop(writer);
+    tokio::time::timeout(std::time::Duration::from_secs(1), server)
+        .await
+        .expect("connection drained")
+        .expect("connection task joined")
+        .expect("connection succeeded");
+    repository.wait_for_cancelled(1).await;
+    assert_eq!(repository.started.load(Ordering::Acquire), 1);
+    assert_eq!(admission.execution.available_permits(), 1);
+    assert_eq!(admission.slots.available_permits(), 2);
+}
+
+#[tokio::test]
+async fn ingest_status_deadline_cancels_the_registered_backend_query() {
+    let repository = Arc::new(BlockingRepository::new(BLOCK_STATUS));
+    let state = test_state_with_admission(repository.clone(), 1, 1);
+    let (mut reader, mut writer, server) = start_connection_with_state(state);
+    let started_at = tokio::time::Instant::now();
+
+    writer
+        .write_all(tool_request("status", "get_ingest_status", json!({})).as_bytes())
+        .await
+        .expect("send blocked status request");
+    repository.wait_for_started(1).await;
+    let mut line = String::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        reader.read_line(&mut line),
+    )
+    .await
+    .expect("status deadline response")
+    .expect("read status deadline response");
+    let response: Value = serde_json::from_str(line.trim()).expect("status response JSON");
+
+    assert_eq!(response["id"], json!("status"));
+    assert_eq!(response["result"]["isError"], json!(true));
+    assert_eq!(
+        response["result"]["structuredContent"]["error"]["code"],
+        json!("deadline_exceeded")
+    );
+    assert_eq!(
+        response["result"]["structuredContent"]["error"]["details"]["deadline_ms"],
+        json!(contract::GET_INGEST_STATUS_DEADLINE_MS)
+    );
+    assert!(
+        started_at.elapsed()
+            >= std::time::Duration::from_millis(contract::GET_INGEST_STATUS_DEADLINE_MS)
+    );
+    repository.wait_for_dropped(1).await;
+    repository.wait_for_cancelled(1).await;
+    assert!(repository.cancelled_queries.lock().await[0].starts_with("moraine-ingest-status-"));
+
+    writer.shutdown().await.expect("half-close request stream");
+    drop(writer);
+    tokio::time::timeout(std::time::Duration::from_secs(1), server)
+        .await
+        .expect("connection drained")
+        .expect("connection task joined")
+        .expect("connection succeeded");
+}
+#[tokio::test]
 async fn queued_success_reports_wall_time_from_frame_acceptance() {
     let repository = Arc::new(BlockingRepository::new(DELAY_SEARCH));
     let state = test_state_with_admission(repository.clone(), 1, 1);
@@ -831,6 +937,11 @@ async fn cancellation_is_registered_before_each_tool_first_repository_read() {
             "open",
             tool_request("open", "open", json!({ "id": session_id })),
         ),
+        (
+            BLOCK_STATUS,
+            "status",
+            tool_request("status", "get_ingest_status", json!({})),
+        ),
     ];
 
     for (index, (mode, id, request)) in requests.into_iter().enumerate() {
@@ -854,11 +965,12 @@ async fn cancellation_is_registered_before_each_tool_first_repository_read() {
     }
 
     let cancelled = repository.cancelled_queries.lock().await.clone();
-    assert_eq!(cancelled.len(), 3);
+    assert_eq!(cancelled.len(), 4);
     assert!(cancelled[0].starts_with("moraine-search-sessions-"));
-    assert!(cancelled[1..]
+    assert!(cancelled[1..3]
         .iter()
         .all(|query_id| query_id.starts_with("moraine-request-")));
+    assert!(cancelled[3].starts_with("moraine-ingest-status-"));
 
     writer.shutdown().await.expect("half-close request stream");
     drop(writer);

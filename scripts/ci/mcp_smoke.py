@@ -169,6 +169,26 @@ def assert_structured_content(result: Dict[str, Any], tool_name: str) -> Dict[st
         raise AssertionError(f"{tool_name} returned error envelope: {payload['error']}")
     if not isinstance(payload.get("data"), dict):
         raise AssertionError(f"{tool_name} structuredContent missing data object")
+    if tool_name in {"search_sessions", "list_sessions", "open", "file_attention"}:
+        coverage = payload["data"].get("coverage")
+        if not isinstance(coverage, dict) or set(coverage) != {
+            "state",
+            "reason",
+            "observed_at_unix_ms",
+        }:
+            raise AssertionError(
+                f"{tool_name} must return only compact three-field coverage: {coverage}"
+            )
+        if coverage.get("state") not in {"complete", "partial", "unknown"}:
+            raise AssertionError(
+                f"{tool_name} returned invalid coverage state: {coverage}"
+            )
+        if not isinstance(coverage.get("reason"), str) or not isinstance(
+            coverage.get("observed_at_unix_ms"), int
+        ):
+            raise AssertionError(
+                f"{tool_name} returned invalid compact coverage values: {coverage}"
+            )
     return payload
 
 
@@ -207,6 +227,19 @@ def collect_strings(value: Any) -> list[str]:
         return strings
     return []
 
+def collect_keys(value: Any) -> list[str]:
+    if isinstance(value, dict):
+        keys = list(value)
+        for child in value.values():
+            keys.extend(collect_keys(child))
+        return keys
+    if isinstance(value, list):
+        keys: list[str] = []
+        for child in value:
+            keys.extend(collect_keys(child))
+        return keys
+    return []
+
 
 def contains_text(value: Any, needle: str) -> bool:
     return any(needle in text for text in collect_strings(value))
@@ -218,6 +251,7 @@ def assert_tools_surface(tool_names_ordered: list[str]) -> None:
         "open",
         "list_sessions",
         "file_attention",
+        "get_ingest_status",
     ]:
         raise AssertionError(
             "tools/list must publish the MCP search surface exactly: "
@@ -717,6 +751,183 @@ def run_smoke(
             write_tools_snapshot(tools_snapshot, tools_result)
 
         next_id = 3
+        ingest_status_result = call_tool(
+            proc,
+            next_id,
+            "get_ingest_status",
+            {},
+        )
+        next_id += 1
+        ingest_status_payload = assert_structured_content(
+            ingest_status_result,
+            "get_ingest_status",
+        )
+        status_data = ingest_status_payload.get("data", {})
+        expected_status_fields = {
+            "observed_at_unix_ms",
+            "current",
+            "conditions",
+            "alerts",
+            "rate",
+            "eta",
+            "history",
+        }
+        if set(status_data) != expected_status_fields:
+            raise AssertionError(
+                f"get_ingest_status must return the explicit safe allowlist: {status_data}"
+            )
+        if not isinstance(status_data.get("conditions"), list):
+            raise AssertionError("get_ingest_status missing typed conditions")
+        if not isinstance(status_data.get("alerts"), list):
+            raise AssertionError("get_ingest_status missing typed alerts")
+        if not isinstance(status_data.get("history"), list):
+            raise AssertionError("get_ingest_status missing narrow history")
+
+        expected_condition_fields = {
+            "condition_type",
+            "state",
+            "reason",
+            "observed_at_unix_ms",
+        }
+        for condition in status_data["conditions"]:
+            if not isinstance(condition, dict) or set(condition) != expected_condition_fields:
+                raise AssertionError(
+                    f"get_ingest_status returned an invalid condition: {condition}"
+                )
+            if condition.get("condition_type") not in {
+                "health",
+                "coverage",
+                "freshness",
+                "readiness",
+            } or condition.get("state") not in {"true", "false", "unknown"}:
+                raise AssertionError(
+                    f"get_ingest_status returned an untyped condition: {condition}"
+                )
+
+        for alert in status_data["alerts"]:
+            if (
+                not isinstance(alert, dict)
+                or set(alert) != {"code", "observed_at_unix_ms"}
+                or alert.get("code")
+                not in {
+                    "heartbeat_stale",
+                    "progress_stalled",
+                    "queue_saturated",
+                    "sink_retrying",
+                    "coverage_degraded",
+                }
+            ):
+                raise AssertionError(
+                    f"get_ingest_status returned an invalid alert: {alert}"
+                )
+
+        rate = status_data.get("rate")
+        if rate is not None and (
+            not isinstance(rate, dict)
+            or set(rate) != {"bytes_per_second", "sample_seconds"}
+        ):
+            raise AssertionError(f"get_ingest_status returned invalid rate data: {rate}")
+        eta = status_data.get("eta")
+        if eta is not None and (
+            not isinstance(eta, dict)
+            or set(eta) != {"scope", "low_seconds", "high_seconds"}
+        ):
+            raise AssertionError(f"get_ingest_status returned invalid ETA data: {eta}")
+
+        expected_history_fields = {
+            "ts_unix_ms",
+            "queue_depth",
+            "files_active",
+            "queue_capacity",
+            "sink_pending_rows",
+            "sink_retrying",
+            "discovery_complete",
+            "files_total",
+            "files_completed",
+            "bytes_total",
+            "bytes_completed",
+        }
+        for point in status_data["history"]:
+            if not isinstance(point, dict) or set(point) != expected_history_fields:
+                raise AssertionError(
+                    f"get_ingest_status returned non-allowlisted history: {point}"
+                )
+
+        current = status_data.get("current")
+        if current is not None:
+            expected_current_fields = {
+                "heartbeat_observed_at_unix_ms",
+                "queue_depth",
+                "files_active",
+                "files_watched",
+                "progress",
+            }
+            if not isinstance(current, dict) or set(current) != expected_current_fields:
+                raise AssertionError(
+                    f"get_ingest_status returned non-allowlisted current data: {current}"
+                )
+            progress = current.get("progress")
+            if progress is not None and (
+                not isinstance(progress, dict)
+                or set(progress)
+                != {
+                    "discovery_complete",
+                    "queue_capacity",
+                    "sink_pending_rows",
+                    "sink_pending_bytes",
+                    "sink_retrying",
+                    "oldest_pending_unix_ms",
+                    "last_durable_progress_unix_ms",
+                    "files_total",
+                    "files_completed",
+                    "bytes_total",
+                    "bytes_completed",
+                }
+            ):
+                raise AssertionError(
+                    f"get_ingest_status returned non-allowlisted progress: {progress}"
+                )
+
+        forbidden_status_fields = {
+            "heartbeat",
+            "host",
+            "service_version",
+            "last_error",
+            "watcher_backend",
+            "watcher_error_count",
+            "watcher_reset_count",
+            "watcher_last_reset_unix_ms",
+            "backend_sinks",
+            "sources",
+            "source_name",
+            "instance_id",
+            "run_started_unix_ms",
+            "snapshot_unix_ms",
+            "source_path",
+            "credentials",
+            "password",
+        }
+        leaked_fields = forbidden_status_fields.intersection(collect_keys(status_data))
+        if leaked_fields:
+            raise AssertionError(
+                f"get_ingest_status leaked private fields: {sorted(leaked_fields)}"
+            )
+
+        invalid_status_payload = call_tool_expect_handled_error(
+            proc,
+            next_id,
+            "get_ingest_status",
+            {"unexpected": "SECRET_INVALID_STATUS_ARGUMENT"},
+            "invalid_request",
+        )
+        next_id += 1
+        if invalid_status_payload.get("request") != {} or contains_text(
+            invalid_status_payload, "SECRET_INVALID_STATUS_ARGUMENT"
+        ):
+            raise AssertionError(
+                "get_ingest_status invalid arguments must be rejected without reflection"
+            )
+
         search_arguments: Dict[str, Any] = {
             "query": query,
             "n_hits": 20,

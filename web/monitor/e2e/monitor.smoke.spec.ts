@@ -130,7 +130,44 @@ async function setupMockMonitorApi(page: Page): Promise<void> {
     });
   });
 
-  await page.route('**/api/v1/status', async (route) => {
+  await page.route('**/api/v1/status?history=120', async (route) => {
+    expect(new URL(route.request().url()).searchParams.get('history')).toBe('120');
+    const progress = {
+      schema_version: 1,
+      instance_id: 'fixture-run',
+      run_started_unix_ms: 1_700_000_000_000,
+      snapshot_unix_ms: 1_700_000_000_000,
+      discovery_complete: true,
+      queue_capacity: 1_024,
+      sink_pending_rows: 12,
+      sink_pending_bytes: 4_096,
+      sink_retrying: true,
+      oldest_pending_unix_ms: 1_700_000_050_000,
+      last_durable_progress_unix_ms: 1_700_000_100_000,
+      files_total: 8,
+      files_completed: 8,
+      bytes_total: 1_000,
+      bytes_completed: 750,
+      sources: [
+        {
+          source_name: 'codex',
+          format: 'jsonl',
+          coverage_basis: 'bytes',
+          files_total: 8,
+          files_completed: 8,
+          bytes_total: 1_000,
+          bytes_completed: 750,
+          coverage_degraded: false,
+        },
+      ],
+    };
+    const heartbeat = {
+      ts_unix_ms: 1_700_000_100_000,
+      queue_depth: 1,
+      files_active: 2,
+      files_watched: 8,
+      progress,
+    };
     await route.fulfill({
       json: {
         ok: true,
@@ -138,11 +175,48 @@ async function setupMockMonitorApi(page: Page): Promise<void> {
           present: true,
           alive: true,
           age_seconds: 3,
-          latest: {
-            queue_depth: 1,
-            files_active: 2,
-            files_watched: 8,
-          },
+          latest: heartbeat,
+        },
+        ingest_status: {
+          observed_at_unix_ms: 1_700_000_103_000,
+          heartbeat: { table_present: true, latest: heartbeat },
+          conditions: [
+            { condition_type: 'health', state: 'true', reason: 'heartbeat_recent', observed_at_unix_ms: 1_700_000_103_000 },
+            { condition_type: 'coverage', state: 'false', reason: 'backfill_partial', observed_at_unix_ms: 1_700_000_103_000 },
+            { condition_type: 'freshness', state: 'true', reason: 'progress_recent', observed_at_unix_ms: 1_700_000_103_000 },
+            { condition_type: 'readiness', state: 'false', reason: 'retrieval_may_be_incomplete', observed_at_unix_ms: 1_700_000_103_000 },
+          ],
+          alerts: [{ code: 'sink_retrying', observed_at_unix_ms: 1_700_000_103_000 }],
+          rate: { bytes_per_second: 25, sample_seconds: 60 },
+          eta: { scope: 'file_backfill', low_seconds: 8, high_seconds: 12 },
+          history: [
+            {
+              ts_unix_ms: 1_700_000_040_000,
+              queue_depth: 2,
+              files_active: 2,
+              queue_capacity: 1_024,
+              sink_pending_rows: 24,
+              sink_retrying: false,
+              discovery_complete: true,
+              files_total: 8,
+              files_completed: 8,
+              bytes_total: 1_000,
+              bytes_completed: 500,
+            },
+            {
+              ts_unix_ms: 1_700_000_100_000,
+              queue_depth: 1,
+              files_active: 2,
+              queue_capacity: 1_024,
+              sink_pending_rows: 12,
+              sink_retrying: true,
+              discovery_complete: true,
+              files_total: 8,
+              files_completed: 8,
+              bytes_total: 1_000,
+              bytes_completed: 750,
+            },
+          ],
         },
       },
     });
@@ -228,7 +302,7 @@ test.beforeEach(async ({ page }) => {
 
 test('loads dashboard and handles core interactions', async ({ page }) => {
   const runtimeTraffic = trackRuntimeTraffic(page);
-  const navigationResponse = await page.goto('/');
+  const navigationResponse = await page.goto('/', { waitUntil: 'domcontentloaded' });
   expect(navigationResponse).not.toBeNull();
   const pageOrigin = new URL(navigationResponse!.url()).origin;
 
@@ -238,6 +312,19 @@ test('loads dashboard and handles core interactions', async ({ page }) => {
   await expect(page.locator('#healthGroup')).toContainText('127.0.0.1:8123');
   await expect(page.locator('#healthGroup')).toContainText('moraine');
   await expect(page.locator('#ingestorGroup')).toContainText('healthy');
+  await expect(page.getByRole('heading', { name: 'Ingestion Progress' })).toBeVisible();
+  await expect(page.locator('#ingestorGroup')).toContainText('queue pressure');
+  await expect(page.locator('#ingestorGroup')).toContainText('1 / 1024');
+  const fileCoverageChip = page.locator('.ss-chip', { hasText: 'file coverage' });
+  await expect(fileCoverageChip).toContainText('8 / 8 · 100.0%');
+  await expect(fileCoverageChip).toHaveClass(/ss-warn/);
+  await expect(page.locator('.source-grid')).toContainText('files · 8/8');
+  await expect(page.locator('.source-grid')).toContainText('bytes · 750/1000');
+  await expect(page.locator('.source-grid article')).toHaveClass(/coverage-partial/);
+  await expect(page.getByText('sink retrying')).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Durable Snapshot Completion' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Durable Checkpoint Throughput' })).toBeVisible();
+  await expect(page.locator('.ingest-chart-grid canvas')).toHaveCount(2);
 
   await page.locator('#analyticsRanges').getByRole('button', { name: '7d' }).click();
   await expect(page.locator('#analyticsMeta')).toContainText('Last 7d');
@@ -287,7 +374,7 @@ test('loads dashboard and handles core interactions', async ({ page }) => {
 
 test('keeps dashboard and detail views inside the mobile viewport', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
-  await page.goto('/');
+  await page.goto('/', { waitUntil: 'domcontentloaded' });
 
   await expect(page.getByRole('heading', { name: 'Moraine Monitor' })).toBeVisible();
   await expect(page.locator('#sessionsPanel')).toBeVisible();

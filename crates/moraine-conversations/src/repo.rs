@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 
 use crate::domain::{
-    AnalyticsRange, AnalyticsSnapshot, IngestHeartbeatRead, SessionAnalytics,
+    AnalyticsRange, AnalyticsSnapshot, IngestHeartbeatRead, IngestStatusRead, SessionAnalytics,
     SessionAnalyticsQuery, StoreDiagnostics, StoreHealth, TablePreview, TablePreviewQuery,
     TableSummaries, WebSearchEvent,
 };
@@ -31,6 +31,12 @@ pub trait ConversationRepository: Send + Sync {
     async fn list_web_searches(&self, limit: u16) -> RepoResult<Vec<WebSearchEvent>>;
 
     async fn latest_ingest_heartbeat(&self) -> RepoResult<IngestHeartbeatRead>;
+    async fn ingest_status(&self, _history_limit: u16) -> RepoResult<IngestStatusRead> {
+        Ok(IngestStatusRead {
+            heartbeat: self.latest_ingest_heartbeat().await?,
+            history: Vec::new(),
+        })
+    }
 
     async fn list_table_summaries(&self) -> RepoResult<TableSummaries>;
 

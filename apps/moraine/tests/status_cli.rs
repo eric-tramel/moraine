@@ -266,7 +266,7 @@ fn status_prefers_canonical_daemon_api_and_preserves_json_schema() {
     assert_eq!(requests.len(), 2, "{requests:?}");
     assert!(requests[0].starts_with("GET / HTTP/1.1"), "{}", requests[0]);
     assert!(
-        requests[1].starts_with("GET /api/v1/status HTTP/1.1"),
+        requests[1].starts_with("GET /api/v1/status?history=120 HTTP/1.1"),
         "{}",
         requests[1]
     );
@@ -275,6 +275,116 @@ fn status_prefers_canonical_daemon_api_and_preserves_json_schema() {
             .iter()
             .all(|request| !request.contains("GET /api/status")),
         "{requests:?}"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
+fn status_human_output_reports_truthful_progress_pressure_and_alerts() {
+    let progress = serde_json::json!({
+        "schema_version": 1,
+        "instance_id": "fixture-run",
+        "run_started_unix_ms": 1_700_000_000_000_i64,
+        "snapshot_unix_ms": 1_700_000_000_000_i64,
+        "discovery_complete": true,
+        "queue_capacity": 64,
+        "sink_pending_rows": 12,
+        "sink_pending_bytes": 4096,
+        "sink_retrying": true,
+        "oldest_pending_unix_ms": 1_700_000_050_000_i64,
+        "last_durable_progress_unix_ms": 1_700_000_100_000_i64,
+        "files_total": 8,
+        "files_completed": 8,
+        "bytes_total": 1000,
+        "bytes_completed": 750,
+        "sources": []
+    });
+    let heartbeat = serde_json::json!({
+        "ts": "2026-07-10 12:34:56.789",
+        "ts_unix_ms": 1_783_686_896_789_i64,
+        "host": "fixture",
+        "service_version": "0.6.4",
+        "queue_depth": 17,
+        "files_active": 2,
+        "files_watched": 8,
+        "rows_raw_written": 8,
+        "rows_events_written": 7,
+        "rows_errors_written": 1,
+        "flush_latency_ms": 4,
+        "append_to_visible_p50_ms": 5,
+        "append_to_visible_p95_ms": 6,
+        "last_error": "",
+        "progress": progress
+    });
+    let api_body = serde_json::json!({
+        "ok": true,
+        "clickhouse": {
+            "url": "http://127.0.0.1:8123",
+            "database": "api_db",
+            "healthy": true,
+            "version": "26.1.2.3",
+            "error": null
+        },
+        "database": {"exists": true},
+        "ingestor": {
+            "present": true,
+            "latest": {
+                "ts": "2026-07-10 12:34:56.789",
+                "queue_depth": 17,
+                "files_active": 2
+            }
+        },
+        "ingest_status": {
+            "observed_at_unix_ms": 1_783_686_899_789_i64,
+            "heartbeat": {"table_present": true, "latest": heartbeat},
+            "conditions": [
+                {"condition_type": "health", "state": "true", "reason": "heartbeat_recent", "observed_at_unix_ms": 1_783_686_899_789_i64},
+                {"condition_type": "coverage", "state": "false", "reason": "backfill_partial", "observed_at_unix_ms": 1_783_686_899_789_i64},
+                {"condition_type": "freshness", "state": "true", "reason": "progress_recent", "observed_at_unix_ms": 1_783_686_899_789_i64},
+                {"condition_type": "readiness", "state": "false", "reason": "retrieval_may_be_incomplete", "observed_at_unix_ms": 1_783_686_899_789_i64}
+            ],
+            "alerts": [
+                {"code": "sink_retrying", "observed_at_unix_ms": 1_783_686_899_789_i64},
+                {"code": "queue_saturated", "observed_at_unix_ms": 1_783_686_899_789_i64}
+            ]
+        }
+    })
+    .to_string();
+    let (monitor_port, worker) =
+        spawn_http_responses(vec![("200 OK", String::new()), ("200 OK", api_body)]);
+    let root = temp_dir();
+    let config = write_config(&root, monitor_port);
+
+    let output = run_plain_status(&config);
+    assert!(
+        output.status.success(),
+        "status failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let rendered = String::from_utf8_lossy(&output.stdout);
+    for expected in [
+        "health=ok (heartbeat_recent)",
+        "coverage=degraded (backfill_partial)",
+        "freshness=ok (progress_recent)",
+        "readiness=degraded (retrieval_may_be_incomplete)",
+        "queue pressure: 17/64",
+        "historical files: 8/8 (100.0%)",
+        "historical bytes: 750/1000 (75.0%)",
+        "sink pressure: 12 rows  |  4096 bytes  |  retry pressure: active",
+        "active alerts: sink_retrying, queue_saturated",
+    ] {
+        assert!(
+            rendered.contains(expected),
+            "missing {expected:?} in {rendered}"
+        );
+    }
+
+    let requests = worker.join().expect("HTTP endpoint worker");
+    assert!(
+        requests[1].starts_with("GET /api/v1/status?history=120 HTTP/1.1"),
+        "{}",
+        requests[1]
     );
     let _ = fs::remove_dir_all(root);
 }

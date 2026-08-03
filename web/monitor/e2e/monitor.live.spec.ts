@@ -167,7 +167,7 @@ test('live monitor UI reflects ingested fixture data', async ({ page }) => {
   const expectedModelText = `${expectedModelCount} model${expectedModelCount === 1 ? '' : 's'}`;
 
   const runtimeTraffic = trackRuntimeTraffic(page);
-  const navigationResponse = await page.goto('/');
+  const navigationResponse = await page.goto('/', { waitUntil: 'domcontentloaded' });
   expect(navigationResponse).not.toBeNull();
   const pageOrigin = new URL(navigationResponse!.url()).origin;
 

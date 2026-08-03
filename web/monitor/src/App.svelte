@@ -2,6 +2,7 @@
   import { get } from 'svelte/store';
   import { onMount } from 'svelte';
   import AnalyticsPanel from './lib/components/AnalyticsPanel.svelte';
+  import IngestProgressPanel from './lib/components/IngestProgressPanel.svelte';
   import StatusStrip from './lib/components/StatusStrip.svelte';
   import SessionsPanel from './lib/components/sessions/SessionsPanel.svelte';
   import TopBar from './lib/components/TopBar.svelte';
@@ -160,6 +161,7 @@
 
   <main class="layout">
     <StatusStrip health={healthData} {healthError} status={statusData} {statusError} />
+    <IngestProgressPanel status={statusData} theme={$themeStore} />
 
     <AnalyticsPanel
       payload={analyticsPayload}

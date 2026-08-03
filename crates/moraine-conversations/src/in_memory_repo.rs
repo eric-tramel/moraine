@@ -3,9 +3,9 @@ use std::sync::{Mutex, MutexGuard};
 use async_trait::async_trait;
 
 use crate::domain::{
-    AnalyticsRange, AnalyticsSnapshot, AnalyticsWindow, IngestHeartbeatRead, SessionAnalytics,
-    SessionAnalyticsQuery, StoreDiagnostics, StoreHealth, TablePreview, TablePreviewQuery,
-    TableSummaries, WebSearchEvent,
+    AnalyticsRange, AnalyticsSnapshot, AnalyticsWindow, IngestHeartbeatRead, IngestStatusRead,
+    SessionAnalytics, SessionAnalyticsQuery, StoreDiagnostics, StoreHealth, TablePreview,
+    TablePreviewQuery, TableSummaries, WebSearchEvent,
 };
 use crate::domain::{
     Conversation, ConversationDetailOptions, ConversationListFilter, ConversationSearchQuery,
@@ -49,6 +49,7 @@ pub struct InMemoryConversationResponses {
     pub analytics_series: Option<RepoResult<AnalyticsSnapshot>>,
     pub list_web_searches: Option<RepoResult<Vec<WebSearchEvent>>>,
     pub latest_ingest_heartbeat: Option<RepoResult<IngestHeartbeatRead>>,
+    pub ingest_status: Option<RepoResult<IngestStatusRead>>,
     pub list_table_summaries: Option<RepoResult<TableSummaries>>,
     pub preview_table: Option<RepoResult<TablePreview>>,
     pub read_store_health: Option<RepoResult<StoreHealth>>,
@@ -80,6 +81,7 @@ pub struct InMemoryConversationCalls {
     pub analytics_series: Vec<AnalyticsRange>,
     pub list_web_searches: Vec<u16>,
     pub latest_ingest_heartbeat: usize,
+    pub ingest_status: Vec<u16>,
     pub list_table_summaries: usize,
     pub preview_table: Vec<TablePreviewQuery>,
     pub read_store_health: usize,
@@ -276,6 +278,23 @@ impl ConversationRepository for InMemoryConversationRepository {
             latest_ingest_heartbeat,
             IngestHeartbeatRead::default()
         )
+    }
+
+    async fn ingest_status(&self, history_limit: u16) -> RepoResult<IngestStatusRead> {
+        self.record(|calls| calls.ingest_status.push(history_limit));
+        match &self.responses.ingest_status {
+            Some(result) => {
+                let mut read = result.clone()?;
+                let limit = usize::from(history_limit.min(120));
+                let keep_from = read.history.len().saturating_sub(limit);
+                drop(read.history.drain(..keep_from));
+                Ok(read)
+            }
+            None => Ok(IngestStatusRead {
+                heartbeat: self.latest_ingest_heartbeat().await?,
+                history: Vec::new(),
+            }),
+        }
     }
 
     async fn list_table_summaries(&self) -> RepoResult<TableSummaries> {

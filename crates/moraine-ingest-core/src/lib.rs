@@ -3,6 +3,7 @@ mod dispatch;
 mod heartbeat;
 pub mod model;
 pub mod normalize;
+mod progress;
 mod reconcile;
 mod redaction;
 mod sink;
@@ -12,11 +13,16 @@ mod tee;
 mod watch;
 
 use crate::checkpoint::checkpoint_key;
-use crate::dispatch::{enqueue_work, run_work_item, spawn_debounce_task};
+use crate::dispatch::{
+    enqueue_work, note_work_received, run_work_item, source_inode_for_file,
+    source_path_is_ingestable, spawn_debounce_task,
+};
 use crate::model::RowBatch;
+use crate::progress::{KiroTargetIdentity, ProgressState, TargetObservation};
 use crate::reconcile::spawn_reconcile_task;
 use crate::redaction::{RedactionAudit, SecretRedactor};
 use crate::sink::{spawn_sink_task, SinkAuthorConfig, SinkRole};
+use crate::sources::kiro_cli::load_kiro_session_metadata;
 use crate::tee::{
     spawn_tee_router, RedactionContext, RouteResolver, SharedRouteResolver, StatusRegistry,
 };
@@ -28,7 +34,7 @@ use moraine_config::{
 };
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, RwLock, Semaphore};
 use tracing::{info, warn};
@@ -59,9 +65,9 @@ pub(crate) struct DispatchState {
     pub(crate) inflight: HashSet<String>,
     pub(crate) dirty: HashSet<String>,
     pub(crate) item_by_key: HashMap<String, WorkItem>,
+    pub(crate) pending_since_unix_ms: HashMap<String, u64>,
 }
 
-#[derive(Default)]
 pub(crate) struct Metrics {
     pub(crate) raw_rows_written: AtomicU64,
     pub(crate) event_rows_written: AtomicU64,
@@ -77,6 +83,43 @@ pub(crate) struct Metrics {
     pub(crate) watcher_last_reset_unix_ms: AtomicU64,
     pub(crate) watcher_backend_state: AtomicU64,
     pub(crate) last_error: Mutex<String>,
+    pub(crate) sink_pending_rows: AtomicU64,
+    pub(crate) sink_pending_bytes: AtomicU64,
+    pub(crate) sink_retrying: AtomicBool,
+    pub(crate) progress: Mutex<ProgressState>,
+}
+
+impl Default for Metrics {
+    fn default() -> Self {
+        Self {
+            raw_rows_written: AtomicU64::new(0),
+            event_rows_written: AtomicU64::new(0),
+            err_rows_written: AtomicU64::new(0),
+            last_flush_ms: AtomicU64::new(0),
+            append_to_visible_p50_ms: AtomicU64::new(0),
+            append_to_visible_p95_ms: AtomicU64::new(0),
+            flush_failures: AtomicU64::new(0),
+            queue_depth: AtomicU64::new(0),
+            watcher_registrations: AtomicU64::new(0),
+            watcher_error_count: AtomicU64::new(0),
+            watcher_reset_count: AtomicU64::new(0),
+            watcher_last_reset_unix_ms: AtomicU64::new(0),
+            watcher_backend_state: AtomicU64::new(0),
+            last_error: Mutex::new(String::new()),
+            sink_pending_rows: AtomicU64::new(0),
+            sink_pending_bytes: AtomicU64::new(0),
+            sink_retrying: AtomicBool::new(false),
+            progress: Mutex::new(ProgressState::new(1024)),
+        }
+    }
+}
+impl Metrics {
+    fn new(queue_capacity: usize) -> Self {
+        Self {
+            progress: Mutex::new(ProgressState::new(queue_capacity)),
+            ..Self::default()
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -178,10 +221,25 @@ pub async fn run_ingestor(config: AppConfig) -> Result<()> {
              `moraine db migrate` runs and this ingest service restarts"
         );
     }
+    let heartbeat_progress_column = heartbeat_column_available(&clickhouse, "progress_json")
+        .await
+        .context("failed to inspect ingest_heartbeats progress column")?;
+    if !heartbeat_progress_column {
+        warn!(
+            "ingest_heartbeats is missing the progress_json column (migration 034); \
+             finite ingest progress will not appear in heartbeats until \
+             `moraine db migrate` runs and this ingest service restarts"
+        );
+    }
 
+    let process_queue_capacity = config
+        .ingest
+        .max_inflight_batches
+        .saturating_mul(16)
+        .max(1024);
     let checkpoints = Arc::new(RwLock::new(checkpoint_map));
     let dispatch = Arc::new(Mutex::new(DispatchState::default()));
-    let metrics = Arc::new(Metrics::default());
+    let metrics = Arc::new(Metrics::new(process_queue_capacity));
     let redactor = Arc::new(
         SecretRedactor::new(&config.redaction).context("failed to initialize secret redaction")?,
     );
@@ -198,11 +256,6 @@ pub async fn run_ingestor(config: AppConfig) -> Result<()> {
         );
     }
 
-    let process_queue_capacity = config
-        .ingest
-        .max_inflight_batches
-        .saturating_mul(16)
-        .max(1024);
     let (process_tx, mut process_rx) = mpsc::channel::<WorkItem>(process_queue_capacity);
     let (sink_tx, sink_rx) =
         mpsc::channel::<SinkMessage>(config.ingest.max_inflight_batches.max(1));
@@ -236,6 +289,7 @@ pub async fn run_ingestor(config: AppConfig) -> Result<()> {
             backends: backend_statuses.clone(),
             backend_sinks_column: heartbeat_backend_column,
             redactions_column: heartbeat_redactions_column,
+            progress_column: heartbeat_progress_column,
             redactions: redaction_audit.clone(),
         },
     );
@@ -267,12 +321,13 @@ pub async fn run_ingestor(config: AppConfig) -> Result<()> {
 
         tokio::spawn(async move {
             while let Some(work) = process_rx.recv().await {
-                metrics_clone.queue_depth.fetch_sub(1, Ordering::Relaxed);
+                note_work_received(&metrics_clone);
                 let key = work.key();
 
                 {
                     let mut state = dispatch_clone.lock().expect("dispatch mutex poisoned");
                     state.pending.remove(&key);
+                    state.pending_since_unix_ms.remove(&key);
                     state.inflight.insert(key.clone());
                 }
 
@@ -304,6 +359,63 @@ pub async fn run_ingestor(config: AppConfig) -> Result<()> {
         metrics.clone(),
     );
 
+    let mut backfill_sources = Vec::new();
+    if config.ingest.backfill_on_start {
+        let checkpoint_snapshot = checkpoints.read().await.clone();
+        for source in &enabled_sources {
+            let files = enumerate_tracked_files(&source.glob, source.format)?
+                .into_iter()
+                .filter(|path| source_path_is_ingestable(source, path))
+                .collect::<Vec<_>>();
+            for path in &files {
+                let observation = match std::fs::metadata(path) {
+                    Ok(metadata) => {
+                        let kiro_identity =
+                            (source.format == SourceFormat::KiroSession).then(|| {
+                                let sidecar = load_kiro_session_metadata(path);
+                                KiroTargetIdentity::new(
+                                    sidecar.fingerprint(),
+                                    sidecar.transcript_fingerprint(),
+                                    sidecar.record().is_some(),
+                                    sidecar.error().is_none() || sidecar.fingerprint() != 0,
+                                )
+                            });
+                        TargetObservation::known(
+                            metadata.len(),
+                            source_inode_for_file(path, &metadata),
+                            kiro_identity,
+                        )
+                    }
+                    Err(exc) => {
+                        warn!(
+                            source = %source.name,
+                            source_file = %path,
+                            "startup snapshot metadata unavailable: {exc}"
+                        );
+                        TargetObservation::unknown()
+                    }
+                };
+                metrics
+                    .progress
+                    .lock()
+                    .expect("ingest progress mutex poisoned")
+                    .register_target(source, path, observation, &checkpoint_snapshot);
+            }
+            info!(
+                "startup backfill queueing {} files for source={} (format={})",
+                files.len(),
+                source.name,
+                source.format
+            );
+            backfill_sources.push((source.clone(), files.into_iter()));
+        }
+        metrics
+            .progress
+            .lock()
+            .expect("ingest progress mutex poisoned")
+            .finish_discovery();
+    }
+
     let reconcile_handle = spawn_reconcile_task(
         config.clone(),
         enabled_sources.clone(),
@@ -315,43 +427,29 @@ pub async fn run_ingestor(config: AppConfig) -> Result<()> {
     let watcher_threads =
         spawn_watcher_threads(enabled_sources.clone(), watch_path_tx, metrics.clone())?;
 
-    if config.ingest.backfill_on_start {
-        let mut backfill_sources = Vec::new();
-        for source in &enabled_sources {
-            let files = enumerate_tracked_files(&source.glob, source.format)?;
-            info!(
-                "startup backfill queueing {} files for source={} (format={})",
-                files.len(),
-                source.name,
-                source.format
-            );
-            backfill_sources.push((source.clone(), files.into_iter()));
+    loop {
+        let mut queued_any = false;
+        for (source, files) in &mut backfill_sources {
+            if let Some(path) = files.next() {
+                queued_any = true;
+                enqueue_work(
+                    WorkItem {
+                        source_name: source.name.clone(),
+                        harness: source.harness.clone(),
+                        format: source.format,
+                        source_glob: source.glob.clone(),
+                        path,
+                    },
+                    &process_tx,
+                    &dispatch,
+                    &metrics,
+                )
+                .await;
+            }
         }
 
-        loop {
-            let mut queued_any = false;
-            for (source, files) in &mut backfill_sources {
-                if let Some(path) = files.next() {
-                    queued_any = true;
-                    enqueue_work(
-                        WorkItem {
-                            source_name: source.name.clone(),
-                            harness: source.harness.clone(),
-                            format: source.format,
-                            source_glob: source.glob.clone(),
-                            path,
-                        },
-                        &process_tx,
-                        &dispatch,
-                        &metrics,
-                    )
-                    .await;
-                }
-            }
-
-            if !queued_any {
-                break;
-            }
+        if !queued_any {
+            break;
         }
     }
 

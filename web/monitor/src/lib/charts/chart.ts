@@ -13,7 +13,7 @@ export function createOrUpdateChart(
   canvas: HTMLCanvasElement,
   type: ChartType,
   labels: string[],
-  datasets: ChartDataset<ChartType, number[]>[],
+  datasets: ChartDataset<ChartType, Array<number | null>>[],
   yTitle: string,
   options: ChartUpdateOptions = {},
 ): ChartInstance<ChartType> {
@@ -68,7 +68,7 @@ export function createOrUpdateChart(
 
   (currentChart.config as { type: ChartType }).type = type;
   currentChart.data.labels = labels;
-  currentChart.data.datasets = datasets as ChartDataset<ChartType, number[]>[];
+  currentChart.data.datasets = datasets as ChartDataset<ChartType, Array<number | null>>[];
 
   const scaleOptions = currentChart.options?.scales as
     | Record<string, { stacked?: boolean; ticks?: Record<string, unknown>; grid?: Record<string, unknown>; title?: Record<string, unknown> }>

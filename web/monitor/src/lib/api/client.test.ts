@@ -16,7 +16,7 @@ describe('versioned monitor requests', () => {
     {
       label: 'status',
       request: () => fetchStatus(),
-      expectedPath: '/api/v1/status',
+      expectedPath: '/api/v1/status?history=120',
     },
     {
       label: 'analytics',

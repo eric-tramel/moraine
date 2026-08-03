@@ -1,13 +1,16 @@
 use crate::checkpoint::checkpoint_key;
 use crate::model::{Checkpoint, NormalizedRecord, RowBatch};
 use crate::normalize::{normalize_record, normalize_record_with_ts_hint};
+use crate::progress::unix_ms_now;
 use crate::sources::claude_code::cowork_session_path;
 use crate::sources::kiro_cli::{load_kiro_session_metadata, KiroSessionMetadata};
 use crate::sources::shared::{format_record_ts, infer_vendor_from_base_url, parse_record_ts};
 use crate::sqlite_poll::VolatilePollMap;
 use crate::{DispatchState, Metrics, SinkMessage, WorkItem};
 use anyhow::{Context, Result};
-use moraine_config::{is_workflow_journal_path, map_tracked_path, AppConfig, SourceFormat};
+use moraine_config::{
+    is_workflow_journal_path, map_tracked_path, AppConfig, IngestSource, SourceFormat,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
@@ -64,12 +67,29 @@ fn encode_kiro_checkpoint_cursor(cursor: &KiroCheckpointCursor) -> String {
     serde_json::to_string(cursor).expect("Kiro checkpoint cursor is serializable")
 }
 
-/// A work item is processable only when its path is already the canonical
-/// tracked path for its format (sidecar paths are canonicalized at the
-/// watcher; anything else here is a stray event for an untracked file).
+/// A path is processable only when it is already the canonical tracked path
+/// for its format (sidecar paths are canonicalized at the watcher; anything
+/// else here is a stray event for an untracked file).
+fn path_is_canonical(format: SourceFormat, source_glob: &str, path: &str) -> bool {
+    map_tracked_path(format, source_glob, path).as_deref() == Some(path)
+}
+
+#[cfg(test)]
 fn work_path_is_canonical(work: &WorkItem) -> bool {
-    map_tracked_path(work.format, &work.source_glob, &work.path).as_deref()
-        == Some(work.path.as_str())
+    path_is_canonical(work.format, &work.source_glob, &work.path)
+}
+
+/// Borrowed form of the single ingestability gate used while discovering the
+/// frozen startup snapshot. It deliberately shares the same predicate as
+/// `work_item_is_ingestable` without constructing and cloning a `WorkItem`.
+pub(crate) fn source_path_is_ingestable(source: &IngestSource, path: &str) -> bool {
+    path_is_ingestable(
+        &source.name,
+        &source.harness,
+        source.format,
+        &source.glob,
+        path,
+    )
 }
 
 /// The single gate before a path becomes ingest work: every entry point
@@ -87,22 +107,38 @@ fn work_path_is_canonical(work: &WorkItem) -> bool {
 /// which never consult the glob. The exclusion is scoped to the `claude-code`
 /// harness so a same-named file under any other configured source is never
 /// silently dropped.
-fn work_item_is_ingestable(work: &WorkItem) -> bool {
-    if !work_path_is_canonical(work) {
+pub(crate) fn work_item_is_ingestable(work: &WorkItem) -> bool {
+    path_is_ingestable(
+        &work.source_name,
+        &work.harness,
+        work.format,
+        &work.source_glob,
+        &work.path,
+    )
+}
+
+fn path_is_ingestable(
+    source_name: &str,
+    harness: &str,
+    format: SourceFormat,
+    source_glob: &str,
+    path: &str,
+) -> bool {
+    if !path_is_canonical(format, source_glob, path) {
         debug!(
             "dropping non-canonical work item {} (format {})",
-            work.path, work.format
+            path, format
         );
         return false;
     }
-    if work.source_name == "claude-cowork" && cowork_session_path(&work.path).is_none() {
-        debug!("skipping non-transcript Claude Cowork path {}", work.path);
+    if source_name == "claude-cowork" && cowork_session_path(path).is_none() {
+        debug!("skipping non-transcript Claude Cowork path {}", path);
         return false;
     }
-    if work.harness == "claude-code" && is_workflow_journal_path(&work.path) {
+    if harness == "claude-code" && is_workflow_journal_path(path) {
         debug!(
             "skipping workflow orchestration journal {} (no sessionId; issue #386)",
-            work.path
+            path
         );
         return false;
     }
@@ -778,6 +814,29 @@ pub(crate) fn spawn_debounce_task(
     })
 }
 
+async fn send_queued_work(
+    work: WorkItem,
+    process_tx: &mpsc::Sender<WorkItem>,
+    metrics: &Metrics,
+) -> bool {
+    let Ok(permit) = process_tx.reserve().await else {
+        return false;
+    };
+    // The reserved slot prevents a receiver from observing this item until
+    // after its pressure accounting has been published.
+    metrics.queue_depth.fetch_add(1, Ordering::Relaxed);
+    permit.send(work);
+    true
+}
+
+pub(crate) fn note_work_received(metrics: &Metrics) {
+    let _ = metrics
+        .queue_depth
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |depth| {
+            Some(depth.saturating_sub(1))
+        });
+}
+
 pub(crate) async fn enqueue_work(
     work: WorkItem,
     process_tx: &mpsc::Sender<WorkItem>,
@@ -796,12 +855,17 @@ pub(crate) async fn enqueue_work(
         if state.inflight.contains(&key) {
             state.dirty.insert(key.clone());
         } else if state.pending.insert(key.clone()) {
+            state
+                .pending_since_unix_ms
+                .insert(key.clone(), unix_ms_now());
             should_send = true;
         }
     }
 
-    if should_send && process_tx.send(work).await.is_ok() {
-        metrics.queue_depth.fetch_add(1, Ordering::Relaxed);
+    if should_send && !send_queued_work(work, process_tx, metrics).await {
+        let mut state = dispatch.lock().expect("dispatch mutex poisoned");
+        state.pending.remove(&key);
+        state.pending_since_unix_ms.remove(&key);
     }
 }
 
@@ -811,6 +875,9 @@ pub(crate) fn complete_work(key: &str, dispatch: &Arc<Mutex<DispatchState>>) -> 
 
     if state.dirty.remove(key) {
         if state.pending.insert(key.to_string()) {
+            state
+                .pending_since_unix_ms
+                .insert(key.to_string(), unix_ms_now());
             return state.item_by_key.get(key).cloned();
         }
         return None;
@@ -857,9 +924,7 @@ pub(crate) async fn run_work_item(
     drop(permit);
 
     if let Some(item) = reschedule {
-        if process_tx.send(item).await.is_ok() {
-            metrics.queue_depth.fetch_add(1, Ordering::Relaxed);
-        }
+        let _ = send_queued_work(item, &process_tx, &metrics).await;
     }
 }
 
@@ -987,7 +1052,11 @@ pub(crate) async fn process_file(
     let sidecar_needs_processing =
         kiro_metadata.is_some() && (first_ingest || generation_changed || sidecar_changed);
 
-    if file_size == checkpoint.last_offset && !generation_changed && !sidecar_needs_processing {
+    if file_size == checkpoint.last_offset
+        && !first_ingest
+        && !generation_changed
+        && !sidecar_needs_processing
+    {
         return Ok(());
     }
     if !config.ingest.exclude_project_dirs.is_empty() {
@@ -1394,7 +1463,8 @@ pub(crate) async fn process_file(
         ..Default::default()
     };
 
-    if batch.row_count() > 0
+    if first_ingest
+        || batch.row_count() > 0
         || generation_changed
         || sidecar_needs_processing
         || offset != checkpoint.last_offset
@@ -1483,6 +1553,7 @@ async fn process_session_json_file(
 
     let cp_key = checkpoint_key(&work.source_name, source_file);
     let committed = { checkpoints.read().await.get(&cp_key).cloned() };
+    let first_ingest = committed.is_none();
 
     let mut checkpoint = committed.unwrap_or(Checkpoint {
         source_name: work.source_name.clone(),
@@ -1605,7 +1676,8 @@ async fn process_session_json_file(
         ..Default::default()
     };
 
-    if batch.row_count() > 0
+    if first_ingest
+        || batch.row_count() > 0
         || message_count != already_emitted
         || file_size != checkpoint.last_offset
     {
@@ -1801,10 +1873,11 @@ fn truncate(input: &str, max_chars: usize) -> String {
 mod tests {
     use super::{
         complete_work, compose_hermes_model, enqueue_work, enrich_claude_model_latency,
-        jsonl_source_line_byte_limit, process_file, process_session_json_file, run_work_item,
-        source_inode_for_file, work_item_is_ingestable, work_path_is_canonical, SessionCursor,
-        CLICKHOUSE_JSON_OBJECT_BYTE_LIMIT, ERROR_KIND_NORMALIZED_ROW_TOO_LARGE,
-        ERROR_KIND_SOURCE_LINE_TOO_LARGE, SESSION_JSON_GENERATION, SESSION_JSON_INODE,
+        jsonl_source_line_byte_limit, note_work_received, process_file, process_session_json_file,
+        run_work_item, send_queued_work, source_inode_for_file, work_item_is_ingestable,
+        work_path_is_canonical, SessionCursor, CLICKHOUSE_JSON_OBJECT_BYTE_LIMIT,
+        ERROR_KIND_NORMALIZED_ROW_TOO_LARGE, ERROR_KIND_SOURCE_LINE_TOO_LARGE,
+        SESSION_JSON_GENERATION, SESSION_JSON_INODE,
     };
     use crate::model::Checkpoint;
     use crate::sqlite_poll::VolatilePollMap;
@@ -2201,6 +2274,30 @@ mod tests {
             .expect("real session transcript must be forwarded");
         assert_eq!(forwarded.key(), session.key());
         assert_eq!(metrics.queue_depth.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn queue_depth_is_accounted_before_a_fast_receiver_observes_work() {
+        let metrics = Arc::new(Metrics::default());
+        let receiver_metrics = metrics.clone();
+        let (process_tx, mut process_rx) = mpsc::channel::<WorkItem>(1);
+        let receiver = tokio::spawn(async move {
+            process_rx.recv().await.expect("queued work");
+            let depth_at_receive = receiver_metrics.queue_depth.load(Ordering::Relaxed);
+            note_work_received(&receiver_metrics);
+            depth_at_receive
+        });
+
+        assert!(
+            send_queued_work(
+                sample_work("/tmp/queue-accounting.jsonl"),
+                &process_tx,
+                &metrics
+            )
+            .await
+        );
+        assert_eq!(receiver.await.expect("receiver task"), 1);
+        assert_eq!(metrics.queue_depth.load(Ordering::Relaxed), 0);
     }
 
     #[test]

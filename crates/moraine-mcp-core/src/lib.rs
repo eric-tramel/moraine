@@ -2,6 +2,7 @@
 
 pub mod contract;
 mod file_attention_v1;
+mod get_ingest_status_v1;
 mod list_sessions_v1;
 mod open_v1;
 mod private_proxy;
@@ -9,7 +10,9 @@ mod search_sessions_v1;
 
 use anyhow::{anyhow, Context, Result};
 use moraine_config::{AppConfig, KNOWN_INGEST_HARNESSES};
-use moraine_conversations::{BackendRepositoryRouter, RepoError};
+use moraine_conversations::{
+    BackendRepositoryRouter, IngestConditionState, IngestConditionType, RepoError,
+};
 pub use moraine_conversations::{ConversationRepository, SessionOriginScope};
 pub use private_proxy::private_route_deadline;
 #[cfg(unix)]
@@ -692,19 +695,285 @@ impl AppState {
                     "annotations": {
                         "readOnlyHint": true
                     }
+                },
+                {
+                    "name": contract::GET_INGEST_STATUS_TOOL,
+                    "description": "Report ingestion health, finite historical coverage, durable progress, freshness, alerts, and a conservative ETA when enough stable checkpoint history exists. Use this before concluding that a missing retrieval result never existed.",
+                    "inputSchema": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {}
+                    },
+                    "outputSchema": tool_output_schema(
+                        contract::GET_INGEST_STATUS_TOOL,
+                        json!({
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": [
+                                "observed_at_unix_ms",
+                                "current",
+                                "conditions",
+                                "alerts",
+                                "rate",
+                                "eta",
+                                "history"
+                            ],
+                            "properties": {
+                                "observed_at_unix_ms": { "type": "integer" },
+                                "current": {
+                                    "type": ["object", "null"],
+                                    "additionalProperties": false,
+                                    "required": [
+                                        "heartbeat_observed_at_unix_ms",
+                                        "queue_depth",
+                                        "files_active",
+                                        "files_watched",
+                                        "progress"
+                                    ],
+                                    "properties": {
+                                        "heartbeat_observed_at_unix_ms": { "type": "integer" },
+                                        "queue_depth": { "type": "integer", "minimum": 0 },
+                                        "files_active": { "type": "integer", "minimum": 0 },
+                                        "files_watched": { "type": "integer", "minimum": 0 },
+                                        "progress": {
+                                            "type": ["object", "null"],
+                                            "additionalProperties": false,
+                                            "required": [
+                                                "discovery_complete",
+                                                "queue_capacity",
+                                                "sink_pending_rows",
+                                                "sink_pending_bytes",
+                                                "sink_retrying",
+                                                "oldest_pending_unix_ms",
+                                                "last_durable_progress_unix_ms",
+                                                "files_total",
+                                                "files_completed",
+                                                "bytes_total",
+                                                "bytes_completed"
+                                            ],
+                                            "properties": {
+                                                "discovery_complete": { "type": "boolean" },
+                                                "queue_capacity": { "type": "integer", "minimum": 0 },
+                                                "sink_pending_rows": { "type": "integer", "minimum": 0 },
+                                                "sink_pending_bytes": { "type": "integer", "minimum": 0 },
+                                                "sink_retrying": { "type": "boolean" },
+                                                "oldest_pending_unix_ms": { "type": "integer", "minimum": 0 },
+                                                "last_durable_progress_unix_ms": { "type": "integer", "minimum": 0 },
+                                                "files_total": { "type": "integer", "minimum": 0 },
+                                                "files_completed": { "type": "integer", "minimum": 0 },
+                                                "bytes_total": { "type": "integer", "minimum": 0 },
+                                                "bytes_completed": { "type": "integer", "minimum": 0 }
+                                            }
+                                        }
+                                    }
+                                },
+                                "conditions": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "additionalProperties": false,
+                                        "required": [
+                                            "condition_type",
+                                            "state",
+                                            "reason",
+                                            "observed_at_unix_ms"
+                                        ],
+                                        "properties": {
+                                            "condition_type": {
+                                                "type": "string",
+                                                "enum": ["health", "coverage", "freshness", "readiness"]
+                                            },
+                                            "state": {
+                                                "type": "string",
+                                                "enum": ["true", "false", "unknown"]
+                                            },
+                                            "reason": { "type": "string" },
+                                            "observed_at_unix_ms": { "type": "integer" }
+                                        }
+                                    }
+                                },
+                                "alerts": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "additionalProperties": false,
+                                        "required": ["code", "observed_at_unix_ms"],
+                                        "properties": {
+                                            "code": {
+                                                "type": "string",
+                                                "enum": [
+                                                    "heartbeat_stale",
+                                                    "progress_stalled",
+                                                    "queue_saturated",
+                                                    "sink_retrying",
+                                                    "coverage_degraded"
+                                                ]
+                                            },
+                                            "observed_at_unix_ms": { "type": "integer" }
+                                        }
+                                    }
+                                },
+                                "rate": {
+                                    "type": ["object", "null"],
+                                    "additionalProperties": false,
+                                    "required": ["bytes_per_second", "sample_seconds"],
+                                    "properties": {
+                                        "bytes_per_second": { "type": "number", "minimum": 0 },
+                                        "sample_seconds": { "type": "integer", "minimum": 0 }
+                                    }
+                                },
+                                "eta": {
+                                    "type": ["object", "null"],
+                                    "additionalProperties": false,
+                                    "required": ["scope", "low_seconds", "high_seconds"],
+                                    "properties": {
+                                        "scope": { "type": "string" },
+                                        "low_seconds": { "type": "integer", "minimum": 0 },
+                                        "high_seconds": { "type": "integer", "minimum": 0 }
+                                    }
+                                },
+                                "history": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "additionalProperties": false,
+                                        "required": [
+                                            "ts_unix_ms",
+                                            "queue_depth",
+                                            "files_active",
+                                            "queue_capacity",
+                                            "sink_pending_rows",
+                                            "sink_retrying",
+                                            "discovery_complete",
+                                            "files_total",
+                                            "files_completed",
+                                            "bytes_total",
+                                            "bytes_completed"
+                                        ],
+                                        "properties": {
+                                            "ts_unix_ms": { "type": "integer" },
+                                            "queue_depth": { "type": "integer", "minimum": 0 },
+                                            "files_active": { "type": "integer", "minimum": 0 },
+                                            "queue_capacity": { "type": "integer", "minimum": 0 },
+                                            "sink_pending_rows": { "type": "integer", "minimum": 0 },
+                                            "sink_retrying": { "type": "boolean" },
+                                            "discovery_complete": { "type": "boolean" },
+                                            "files_total": { "type": "integer", "minimum": 0 },
+                                            "files_completed": { "type": "integer", "minimum": 0 },
+                                            "bytes_total": { "type": "integer", "minimum": 0 },
+                                            "bytes_completed": { "type": "integer", "minimum": 0 }
+                                        }
+                                    }
+                                }
+                            }
+                        })
+                    ),
+                    "annotations": {
+                        "readOnlyHint": true
+                    }
                 }
             ]
         })
     }
 
     async fn call_tool(&self, params: ToolCallParams) -> Result<Value> {
-        match params.name.as_str() {
+        let tool = params.name;
+        let result = match tool.as_str() {
             contract::SEARCH_SESSIONS_TOOL => self.search_sessions_v1(params.arguments).await,
             contract::LIST_SESSIONS_TOOL => self.list_sessions_v1(params.arguments).await,
             contract::OPEN_TOOL => self.open_v1(params.arguments).await,
             contract::FILE_ATTENTION_TOOL => self.file_attention_v1(params.arguments).await,
+            contract::GET_INGEST_STATUS_TOOL => self.get_ingest_status_v1(params.arguments).await,
             other => Err(anyhow!("unknown tool: {other}")),
+        }?;
+        if matches!(
+            tool.as_str(),
+            contract::SEARCH_SESSIONS_TOOL
+                | contract::LIST_SESSIONS_TOOL
+                | contract::OPEN_TOOL
+                | contract::FILE_ATTENTION_TOOL
+        ) {
+            Ok(self.annotate_retrieval_coverage(result).await)
+        } else {
+            Ok(result)
         }
+    }
+
+    async fn annotate_retrieval_coverage(&self, mut result: Value) -> Value {
+        if result
+            .get("isError")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            return result;
+        }
+        let observed_at_unix_ms = get_ingest_status_v1::unix_now_ms();
+        let (state, reason, observed_at_unix_ms) = match self.read_ingest_status_bounded(1).await {
+            Ok(read) => read
+                .derive(observed_at_unix_ms)
+                .conditions
+                .into_iter()
+                .find(|condition| condition.condition_type == IngestConditionType::Coverage)
+                .map(|condition| {
+                    (
+                        condition.state,
+                        condition.reason,
+                        condition.observed_at_unix_ms,
+                    )
+                })
+                .unwrap_or((
+                    IngestConditionState::Unknown,
+                    "condition_missing".to_string(),
+                    observed_at_unix_ms,
+                )),
+            Err(_) => (
+                IngestConditionState::Unknown,
+                "status_unavailable".to_string(),
+                observed_at_unix_ms,
+            ),
+        };
+        if let Some(data) = result
+            .pointer_mut("/structuredContent/data")
+            .and_then(Value::as_object_mut)
+        {
+            data.insert(
+                "coverage".to_string(),
+                json!({
+                    "state": match state {
+                        IngestConditionState::True => "complete",
+                        IngestConditionState::False => "partial",
+                        IngestConditionState::Unknown => "unknown",
+                    },
+                    "reason": reason,
+                    "observed_at_unix_ms": observed_at_unix_ms,
+                }),
+            );
+        }
+        let warning = match state {
+            IngestConditionState::True => None,
+            IngestConditionState::False => Some(
+                "coverage_partial: historical ingestion is incomplete; retrieval results may be incomplete.",
+            ),
+            IngestConditionState::Unknown => Some(
+                "coverage_unknown: ingestion coverage is unavailable; retrieval results may be incomplete.",
+            ),
+        };
+        if let Some(warning) = warning {
+            if let Some(warnings) = result
+                .pointer_mut("/structuredContent/warnings")
+                .and_then(Value::as_array_mut)
+            {
+                warnings.push(Value::String(warning.to_string()));
+            }
+            if let Some(text) = result
+                .pointer_mut("/content/0/text")
+                .and_then(|value| value.as_str())
+                .map(ToOwned::to_owned)
+            {
+                result["content"][0]["text"] = Value::String(format!("{text}\nWarning: {warning}"));
+            }
+        }
+        result
     }
 }
 
@@ -1301,6 +1570,10 @@ fn admitted_tool_call(req: &RpcRequest, max_results: u16) -> Option<AdmittedTool
             serde_json::from_value::<contract::FileAttentionArgs>(params.arguments.clone())
                 .is_ok_and(|args| args.validate(max_results).is_ok())
         }
+        contract::GET_INGEST_STATUS_TOOL => params
+            .arguments
+            .as_object()
+            .is_some_and(serde_json::Map::is_empty),
         _ => false,
     };
     valid.then_some(AdmittedToolCall {
@@ -1992,6 +2265,143 @@ mod tests {
         assert_eq!(state.request_admission.slots.available_permits(), 24);
     }
 
+    #[test]
+    fn ingest_status_admission_accepts_only_an_empty_object() {
+        let request = |arguments| RpcRequest {
+            id: Some(json!(1)),
+            method: "tools/call".to_string(),
+            params: json!({
+                "name": contract::GET_INGEST_STATUS_TOOL,
+                "arguments": arguments,
+            }),
+        };
+
+        assert!(admitted_tool_call(&request(json!({})), 50).is_some());
+        for invalid in [
+            Value::Null,
+            json!([]),
+            json!(true),
+            json!(0),
+            json!(""),
+            json!({ "unexpected": true }),
+        ] {
+            assert!(
+                admitted_tool_call(&request(invalid), 50).is_none(),
+                "invalid status arguments must bypass repository admission"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn every_retrieval_coverage_annotation_preserves_payload_and_is_three_fields() {
+        let state = test_state();
+        for tool in [
+            contract::SEARCH_SESSIONS_TOOL,
+            contract::LIST_SESSIONS_TOOL,
+            contract::OPEN_TOOL,
+            contract::FILE_ATTENTION_TOOL,
+        ] {
+            let payload = serde_json::to_value(
+                contract::ToolEnvelope::success(
+                    tool,
+                    json!({ "request_sentinel": tool }),
+                    json!({ "result_sentinel": tool }),
+                    contract::Performance::from_elapsed(std::time::Duration::ZERO),
+                )
+                .with_warnings(vec![format!("existing_warning:{tool}")]),
+            )
+            .expect("retrieval envelope");
+            let original = tool_success_result(format!("existing text:{tool}"), payload);
+            let annotated = state.annotate_retrieval_coverage(original).await;
+            let data = &annotated["structuredContent"]["data"];
+            let coverage = data["coverage"].as_object().expect("coverage object");
+
+            assert_eq!(data["result_sentinel"], json!(tool));
+            assert_eq!(
+                annotated["structuredContent"]["request"]["request_sentinel"],
+                json!(tool)
+            );
+            assert_eq!(coverage.len(), 3);
+            assert!(coverage.contains_key("state"));
+            assert!(coverage.contains_key("reason"));
+            assert!(coverage.contains_key("observed_at_unix_ms"));
+            assert!(!coverage.contains_key("complete"));
+            assert_eq!(
+                annotated["structuredContent"]["warnings"][0],
+                json!(format!("existing_warning:{tool}"))
+            );
+            assert_eq!(
+                annotated["structuredContent"]["warnings"][1],
+                json!("coverage_unknown: ingestion coverage is unavailable; retrieval results may be incomplete.")
+            );
+            assert!(annotated["content"][0]["text"]
+                .as_str()
+                .expect("text result")
+                .starts_with(&format!("existing text:{tool}\nWarning: ")));
+        }
+    }
+
+    #[tokio::test]
+    async fn retrieval_coverage_failure_is_generic_and_does_not_leak_repository_error() {
+        let raw_error = "SECRET_COVERAGE_ERROR /private/source.db password=hunter2";
+        let repository = Arc::new(InMemoryConversationRepository::with_responses(
+            RepoConfig::default(),
+            InMemoryConversationResponses {
+                latest_ingest_heartbeat: Some(Err(RepoError::backend(raw_error))),
+                ..InMemoryConversationResponses::default()
+            },
+        ));
+        let state = AppState::embedded(AppConfig::default(), repository);
+        let payload = serde_json::to_value(contract::ToolEnvelope::success(
+            contract::SEARCH_SESSIONS_TOOL,
+            json!({}),
+            json!({ "result_count": 0 }),
+            contract::Performance::from_elapsed(std::time::Duration::ZERO),
+        ))
+        .expect("retrieval envelope");
+        let annotated = state
+            .annotate_retrieval_coverage(tool_success_result("No results.".to_string(), payload))
+            .await;
+        let coverage = &annotated["structuredContent"]["data"]["coverage"];
+        let serialized = serde_json::to_string(&annotated).expect("annotated response JSON");
+
+        assert_eq!(
+            coverage,
+            &json!({
+                "state": "unknown",
+                "reason": "status_unavailable",
+                "observed_at_unix_ms": coverage["observed_at_unix_ms"],
+            })
+        );
+        assert!(!serialized.contains("SECRET_COVERAGE_ERROR"));
+        assert!(!serialized.contains("/private/source.db"));
+        assert!(!serialized.contains("password=hunter2"));
+    }
+
+    #[tokio::test]
+    async fn ingest_status_success_uses_the_published_safe_output_shape() {
+        let state = test_state();
+        let response = call_tool_rpc(&state, 7, contract::GET_INGEST_STATUS_TOOL, json!({})).await;
+        let data = &response["result"]["structuredContent"]["data"];
+
+        assert_eq!(response["result"]["isError"], json!(false));
+        assert_eq!(data["current"], Value::Null);
+        let fields = data.as_object().expect("status data object");
+        assert_eq!(fields.len(), 7);
+        for field in [
+            "alerts",
+            "conditions",
+            "current",
+            "eta",
+            "history",
+            "observed_at_unix_ms",
+            "rate",
+        ] {
+            assert!(fields.contains_key(field), "missing status field {field}");
+        }
+        assert_published_output_schema_matches(&response, contract::GET_INGEST_STATUS_TOOL);
+    }
+
     fn successful_test_state() -> Arc<AppState> {
         let session = McpSessionOpen {
             metadata: SessionMetadata {
@@ -2094,13 +2504,15 @@ mod tests {
             }
         }
 
-        if let Some(required) = schema.get("required").and_then(Value::as_array) {
-            if required.iter().any(|field| {
-                field
-                    .as_str()
-                    .is_none_or(|field| instance.get(field).is_none())
-            }) {
-                return false;
+        if instance.is_object() {
+            if let Some(required) = schema.get("required").and_then(Value::as_array) {
+                if required.iter().any(|field| {
+                    field
+                        .as_str()
+                        .is_none_or(|field| instance.get(field).is_none())
+                }) {
+                    return false;
+                }
             }
         }
 
@@ -2243,10 +2655,22 @@ mod tests {
 
         assert_eq!(
             names,
-            ["search_sessions", "open", "list_sessions", "file_attention"]
+            [
+                "search_sessions",
+                "open",
+                "list_sessions",
+                "file_attention",
+                "get_ingest_status"
+            ]
         );
 
-        for tool_name in ["search_sessions", "open", "list_sessions", "file_attention"] {
+        for tool_name in [
+            "search_sessions",
+            "open",
+            "list_sessions",
+            "file_attention",
+            "get_ingest_status",
+        ] {
             let tool = tools
                 .iter()
                 .find(|tool| tool["name"].as_str() == Some(tool_name))
@@ -2257,6 +2681,29 @@ mod tests {
             );
             assert_eq!(tool["annotations"]["readOnlyHint"], json!(true));
         }
+
+        let status = tools
+            .iter()
+            .find(|tool| tool["name"].as_str() == Some("get_ingest_status"))
+            .expect("get_ingest_status exists");
+        assert_eq!(status["inputSchema"]["additionalProperties"], json!(false));
+        let status_data = &status["outputSchema"]["properties"]["data"];
+        assert_eq!(status_data["additionalProperties"], json!(false));
+        assert_eq!(
+            status_data["required"],
+            json!([
+                "observed_at_unix_ms",
+                "current",
+                "conditions",
+                "alerts",
+                "rate",
+                "eta",
+                "history",
+            ])
+        );
+        assert!(status_data["properties"].get("heartbeat").is_none());
+        assert!(status_data["properties"].get("current").is_some());
+        assert!(status_data["properties"].get("history").is_some());
 
         let open = tools
             .iter()

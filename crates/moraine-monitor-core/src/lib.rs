@@ -37,6 +37,10 @@ struct LimitQuery {
     limit: Option<u32>,
 }
 
+#[derive(Default, Deserialize)]
+struct StatusQuery {
+    history: Option<u64>,
+}
 #[derive(Deserialize)]
 struct AnalyticsQuery {
     range: Option<String>,
@@ -427,7 +431,10 @@ fn health_failure_response(
     )
 }
 
-async fn api_status(Extension(backend): Extension<Arc<BackendRepository>>) -> Response {
+async fn api_status(
+    Query(query): Query<StatusQuery>,
+    Extension(backend): Extension<Arc<BackendRepository>>,
+) -> Response {
     let health = backend
         .repository()
         .read_store_health()
@@ -435,10 +442,11 @@ async fn api_status(Extension(backend): Extension<Arc<BackendRepository>>) -> Re
         .unwrap_or_else(|error| unavailable_store_health(error.to_string()));
     let database_exists = probe_bool(&health.database_exists).unwrap_or(false);
 
-    let (tables, heartbeat) = if database_exists {
-        let (tables, heartbeat) = tokio::join!(
+    let history_limit = query.history.unwrap_or(0).min(120) as u16;
+    let (tables, heartbeat, ingest_status) = if database_exists {
+        let (tables, status) = tokio::join!(
             backend.repository().list_table_summaries(),
-            backend.repository().latest_ingest_heartbeat()
+            backend.repository().ingest_status(history_limit)
         );
         let tables = match tables {
             Ok(tables) => monitor_table_summaries(tables),
@@ -449,10 +457,14 @@ async fn api_status(Extension(backend): Extension<Arc<BackendRepository>>) -> Re
                 );
             }
         };
-        let heartbeat = heartbeat.map(monitor_heartbeat_status).unwrap_or_default();
-        (tables, heartbeat)
+        let status = status.map(|read| read.derive(unix_now_ms()));
+        let heartbeat = status
+            .as_ref()
+            .map(|status| monitor_heartbeat_status(status.heartbeat.clone()))
+            .unwrap_or_default();
+        (tables, heartbeat, status.ok())
     } else {
-        (Vec::new(), MonitorHeartbeatStatus::default())
+        (Vec::new(), MonitorHeartbeatStatus::default(), None)
     };
 
     let estimated_total_rows = tables.iter().map(|table| table.rows).sum::<u64>();
@@ -469,6 +481,7 @@ async fn api_status(Extension(backend): Extension<Arc<BackendRepository>>) -> Re
                 "tables": tables,
             },
             "ingestor": heartbeat_payload(&heartbeat),
+            "ingest_status": ingest_status,
         }),
         StatusCode::OK,
     )
@@ -1137,9 +1150,9 @@ mod tests {
     use moraine_conversations::{
         AnalyticsConcurrencyPoint, AnalyticsSnapshot, AnalyticsTokenPoint, AnalyticsTurnPoint,
         AnalyticsWindow, ConversationMode, ConversationRepository, ConversationSummary,
-        InMemoryConversationRepository, InMemoryConversationResponses, IngestHeartbeat, RepoConfig,
-        SessionStep, StoreDiagnostics, TableColumn, TablePreview, TableSummary, ToolResult,
-        TurnSummary, WebSearchEvent,
+        InMemoryConversationRepository, InMemoryConversationResponses, IngestHeartbeat,
+        IngestStatusRead, RepoConfig, SessionStep, StoreDiagnostics, TableColumn, TablePreview,
+        TableSummary, ToolResult, TurnSummary, WebSearchEvent,
     };
     use std::collections::BTreeMap;
     use std::fs;
@@ -1293,6 +1306,26 @@ mod tests {
         (status, response_json(response).await)
     }
 
+    fn normalize_status_observation_times(payload: &mut Value) {
+        let Some(status) = payload
+            .get_mut("ingest_status")
+            .and_then(Value::as_object_mut)
+        else {
+            return;
+        };
+        status.insert("observed_at_unix_ms".to_string(), json!(0));
+        for field in ["conditions", "alerts"] {
+            let Some(entries) = status.get_mut(field).and_then(Value::as_array_mut) else {
+                continue;
+            };
+            for entry in entries {
+                if let Some(entry) = entry.as_object_mut() {
+                    entry.insert("observed_at_unix_ms".to_string(), json!(0));
+                }
+            }
+        }
+    }
+
     fn sample_health() -> StoreHealth {
         StoreHealth {
             ping: StoreProbe::Available(3.5),
@@ -1332,6 +1365,7 @@ mod tests {
                 watcher_reset_count: Some(0),
                 watcher_last_reset_unix_ms: None,
                 backend_sinks: Some(json!({"team-ch": "healthy"})),
+                progress: None,
             }),
         }
     }
@@ -1563,6 +1597,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn status_history_query_defaults_to_zero_clamps_and_rejects_malformed_values() {
+        let heartbeat = sample_heartbeat();
+        let mut template = heartbeat.latest.clone().expect("sample heartbeat");
+        template.progress = Some(Default::default());
+        let history = (0_i64..121)
+            .map(|offset| {
+                let mut sample = template.clone();
+                sample.ts_unix_ms = template
+                    .ts_unix_ms
+                    .saturating_sub((120_i64.saturating_sub(offset)).saturating_mul(1_000));
+                sample
+            })
+            .collect();
+        let mut responses = successful_responses();
+        responses.ingest_status = Some(Ok(IngestStatusRead { heartbeat, history }));
+        let (state, repository) = fake_state(responses);
+        let app = monitor_router(state);
+
+        for path in ["/api/v1/status", "/api/status?history=0"] {
+            let (status, payload) = router_json(&app, path).await;
+            assert_eq!(status, StatusCode::OK, "{path}");
+            assert!(
+                payload["ingest_status"].get("history").is_none(),
+                "{path} must not return history"
+            );
+        }
+
+        for path in ["/api/v1/status?history=999", "/api/status?history=999"] {
+            let (status, payload) = router_json(&app, path).await;
+            assert_eq!(status, StatusCode::OK, "{path}");
+            let history = payload["ingest_status"]["history"]
+                .as_array()
+                .expect("bounded history");
+            assert_eq!(history.len(), 120, "{path}");
+            let point = history[0].as_object().expect("narrow history point");
+            for excluded in ["host", "last_error", "progress", "backend_sinks", "sources"] {
+                assert!(
+                    !point.contains_key(excluded),
+                    "history must not include {excluded}"
+                );
+            }
+        }
+
+        for path in [
+            "/api/v1/status?history=not-a-number",
+            "/api/status?history=-1",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .body(Body::empty())
+                        .expect("malformed history request"),
+                )
+                .await
+                .expect("malformed history response");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
+        }
+
+        assert_eq!(repository.calls().ingest_status, vec![0, 0, 120, 120]);
+    }
+
+    #[tokio::test]
     async fn handlers_delegate_to_shared_repository_and_preserve_json_contracts() {
         let (backend, repository) = fake_backend(successful_responses()).await;
 
@@ -1577,7 +1675,7 @@ mod tests {
             json!({"backend_sinks": {"team-ch": "healthy"}})
         );
 
-        let response = api_status(Extension(backend.clone())).await;
+        let response = api_status(Query(StatusQuery::default()), Extension(backend.clone())).await;
         assert_eq!(response.status(), StatusCode::OK);
         let status = response_json(response).await;
         assert_eq!(status["database"]["exists"], json!(true));
@@ -1659,6 +1757,7 @@ mod tests {
         assert_eq!(calls.read_store_health, 2);
         assert_eq!(calls.read_store_diagnostics, 0);
         assert_eq!(calls.latest_ingest_heartbeat, 2);
+        assert_eq!(calls.ingest_status, vec![0]);
         assert_eq!(calls.list_table_summaries, 2);
         assert_eq!(calls.list_web_searches, vec![1_000]);
         assert_eq!(calls.analytics_series, vec![AnalyticsRange::SevenDays]);
@@ -1812,7 +1911,9 @@ mod tests {
         let health = response_json(api_health(Extension(backend.clone())).await).await;
         assert_eq!(health["ingestor"]["latest"]["backend_sinks"], json!({}));
 
-        let status = response_json(api_status(Extension(backend)).await).await;
+        let status =
+            response_json(api_status(Query(StatusQuery::default()), Extension(backend)).await)
+                .await;
         let latest = status["ingestor"]["latest"].as_object().expect("latest");
         assert!(!latest.contains_key("backend_sinks"));
         assert!(!latest.contains_key("watcher_backend"));
@@ -1884,13 +1985,21 @@ mod tests {
             ),
         ];
         for (canonical_path, legacy_path) in route_matrix {
-            let canonical = router_json(&app, canonical_path).await;
-            let legacy = router_json(&app, legacy_path).await;
+            let (canonical_status, mut canonical_payload) = router_json(&app, canonical_path).await;
+            if canonical_path == "/api/v1/status" {
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+            let (legacy_status, mut legacy_payload) = router_json(&app, legacy_path).await;
+            if canonical_path == "/api/v1/status" {
+                normalize_status_observation_times(&mut canonical_payload);
+                normalize_status_observation_times(&mut legacy_payload);
+            }
             assert_eq!(
-                canonical, legacy,
+                (canonical_status, canonical_payload),
+                (legacy_status, legacy_payload),
                 "{legacy_path} must directly alias {canonical_path}"
             );
-            assert_eq!(canonical.0, StatusCode::OK);
+            assert_eq!(canonical_status, StatusCode::OK);
         }
 
         let (status, capabilities) = router_json(&app, "/api/v1/capabilities").await;
@@ -1917,6 +2026,7 @@ mod tests {
         assert_eq!(calls.read_store_health, 4);
         assert_eq!(calls.read_store_diagnostics, 1);
         assert_eq!(calls.latest_ingest_heartbeat, 4);
+        assert_eq!(calls.ingest_status, vec![0, 0]);
         assert_eq!(calls.list_table_summaries, 4);
         assert_eq!(calls.list_web_searches, vec![1_000, 1_000]);
         assert_eq!(

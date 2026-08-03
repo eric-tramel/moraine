@@ -14,6 +14,8 @@ const BASE64_URL_ALPHABET: &[u8; 64] =
 pub const SEARCH_SESSIONS_TOOL: &str = "search_sessions";
 pub const OPEN_TOOL: &str = "open";
 pub const LIST_SESSIONS_TOOL: &str = "list_sessions";
+pub const GET_INGEST_STATUS_TOOL: &str = "get_ingest_status";
+pub const GET_INGEST_STATUS_DEADLINE_MS: u64 = 3_000;
 pub const SEARCH_SESSIONS_SCHEMA_VERSION: &str = "moraine.mcp.search_sessions.v1";
 pub const OPEN_SCHEMA_VERSION: &str = "moraine.mcp.open.v1";
 pub const LIST_SESSIONS_SCHEMA_VERSION: &str = "moraine.mcp.list_sessions.v1";
@@ -37,6 +39,9 @@ pub const FILE_ATTENTION_DEADLINE_MS: u64 = 4_000;
 /// low-confidence warning. A bare basename (`mod.rs`, depth 1) warns;
 /// `src/lib.rs` (depth 2) does not.
 pub const FILE_ATTENTION_MIN_TAIL_SEGMENTS: usize = 2;
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GetIngestStatusArgs {}
 
 pub type ContractResult<T> = Result<T, ContractError>;
 
