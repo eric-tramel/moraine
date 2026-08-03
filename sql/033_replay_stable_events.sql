@@ -23,6 +23,12 @@ DROP TABLE IF EXISTS moraine.event_uid_lookup_033;
 DROP TABLE IF EXISTS moraine.events_replay_stable_033;
 DROP TABLE IF EXISTS moraine.event_links_replay_stable_033;
 
+-- Writers are quiesced by the CLI. Compact the source replacement keys once
+-- so every subsequent rebuild can stream physical rows without SELECT FINAL.
+OPTIMIZE TABLE moraine.events FINAL
+SETTINGS max_threads = 1,
+  max_memory_usage = 1073741824;
+
 CREATE VIEW moraine.event_uid_base_source_033 AS
 WITH
   ['createdAt', 'created_at', 'cwd', 'directory', 'lastUpdatedAt', 'last_updated',
@@ -128,9 +134,9 @@ SELECT
     value -> concat(toString(length(value)), ':', value),
     identity_fields
   ))))) AS base_event_uid
--- event_uid is the v1 canonical identity; FINAL therefore yields one source
--- row for each event occurrence observed before this migration.
-FROM moraine.events FINAL;
+-- The source table was compacted above, so each physical row is one event
+-- occurrence observed before this migration.
+FROM moraine.events;
 
 CREATE TABLE moraine.event_uid_map_033 (
   old_event_uid String,
@@ -140,49 +146,55 @@ CREATE TABLE moraine.event_uid_map_033 (
 ENGINE = MergeTree
 ORDER BY old_event_uid;
 
+-- Completed-cutover retries already carry their occurrence. Preserve those
+-- assignments without adding another corpus-sized window state.
+INSERT INTO moraine.event_uid_map_033
+SELECT
+  old_event_uid,
+  lower(hex(SHA256(concat(
+    toString(length('moraine:event:occurrence:v1')), ':', 'moraine:event:occurrence:v1',
+    toString(length(base_event_uid)), ':', base_event_uid,
+    toString(length(toString(existing_occurrence))), ':', toString(existing_occurrence)
+  )))) AS new_event_uid,
+  existing_occurrence AS semantic_occurrence
+FROM moraine.event_uid_base_source_033
+WHERE existing_occurrence > 0
+SETTINGS max_block_size = 1024,
+  preferred_max_column_in_block_size_bytes = 33554432,
+  min_insert_block_size_rows = 8192,
+  min_insert_block_size_bytes = 16777216,
+  max_threads = 1,
+  max_memory_usage = 1073741824;
+
+-- Fresh schema-032 rows are unmarked. Rank only this legacy population; on a
+-- completed-cutover retry it contains unique base events and needs no sort.
 INSERT INTO moraine.event_uid_map_033
 SELECT
   old_event_uid,
   if(
-    resolved_occurrence = 0,
+    duplicate_count = 1,
     base_event_uid,
     lower(hex(SHA256(concat(
       toString(length('moraine:event:occurrence:v1')), ':', 'moraine:event:occurrence:v1',
       toString(length(base_event_uid)), ':', base_event_uid,
-      toString(length(toString(resolved_occurrence))), ':', toString(resolved_occurrence)
+      toString(length(toString(occurrence))), ':', toString(occurrence)
     ))))
   ) AS new_event_uid,
-  toUInt32(resolved_occurrence) AS semantic_occurrence
+  if(duplicate_count = 1, 0, toUInt32(occurrence)) AS semantic_occurrence
 FROM (
   SELECT
     *,
-    if(
-      existing_occurrence > 0,
-      existing_occurrence,
-      if(
-        duplicate_count = 1,
-        0,
-        max_existing_occurrence + unmarked_occurrence
-      )
-    ) AS resolved_occurrence
-  FROM (
-    SELECT
-      *,
-      count() OVER (
-        PARTITION BY source_name, source_file, source_generation, source_line_no,
-          source_offset, base_event_uid
-      ) AS duplicate_count,
-      max(existing_occurrence) OVER (
-        PARTITION BY source_name, source_file, source_generation, source_line_no,
-          source_offset, base_event_uid
-      ) AS max_existing_occurrence,
-      row_number() OVER (
-        PARTITION BY source_name, source_file, source_generation, source_line_no,
-          source_offset, base_event_uid, existing_occurrence = 0
-        ORDER BY old_event_uid
-      ) AS unmarked_occurrence
-    FROM moraine.event_uid_base_source_033
-  )
+    count() OVER (
+      PARTITION BY source_name, source_file, source_generation, source_line_no,
+        source_offset, base_event_uid
+    ) AS duplicate_count,
+    row_number() OVER (
+      PARTITION BY source_name, source_file, source_generation, source_line_no,
+        source_offset, base_event_uid
+      ORDER BY old_event_uid
+    ) AS occurrence
+  FROM moraine.event_uid_base_source_033
+  WHERE existing_occurrence = 0
 )
 SETTINGS max_block_size = 1024,
   preferred_max_column_in_block_size_bytes = 33554432,
