@@ -34,7 +34,8 @@ use crate::render::{
 use crate::service::Service;
 
 pub(super) const WRITER_BARRIER_MIGRATIONS: [&str; 2] = ["031", "033"];
-pub(super) const WRITER_BARRIER_SERVICES: [Service; 2] = [Service::Backend, Service::Ingest];
+pub(super) const WRITER_BARRIER_SERVICES: [Service; 3] =
+    [Service::Backend, Service::Ingest, Service::Mcp];
 
 pub(crate) async fn dispatch(cli: Cli, output: CliOutput) -> Result<ExitCode> {
     match cli.command {
@@ -483,14 +484,19 @@ mod tests {
                     match service {
                         Service::Backend => Some(41),
                         Service::Ingest => Some(42),
-                        Service::ClickHouse | Service::Mcp => None,
+                        Service::Mcp => Some(43),
+                        Service::ClickHouse => None,
                     }
                 })
                 .expect_err("live tracked services must block a storage cutover");
 
-            assert_eq!(inspected, vec![Service::Backend, Service::Ingest]);
+            assert_eq!(
+                inspected,
+                vec![Service::Backend, Service::Ingest, Service::Mcp]
+            );
             assert!(error.to_string().contains("backend (pid 41)"));
             assert!(error.to_string().contains("ingest (pid 42)"));
+            assert!(error.to_string().contains("mcp (pid 43)"));
             assert!(error.to_string().contains("moraine down"));
         }
     }

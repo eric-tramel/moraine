@@ -21,7 +21,7 @@
           "endpoint_kind": "generation",
           "event_kind": "message",
           "event_ts": "2026-07-18 12:00:00.000",
-          "event_uid": "b92c706e9400c42d5e552e12b74488a116cf0d95818b600d588ecb7a876bd49d",
+          "event_uid": "a1dffb65f7259afbb6e1ca5f4d53289cacf206fe2fee4d463b1a90becde0e36b",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "has_reasoning": 0,
@@ -132,7 +132,7 @@
           "endpoint_kind": "generation",
           "event_kind": "reasoning",
           "event_ts": "2026-07-18 12:00:01.000",
-          "event_uid": "c964ce754db75df27c2d0a5b832c3420292c3614fd46cbfbe7d6dcc0122d56e1",
+          "event_uid": "920426203d97eda8a8e07517b9e9a9eba2898343acd065081ab68518d998a608",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "has_reasoning": 1,
@@ -214,7 +214,7 @@
           "endpoint_kind": "generation",
           "event_kind": "message",
           "event_ts": "2026-07-18 12:00:01.000",
-          "event_uid": "81d2ce3261ffac1fc5fc007e84391abfbd1dee480587a0e5b07f6cacc70c22be",
+          "event_uid": "b9c49b65a09db2ab9901e554cdcbec09f652d6b0073ac9231f8b319581c42755",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "has_reasoning": 0,
@@ -296,7 +296,7 @@
           "endpoint_kind": "generation",
           "event_kind": "tool_call",
           "event_ts": "2026-07-18 12:00:01.000",
-          "event_uid": "6b46ff3c0846aeaa564f10a812a24eb782168aa770ff0c710378d443a1ba5e4b",
+          "event_uid": "492299ebc6ca54a8d8418bc76fb858fdf5afd7c49677d9e8222c6f82f4391974",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "has_reasoning": 0,
@@ -378,7 +378,7 @@
           "endpoint_kind": "generation",
           "event_kind": "message",
           "event_ts": "2026-07-18 12:00:01.000",
-          "event_uid": "cfd04dc4c25915215e066f499a33d5298ef0b7e9b64f60d2991621406bf488aa",
+          "event_uid": "af6ee2fbd78fc31d59615bf24b85f1767a27308890300e86e3f45d63858bf372",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "has_reasoning": 0,
@@ -448,7 +448,7 @@
       ],
       "link_rows": [
         {
-          "event_uid": "c964ce754db75df27c2d0a5b832c3420292c3614fd46cbfbe7d6dcc0122d56e1",
+          "event_uid": "920426203d97eda8a8e07517b9e9a9eba2898343acd065081ab68518d998a608",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "inference_provider": "",
@@ -460,7 +460,7 @@
           "source_name": "golden-qwen-code"
         },
         {
-          "event_uid": "81d2ce3261ffac1fc5fc007e84391abfbd1dee480587a0e5b07f6cacc70c22be",
+          "event_uid": "b9c49b65a09db2ab9901e554cdcbec09f652d6b0073ac9231f8b319581c42755",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "inference_provider": "",
@@ -472,7 +472,7 @@
           "source_name": "golden-qwen-code"
         },
         {
-          "event_uid": "6b46ff3c0846aeaa564f10a812a24eb782168aa770ff0c710378d443a1ba5e4b",
+          "event_uid": "492299ebc6ca54a8d8418bc76fb858fdf5afd7c49677d9e8222c6f82f4391974",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "inference_provider": "",
@@ -484,7 +484,7 @@
           "source_name": "golden-qwen-code"
         },
         {
-          "event_uid": "cfd04dc4c25915215e066f499a33d5298ef0b7e9b64f60d2991621406bf488aa",
+          "event_uid": "af6ee2fbd78fc31d59615bf24b85f1767a27308890300e86e3f45d63858bf372",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "inference_provider": "",
@@ -519,7 +519,7 @@
       "session_hint": "qwen-session-001",
       "tool_rows": [
         {
-          "event_uid": "6b46ff3c0846aeaa564f10a812a24eb782168aa770ff0c710378d443a1ba5e4b",
+          "event_uid": "492299ebc6ca54a8d8418bc76fb858fdf5afd7c49677d9e8222c6f82f4391974",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "inference_provider": "",
@@ -564,7 +564,7 @@
           "endpoint_kind": "generation",
           "event_kind": "tool_result",
           "event_ts": "2026-07-18 12:00:02.000",
-          "event_uid": "259d846f287855904ad9a37488a1bac4b82ac83046355222ef92ae5adefa7b0d",
+          "event_uid": "f95d09f45435fcd4be32dc62e9a9886ca04e2f55f92be7abb6a255cddf7c034b",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "has_reasoning": 0,
@@ -634,7 +634,7 @@
       ],
       "link_rows": [
         {
-          "event_uid": "259d846f287855904ad9a37488a1bac4b82ac83046355222ef92ae5adefa7b0d",
+          "event_uid": "f95d09f45435fcd4be32dc62e9a9886ca04e2f55f92be7abb6a255cddf7c034b",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "inference_provider": "",
@@ -669,7 +669,7 @@
       "session_hint": "qwen-session-001",
       "tool_rows": [
         {
-          "event_uid": "259d846f287855904ad9a37488a1bac4b82ac83046355222ef92ae5adefa7b0d",
+          "event_uid": "f95d09f45435fcd4be32dc62e9a9886ca04e2f55f92be7abb6a255cddf7c034b",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "inference_provider": "",
@@ -714,7 +714,7 @@
           "endpoint_kind": "generation",
           "event_kind": "message",
           "event_ts": "2026-07-18 12:00:03.000",
-          "event_uid": "6534ae2972d96e49536fee2895baaf92fba7585d50558d476e600cbcf649d458",
+          "event_uid": "5e01d99bb038187d6a3253f97ee7d39546f9983ac1d03194fbaf0bd6ab278084",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "has_reasoning": 0,
@@ -796,7 +796,7 @@
           "endpoint_kind": "generation",
           "event_kind": "tool_call",
           "event_ts": "2026-07-18 12:00:03.000",
-          "event_uid": "ce51a93d23e2a374ab4bf034e52db2da141b586ba5f527311cc1ce4d04617c17",
+          "event_uid": "b70c095a03a2699c51269fee6abe43234bc2a5f4ab93f450bb1dc37d0def3206",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "has_reasoning": 0,
@@ -866,7 +866,7 @@
       ],
       "link_rows": [
         {
-          "event_uid": "6534ae2972d96e49536fee2895baaf92fba7585d50558d476e600cbcf649d458",
+          "event_uid": "5e01d99bb038187d6a3253f97ee7d39546f9983ac1d03194fbaf0bd6ab278084",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "inference_provider": "",
@@ -878,7 +878,7 @@
           "source_name": "golden-qwen-code"
         },
         {
-          "event_uid": "ce51a93d23e2a374ab4bf034e52db2da141b586ba5f527311cc1ce4d04617c17",
+          "event_uid": "b70c095a03a2699c51269fee6abe43234bc2a5f4ab93f450bb1dc37d0def3206",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "inference_provider": "",
@@ -913,7 +913,7 @@
       "session_hint": "qwen-session-001",
       "tool_rows": [
         {
-          "event_uid": "ce51a93d23e2a374ab4bf034e52db2da141b586ba5f527311cc1ce4d04617c17",
+          "event_uid": "b70c095a03a2699c51269fee6abe43234bc2a5f4ab93f450bb1dc37d0def3206",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "inference_provider": "",
@@ -958,7 +958,7 @@
           "endpoint_kind": "generation",
           "event_kind": "tool_result",
           "event_ts": "2026-07-18 12:00:04.000",
-          "event_uid": "0fa0b3add8e5232f160e75dd0f842fae12a3f5801f855163d328c5678126d490",
+          "event_uid": "6290baf1d33ff5935767b117b44b3e2c835c667c25513309635e3d4dc60a6263",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "has_reasoning": 0,
@@ -1028,7 +1028,7 @@
       ],
       "link_rows": [
         {
-          "event_uid": "0fa0b3add8e5232f160e75dd0f842fae12a3f5801f855163d328c5678126d490",
+          "event_uid": "6290baf1d33ff5935767b117b44b3e2c835c667c25513309635e3d4dc60a6263",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "inference_provider": "",
@@ -1063,7 +1063,7 @@
       "session_hint": "qwen-session-001",
       "tool_rows": [
         {
-          "event_uid": "0fa0b3add8e5232f160e75dd0f842fae12a3f5801f855163d328c5678126d490",
+          "event_uid": "6290baf1d33ff5935767b117b44b3e2c835c667c25513309635e3d4dc60a6263",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "inference_provider": "",
@@ -1108,7 +1108,7 @@
           "endpoint_kind": "generation",
           "event_kind": "tool_call",
           "event_ts": "2026-07-18 12:00:04.250",
-          "event_uid": "b6481458de91d868a4fb2a468cc8ed302e496d6f8f86f42aba80900b4f484622",
+          "event_uid": "8ffc00f50505cf42f80fd7674118b15d151ecde1685a4c7fd9c3fed1e32e98c1",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "has_reasoning": 0,
@@ -1178,7 +1178,7 @@
       ],
       "link_rows": [
         {
-          "event_uid": "b6481458de91d868a4fb2a468cc8ed302e496d6f8f86f42aba80900b4f484622",
+          "event_uid": "8ffc00f50505cf42f80fd7674118b15d151ecde1685a4c7fd9c3fed1e32e98c1",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "inference_provider": "",
@@ -1213,7 +1213,7 @@
       "session_hint": "qwen-session-001",
       "tool_rows": [
         {
-          "event_uid": "b6481458de91d868a4fb2a468cc8ed302e496d6f8f86f42aba80900b4f484622",
+          "event_uid": "8ffc00f50505cf42f80fd7674118b15d151ecde1685a4c7fd9c3fed1e32e98c1",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "inference_provider": "",
@@ -1258,7 +1258,7 @@
           "endpoint_kind": "generation",
           "event_kind": "tool_result",
           "event_ts": "2026-07-18 12:00:04.500",
-          "event_uid": "821f46adb41b1650ad85dc6b3698e9be3d702d34a2f0769b5e64f1325b7b16c4",
+          "event_uid": "3d04b727407375869f61929e6850c05435b8003040bbedbf33e11c78374acd34",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "has_reasoning": 0,
@@ -1328,7 +1328,7 @@
       ],
       "link_rows": [
         {
-          "event_uid": "821f46adb41b1650ad85dc6b3698e9be3d702d34a2f0769b5e64f1325b7b16c4",
+          "event_uid": "3d04b727407375869f61929e6850c05435b8003040bbedbf33e11c78374acd34",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "inference_provider": "",
@@ -1363,7 +1363,7 @@
       "session_hint": "qwen-session-001",
       "tool_rows": [
         {
-          "event_uid": "821f46adb41b1650ad85dc6b3698e9be3d702d34a2f0769b5e64f1325b7b16c4",
+          "event_uid": "3d04b727407375869f61929e6850c05435b8003040bbedbf33e11c78374acd34",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "inference_provider": "",
@@ -1406,7 +1406,7 @@
           "endpoint_kind": "generation",
           "event_kind": "session_meta",
           "event_ts": "2026-07-18 12:00:05.000",
-          "event_uid": "78e1551a32645df7663f2b5b92df0fe07b30c73f59e7699a06c2f2263d639263",
+          "event_uid": "2e7677371bee5f88769591acd6b207a71fd78b1ec160294ba8889ed27eb285f3",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "has_reasoning": 0,
@@ -1476,7 +1476,7 @@
       ],
       "link_rows": [
         {
-          "event_uid": "78e1551a32645df7663f2b5b92df0fe07b30c73f59e7699a06c2f2263d639263",
+          "event_uid": "2e7677371bee5f88769591acd6b207a71fd78b1ec160294ba8889ed27eb285f3",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "inference_provider": "",
@@ -1528,7 +1528,7 @@
           "endpoint_kind": "generation",
           "event_kind": "summary",
           "event_ts": "2026-07-18 12:00:06.000",
-          "event_uid": "972794d3a9ab9b1eef8da0253a8f0511adcf4a08b05b4c2dd80899d3f37cb1a8",
+          "event_uid": "a27e291f944d5d51d66b4305de024ebe3c02d2885da05680c1b6a5d4bc5a6f60",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "has_reasoning": 0,
@@ -1598,7 +1598,7 @@
       ],
       "link_rows": [
         {
-          "event_uid": "972794d3a9ab9b1eef8da0253a8f0511adcf4a08b05b4c2dd80899d3f37cb1a8",
+          "event_uid": "a27e291f944d5d51d66b4305de024ebe3c02d2885da05680c1b6a5d4bc5a6f60",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "inference_provider": "",
@@ -1652,7 +1652,7 @@
           "endpoint_kind": "generation",
           "event_kind": "system",
           "event_ts": "2026-07-18 12:00:07.000",
-          "event_uid": "cbe3f70c1605ed6d4aef278873b50d5a3a5e6d4ab3f21a42d29ad4792cfb46bc",
+          "event_uid": "00606b53f46daf5a5b7a3b38988fa77b1493e22cee05aa489322730016f8f656",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "has_reasoning": 0,
@@ -1722,7 +1722,7 @@
       ],
       "link_rows": [
         {
-          "event_uid": "cbe3f70c1605ed6d4aef278873b50d5a3a5e6d4ab3f21a42d29ad4792cfb46bc",
+          "event_uid": "00606b53f46daf5a5b7a3b38988fa77b1493e22cee05aa489322730016f8f656",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "inference_provider": "",
@@ -1776,7 +1776,7 @@
           "endpoint_kind": "generation",
           "event_kind": "system",
           "event_ts": "2026-07-18 12:00:08.000",
-          "event_uid": "059f20b3107920a74b8e0fc74fc5e66355e955174b81de7178bf0aec3166c331",
+          "event_uid": "3917e853145ab5792148dc087fd72fc8538a1d43e9d8223f3e5fc9e846becd8a",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "has_reasoning": 0,
@@ -1846,7 +1846,7 @@
       ],
       "link_rows": [
         {
-          "event_uid": "059f20b3107920a74b8e0fc74fc5e66355e955174b81de7178bf0aec3166c331",
+          "event_uid": "3917e853145ab5792148dc087fd72fc8538a1d43e9d8223f3e5fc9e846becd8a",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "inference_provider": "",
@@ -1900,7 +1900,7 @@
           "endpoint_kind": "generation",
           "event_kind": "message",
           "event_ts": "2026-07-18 12:00:09.000",
-          "event_uid": "44a01580e30c94a21e66f37a8fd5d206276d59014fb34c3e13e418ca6b085caf",
+          "event_uid": "9f2aa81f8c8fc009fcdfb7558c290b6682f91075bbfe2be8c3316f35b450d6db",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "has_reasoning": 0,
@@ -1970,7 +1970,7 @@
       ],
       "link_rows": [
         {
-          "event_uid": "44a01580e30c94a21e66f37a8fd5d206276d59014fb34c3e13e418ca6b085caf",
+          "event_uid": "9f2aa81f8c8fc009fcdfb7558c290b6682f91075bbfe2be8c3316f35b450d6db",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "inference_provider": "",
@@ -2024,7 +2024,7 @@
           "endpoint_kind": "generation",
           "event_kind": "message",
           "event_ts": "2026-07-18 12:00:10.000",
-          "event_uid": "40e733a6739e590b4c9972a34c34dadc4b6eb0c9bafeacbddda93f94a31ed5d7",
+          "event_uid": "1bc9c7712af5ba41e5f9eac4136da20faf26ebd8504eb3b003b33841b5da56e3",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "has_reasoning": 0,
@@ -2094,7 +2094,7 @@
       ],
       "link_rows": [
         {
-          "event_uid": "40e733a6739e590b4c9972a34c34dadc4b6eb0c9bafeacbddda93f94a31ed5d7",
+          "event_uid": "1bc9c7712af5ba41e5f9eac4136da20faf26ebd8504eb3b003b33841b5da56e3",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "inference_provider": "",
@@ -2146,7 +2146,7 @@
           "endpoint_kind": "generation",
           "event_kind": "system",
           "event_ts": "2026-07-18 12:00:11.000",
-          "event_uid": "9d78ac6dae8dc10627ce9ba730f9c4815ccb9e55eb7b7cecca924928b2897263",
+          "event_uid": "f3d34c5a42bd79a984080911ee6181d44f97477c9afec934ef86b25438768dae",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "has_reasoning": 0,
@@ -2216,7 +2216,7 @@
       ],
       "link_rows": [
         {
-          "event_uid": "9d78ac6dae8dc10627ce9ba730f9c4815ccb9e55eb7b7cecca924928b2897263",
+          "event_uid": "f3d34c5a42bd79a984080911ee6181d44f97477c9afec934ef86b25438768dae",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "inference_provider": "",
@@ -2270,7 +2270,7 @@
           "endpoint_kind": "generation",
           "event_kind": "message",
           "event_ts": "2026-07-18 12:00:12.000",
-          "event_uid": "35afded30e4229ed15d4ac02ac86a3b0525e0df3a9c99662b9b9c2744becd76f",
+          "event_uid": "e0797b921a53d7404bfdea78f714c8adc950a5c3d587690567d4d9ed9746bab1",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "has_reasoning": 0,
@@ -2340,7 +2340,7 @@
       ],
       "link_rows": [
         {
-          "event_uid": "35afded30e4229ed15d4ac02ac86a3b0525e0df3a9c99662b9b9c2744becd76f",
+          "event_uid": "e0797b921a53d7404bfdea78f714c8adc950a5c3d587690567d4d9ed9746bab1",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "inference_provider": "",
@@ -2394,7 +2394,7 @@
           "endpoint_kind": "generation",
           "event_kind": "message",
           "event_ts": "2026-07-18 12:00:13.000",
-          "event_uid": "ceb14d8c2cde7d405c932a4c4490bc01c0afcb7fd830d03a29462c4d643560a2",
+          "event_uid": "bed73f62288ce56c88eb182941141242ae91677c617081250515b2db46ef72b0",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "has_reasoning": 0,
@@ -2464,7 +2464,7 @@
       ],
       "link_rows": [
         {
-          "event_uid": "ceb14d8c2cde7d405c932a4c4490bc01c0afcb7fd830d03a29462c4d643560a2",
+          "event_uid": "bed73f62288ce56c88eb182941141242ae91677c617081250515b2db46ef72b0",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "inference_provider": "",
@@ -2644,7 +2644,7 @@
           "endpoint_kind": "generation",
           "event_kind": "message",
           "event_ts": "1970-01-01 00:00:00.000",
-          "event_uid": "3badf99af4b7313e92587dce2506cbf8393cfc6838043935e25ad6d562faa02f",
+          "event_uid": "7a2fc7eb379e92a30f48dd77c7f4a664dff02b06ab412d5b321b17b812000e32",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "has_reasoning": 0,
@@ -2714,7 +2714,7 @@
       ],
       "link_rows": [
         {
-          "event_uid": "3badf99af4b7313e92587dce2506cbf8393cfc6838043935e25ad6d562faa02f",
+          "event_uid": "7a2fc7eb379e92a30f48dd77c7f4a664dff02b06ab412d5b321b17b812000e32",
           "event_version": "<event_version>",
           "harness": "qwen-code",
           "inference_provider": "",

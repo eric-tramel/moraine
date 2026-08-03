@@ -192,9 +192,12 @@ belong in the source module.
 
 Adapters must emit rows that already satisfy the normalized schema domain:
 
-- Event UIDs are deterministic for the source file coordinate, record payload,
-  and source-local suffix. Do not reuse the raw record UID for multiple
-  normalized events.
+- Adapter event UIDs are provisional record-local keys based on source
+  coordinates, payload, and a distinct source-local suffix. They wire emitted
+  events, links, and tool rows only until shared finalization computes the
+  replay-stable canonical UID after enrichment and tool folding. Do not reuse a
+  provisional UID for multiple normalized events; stable logical ordinals such
+  as `turn_index` remain part of canonical occurrence identity.
 - `event_kind`, `payload_type`, and `actor_kind` must use the canonical domain.
 - Links must distinguish normalized event links (`linked_event_uid`) from
   source external ids (`linked_external_id`).

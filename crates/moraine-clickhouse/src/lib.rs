@@ -17,6 +17,11 @@ use std::collections::{BTreeSet, HashSet};
 use std::time::Duration;
 const DEFAULT_USER_AGENT_ROLE: &str = "moraine-clickhouse";
 const MIGRATION_REQUEST_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+const MIGRATION_QUERY_PARAMS: &[(&str, &str)] = &[
+    // Leave the client five minutes to observe ClickHouse's terminal response.
+    ("max_execution_time", "3300"),
+    ("timeout_overflow_mode", "throw"),
+];
 
 #[derive(Clone)]
 pub struct ClickHouseClient {
@@ -533,7 +538,7 @@ impl ClickHouseClient {
                     Some(&self.cfg.database),
                     false,
                     None,
-                    &[],
+                    MIGRATION_QUERY_PARAMS,
                     Some(MIGRATION_REQUEST_TIMEOUT),
                 )
                 .await
@@ -558,7 +563,7 @@ impl ClickHouseClient {
                 Some(&self.cfg.database),
                 false,
                 None,
-                &[],
+                MIGRATION_QUERY_PARAMS,
                 Some(MIGRATION_REQUEST_TIMEOUT),
             )
             .await

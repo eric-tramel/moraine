@@ -159,7 +159,8 @@ pub(crate) fn normalize_record_with_ts_hint(
     };
 
     let mut partials = source.normalize(record, &ctx, &top_type, &base_uid, model_hint);
-    let folded_identity = fold_tool_payloads_into_events(&mut partials)?;
+    let mut folded_identity = fold_tool_payloads_into_events(&mut partials)?;
+    stamp_duplicate_semantic_occurrences(&mut partials.event_rows, &mut folded_identity)?;
     finalize_event_identities(&mut partials, &folded_identity)?;
     let hint_fallback = if metadata.model_hint_fallback.is_empty() {
         model_hint
@@ -186,6 +187,7 @@ pub(crate) fn normalize_record_with_ts_hint(
 struct FoldedEventIdentity {
     semantic_payload: String,
     tool_fields: Vec<String>,
+    occurrence: Option<u32>,
 }
 
 fn fold_tool_payloads_into_events(
@@ -254,9 +256,9 @@ fn fold_tool_payloads_into_events(
             })
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect::<serde_json::Map<_, _>>();
-        canonical_payload.insert("moraine_tool_io".to_string(), Value::Object(tool_payload));
         let mut semantic_payload = Value::Object(canonical_payload.clone());
         sanitize_semantic_payload(&mut semantic_payload);
+        canonical_payload.insert("moraine_tool_io".to_string(), Value::Object(tool_payload));
         let semantic_payload =
             serde_json::to_string(&semantic_payload).unwrap_or_else(|_| "{}".to_string());
         let tool_fields = TOOL_IDENTITY_FIELDS
@@ -268,6 +270,7 @@ fn fold_tool_payloads_into_events(
             FoldedEventIdentity {
                 semantic_payload,
                 tool_fields,
+                occurrence: None,
             },
         );
         for key in [
@@ -297,6 +300,8 @@ fn fold_tool_payloads_into_events(
     Ok(identities)
 }
 const EVENT_IDENTITY_DOMAIN: &str = "moraine:event:v2";
+const EVENT_OCCURRENCE_DOMAIN: &str = "moraine:event:occurrence:v1";
+const SEMANTIC_OCCURRENCE_FIELD: &str = "moraine_semantic_occurrence";
 const EVENT_IDENTITY_FIELDS: &[&str] = &[
     "author",
     "harness",
@@ -309,6 +314,7 @@ const EVENT_IDENTITY_FIELDS: &[&str] = &[
     "op_status",
     "request_id",
     "trace_id",
+    "turn_index",
     "item_id",
     "tool_call_id",
     "parent_tool_call_id",
@@ -353,6 +359,7 @@ const SEMANTIC_PAYLOAD_EXCLUDED_FIELDS: &[&str] = &[
     "last_updated",
     "moraine_tool_io",
     "moraine_emission_index",
+    "moraine_semantic_occurrence",
     "project_id",
     "repo_rel_path",
     "request_event_uid",
@@ -364,6 +371,123 @@ const SEMANTIC_PAYLOAD_EXCLUDED_FIELDS: &[&str] = &[
     "workspacePath",
     "worktree_root",
 ];
+
+#[derive(Debug, Eq, Hash, PartialEq)]
+struct SemanticOccurrenceGroup {
+    source_name: String,
+    source_file: String,
+    source_generation: u64,
+    source_line_no: u64,
+    source_offset: u64,
+    base_event_uid: String,
+}
+
+fn stamp_duplicate_semantic_occurrences(
+    event_rows: &mut [Value],
+    folded_identity: &mut HashMap<String, FoldedEventIdentity>,
+) -> Result<()> {
+    let identities = event_rows
+        .iter()
+        .map(|event| {
+            let old_uid = event
+                .get("event_uid")
+                .and_then(Value::as_str)
+                .filter(|uid| !uid.is_empty())
+                .ok_or_else(|| anyhow!("normalized event is missing a nonempty event_uid"))?;
+            Ok((
+                old_uid.to_string(),
+                SemanticOccurrenceGroup {
+                    source_name: event
+                        .get("source_name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    source_file: event
+                        .get("source_file")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    source_generation: event
+                        .get("source_generation")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
+                    source_line_no: event
+                        .get("source_line_no")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
+                    source_offset: event
+                        .get("source_offset")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
+                    base_event_uid: semantic_event_uid(event, folded_identity.get(old_uid))?,
+                },
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut counts = HashMap::with_capacity(identities.len());
+    for (_, group) in &identities {
+        *counts.entry(group).or_insert(0_u32) += 1;
+    }
+    let mut occurrences = HashMap::with_capacity(counts.len());
+    for (event, (old_uid, group)) in event_rows.iter_mut().zip(&identities) {
+        if counts[group] < 2 {
+            continue;
+        }
+        let occurrence = occurrences.entry(group).or_insert(0_u32);
+        *occurrence += 1;
+        stamp_semantic_occurrence(event, *occurrence)?;
+        if let Some(folded) = folded_identity.get_mut(old_uid) {
+            folded.occurrence = Some(*occurrence);
+        }
+    }
+    Ok(())
+}
+
+fn stamp_semantic_occurrence(event: &mut Value, occurrence: u32) -> Result<()> {
+    let object = event
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("normalized event is not an object"))?;
+    let payload = object
+        .get("payload_json")
+        .and_then(Value::as_str)
+        .unwrap_or("{}");
+    let mut payload = serde_json::from_str::<Value>(payload)
+        .map_err(|error| anyhow!("normalized event payload_json is not valid JSON: {error}"))?;
+    let payload = payload
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("normalized event payload_json is not an object"))?;
+    payload.insert(SEMANTIC_OCCURRENCE_FIELD.to_string(), json!(occurrence));
+    object.insert(
+        "payload_json".to_string(),
+        Value::String(Value::Object(std::mem::take(payload)).to_string()),
+    );
+    Ok(())
+}
+
+fn clear_semantic_occurrence(event: &mut Value) -> Result<()> {
+    let object = event
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("normalized event is not an object"))?;
+    let Some(payload_json) = object
+        .get("payload_json")
+        .and_then(Value::as_str)
+        .filter(|payload| payload.contains(SEMANTIC_OCCURRENCE_FIELD))
+    else {
+        return Ok(());
+    };
+    let mut payload = serde_json::from_str::<Value>(payload_json)
+        .map_err(|error| anyhow!("normalized event payload_json is not valid JSON: {error}"))?;
+    let payload = payload
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("normalized event payload_json is not an object"))?;
+    if payload.remove(SEMANTIC_OCCURRENCE_FIELD).is_some() {
+        object.insert(
+            "payload_json".to_string(),
+            Value::String(Value::Object(std::mem::take(payload)).to_string()),
+        );
+    }
+    Ok(())
+}
 
 /// Replaces adapter-local provisional keys only after every canonical field and
 /// folded tool payload is present, then rewrites same-record event references.
@@ -386,6 +510,10 @@ pub(crate) fn finalize_batch_event_identities(
     batch: &mut RowBatch,
     uid_map: &mut HashMap<String, String>,
 ) -> Result<()> {
+    for event in &mut batch.event_rows {
+        clear_semantic_occurrence(event)?;
+    }
+    stamp_duplicate_semantic_occurrences(&mut batch.event_rows, &mut HashMap::new())?;
     finalize_identity_rows_with_map(
         &mut batch.event_rows,
         &mut batch.link_rows,
@@ -432,6 +560,7 @@ where
     for event in event_rows {
         rewrite_uid_field(event, "event_uid", uid_map);
         rewrite_uid_field(event, "origin_event_id", uid_map);
+        rewrite_payload_uid_field(event, "request_event_uid", uid_map);
     }
     for tool in tool_rows {
         rewrite_uid_field(tool, "event_uid", uid_map);
@@ -455,6 +584,32 @@ fn rewrite_uid_field(row: &mut Value, field: &str, uid_map: &HashMap<String, Str
     }
 }
 
+fn rewrite_payload_uid_field(row: &mut Value, field: &str, uid_map: &HashMap<String, String>) {
+    let Some(object) = row.as_object_mut() else {
+        return;
+    };
+    let Some(payload) = object.get("payload_json").and_then(Value::as_str) else {
+        return;
+    };
+    let Ok(mut payload) = serde_json::from_str::<Value>(payload) else {
+        return;
+    };
+    let Some(payload_object) = payload.as_object_mut() else {
+        return;
+    };
+    let Some(old_uid) = payload_object.get(field).and_then(Value::as_str) else {
+        return;
+    };
+    let Some(new_uid) = uid_map.get(old_uid) else {
+        return;
+    };
+    payload_object.insert(field.to_string(), Value::String(new_uid.clone()));
+    object.insert(
+        "payload_json".to_string(),
+        Value::String(payload.to_string()),
+    );
+}
+
 fn semantic_event_uid(
     event: &Value,
     folded_identity: Option<&FoldedEventIdentity>,
@@ -475,19 +630,24 @@ fn semantic_event_uid(
         object.get("token_usage_native_units"),
         |value| value.as_f64().unwrap_or(0.0).to_string(),
     );
-    if let Some(identity) = folded_identity {
+    let occurrence = if let Some(identity) = folded_identity {
         hash_identity_field(&mut hasher, identity.semantic_payload.as_bytes());
         for field in &identity.tool_fields {
             hash_identity_field(&mut hasher, field.as_bytes());
         }
+        identity.occurrence
     } else {
-        let (payload, tool_fields) = semantic_payload_parts(object.get("payload_json"));
+        let (payload, tool_fields, occurrence) = semantic_payload_parts(object.get("payload_json"));
         hash_identity_field(&mut hasher, payload.as_bytes());
         for field in tool_fields {
             hash_identity_field(&mut hasher, field.as_bytes());
         }
-    }
-    Ok(format!("{:x}", hasher.finalize()))
+        occurrence
+    };
+    let base_uid = format!("{:x}", hasher.finalize());
+    Ok(occurrence
+        .map(|occurrence| semantic_occurrence_uid(&base_uid, occurrence))
+        .unwrap_or(base_uid))
 }
 
 fn hash_identity_field(hasher: &mut Sha256, value: &[u8]) {
@@ -505,6 +665,14 @@ fn hash_identity_field(hasher: &mut Sha256, value: &[u8]) {
     hasher.update(&digits[cursor..]);
     hasher.update(b":");
     hasher.update(value);
+}
+
+fn semantic_occurrence_uid(base_uid: &str, occurrence: u32) -> String {
+    let mut hasher = Sha256::new();
+    hash_identity_field(&mut hasher, EVENT_OCCURRENCE_DOMAIN.as_bytes());
+    hash_identity_field(&mut hasher, base_uid.as_bytes());
+    hash_identity_field(&mut hasher, occurrence.to_string().as_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 fn hash_json_identity_value(hasher: &mut Sha256, value: Option<&Value>) {
@@ -550,29 +718,40 @@ fn encode_identity_value(value: Option<&Value>) -> String {
     }
 }
 
-fn semantic_payload_parts(value: Option<&Value>) -> (String, Vec<String>) {
+fn semantic_payload_parts(value: Option<&Value>) -> (String, Vec<String>, Option<u32>) {
     let Some(payload) = value.and_then(Value::as_str) else {
         return (
             String::new(),
             vec![String::new(); TOOL_IDENTITY_FIELDS.len()],
+            None,
         );
     };
     let Ok(mut parsed) = serde_json::from_str::<Value>(payload) else {
         return (
             payload.to_string(),
             vec![String::new(); TOOL_IDENTITY_FIELDS.len()],
+            None,
         );
     };
+    let occurrence = parsed
+        .get(SEMANTIC_OCCURRENCE_FIELD)
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok());
     let tool = parsed
-        .get("moraine_tool_io")
-        .and_then(Value::as_object)
-        .cloned();
+        .as_object_mut()
+        .and_then(|object| object.remove("moraine_tool_io"));
     sanitize_semantic_payload(&mut parsed);
     let tool_fields = TOOL_IDENTITY_FIELDS
         .iter()
-        .map(|field| encode_identity_value(tool.as_ref().and_then(|tool| tool.get(*field))))
+        .map(|field| {
+            encode_identity_value(
+                tool.as_ref()
+                    .and_then(Value::as_object)
+                    .and_then(|tool| tool.get(*field)),
+            )
+        })
         .collect();
-    (compact_json(&parsed), tool_fields)
+    (compact_json(&parsed), tool_fields, occurrence)
 }
 
 fn sanitize_semantic_payload(payload: &mut Value) {
@@ -669,7 +848,7 @@ mod tests {
             "token_usage_buckets": {},
             "token_usage_native_units": {}
         });
-        const EXPECTED: &str = "da350fd4a9138ce5528da94d85c2c2753a741cb16617ec3c2fe4a86754166f4a";
+        const EXPECTED: &str = "2731e27aa7b433d31efcd0f1ebd8b259b78bdf6c05809221562aa919132a7a66";
         assert_eq!(
             semantic_event_uid(&event, None).expect("base uid"),
             EXPECTED
@@ -686,6 +865,7 @@ mod tests {
             "excluded metadata must hash identically whether absent or present"
         );
 
+        event["turn_index"] = json!(0);
         event["session_id"] = json!("replay-stable-session");
         event["text_content"] = json!("read src/lib.rs");
         event["token_usage_buckets"] = json!({
@@ -704,7 +884,7 @@ mod tests {
         );
         assert_eq!(
             semantic_event_uid(&event, None).expect("schema-033 migration vector"),
-            "9e4f03ed718cc58482613c6cea7f65435f15cd26c46c87291a16431ad310c3f6"
+            "3c1a0632e69053e260e3dcc3589620fa6bfcf35bc926fee885327d3e60fa5c18"
         );
         event["session_id"] = json!("replay-fixture-session");
         event["token_usage_buckets"] = json!({});
@@ -730,7 +910,7 @@ mod tests {
         event["token_usage_buckets"] = json!({"input_text": 12, "reasoning": 3});
         event["token_usage_native_units"] = json!({"input_images": 1.5});
         const UNICODE_EXPECTED: &str =
-            "1f01770f4e1c2c55b629e5a0f5b4aafbecc2995eff18d8905ce0eb765c4e70a1";
+            "b6625615b3ef4b0a393dfdc6fa541a4597461bd76ffe62934cf9e16bb286c536";
         assert_eq!(
             semantic_event_uid(&event, None).expect("Unicode and delimiter UID"),
             UNICODE_EXPECTED
@@ -857,6 +1037,16 @@ mod tests {
             response_batch.event_rows[0]["origin_event_id"],
             expected_request_uid
         );
+        let response_payload: Value = serde_json::from_str(
+            response_batch.event_rows[0]["payload_json"]
+                .as_str()
+                .expect("response payload_json"),
+        )
+        .expect("response payload");
+        assert_eq!(
+            response_payload["request_event_uid"],
+            Value::String(expected_request_uid.clone())
+        );
         assert_eq!(
             request_batch.tool_rows[0]["event_uid"],
             expected_request_uid
@@ -875,6 +1065,61 @@ mod tests {
                 .contains("super-secret"),
             "the finalized identity input must contain only post-redaction values"
         );
+    }
+
+    #[test]
+    fn sink_finalization_preserves_siblings_that_redact_to_identical_content() {
+        let first = json!({
+            "event_uid": "first-pre-redaction-uid",
+            "source_ref": "/tmp/session.jsonl:1:42",
+            "author": "assistant",
+            "harness": "claude-code",
+            "session_id": "stable-session",
+            "event_kind": "message",
+            "actor_kind": "assistant",
+            "payload_type": "agent_message",
+            "text_content": "[REDACTED]",
+            "payload_json": "{\"message\":\"[REDACTED]\",\"moraine_semantic_occurrence\":1}"
+        });
+        let mut second = first.clone();
+        second["event_uid"] = json!("second-pre-redaction-uid");
+        second["payload_json"] =
+            json!("{\"message\":\"[REDACTED]\",\"moraine_semantic_occurrence\":2}");
+        let mut third = first.clone();
+        third["event_uid"] = json!("third-pre-redaction-uid");
+        let mut fourth = second.clone();
+        fourth["event_uid"] = json!("fourth-pre-redaction-uid");
+        let mut batch = RowBatch::default();
+        batch.event_rows = vec![first, second, third, fourth];
+
+        finalize_batch_event_identities(&mut batch, &mut HashMap::new())
+            .expect("finalize redacted siblings");
+
+        let mut event_uids = batch
+            .event_rows
+            .iter()
+            .map(|event| event["event_uid"].as_str().expect("event UID"))
+            .collect::<Vec<_>>();
+        event_uids.sort_unstable();
+        event_uids.dedup();
+        assert_eq!(
+            event_uids.len(),
+            4,
+            "redaction must not collapse distinct same-record siblings"
+        );
+        let occurrences = batch
+            .event_rows
+            .iter()
+            .map(|event| {
+                serde_json::from_str::<Value>(
+                    event["payload_json"].as_str().expect("payload_json string"),
+                )
+                .expect("payload JSON")["moraine_semantic_occurrence"]
+                    .as_u64()
+                    .expect("semantic occurrence")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(occurrences, vec![1, 2, 3, 4]);
     }
 
     #[test]

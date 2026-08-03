@@ -542,6 +542,67 @@ fn canonical_event_identity_ignores_replay_provenance_but_preserves_fanout() {
 }
 
 #[test]
+fn canonical_event_identity_preserves_identical_sibling_occurrences() {
+    let record = json!({
+        "type": "assistant",
+        "sessionId": "duplicate-sibling-session",
+        "uuid": "assistant-duplicate-siblings",
+        "timestamp": "2026-01-19T15:58:41.421Z",
+        "message": {
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "same"},
+                {"type": "text", "text": "same"}
+            ]
+        }
+    });
+    let normalize = |source_file, generation, line, offset| {
+        normalize_record(
+            &record,
+            "claude",
+            "claude-code",
+            source_file,
+            11,
+            generation,
+            line,
+            offset,
+            "",
+            "",
+            "",
+        )
+        .expect("duplicate-sibling replay")
+    };
+
+    let first = normalize("/old/path/session.jsonl", 1, 7, 100);
+    let replayed = normalize("/new/path/session.jsonl", 99, 700, 10_000);
+    let event_uids = |rows: &[Value]| {
+        rows.iter()
+            .map(|row| row["event_uid"].as_str().expect("event uid").to_string())
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(first.event_rows.len(), 2);
+    assert_ne!(
+        first.event_rows[0]["event_uid"], first.event_rows[1]["event_uid"],
+        "identical sibling occurrences must not collapse"
+    );
+    assert_eq!(
+        event_uids(&first.event_rows),
+        event_uids(&replayed.event_rows),
+        "occurrence identity must ignore replay provenance"
+    );
+    for (index, event) in first.event_rows.iter().enumerate() {
+        let payload: Value =
+            serde_json::from_str(event["payload_json"].as_str().expect("payload_json"))
+                .expect("payload JSON");
+        assert_eq!(
+            payload["moraine_semantic_occurrence"].as_u64(),
+            Some((index + 1) as u64)
+        );
+    }
+}
+
+#[test]
 fn claude_reasoning_block_uses_canonical_metadata() {
     let record = json!({
         "type": "assistant",

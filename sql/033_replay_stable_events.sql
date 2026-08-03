@@ -11,6 +11,7 @@ DROP VIEW IF EXISTS moraine.mv_mcp_event_navigation_from_events;
 DROP VIEW IF EXISTS moraine.mv_search_postings;
 DROP VIEW IF EXISTS moraine.mv_file_attention_project_roots_from_events;
 DROP VIEW IF EXISTS moraine.events_replay_source_033;
+DROP VIEW IF EXISTS moraine.event_uid_base_source_033;
 DROP VIEW IF EXISTS moraine.search_postings_source_033;
 
 ALTER TABLE moraine.mcp_event_navigation
@@ -22,19 +23,13 @@ DROP TABLE IF EXISTS moraine.event_uid_lookup_033;
 DROP TABLE IF EXISTS moraine.events_replay_stable_033;
 DROP TABLE IF EXISTS moraine.event_links_replay_stable_033;
 
-CREATE TABLE moraine.event_uid_map_033 (
-  old_event_uid String,
-  new_event_uid String
-)
-ENGINE = MergeTree
-ORDER BY old_event_uid;
-
-INSERT INTO moraine.event_uid_map_033
+CREATE VIEW moraine.event_uid_base_source_033 AS
 WITH
   ['createdAt', 'created_at', 'cwd', 'directory', 'lastUpdatedAt', 'last_updated',
-   'moraine_emission_index', 'moraine_tool_io', 'project_id', 'repo_rel_path',
-   'request_event_uid', 'session_start', 'source_ref', 'time_created', 'timestamp',
-   'updated_at', 'workspacePath', 'worktree_root'] AS excluded_payload_fields,
+   'moraine_emission_index', 'moraine_semantic_occurrence', 'moraine_tool_io',
+   'project_id', 'repo_rel_path', 'request_event_uid', 'session_start', 'source_ref',
+   'time_created', 'timestamp', 'updated_at', 'workspacePath', 'worktree_root'
+  ] AS excluded_payload_fields,
   concat(
     '{',
     arrayStringConcat(
@@ -65,6 +60,7 @@ WITH
     op_status,
     request_id,
     trace_id,
+    toString(turn_index),
     item_id,
     tool_call_id,
     parent_tool_call_id,
@@ -120,30 +116,93 @@ WITH
     JSONExtractString(payload_json, 'moraine_tool_io', 'output_text')
   ] AS identity_fields
 SELECT
-  event_uid,
+  event_uid AS old_event_uid,
+  source_name,
+  source_file,
+  source_generation,
+  source_line_no,
+  source_offset,
+  toUInt32(JSONExtractUInt(payload_json, 'moraine_semantic_occurrence'))
+    AS existing_occurrence,
   lower(hex(SHA256(arrayStringConcat(arrayMap(
     value -> concat(toString(length(value)), ':', value),
     identity_fields
-  ))))) AS new_event_uid
--- event_uid is the v1 canonical identity; FINAL therefore yields one mapping
--- per logical event. ANY joins below also prevent malformed duplicate source
--- rows from multiplying the rebuilt canonical tables.
-FROM moraine.events FINAL
+  ))))) AS base_event_uid
+-- event_uid is the v1 canonical identity; FINAL therefore yields one source
+-- row for each event occurrence observed before this migration.
+FROM moraine.events FINAL;
+
+CREATE TABLE moraine.event_uid_map_033 (
+  old_event_uid String,
+  new_event_uid String,
+  semantic_occurrence UInt32
+)
+ENGINE = MergeTree
+ORDER BY old_event_uid;
+
+INSERT INTO moraine.event_uid_map_033
+SELECT
+  old_event_uid,
+  if(
+    resolved_occurrence = 0,
+    base_event_uid,
+    lower(hex(SHA256(concat(
+      toString(length('moraine:event:occurrence:v1')), ':', 'moraine:event:occurrence:v1',
+      toString(length(base_event_uid)), ':', base_event_uid,
+      toString(length(toString(resolved_occurrence))), ':', toString(resolved_occurrence)
+    ))))
+  ) AS new_event_uid,
+  toUInt32(resolved_occurrence) AS semantic_occurrence
+FROM (
+  SELECT
+    *,
+    if(
+      existing_occurrence > 0,
+      existing_occurrence,
+      if(
+        duplicate_count = 1,
+        0,
+        max_existing_occurrence + unmarked_occurrence
+      )
+    ) AS resolved_occurrence
+  FROM (
+    SELECT
+      *,
+      count() OVER (
+        PARTITION BY source_name, source_file, source_generation, source_line_no,
+          source_offset, base_event_uid
+      ) AS duplicate_count,
+      max(existing_occurrence) OVER (
+        PARTITION BY source_name, source_file, source_generation, source_line_no,
+          source_offset, base_event_uid
+      ) AS max_existing_occurrence,
+      row_number() OVER (
+        PARTITION BY source_name, source_file, source_generation, source_line_no,
+          source_offset, base_event_uid, existing_occurrence = 0
+        ORDER BY old_event_uid
+      ) AS unmarked_occurrence
+    FROM moraine.event_uid_base_source_033
+  )
+)
 SETTINGS max_block_size = 1024,
   preferred_max_column_in_block_size_bytes = 33554432,
   min_insert_block_size_rows = 8192,
   min_insert_block_size_bytes = 16777216,
+  max_bytes_before_external_sort = 67108864,
   max_threads = 1,
   max_memory_usage = 1073741824;
 
+DROP VIEW moraine.event_uid_base_source_033;
+
 CREATE TABLE moraine.event_uid_lookup_033 (
   old_event_uid String,
-  new_event_uid String
+  new_event_uid String,
+  semantic_occurrence UInt32
 )
 ENGINE = Join(ANY, LEFT, old_event_uid);
 
 INSERT INTO moraine.event_uid_lookup_033
-SELECT old_event_uid, new_event_uid
+SELECT old_event_uid, new_event_uid, semantic_occurrence
 FROM moraine.event_uid_map_033
 SETTINGS max_block_size = 1024,
   max_threads = 1,
@@ -156,12 +215,7 @@ PARTITION BY cityHash64(session_id) % 64
 ORDER BY (session_id, event_uid);
 
 CREATE VIEW moraine.events_replay_source_033 AS
-SELECT e.* REPLACE (
-  joinGet('moraine.event_uid_lookup_033', 'new_event_uid', e.event_uid) AS event_uid,
-  coalesce(
-    nullIf(joinGet('moraine.event_uid_lookup_033', 'new_event_uid', e.origin_event_id), ''),
-    e.origin_event_id
-  ) AS origin_event_id,
+WITH
   if(
     toString(e.harness) = 'qwen-code'
       AND e.actor_kind = 'assistant'
@@ -176,6 +230,38 @@ SELECT e.* REPLACE (
       )
     ),
     e.payload_json
+  ) AS emission_payload,
+  joinGet(
+    'moraine.event_uid_lookup_033',
+    'semantic_occurrence',
+    e.event_uid
+  ) AS semantic_occurrence,
+  if(
+    semantic_occurrence = 0,
+    emission_payload,
+    JSONMergePatch(
+      emission_payload,
+      concat('{"moraine_semantic_occurrence":', toString(semantic_occurrence), '}')
+    )
+  ) AS occurrence_payload,
+  joinGet(
+    'moraine.event_uid_lookup_033',
+    'new_event_uid',
+    JSONExtractString(e.payload_json, 'request_event_uid')
+  ) AS request_event_uid
+SELECT e.* REPLACE (
+  joinGet('moraine.event_uid_lookup_033', 'new_event_uid', e.event_uid) AS event_uid,
+  coalesce(
+    nullIf(joinGet('moraine.event_uid_lookup_033', 'new_event_uid', e.origin_event_id), ''),
+    e.origin_event_id
+  ) AS origin_event_id,
+  if(
+    empty(request_event_uid),
+    occurrence_payload,
+    JSONMergePatch(
+      occurrence_payload,
+      concat('{"request_event_uid":', toJSONString(request_event_uid), '}')
+    )
   ) AS payload_json
 )
 FROM moraine.events AS e FINAL;

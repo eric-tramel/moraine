@@ -1050,7 +1050,7 @@ FORMAT JSONEachRow"#
     let link = links.first().context("missing replay-stability link")?;
     assert_eq!(
         link.request_uid,
-        "9e4f03ed718cc58482613c6cea7f65435f15cd26c46c87291a16431ad310c3f6"
+        "3c1a0632e69053e260e3dcc3589620fa6bfcf35bc926fee885327d3e60fa5c18"
     );
     assert_eq!(link.origin_event_id, link.request_uid);
     assert_eq!(link.linked_event_uid, link.request_uid);
@@ -1540,7 +1540,15 @@ VALUES
 ('00000001bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', 'schema32-qwen', toDate('2026-01-01'), 'custom-qwen-source', 'qwen-code',
  '/old/qwen.jsonl', 1, 50, 500, '/old/qwen.jsonl:50', '2026-01-01T00:00:02.000Z',
  toDateTime64('2026-01-01 00:00:02', 3), 'message', 'assistant', 'agent_message',
- '', '', '', 'second', 'second', '{{"uuid":"assistant-1","parentUuid":null,"part":{{"text":"second"}}}}', '', 1005)"#
+ '', '', '', 'second', 'second', '{{"uuid":"assistant-1","parentUuid":null,"part":{{"text":"second"}}}}', '', 1005),
+('schema32-duplicate-a', 'schema32-duplicates', toDate('2026-01-01'), 'claude', 'claude-code',
+ '/old/claude.jsonl', 1, 60, 600, '/old/claude.jsonl:60', '2026-01-01T00:00:03.000Z',
+ toDateTime64('2026-01-01 00:00:03', 3), 'message', 'assistant', 'agent_message',
+ '', '', '', 'same', 'same', '{{"type":"text","text":"same"}}', '', 1006),
+('schema32-duplicate-b', 'schema32-duplicates', toDate('2026-01-01'), 'claude', 'claude-code',
+ '/old/claude.jsonl', 1, 60, 600, '/old/claude.jsonl:60', '2026-01-01T00:00:03.000Z',
+ toDateTime64('2026-01-01 00:00:03', 3), 'message', 'assistant', 'agent_message',
+ '', '', '', 'same', 'same', '{{"type":"text","text":"same"}}', '', 1007)"#
                 ),
                 None,
                 Some(db),
@@ -1584,6 +1592,23 @@ VALUES
         )
         .await
         .context("failed to capture first-pass Qwen UIDs")?;
+    let first_duplicate_uid_sequence = clickhouse
+        .request_text(
+            &format!(
+                "SELECT arrayStringConcat(groupArray(concat(toString(occurrence), ':', event_uid)), ',') FROM (\
+                   SELECT event_uid, JSONExtractUInt(payload_json, 'moraine_semantic_occurrence') AS occurrence \
+                   FROM `{db}`.`events` FINAL \
+                   WHERE session_id = 'schema32-duplicates' \
+                   ORDER BY occurrence\
+                 )"
+            ),
+            None,
+            Some(db),
+            false,
+            None,
+        )
+        .await
+        .context("failed to capture first-pass duplicate occurrence UIDs")?;
     clickhouse
         .request_text(
             &format!(
@@ -1611,8 +1636,13 @@ VALUES
         request_uid: String,
         response_origin_uid: String,
         linked_uid: String,
+        request_payload_uid: String,
         qwen_emission_indexes: String,
         qwen_uids: String,
+        duplicate_rows: u64,
+        duplicate_uids: u64,
+        duplicate_occurrences: String,
+        duplicate_uid_sequence: String,
         qwen_trace_text: String,
     }
     let rows: Vec<UpgradeResult> = clickhouse
@@ -1638,8 +1668,22 @@ VALUES
     SELECT text_content FROM `{db}`.`v_conversation_trace`
     WHERE session_id = 'schema32-qwen' ORDER BY event_order
   )) AS qwen_trace_text,
+  (SELECT count() FROM `{db}`.`events` FINAL
+    WHERE session_id = 'schema32-duplicates') AS duplicate_rows,
+  (SELECT uniqExact(event_uid) FROM `{db}`.`events` FINAL
+    WHERE session_id = 'schema32-duplicates') AS duplicate_uids,
+  (SELECT arrayStringConcat(arraySort(groupArray(toString(JSONExtractUInt(
+      payload_json, 'moraine_semantic_occurrence')))), ',')
+    FROM `{db}`.`events` FINAL
+    WHERE session_id = 'schema32-duplicates') AS duplicate_occurrences,
+  (SELECT arrayStringConcat(groupArray(concat(toString(occurrence), ':', event_uid)), ',') FROM (
+    SELECT event_uid, JSONExtractUInt(payload_json, 'moraine_semantic_occurrence') AS occurrence
+    FROM `{db}`.`events` FINAL
+    WHERE session_id = 'schema32-duplicates' ORDER BY occurrence
+  )) AS duplicate_uid_sequence,
   request.event_uid AS request_uid,
   response.origin_event_id AS response_origin_uid,
+  JSONExtractString(response.payload_json, 'request_event_uid') AS request_payload_uid,
   link.linked_event_uid AS linked_uid
 FROM `{db}`.`events` AS request FINAL
 CROSS JOIN `{db}`.`events` AS response FINAL
@@ -1658,10 +1702,18 @@ FORMAT JSONEachRow"#
     assert_eq!(row.locator_rows, 2);
     assert_eq!(row.navigation_rows, 2);
     assert_eq!(row.response_origin_uid, row.request_uid);
+    assert_eq!(row.request_payload_uid, row.request_uid);
     assert_eq!(row.linked_uid, row.request_uid);
     assert_eq!(row.qwen_emission_indexes, "1,2");
     assert_eq!(row.qwen_uids, first_qwen_uids.trim());
     assert_eq!(row.qwen_trace_text, "first,second");
+    assert_eq!(row.duplicate_rows, 2);
+    assert_eq!(row.duplicate_uids, 2);
+    assert_eq!(row.duplicate_occurrences, "1,2");
+    assert_eq!(
+        row.duplicate_uid_sequence,
+        first_duplicate_uid_sequence.trim()
+    );
     Ok(())
 }
 

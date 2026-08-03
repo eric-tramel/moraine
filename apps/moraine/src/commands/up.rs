@@ -747,7 +747,10 @@ mod tests {
         })
         .expect("writer barrier");
 
-        assert_eq!(attempted, vec![Service::Backend, Service::Ingest]);
+        assert_eq!(
+            attempted,
+            vec![Service::Backend, Service::Ingest, Service::Mcp]
+        );
     }
 
     #[test]
