@@ -282,9 +282,15 @@ fn handle_qwen_assistant(record: &QwenRecord<'_>, emitter: &mut SourceEmitter<'_
                 )
             };
 
-        let hashed_uid = emitter.uid_for_json(part, &format!("qwen:assistant:{part_kind}:{index}"));
-        let uid = format!("{index:08x}{}", &hashed_uid[8..]);
-        let payload = record.payload("part", body);
+        let uid = emitter.uid_for_json(part, &format!("qwen:assistant:{part_kind}:{index}"));
+        let mut payload = record.payload("part", body);
+        payload
+            .as_object_mut()
+            .expect("Qwen payload is an object")
+            .insert(
+                "moraine_emission_index".to_string(),
+                json!(index.saturating_add(1)),
+            );
         let mut event = record
             .stamp(emitter.event_for_json(
                 &uid,
@@ -574,14 +580,22 @@ mod tests {
         assert_eq!(row.event_rows[2]["input_tokens"], 0);
         assert_eq!(row.event_rows[0]["model"], "qwen3-coder");
         assert_eq!(row.event_rows[0]["inference_provider"], "");
-        let event_uids = row
+        let emission_indexes = row
             .event_rows
             .iter()
-            .map(|event| event["event_uid"].as_str().expect("event uid"))
+            .map(|event| {
+                serde_json::from_str::<Value>(
+                    event["payload_json"].as_str().expect("event payload"),
+                )
+                .expect("parse event payload")["moraine_emission_index"]
+                    .as_u64()
+                    .expect("emission index")
+            })
             .collect::<Vec<_>>();
-        assert!(
-            event_uids.windows(2).all(|pair| pair[0] < pair[1]),
-            "tied source coordinates must sort assistant parts by their emitted UID"
+        assert_eq!(
+            emission_indexes,
+            vec![1, 2, 3],
+            "same-record assistant parts need an explicit read-order key"
         );
         assert!(!row.event_rows[2]["payload_json"]
             .as_str()

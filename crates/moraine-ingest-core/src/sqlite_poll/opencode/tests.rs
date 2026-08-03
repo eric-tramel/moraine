@@ -892,9 +892,9 @@ async fn opencode_sqlite_unchanged_db_is_a_noop_then_mutation_reemits_row() {
         .get("event_uid")
         .and_then(Value::as_str)
         .expect("reemitted tool_call uid");
-    assert_eq!(
+    assert_ne!(
         third_tool_uid, first_pending_tool_uid,
-        "logical tool-call UID survives row mutation"
+        "completed tool content must archive rather than replace the pending event"
     );
     assert_eq!(
         third_tool_call.get("model").and_then(Value::as_str),

@@ -1058,6 +1058,11 @@ fn assert_source_contract(
                     .to_string()
             })
             .collect::<HashSet<_>>();
+        assert_eq!(
+            event_uids.len(),
+            record.event_rows.len(),
+            "{context} emitted multiple canonical events with the same identity"
+        );
 
         if !record.raw_row.is_null() {
             saw_raw = true;

@@ -67,11 +67,11 @@ FROM (
     turn_index,
     row_number() OVER (
       PARTITION BY session_id
-      ORDER BY sort_time, source_file, source_generation, source_offset, source_line_no, event_uid
+      ORDER BY sort_time, source_file, source_generation, source_offset, source_line_no, emission_index, event_uid
     ) AS event_order,
     countIf(is_user_message != 0) OVER (
       PARTITION BY session_id
-      ORDER BY sort_time, source_file, source_generation, source_offset, source_line_no, event_uid
+      ORDER BY sort_time, source_file, source_generation, source_offset, source_line_no, emission_index, event_uid
       ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
     ) AS running_user_count
   FROM {navigation} FINAL

@@ -210,8 +210,8 @@ run_sql_block <<'SQL'
 INSERT INTO mcp_event_navigation
 (
   session_id, sort_time, source_file, source_generation, source_offset,
-  source_line_no, event_uid, event_version, source_name, event_ts, display_time,
-  event_kind, actor_kind, payload_type, turn_index, tool_call_id, tool_name,
+  source_line_no, emission_index, event_uid, event_version, source_name, event_ts,
+  display_time, event_kind, actor_kind, payload_type, turn_index, tool_call_id, tool_name,
   tool_phase, op_status, item_id, harness, inference_provider, cwd,
   is_user_message, is_metadata_bearing
 )
@@ -225,6 +225,7 @@ SELECT
   source_generation,
   source_offset,
   source_line_no,
+  toUInt32(JSONExtractUInt(payload_json, 'moraine_emission_index')),
   event_uid,
   event_version,
   source_name,

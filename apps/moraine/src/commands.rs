@@ -10,8 +10,8 @@ use anyhow::{bail, Context, Result};
 use moraine_clickhouse::{ClickHouseClient, DoctorReport, MigrationProgress};
 use moraine_config::AppConfig;
 use moraine_conversations::{ClickHouseConversationRepository, RepoConfig};
-use std::path::PathBuf;
-use std::process::ExitCode;
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitCode};
 
 use crate::cli::{
     Cli, CliCommand, ClickhouseCommand, ConfigCommand, DbCommand, ExportCommand, OutputFormat,
@@ -23,7 +23,9 @@ use crate::managed_clickhouse::{
 };
 use crate::paths::{load_cfg, runtime_paths, RuntimePaths};
 use crate::process::{
+    lock_storage_migration, lock_storage_writer_launch, pid_path, remove_pid_if_matches,
     require_service_binary, service_args_with_defaults, service_running_read_only,
+    write_pid_exclusive, StorageGateGuard,
 };
 use crate::render::{
     render_clickhouse_status, render_db_doctor, render_db_migrate, render_logs, state_label,
@@ -31,9 +33,9 @@ use crate::render::{
 };
 use crate::service::Service;
 
-pub(super) const CONTENT_AUTHORITY_MIGRATION: &str = "031";
-pub(super) const CONTENT_AUTHORITY_WRITER_SERVICES: [Service; 2] =
-    [Service::Backend, Service::Ingest];
+pub(super) const WRITER_BARRIER_MIGRATIONS: [&str; 2] = ["031", "033"];
+pub(super) const WRITER_BARRIER_SERVICES: [Service; 3] =
+    [Service::Backend, Service::Ingest, Service::Mcp];
 
 pub(crate) async fn dispatch(cli: Cli, output: CliOutput) -> Result<ExitCode> {
     match cli.command {
@@ -185,6 +187,7 @@ async fn run_service(global_config: Option<PathBuf>, run: RunArgs) -> Result<Exi
         return run_foreground_clickhouse(&cfg, &paths).await;
     }
 
+    let writer_gate = lock_storage_writer_launch(&paths, run.service)?;
     let binary = require_service_binary(run.service, &paths)?;
     let args = service_args_with_defaults(
         run.service,
@@ -194,16 +197,46 @@ async fn run_service(global_config: Option<PathBuf>, run: RunArgs) -> Result<Exi
         &passthrough,
     );
 
-    let mut command = std::process::Command::new(binary);
+    let mut command = Command::new(binary);
     command.args(args);
     if let Some((key, value)) = config_path.child_origin_environment() {
         command.env(key, value);
     }
-    let status = command
-        .status()
-        .map_err(anyhow::Error::from)
-        .with_context(|| format!("failed to run {}", run.service.name()))?;
+    run_registered_foreground_child(
+        command,
+        &pid_path(&paths, run.service),
+        run.service.name(),
+        writer_gate,
+    )
+}
 
+fn run_registered_foreground_child(
+    mut command: Command,
+    pid_file: &Path,
+    service_name: &str,
+    writer_gate: Option<StorageGateGuard>,
+) -> Result<ExitCode> {
+    if let Some(parent) = pid_file.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create PID directory {}", parent.display()))?;
+    }
+    let mut child = command
+        .spawn()
+        .map_err(anyhow::Error::from)
+        .with_context(|| format!("failed to run {service_name}"))?;
+    let child_pid = child.id();
+    if let Err(error) = write_pid_exclusive(pid_file, child_pid) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
+    drop(writer_gate);
+    let result = child
+        .wait()
+        .map_err(anyhow::Error::from)
+        .with_context(|| format!("failed to wait for {service_name}"));
+    remove_pid_if_matches(pid_file, child_pid);
+    let status = result?;
     Ok(ExitCode::from(status.code().unwrap_or(1) as u8))
 }
 
@@ -219,10 +252,10 @@ fn conversation_repository(cfg: &AppConfig) -> Result<ClickHouseConversationRepo
 // while `export` owns a versioned row contract and schema-skew gate. Those paths keep
 // direct ClickHouse access; operational status reads go through ConversationRepository.
 
-pub(super) fn content_authority_writer_barrier_required(missing_migrations: &[String]) -> bool {
+pub(super) fn writer_barrier_required(missing_migrations: &[String]) -> bool {
     missing_migrations
         .iter()
-        .any(|version| version == CONTENT_AUTHORITY_MIGRATION)
+        .any(|version| WRITER_BARRIER_MIGRATIONS.contains(&version.as_str()))
 }
 
 fn ensure_standalone_migration_quiescent_with<F>(
@@ -232,11 +265,11 @@ fn ensure_standalone_migration_quiescent_with<F>(
 where
     F: FnMut(Service) -> Option<u32>,
 {
-    if !content_authority_writer_barrier_required(missing_migrations) {
+    if !writer_barrier_required(missing_migrations) {
         return Ok(());
     }
 
-    let active = CONTENT_AUTHORITY_WRITER_SERVICES
+    let active = WRITER_BARRIER_SERVICES
         .into_iter()
         .filter_map(|service| {
             running_pid(service).map(|pid| format!("{} (pid {pid})", service.name()))
@@ -244,8 +277,8 @@ where
         .collect::<Vec<_>>();
     if !active.is_empty() {
         bail!(
-            "cannot apply migration 031 while tracked Moraine services are running: {}; \
-             run `moraine down` first so the content cutover snapshot is quiescent",
+            "cannot apply a canonical storage migration while tracked Moraine services are running: {}; \
+             run `moraine down` first so the storage cutover snapshot is quiescent",
             active.join(", ")
         );
     }
@@ -282,6 +315,9 @@ where
 async fn cmd_db_migrate(cfg: &AppConfig, paths: &RuntimePaths) -> Result<MigrationOutcome> {
     let ch = ClickHouseClient::new(cfg.clickhouse.clone())?;
     let schema_skew = ch.schema_skew().await?;
+    let _migration_gate = writer_barrier_required(&schema_skew.missing_on_server)
+        .then(|| lock_storage_migration(paths))
+        .transpose()?;
     ensure_standalone_migration_quiescent_with(&schema_skew.missing_on_server, |service| {
         service_running_read_only(paths, service)
     })?;
@@ -434,30 +470,35 @@ mod tests {
     }
 
     #[test]
-    fn standalone_migration_requires_quiescence_only_while_031_is_pending() {
+    fn standalone_migration_requires_quiescence_for_storage_cutovers() {
         ensure_standalone_migration_quiescent_with(&["032".to_string()], |_| {
-            panic!("current 031 must not inspect service PIDs")
+            panic!("non-cutover migrations must not inspect service PIDs")
         })
         .expect("032 alone needs no writer barrier");
 
-        let mut inspected = Vec::new();
-        let error = ensure_standalone_migration_quiescent_with(
-            &["031".to_string(), "032".to_string()],
-            |service| {
-                inspected.push(service);
-                match service {
-                    Service::Backend => Some(41),
-                    Service::Ingest => Some(42),
-                    Service::ClickHouse | Service::Mcp => None,
-                }
-            },
-        )
-        .expect_err("live tracked services must block standalone 031");
+        for migration in ["031", "033"] {
+            let mut inspected = Vec::new();
+            let error =
+                ensure_standalone_migration_quiescent_with(&[migration.to_string()], |service| {
+                    inspected.push(service);
+                    match service {
+                        Service::Backend => Some(41),
+                        Service::Ingest => Some(42),
+                        Service::Mcp => Some(43),
+                        Service::ClickHouse => None,
+                    }
+                })
+                .expect_err("live tracked services must block a storage cutover");
 
-        assert_eq!(inspected, vec![Service::Backend, Service::Ingest]);
-        assert!(error.to_string().contains("backend (pid 41)"));
-        assert!(error.to_string().contains("ingest (pid 42)"));
-        assert!(error.to_string().contains("moraine down"));
+            assert_eq!(
+                inspected,
+                vec![Service::Backend, Service::Ingest, Service::Mcp]
+            );
+            assert!(error.to_string().contains("backend (pid 41)"));
+            assert!(error.to_string().contains("ingest (pid 42)"));
+            assert!(error.to_string().contains("mcp (pid 43)"));
+            assert!(error.to_string().contains("moraine down"));
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -513,5 +554,27 @@ mod tests {
             .await
             .expect("schema command should not load config");
         assert_eq!(code, ExitCode::SUCCESS);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn foreground_child_is_registered_for_storage_cutover_barriers() {
+        let root =
+            std::env::temp_dir().join(format!("moraine-foreground-pid-{}", std::process::id()));
+        let pid_file = root.join("run/ingest.pid");
+        let mut command = Command::new("/bin/sh");
+        command
+            .env("PID_FILE", &pid_file)
+            .args(["-c", "sleep 0.1; test \"$(cat \"$PID_FILE\")\" = \"$$\""]);
+
+        let code = run_registered_foreground_child(command, &pid_file, "ingest", None)
+            .expect("run registered foreground child");
+
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert!(
+            !pid_file.exists(),
+            "completed child must remove its PID file"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 }

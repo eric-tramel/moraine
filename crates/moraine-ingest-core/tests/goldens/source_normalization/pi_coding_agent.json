@@ -19,7 +19,7 @@
           "endpoint_kind": "generation",
           "event_kind": "session_meta",
           "event_ts": "2026-05-08 02:00:00.000",
-          "event_uid": "74f53d28a2dfb50fee76f20468c9c8e15cab26c409480cf9b0abf4fd447ebb01",
+          "event_uid": "30a11089e3e0863e2bb381b0c54405c808d562158c8e49892392be2cce33cd60",
           "event_version": "<event_version>",
           "harness": "pi-coding-agent",
           "has_reasoning": 0,
@@ -128,7 +128,7 @@
           "endpoint_kind": "generation",
           "event_kind": "system",
           "event_ts": "2026-05-08 02:00:00.100",
-          "event_uid": "15c7b965896e1802d85d2344c4b5a29a5920cb31f85b1abfce4a15f8c2463ff8",
+          "event_uid": "f786eb47ec2a1a8993e24a10802c100e5f09f253ba6a78d7ddbc915f801fa6ea",
           "event_version": "<event_version>",
           "harness": "pi-coding-agent",
           "has_reasoning": 0,
@@ -237,7 +237,7 @@
           "endpoint_kind": "generation",
           "event_kind": "system",
           "event_ts": "2026-05-08 02:00:00.200",
-          "event_uid": "84d57683f0cca67f1b3d6b228958bea21ebc8c2b28fe9b80d6fdb5043066dc24",
+          "event_uid": "e2bd3307e576683aeee0cf06e69b9e5fa3296296884bbe6c76ecd2f495b26728",
           "event_version": "<event_version>",
           "harness": "pi-coding-agent",
           "has_reasoning": 0,
@@ -307,7 +307,7 @@
       ],
       "link_rows": [
         {
-          "event_uid": "84d57683f0cca67f1b3d6b228958bea21ebc8c2b28fe9b80d6fdb5043066dc24",
+          "event_uid": "e2bd3307e576683aeee0cf06e69b9e5fa3296296884bbe6c76ecd2f495b26728",
           "event_version": "<event_version>",
           "harness": "pi-coding-agent",
           "inference_provider": "",
@@ -361,7 +361,7 @@
           "endpoint_kind": "generation",
           "event_kind": "message",
           "event_ts": "2026-05-08 02:00:01.000",
-          "event_uid": "e8a5998f3d065005bdb660f8b59b0ba108856d0b1dd1f9abc951a1cdd007c72a",
+          "event_uid": "2f27eea88f083358659d81d9a24df28e3b7c128c1ef3ff4c44f04174b4e53365",
           "event_version": "<event_version>",
           "harness": "pi-coding-agent",
           "has_reasoning": 0,
@@ -431,7 +431,7 @@
       ],
       "link_rows": [
         {
-          "event_uid": "e8a5998f3d065005bdb660f8b59b0ba108856d0b1dd1f9abc951a1cdd007c72a",
+          "event_uid": "2f27eea88f083358659d81d9a24df28e3b7c128c1ef3ff4c44f04174b4e53365",
           "event_version": "<event_version>",
           "harness": "pi-coding-agent",
           "inference_provider": "",
@@ -485,7 +485,7 @@
           "endpoint_kind": "generation",
           "event_kind": "reasoning",
           "event_ts": "2026-05-08 02:00:02.000",
-          "event_uid": "4820b12b83a6ed80fda3fd48a343bbe4c1428e9181df041fcc327f4bdf1af282",
+          "event_uid": "a028e7f02386fc9309de445bfc0f2616f6f5a162388e7586e8592728f925ceaf",
           "event_version": "<event_version>",
           "harness": "pi-coding-agent",
           "has_reasoning": 1,
@@ -567,7 +567,7 @@
           "endpoint_kind": "generation",
           "event_kind": "message",
           "event_ts": "2026-05-08 02:00:02.000",
-          "event_uid": "665c118793aff086b1ef759b8a80618a57cc1c5bb995f5af7517196eebb9ad35",
+          "event_uid": "91a4ddab48bb580a989c2412444858b2e77675897d81e3cfbd68114c30f5e557",
           "event_version": "<event_version>",
           "harness": "pi-coding-agent",
           "has_reasoning": 0,
@@ -649,7 +649,7 @@
           "endpoint_kind": "generation",
           "event_kind": "tool_call",
           "event_ts": "2026-05-08 02:00:02.000",
-          "event_uid": "07a1c41261b4db6a15217d11441decc06ad465f2331b5da06c3f4695231dc946",
+          "event_uid": "cbb0bfc5a971b67e217a1517916b7d6737a1252b5edd7670cd75002183e71a6a",
           "event_version": "<event_version>",
           "harness": "pi-coding-agent",
           "has_reasoning": 0,
@@ -719,7 +719,7 @@
       ],
       "link_rows": [
         {
-          "event_uid": "4820b12b83a6ed80fda3fd48a343bbe4c1428e9181df041fcc327f4bdf1af282",
+          "event_uid": "a028e7f02386fc9309de445bfc0f2616f6f5a162388e7586e8592728f925ceaf",
           "event_version": "<event_version>",
           "harness": "pi-coding-agent",
           "inference_provider": "openrouter",
@@ -731,7 +731,7 @@
           "source_name": "golden-pi"
         },
         {
-          "event_uid": "665c118793aff086b1ef759b8a80618a57cc1c5bb995f5af7517196eebb9ad35",
+          "event_uid": "91a4ddab48bb580a989c2412444858b2e77675897d81e3cfbd68114c30f5e557",
           "event_version": "<event_version>",
           "harness": "pi-coding-agent",
           "inference_provider": "openrouter",
@@ -743,7 +743,7 @@
           "source_name": "golden-pi"
         },
         {
-          "event_uid": "07a1c41261b4db6a15217d11441decc06ad465f2331b5da06c3f4695231dc946",
+          "event_uid": "cbb0bfc5a971b67e217a1517916b7d6737a1252b5edd7670cd75002183e71a6a",
           "event_version": "<event_version>",
           "harness": "pi-coding-agent",
           "inference_provider": "openrouter",
@@ -778,7 +778,7 @@
       "session_hint": "11111111-2222-4333-8444-555555555555",
       "tool_rows": [
         {
-          "event_uid": "07a1c41261b4db6a15217d11441decc06ad465f2331b5da06c3f4695231dc946",
+          "event_uid": "cbb0bfc5a971b67e217a1517916b7d6737a1252b5edd7670cd75002183e71a6a",
           "event_version": "<event_version>",
           "harness": "pi-coding-agent",
           "inference_provider": "openrouter",
@@ -823,7 +823,7 @@
           "endpoint_kind": "generation",
           "event_kind": "tool_result",
           "event_ts": "2026-05-08 02:00:03.000",
-          "event_uid": "b792ac09b1ddd1aa506a2d84ff4da3aa7a4ee1b791d12c8ed77eca2b46c18355",
+          "event_uid": "17b4a7eacad15b0135975374086f8faca705ecdd25d2f02bc7b1d9fa895228fe",
           "event_version": "<event_version>",
           "harness": "pi-coding-agent",
           "has_reasoning": 0,
@@ -893,7 +893,7 @@
       ],
       "link_rows": [
         {
-          "event_uid": "b792ac09b1ddd1aa506a2d84ff4da3aa7a4ee1b791d12c8ed77eca2b46c18355",
+          "event_uid": "17b4a7eacad15b0135975374086f8faca705ecdd25d2f02bc7b1d9fa895228fe",
           "event_version": "<event_version>",
           "harness": "pi-coding-agent",
           "inference_provider": "",
@@ -928,7 +928,7 @@
       "session_hint": "11111111-2222-4333-8444-555555555555",
       "tool_rows": [
         {
-          "event_uid": "b792ac09b1ddd1aa506a2d84ff4da3aa7a4ee1b791d12c8ed77eca2b46c18355",
+          "event_uid": "17b4a7eacad15b0135975374086f8faca705ecdd25d2f02bc7b1d9fa895228fe",
           "event_version": "<event_version>",
           "harness": "pi-coding-agent",
           "inference_provider": "",
@@ -973,7 +973,7 @@
           "endpoint_kind": "generation",
           "event_kind": "tool_result",
           "event_ts": "2026-05-08 02:00:04.000",
-          "event_uid": "b973ebf61f6db383539ef8d23f219662932b4cda5a03ce4645888ff481132a2a",
+          "event_uid": "24f2a7f3f130e093a73cd9f67a89321401458b5ed00b371a1e715b0f18217b40",
           "event_version": "<event_version>",
           "harness": "pi-coding-agent",
           "has_reasoning": 0,
@@ -1043,7 +1043,7 @@
       ],
       "link_rows": [
         {
-          "event_uid": "b973ebf61f6db383539ef8d23f219662932b4cda5a03ce4645888ff481132a2a",
+          "event_uid": "24f2a7f3f130e093a73cd9f67a89321401458b5ed00b371a1e715b0f18217b40",
           "event_version": "<event_version>",
           "harness": "pi-coding-agent",
           "inference_provider": "",
@@ -1078,7 +1078,7 @@
       "session_hint": "11111111-2222-4333-8444-555555555555",
       "tool_rows": [
         {
-          "event_uid": "b973ebf61f6db383539ef8d23f219662932b4cda5a03ce4645888ff481132a2a",
+          "event_uid": "24f2a7f3f130e093a73cd9f67a89321401458b5ed00b371a1e715b0f18217b40",
           "event_version": "<event_version>",
           "harness": "pi-coding-agent",
           "inference_provider": "",
@@ -1103,7 +1103,7 @@
           "worktree_root": ""
         },
         {
-          "event_uid": "b973ebf61f6db383539ef8d23f219662932b4cda5a03ce4645888ff481132a2a",
+          "event_uid": "24f2a7f3f130e093a73cd9f67a89321401458b5ed00b371a1e715b0f18217b40",
           "event_version": "<event_version>",
           "harness": "pi-coding-agent",
           "inference_provider": "",
@@ -1146,7 +1146,7 @@
           "endpoint_kind": "generation",
           "event_kind": "summary",
           "event_ts": "2026-05-08 02:00:05.000",
-          "event_uid": "b0f5dd7b04c0801fd2335b6d07ddf79cc761ef256c9ebb7ae67b4ad6970131bc",
+          "event_uid": "83294be7b0542415347d4147465ebda037e99367465277a653479aadf29c66fb",
           "event_version": "<event_version>",
           "harness": "pi-coding-agent",
           "has_reasoning": 0,
@@ -1216,7 +1216,7 @@
       ],
       "link_rows": [
         {
-          "event_uid": "b0f5dd7b04c0801fd2335b6d07ddf79cc761ef256c9ebb7ae67b4ad6970131bc",
+          "event_uid": "83294be7b0542415347d4147465ebda037e99367465277a653479aadf29c66fb",
           "event_version": "<event_version>",
           "harness": "pi-coding-agent",
           "inference_provider": "",
@@ -1268,7 +1268,7 @@
           "endpoint_kind": "generation",
           "event_kind": "summary",
           "event_ts": "2026-05-08 02:00:06.000",
-          "event_uid": "80d6b4f50cc1bd94b4f8d1223e5c94417ff15c91b52122708acb2fd4edf714b0",
+          "event_uid": "6622e204b88153566262d59784849f276df94596e5fb7aed6979aff03f300ca6",
           "event_version": "<event_version>",
           "harness": "pi-coding-agent",
           "has_reasoning": 0,
@@ -1338,7 +1338,7 @@
       ],
       "link_rows": [
         {
-          "event_uid": "80d6b4f50cc1bd94b4f8d1223e5c94417ff15c91b52122708acb2fd4edf714b0",
+          "event_uid": "6622e204b88153566262d59784849f276df94596e5fb7aed6979aff03f300ca6",
           "event_version": "<event_version>",
           "harness": "pi-coding-agent",
           "inference_provider": "",
@@ -1390,7 +1390,7 @@
           "endpoint_kind": "generation",
           "event_kind": "system",
           "event_ts": "2026-05-08 02:00:07.000",
-          "event_uid": "986068c400507a10abaf59f58c472d0642af51cbaa5a8a7f7c647f6397a73060",
+          "event_uid": "6cdd96fb402ea9946d355989c1daf910ec7fb2957e0b712f96b17b898438a9f5",
           "event_version": "<event_version>",
           "harness": "pi-coding-agent",
           "has_reasoning": 0,
@@ -1460,7 +1460,7 @@
       ],
       "link_rows": [
         {
-          "event_uid": "986068c400507a10abaf59f58c472d0642af51cbaa5a8a7f7c647f6397a73060",
+          "event_uid": "6cdd96fb402ea9946d355989c1daf910ec7fb2957e0b712f96b17b898438a9f5",
           "event_version": "<event_version>",
           "harness": "pi-coding-agent",
           "inference_provider": "",
@@ -1514,7 +1514,7 @@
           "endpoint_kind": "generation",
           "event_kind": "message",
           "event_ts": "2026-05-08 02:00:08.000",
-          "event_uid": "98f6308de6962dac48ee4e0931eeb21c0661cdf1c3375b567858a41ed96cc845",
+          "event_uid": "b56ca5c4273ba64c74ff350ecf4e72bc4c2182ae7348a02faf9352e718148a70",
           "event_version": "<event_version>",
           "harness": "pi-coding-agent",
           "has_reasoning": 0,
@@ -1584,7 +1584,7 @@
       ],
       "link_rows": [
         {
-          "event_uid": "98f6308de6962dac48ee4e0931eeb21c0661cdf1c3375b567858a41ed96cc845",
+          "event_uid": "b56ca5c4273ba64c74ff350ecf4e72bc4c2182ae7348a02faf9352e718148a70",
           "event_version": "<event_version>",
           "harness": "pi-coding-agent",
           "inference_provider": "",
@@ -1636,7 +1636,7 @@
           "endpoint_kind": "generation",
           "event_kind": "system",
           "event_ts": "2026-05-08 02:00:09.000",
-          "event_uid": "3d28aeec7b8166f63655db07cf375c899198c745d32b7945104a535fc55ab31d",
+          "event_uid": "1da44d9f4d53a30ca4f0ccf8d0eb7d3b17b05ff996d0b1200aeb1104e120270b",
           "event_version": "<event_version>",
           "harness": "pi-coding-agent",
           "has_reasoning": 0,
@@ -1706,7 +1706,7 @@
       ],
       "link_rows": [
         {
-          "event_uid": "3d28aeec7b8166f63655db07cf375c899198c745d32b7945104a535fc55ab31d",
+          "event_uid": "1da44d9f4d53a30ca4f0ccf8d0eb7d3b17b05ff996d0b1200aeb1104e120270b",
           "event_version": "<event_version>",
           "harness": "pi-coding-agent",
           "inference_provider": "",
@@ -1758,7 +1758,7 @@
           "endpoint_kind": "generation",
           "event_kind": "session_meta",
           "event_ts": "2026-05-08 02:00:10.000",
-          "event_uid": "e0403bedf13e57b631dfe0b7f893c96d1854fcfd1f5019bf59334d2cb3c45542",
+          "event_uid": "cb38e986268283f7b382a4f3439f81c2fb1bb52d06c6a1f64e4defa7a4836400",
           "event_version": "<event_version>",
           "harness": "pi-coding-agent",
           "has_reasoning": 0,
@@ -1828,7 +1828,7 @@
       ],
       "link_rows": [
         {
-          "event_uid": "e0403bedf13e57b631dfe0b7f893c96d1854fcfd1f5019bf59334d2cb3c45542",
+          "event_uid": "cb38e986268283f7b382a4f3439f81c2fb1bb52d06c6a1f64e4defa7a4836400",
           "event_version": "<event_version>",
           "harness": "pi-coding-agent",
           "inference_provider": "",

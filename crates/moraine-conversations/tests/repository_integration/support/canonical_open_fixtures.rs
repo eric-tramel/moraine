@@ -21,6 +21,7 @@ fn nav_row(
         "source_generation": 1_u32,
         "source_offset": index,
         "source_line_no": index,
+        "emission_index": index as u32,
         "event_time": event_time,
         "event_unix_ms": 1_769_940_000_000_i64 + (index as i64 * 1_000),
         "event_kind": event_kind,

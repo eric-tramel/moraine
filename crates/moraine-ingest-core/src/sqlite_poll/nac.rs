@@ -250,7 +250,7 @@ pub(crate) async fn process_nac_sqlite_db(
 
     let oversized_row = match &mut outcome {
         NacScanOutcome::Scanned { records, .. } => {
-            link_tool_responses(records, &source_file, source_generation);
+            link_tool_responses(records, &source_file, source_generation)?;
             records.iter().find_map(|synthetic| {
                 if crate::dispatch::record_project_dir_is_excluded(
                     config,
@@ -1041,15 +1041,33 @@ fn synthesize_session(
         record_budget.saturating_sub(records.len()),
     )?;
     let mut part_hashes = BTreeMap::new();
-    for (logical_id, record, line, offset) in logical_parts {
-        let hash = value_hash(&record);
+    let mut emit_ids = BTreeSet::new();
+    for (logical_id, record, _, _) in &logical_parts {
+        let hash = value_hash(record);
         let changed = created_changed
             || prior
-                .and_then(|cursor| cursor.part_hashes.get(&logical_id))
+                .and_then(|cursor| cursor.part_hashes.get(logical_id))
                 .map(String::as_str)
                 != Some(hash.as_str());
-        part_hashes.insert(logical_id, hash);
+        part_hashes.insert(logical_id.clone(), hash);
         if changed {
+            emit_ids.insert(logical_id.clone());
+        }
+    }
+    let mut dependency_ids = BTreeSet::new();
+    for (logical_id, record, _, _) in &logical_parts {
+        if let Some(request_logical_id) = record.get("request_logical_id").and_then(Value::as_str) {
+            if emit_ids.contains(logical_id) {
+                dependency_ids.insert(request_logical_id.to_string());
+            }
+            if emit_ids.contains(request_logical_id) {
+                dependency_ids.insert(logical_id.clone());
+            }
+        }
+    }
+    emit_ids.extend(dependency_ids);
+    for (logical_id, record, line, offset) in logical_parts {
+        if emit_ids.contains(&logical_id) {
             records.push(SyntheticRecord {
                 record,
                 project_dir: project_dir_for(session),
@@ -1432,7 +1450,11 @@ fn worker_event_record(
     }
 }
 
-fn link_tool_responses(records: &mut [SyntheticRecord], source_file: &str, generation: u32) {
+fn link_tool_responses(
+    records: &mut [SyntheticRecord],
+    source_file: &str,
+    generation: u32,
+) -> Result<()> {
     let mut requests = BTreeMap::<(String, String), String>::new();
     for synthetic in records.iter() {
         if synthetic.record.get("type").and_then(Value::as_str) != Some("tool_request") {
@@ -1440,15 +1462,28 @@ fn link_tool_responses(records: &mut [SyntheticRecord], source_file: &str, gener
         }
         let session_id = value_string(synthetic.record.get("session_id"));
         let call_id = value_string(synthetic.record.get("tool_call_id"));
-        let logical_id = value_string(synthetic.record.get("logical_id"));
-        let uid = crate::sources::shared::event_uid(
+        let normalized = normalize_record(
+            &synthetic.record,
+            "nac",
+            "nac",
             source_file,
+            0,
             generation,
             synthetic.source_line_no,
             synthetic.source_offset,
-            &logical_id,
-            "tool_request",
-        );
+            "",
+            "",
+            "",
+        )
+        .context("failed to derive canonical NAC tool-request identity")?;
+        let uid = normalized
+            .event_rows
+            .first()
+            .and_then(|event| event.get("event_uid"))
+            .and_then(Value::as_str)
+            .filter(|uid| !uid.is_empty())
+            .context("normalized NAC tool request is missing event_uid")?
+            .to_string();
         requests.insert((session_id, call_id), uid);
     }
     for synthetic in records.iter_mut() {
@@ -1457,34 +1492,13 @@ fn link_tool_responses(records: &mut [SyntheticRecord], source_file: &str, gener
         }
         let session_id = value_string(synthetic.record.get("session_id"));
         let call_id = value_string(synthetic.record.get("tool_call_id"));
-        let direct_uid = synthetic
-            .record
-            .get("request_logical_id")
-            .and_then(Value::as_str)
-            .map(|logical_id| {
-                crate::sources::shared::event_uid(
-                    source_file,
-                    generation,
-                    synthetic
-                        .record
-                        .get("request_source_line_no")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0),
-                    synthetic
-                        .record
-                        .get("request_source_offset")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0),
-                    logical_id,
-                    "tool_request",
-                )
-            });
-        if let Some(uid) = direct_uid.or_else(|| requests.get(&(session_id, call_id)).cloned()) {
+        if let Some(uid) = requests.get(&(session_id, call_id)) {
             if let Some(object) = synthetic.record.as_object_mut() {
                 object.insert("request_event_uid".to_string(), json!(uid));
             }
         }
     }
+    Ok(())
 }
 
 fn normalize_nac_timestamp(raw: &str, nanos: bool) -> std::result::Result<String, NacScanError> {
@@ -1749,6 +1763,112 @@ mod tests {
     }
 
     #[test]
+    fn appended_tool_response_reemits_its_unchanged_request_dependency() {
+        let initial = session_with_messages(json!([{
+            "role": "assistant",
+            "tool_calls": [{
+                "id": "call-stable",
+                "type": "function",
+                "function": {"name": "Read", "arguments": "{\"path\":\"src/lib.rs\"}"}
+            }]
+        }]));
+        let (_, prior) = synthesize_session(&initial, "nac:stable-session", None, 20)
+            .expect("synthesize initial request");
+        let updated = session_with_messages(json!([
+            {
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call-stable",
+                    "type": "function",
+                    "function": {"name": "Read", "arguments": "{\"path\":\"src/lib.rs\"}"}
+                }]
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call-stable",
+                "content": "file contents"
+            }
+        ]));
+
+        let (mut delta, _) = synthesize_session(&updated, "nac:stable-session", Some(&prior), 20)
+            .expect("synthesize appended response");
+        assert_eq!(
+            delta
+                .iter()
+                .filter(|row| row.record["type"] == "tool_request")
+                .count(),
+            1
+        );
+        assert_eq!(
+            delta
+                .iter()
+                .filter(|row| row.record["type"] == "tool_response")
+                .count(),
+            1
+        );
+        link_tool_responses(&mut delta, "/tmp/store.db", 1).expect("link dependency closure");
+        assert!(delta
+            .iter()
+            .find(|row| row.record["type"] == "tool_response")
+            .and_then(|row| row.record.get("request_event_uid"))
+            .and_then(Value::as_str)
+            .is_some_and(|uid| !uid.is_empty()));
+    }
+
+    #[test]
+    fn changed_tool_request_reemits_its_unchanged_response_dependency() {
+        let initial = session_with_messages(json!([
+            {
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call-stable",
+                    "type": "function",
+                    "function": {"name": "Read", "arguments": "{\"path\":\"src/old.rs\"}"}
+                }]
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call-stable",
+                "content": "file contents"
+            }
+        ]));
+        let (_, prior) = synthesize_session(&initial, "nac:stable-session", None, 20)
+            .expect("synthesize initial tool pair");
+        let updated = session_with_messages(json!([
+            {
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call-stable",
+                    "type": "function",
+                    "function": {"name": "Read", "arguments": "{\"path\":\"src/new.rs\"}"}
+                }]
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call-stable",
+                "content": "file contents"
+            }
+        ]));
+
+        let (delta, _) = synthesize_session(&updated, "nac:stable-session", Some(&prior), 20)
+            .expect("synthesize changed request");
+        assert_eq!(
+            delta
+                .iter()
+                .filter(|row| row.record["type"] == "tool_request")
+                .count(),
+            1
+        );
+        assert_eq!(
+            delta
+                .iter()
+                .filter(|row| row.record["type"] == "tool_response")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn logical_part_budget_fails_before_building_an_unbounded_vector() {
         let session = session_with_messages(json!([{
             "role": "assistant",
@@ -1803,16 +1923,31 @@ mod tests {
                 source_offset: 2,
             },
         ];
-        link_tool_responses(&mut records, "/tmp/store.db", 1);
-        let expected = crate::sources::shared::event_uid(
+        link_tool_responses(&mut records, "/tmp/store.db", 1).expect("link tool response");
+        let expected = normalize_record(
+            &records[1].record,
+            "nac",
+            "nac",
             "/tmp/store.db",
+            0,
             1,
             6,
             1,
-            "request-b",
-            "tool_request",
-        );
+            "",
+            "",
+            "",
+        )
+        .expect("normalize request")
+        .event_rows[0]["event_uid"]
+            .clone();
         assert_eq!(records[2].record["request_event_uid"], expected);
+
+        let mut replayed = records.clone();
+        replayed[1].source_line_no = 60;
+        replayed[1].source_offset = 1_000;
+        link_tool_responses(&mut replayed, "/renamed/store.db", 9)
+            .expect("link replayed tool response");
+        assert_eq!(replayed[2].record["request_event_uid"], expected);
     }
 
     #[tokio::test]
@@ -2086,7 +2221,7 @@ mod tests {
             .expect("completed assistant response");
         assert_eq!(completed_response.record["latency_ms"], 1200);
 
-        link_tool_responses(&mut first, &source_file, 1);
+        link_tool_responses(&mut first, &source_file, 1).expect("link tool responses");
         let response = first
             .iter()
             .find(|record| record.record["type"] == "tool_response")

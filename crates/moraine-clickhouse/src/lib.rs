@@ -16,6 +16,12 @@ const MAX_INSERT_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
 use std::collections::{BTreeSet, HashSet};
 use std::time::Duration;
 const DEFAULT_USER_AGENT_ROLE: &str = "moraine-clickhouse";
+const MIGRATION_REQUEST_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+const MIGRATION_QUERY_PARAMS: &[(&str, &str)] = &[
+    // Leave the client five minutes to observe ClickHouse's terminal response.
+    ("max_execution_time", "3300"),
+    ("timeout_overflow_mode", "throw"),
+];
 
 #[derive(Clone)]
 pub struct ClickHouseClient {
@@ -248,6 +254,28 @@ impl ClickHouseClient {
         default_format: Option<&str>,
         params: &[(&str, &str)],
     ) -> Result<String> {
+        self.request_text_with_options(
+            query,
+            body,
+            database,
+            async_insert,
+            default_format,
+            params,
+            None,
+        )
+        .await
+    }
+
+    async fn request_text_with_options(
+        &self,
+        query: &str,
+        body: Option<Vec<u8>>,
+        database: Option<&str>,
+        async_insert: bool,
+        default_format: Option<&str>,
+        params: &[(&str, &str)],
+        request_timeout: Option<Duration>,
+    ) -> Result<String> {
         let req = self
             .request_builder(
                 query,
@@ -257,7 +285,7 @@ impl ClickHouseClient {
                     async_insert,
                     default_format,
                     params,
-                    request_timeout: None,
+                    request_timeout,
                 },
             )
             .await?;
@@ -504,15 +532,23 @@ impl ClickHouseClient {
 
             let sql = materialize_migration_sql(migration.sql, &self.cfg.database)?;
             for statement in split_sql_statements(&sql) {
-                self.request_text(&statement, None, Some(&self.cfg.database), false, None)
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "failed migration {} statement: {}",
-                            migration.name,
-                            truncate_for_error(&statement)
-                        )
-                    })?;
+                self.request_text_with_options(
+                    &statement,
+                    None,
+                    Some(&self.cfg.database),
+                    false,
+                    None,
+                    MIGRATION_QUERY_PARAMS,
+                    Some(MIGRATION_REQUEST_TIMEOUT),
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed migration {} statement: {}",
+                        migration.name,
+                        truncate_for_error(&statement)
+                    )
+                })?;
             }
 
             let log_stmt = format!(
@@ -521,9 +557,17 @@ impl ClickHouseClient {
                 escape_literal(migration.version),
                 escape_literal(migration.name)
             );
-            self.request_text(&log_stmt, None, Some(&self.cfg.database), false, None)
-                .await
-                .with_context(|| format!("failed to record migration {}", migration.name))?;
+            self.request_text_with_options(
+                &log_stmt,
+                None,
+                Some(&self.cfg.database),
+                false,
+                None,
+                MIGRATION_QUERY_PARAMS,
+                Some(MIGRATION_REQUEST_TIMEOUT),
+            )
+            .await
+            .with_context(|| format!("failed to record migration {}", migration.name))?;
 
             executed.push(migration.version.to_string());
             on_progress(MigrationProgress::Applied {
@@ -905,6 +949,11 @@ pub fn bundled_migrations() -> Vec<Migration> {
             version: "032",
             name: "032_drop_frozen_tool_io.sql",
             sql: include_str!("../../../sql/032_drop_frozen_tool_io.sql"),
+        },
+        Migration {
+            version: "033",
+            name: "033_replay_stable_events.sql",
+            sql: include_str!("../../../sql/033_replay_stable_events.sql"),
         },
     ]
 }
@@ -1662,6 +1711,181 @@ mod tests {
     }
 
     #[test]
+    fn migration_033_uses_restart_safe_atomic_cutovers() {
+        let migration = bundled_migrations()
+            .into_iter()
+            .find(|migration| migration.version == "033")
+            .expect("migration 033 must be registered");
+        let sql = materialize_migration_sql(migration.sql, "other_db")
+            .expect("materialize migration 033");
+        let statements = split_sql_statements(&sql);
+        let link_exchange = statements
+            .iter()
+            .position(|statement| {
+                statement.contains(
+                    "EXCHANGE TABLES\n  other_db.event_links AND other_db.event_links_replay_stable_033",
+                )
+            })
+            .expect("link cutover must use EXCHANGE");
+        let event_exchange = statements
+            .iter()
+            .position(|statement| {
+                statement.contains(
+                    "EXCHANGE TABLES\n  other_db.events AND other_db.events_replay_stable_033",
+                )
+            })
+            .expect("event cutover must use EXCHANGE");
+        let event_optimize = statements
+            .iter()
+            .position(|statement| {
+                statement.starts_with("OPTIMIZE TABLE other_db.events_replay_stable_033 FINAL")
+            })
+            .expect("event replacement must converge before cutover");
+        let link_optimize = statements
+            .iter()
+            .position(|statement| {
+                statement.starts_with("OPTIMIZE TABLE other_db.event_links_replay_stable_033 FINAL")
+            })
+            .expect("link replacement must converge before cutover");
+        let uid_lookup_drop = statements
+            .iter()
+            .position(|statement| statement == "DROP TABLE other_db.event_uid_lookup_033")
+            .expect("UID lookup must be released before cutover");
+        let final_link_drop = statements
+            .iter()
+            .rposition(|statement| {
+                statement == "DROP TABLE IF EXISTS other_db.event_links_replay_stable_033"
+            })
+            .expect("old link table must be dropped after cutover");
+        let final_event_drop = statements
+            .iter()
+            .rposition(|statement| {
+                statement == "DROP TABLE IF EXISTS other_db.events_replay_stable_033"
+            })
+            .expect("old event table must be dropped after cutover");
+        let uid_base_rewrites = statements
+            .iter()
+            .filter(|statement| statement.starts_with("INSERT INTO other_db.event_uid_base_033"))
+            .collect::<Vec<_>>();
+        let uid_map = statements
+            .iter()
+            .find(|statement| statement.starts_with("INSERT INTO other_db.event_uid_map_033"))
+            .expect("UID map build must be registered");
+        let uid_lookup = statements
+            .iter()
+            .find(|statement| statement.starts_with("CREATE TABLE other_db.event_uid_lookup_033"))
+            .expect("bounded UID lookup must be registered");
+        let event_source = statements
+            .iter()
+            .find(|statement| {
+                statement.starts_with("CREATE VIEW other_db.events_replay_source_033")
+            })
+            .expect("event rewrite source must be registered");
+        let event_rewrites = statements
+            .iter()
+            .filter(|statement| {
+                statement.starts_with("INSERT INTO other_db.events_replay_stable_033")
+            })
+            .collect::<Vec<_>>();
+        let link_rewrite = statements
+            .iter()
+            .find(|statement| {
+                statement.starts_with("INSERT INTO other_db.event_links_replay_stable_033")
+            })
+            .expect("link rewrite must be registered");
+        let locator_rebuild = statements
+            .iter()
+            .find(|statement| statement.starts_with("INSERT INTO other_db.mcp_event_locator"))
+            .expect("locator rebuild must be registered");
+        let navigation_rebuild = statements
+            .iter()
+            .find(|statement| statement.starts_with("INSERT INTO other_db.mcp_event_navigation"))
+            .expect("navigation rebuild must be registered");
+        let search_rewrites = statements
+            .iter()
+            .filter(|statement| statement.starts_with("INSERT INTO other_db.search_postings"))
+            .collect::<Vec<_>>();
+
+        assert!(event_optimize < link_exchange);
+        assert!(link_optimize < link_exchange);
+        assert!(uid_lookup_drop < link_exchange);
+        assert!(link_exchange < event_exchange);
+        assert!(event_exchange < final_link_drop);
+        assert!(event_exchange < final_event_drop);
+        assert_eq!(
+            statements
+                .iter()
+                .filter(|statement| statement.starts_with("EXCHANGE TABLES"))
+                .count(),
+            2
+        );
+        assert!(!sql.contains("RENAME TABLE"));
+        assert!(!sql.contains("_frozen"));
+        assert!(!uid_map.contains("GROUP BY"));
+        assert!(uid_lookup.contains("ENGINE = Join(ANY, LEFT, old_event_uid)"));
+        assert_eq!(uid_base_rewrites.len(), 8);
+        assert!(sql.contains("FROM other_db.events FINAL"));
+        for (bucket, rewrite) in uid_base_rewrites.iter().enumerate() {
+            assert!(rewrite.contains(&format!("WHERE source_bucket = {bucket}")));
+            assert!(rewrite.contains("max_memory_usage = 1073741824"));
+        }
+        assert!(event_source.contains("FROM other_db.events AS e FINAL"));
+        assert!(event_source
+            .contains("joinGet('other_db.event_uid_lookup_033', 'new_event_uid', e.event_uid)"));
+        assert!(link_rewrite
+            .contains("joinGet('other_db.event_uid_lookup_033', 'new_event_uid', l.event_uid)"));
+        assert_eq!(event_rewrites.len(), 8);
+        assert!(!locator_rebuild.contains("events FINAL"));
+        assert!(!navigation_rebuild.contains("events FINAL"));
+        assert_eq!(search_rewrites.len(), 16);
+        for (bucket, rewrite) in search_rewrites.iter().enumerate() {
+            assert!(rewrite.contains(&format!(
+                "AND intDiv(cityHash64(d.session_id) % 64, 4) = {bucket}"
+            )));
+            assert!(rewrite.contains("max_bytes_before_external_group_by = 67108864"));
+            assert!(rewrite.contains("max_memory_usage = 1073741824"));
+        }
+        for (bucket, rewrite) in event_rewrites.iter().enumerate() {
+            assert!(rewrite.contains(&format!(
+                "WHERE intDiv(cityHash64(session_id) % 64, 8) = {bucket}"
+            )));
+            for setting in [
+                "max_block_size = 1024",
+                "preferred_max_column_in_block_size_bytes = 33554432",
+                "min_insert_block_size_rows = 0",
+                "min_insert_block_size_bytes = 0",
+                "max_insert_threads = 1",
+                "max_threads = 1",
+                "max_memory_usage = 1073741824",
+            ] {
+                assert!(rewrite.contains(setting));
+            }
+        }
+        for setting in [
+            "max_block_size = 1024",
+            "preferred_max_column_in_block_size_bytes = 33554432",
+            "max_threads = 1",
+        ] {
+            assert!(
+                statements
+                    .iter()
+                    .filter(|statement| statement.contains(setting))
+                    .count()
+                    >= 6,
+                "every bulk migration insert must bound payload-heavy reads with {setting}"
+            );
+        }
+        assert!(
+            statements
+                .iter()
+                .filter(|statement| statement.contains("max_memory_usage = 1073741824"))
+                .count()
+                >= 6,
+            "every bulk migration insert must have a fixed memory budget"
+        );
+    }
+
+    #[test]
     fn migration_031_uses_the_same_narrow_path_projection_for_live_and_backfill() {
         let migration = bundled_migrations()
             .into_iter()
@@ -2329,11 +2553,11 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn migration_progress_applies_031_and_032_after_v071() {
+    async fn migration_progress_applies_post_v071_storage_cutovers() {
         let bundled = bundled_migrations();
         let pending = bundled
             .iter()
-            .filter(|migration| matches!(migration.version, "031" | "032"))
+            .filter(|migration| matches!(migration.version, "031" | "032" | "033"))
             .cloned()
             .collect::<Vec<_>>();
         assert_eq!(
@@ -2341,11 +2565,11 @@ mod tests {
                 .iter()
                 .map(|migration| migration.version)
                 .collect::<Vec<_>>(),
-            vec!["031", "032"]
+            vec!["031", "032", "033"]
         );
         let applied = bundled
             .iter()
-            .filter(|migration| !matches!(migration.version, "031" | "032"))
+            .filter(|migration| !matches!(migration.version, "031" | "032" | "033"))
             .map(|migration| migration.version.to_string())
             .collect::<Vec<_>>();
         assert_eq!(applied.last().map(String::as_str), Some("030"));
@@ -2362,42 +2586,28 @@ mod tests {
         let executed = client
             .run_migrations_with_progress(|event| events.push(event))
             .await
-            .expect("apply migrations 031 and 032");
+            .expect("apply post-v0.7.1 storage migrations");
 
-        assert_eq!(executed, vec!["031", "032"]);
-        assert_eq!(
-            events,
-            vec![
-                MigrationProgress::Plan {
-                    applied: bundled.len() - 2,
-                    pending: 2,
-                },
-                MigrationProgress::Started {
-                    index: 1,
-                    total: 2,
-                    version: pending[0].version,
-                    name: pending[0].name,
-                },
-                MigrationProgress::Applied {
-                    index: 1,
-                    total: 2,
-                    version: pending[0].version,
-                    name: pending[0].name,
-                },
-                MigrationProgress::Started {
-                    index: 2,
-                    total: 2,
-                    version: pending[1].version,
-                    name: pending[1].name,
-                },
-                MigrationProgress::Applied {
-                    index: 2,
-                    total: 2,
-                    version: pending[1].version,
-                    name: pending[1].name,
-                },
-            ]
-        );
+        assert_eq!(executed, vec!["031", "032", "033"]);
+        let mut expected_events = vec![MigrationProgress::Plan {
+            applied: bundled.len() - pending.len(),
+            pending: pending.len(),
+        }];
+        for (index, migration) in pending.iter().enumerate() {
+            expected_events.push(MigrationProgress::Started {
+                index: index + 1,
+                total: pending.len(),
+                version: migration.version,
+                name: migration.name,
+            });
+            expected_events.push(MigrationProgress::Applied {
+                index: index + 1,
+                total: pending.len(),
+                version: migration.version,
+                name: migration.name,
+            });
+        }
+        assert_eq!(events, expected_events);
         let queries = queries.lock().expect("migration query mutex poisoned");
         let ledger_indices = queries
             .iter()
@@ -2407,7 +2617,7 @@ mod tests {
                     .then_some(index)
             })
             .collect::<Vec<_>>();
-        assert_eq!(ledger_indices.len(), 2);
+        assert_eq!(ledger_indices.len(), 3);
         assert_eq!(ledger_indices.last().copied(), Some(queries.len() - 1));
     }
 

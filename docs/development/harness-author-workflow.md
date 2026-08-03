@@ -79,8 +79,10 @@ a schema migration task, not only an adapter change.
 
 Every source must preserve these invariants:
 
-- Stable deterministic event UIDs based on source file coordinate, payload, and
-  source-local suffix.
+- Record-local provisional UIDs that are distinct for every emitted event and
+  stable enough to wire adapter-emitted links and tool rows. The shared
+  normalizer replaces them after tool folding with canonical semantic UIDs,
+  preserves identical sibling occurrences, and rewrites internal references.
 - Canonical event kind, payload type, actor kind, and link type values.
 - Distinct normalized event links and source external-id links.
 - Tool rows that reference emitted event UIDs.
