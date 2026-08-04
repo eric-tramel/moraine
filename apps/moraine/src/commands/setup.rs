@@ -2916,7 +2916,7 @@ mod tests {
     use crate::render::OutputMode;
     use std::collections::{BTreeMap, BTreeSet};
     #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{symlink, PermissionsExt};
     use toml_edit::value as toml_value;
 
     struct ScopedEnvironmentVariable {
@@ -4697,6 +4697,15 @@ host = "127.42.0.9"
         assert!(shared_launcher.contains("moraine plugin launch error: binary_untrusted"));
         assert!(shared_launcher.contains("exec \"$moraine_bin\" run mcp"));
         assert!(!shared_launcher.contains("scripts/launch.sh"));
+        let file_launcher = fs::read_to_string(
+            repo_root
+                .join("plugins")
+                .join("moraine")
+                .join("scripts")
+                .join("launch.sh"),
+        )
+        .expect("read file launcher script");
+        assert_eq!(shared_launcher, file_launcher);
 
         let codex_manifest_path = repo_root
             .join("plugins")
@@ -4804,6 +4813,118 @@ host = "127.42.0.9"
         );
         assert!(output.stderr.is_empty());
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_plugin_launcher_execs_uv_tool_moraine_from_home_workspace() {
+        let home = temp_path("uv-tool-home-launcher");
+        let bin = home.join(".local").join("bin");
+        let tool_bin = home
+            .join(".local")
+            .join("share")
+            .join("uv")
+            .join("tools")
+            .join("moraine-cli")
+            .join("bin");
+        fs::create_dir_all(&bin).expect("create uv tool bin dir");
+        fs::create_dir_all(&tool_bin).expect("create uv tool environment bin dir");
+        let installed_moraine = tool_bin.join("moraine");
+        fs::write(
+            &installed_moraine,
+            "#!/bin/sh\nprintf 'fake-moraine:%s:%s\\n' \"$1\" \"$2\"\n",
+        )
+        .expect("write fake moraine");
+        let mut permissions = fs::metadata(&installed_moraine)
+            .expect("fake metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&installed_moraine, permissions).expect("chmod fake moraine");
+        symlink(&installed_moraine, bin.join("moraine")).expect("link uv tool executable");
+
+        let output = Command::new("/bin/sh")
+            .arg("-eu")
+            .arg("-c")
+            .arg(shared_plugin_launcher())
+            .current_dir(&home)
+            .env("HOME", &home)
+            .env("PATH", &bin)
+            .output()
+            .expect("run shared plugin launcher");
+
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "fake-moraine:run:mcp\n"
+        );
+        assert!(output.stderr.is_empty());
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_plugin_launcher_rejects_user_bin_symlink_to_git_worktree() {
+        let home = temp_path("symlinked-project-launcher");
+        let bin = home.join(".local").join("bin");
+        let project_bin = home.join("project").join("target").join("debug");
+        fs::create_dir_all(&bin).expect("create user bin dir");
+        fs::create_dir_all(&project_bin).expect("create project bin dir");
+        fs::create_dir(home.join("project").join(".git")).expect("create Git marker");
+        let project_moraine = project_bin.join("moraine");
+        fs::write(&project_moraine, "#!/bin/sh\nexit 99\n").expect("write fake moraine");
+        let mut permissions = fs::metadata(&project_moraine)
+            .expect("fake metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&project_moraine, permissions).expect("chmod fake moraine");
+        symlink(&project_moraine, bin.join("moraine")).expect("link project executable");
+
+        let output = Command::new("/bin/sh")
+            .arg("-eu")
+            .arg("-c")
+            .arg(shared_plugin_launcher())
+            .current_dir(&home)
+            .env("HOME", &home)
+            .env("PATH", &bin)
+            .output()
+            .expect("run shared plugin launcher");
+
+        assert_eq!(output.status.code(), Some(126));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("binary_untrusted"));
+        assert!(stderr.contains("Git worktree"));
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_plugin_launcher_rejects_other_moraine_beneath_home_workspace() {
+        let home = temp_path("untrusted-home-launcher");
+        let bin = home.join("project-bin");
+        fs::create_dir_all(&bin).expect("create project bin dir");
+        let fake_moraine = bin.join("moraine");
+        fs::write(&fake_moraine, "#!/bin/sh\nexit 99\n").expect("write fake moraine");
+        let mut permissions = fs::metadata(&fake_moraine)
+            .expect("fake metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&fake_moraine, permissions).expect("chmod fake moraine");
+
+        let output = Command::new("/bin/sh")
+            .arg("-eu")
+            .arg("-c")
+            .arg(shared_plugin_launcher())
+            .current_dir(&home)
+            .env("HOME", &home)
+            .env("PATH", &bin)
+            .output()
+            .expect("run shared plugin launcher");
+
+        assert_eq!(output.status.code(), Some(126));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("binary_untrusted"));
+        assert!(stderr.contains("current project directory"));
+        let _ = fs::remove_dir_all(home);
     }
 
     #[test]
