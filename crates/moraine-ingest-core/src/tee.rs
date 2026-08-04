@@ -23,7 +23,6 @@ use moraine_clickhouse::{enforce_remote_schema_policy, ClickHouseClient};
 use moraine_config::{AppConfig, ClickHouseConfig, IngestSource, DEFAULT_BACKEND_NAME};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, Notify, RwLock};
@@ -38,6 +37,10 @@ const HANDSHAKE_RETRY: Duration = Duration::from_secs(30);
 pub(crate) enum BackendSinkStatus {
     /// Constructed but the schema handshake has not completed yet.
     Connecting,
+    /// The sink is available, but replay has not yet established a durable
+    /// contiguous checkpoint. Live rows remain admissible without checkpoint
+    /// authority.
+    CatchingUp,
     Ok,
     /// Mirror queue overflowed; live forwarding is paused until the sink
     /// drains, then catch-up replay recovers the dropped span.
@@ -54,6 +57,7 @@ impl BackendSinkStatus {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Connecting => "connecting",
+            Self::CatchingUp => "catching_up",
             Self::Ok => "ok",
             Self::Lagging => "lagging",
             Self::Unreachable => "unreachable",
@@ -66,23 +70,28 @@ impl BackendSinkStatus {
 /// Shared per-backend state: status transitions are driven by the router
 /// (overflow), the backend's sink task (flush outcomes), and its supervisor
 /// (handshake); the default sink's heartbeat reads it.
+struct BackendSinkState {
+    status: BackendSinkStatus,
+    /// Advances for every routed batch that replay must recover. Comparing
+    /// this epoch under the same lock as admission closes the promotion race.
+    drop_epoch: u64,
+    dropped_batches: u64,
+}
+
 pub(crate) struct BackendSinkCell {
     name: String,
-    status: Mutex<BackendSinkStatus>,
-    /// Sink task running post-handshake; the router only forwards to live sinks.
-    live: AtomicBool,
-    /// Routed batches that were not mirrored (overflow or non-ok status).
-    /// Catch-up replay recovers the data; the count is diagnostic.
-    dropped_batches: AtomicU64,
+    state: Mutex<BackendSinkState>,
 }
 
 impl BackendSinkCell {
     pub(crate) fn new(name: &str) -> Self {
         Self {
             name: name.to_string(),
-            status: Mutex::new(BackendSinkStatus::Connecting),
-            live: AtomicBool::new(false),
-            dropped_batches: AtomicU64::new(0),
+            state: Mutex::new(BackendSinkState {
+                status: BackendSinkStatus::Connecting,
+                drop_epoch: 0,
+                dropped_batches: 0,
+            }),
         }
     }
 
@@ -91,78 +100,176 @@ impl BackendSinkCell {
     }
 
     pub(crate) fn status(&self) -> BackendSinkStatus {
-        *self.status.lock().expect("backend status mutex poisoned")
+        self.state
+            .lock()
+            .expect("backend status mutex poisoned")
+            .status
     }
 
-    pub(crate) fn set_status(&self, status: BackendSinkStatus) {
-        *self.status.lock().expect("backend status mutex poisoned") = status;
+    fn mark_unreachable(&self) {
+        let mut state = self.state.lock().expect("backend status mutex poisoned");
+        if !matches!(
+            state.status,
+            BackendSinkStatus::DisabledSkew | BackendSinkStatus::DisabledMissingIdentityAuthor
+        ) {
+            state.status = BackendSinkStatus::Unreachable;
+        }
     }
 
-    fn is_live(&self) -> bool {
-        self.live.load(Ordering::Relaxed)
+    fn disable_skew(&self) {
+        self.state
+            .lock()
+            .expect("backend status mutex poisoned")
+            .status = BackendSinkStatus::DisabledSkew;
     }
 
-    fn mark_live(&self) {
-        self.live.store(true, Ordering::Relaxed);
+    fn disable_missing_identity_author(&self) {
+        self.state
+            .lock()
+            .expect("backend status mutex poisoned")
+            .status = BackendSinkStatus::DisabledMissingIdentityAuthor;
     }
 
-    fn record_drop(&self) {
-        self.dropped_batches.fetch_add(1, Ordering::Relaxed);
+    #[cfg(test)]
+    pub(crate) fn set_status_for_test(&self, status: BackendSinkStatus) {
+        self.state
+            .lock()
+            .expect("backend status mutex poisoned")
+            .status = status;
     }
 
     pub(crate) fn dropped_batches(&self) -> u64 {
-        self.dropped_batches.load(Ordering::Relaxed)
+        self.state
+            .lock()
+            .expect("backend status mutex poisoned")
+            .dropped_batches
     }
 
-    /// Router-side: queue overflowed. Returns true on the Ok -> Lagging
-    /// transition so the caller can warn once instead of once per batch.
-    fn mark_overflow(&self) -> bool {
-        let mut status = self.status.lock().expect("backend status mutex poisoned");
-        if *status == BackendSinkStatus::Ok {
-            *status = BackendSinkStatus::Lagging;
-            return true;
-        }
-        false
+    /// Router-side admission, queueing, overflow demotion, and drop accounting
+    /// are one critical section. Catch-up promotion takes the same lock, so a
+    /// racing batch is either admitted after `Ok` or advances the replay epoch.
+    fn try_forward(
+        &self,
+        tx: &mpsc::Sender<SinkMessage>,
+        batch: &RowBatch,
+    ) -> BackendForwardOutcome {
+        let mut state = self.state.lock().expect("backend status mutex poisoned");
+        let persist_checkpoint = match state.status {
+            BackendSinkStatus::Ok => true,
+            BackendSinkStatus::CatchingUp => false,
+            _ => {
+                state.drop_epoch = state.drop_epoch.saturating_add(1);
+                state.dropped_batches = state.dropped_batches.saturating_add(1);
+                return BackendForwardOutcome::DroppedWhilePaused;
+            }
+        };
+        let permit = match tx.try_reserve() {
+            Ok(permit) => permit,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                state.drop_epoch = state.drop_epoch.saturating_add(1);
+                state.dropped_batches = state.dropped_batches.saturating_add(1);
+                if state.status == BackendSinkStatus::Ok {
+                    state.status = BackendSinkStatus::Lagging;
+                }
+                return BackendForwardOutcome::Overflowed;
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                state.drop_epoch = state.drop_epoch.saturating_add(1);
+                state.dropped_batches = state.dropped_batches.saturating_add(1);
+                state.status = BackendSinkStatus::Unreachable;
+                return BackendForwardOutcome::Closed;
+            }
+        };
+        let epoch = state.drop_epoch;
+        drop(state);
+        permit.send(SinkMessage::BackendBatch {
+            batch: batch.clone(),
+            epoch,
+            persist_checkpoint,
+        });
+        BackendForwardOutcome::Queued
     }
 
     /// Sink-side: a flush failed. Returns true on the transition to
     /// Unreachable so the caller can warn once per outage.
     pub(crate) fn mark_flush_failure(&self) -> bool {
-        let mut status = self.status.lock().expect("backend status mutex poisoned");
-        match *status {
-            BackendSinkStatus::Ok | BackendSinkStatus::Lagging => {
-                *status = BackendSinkStatus::Unreachable;
+        let mut state = self.state.lock().expect("backend status mutex poisoned");
+        match state.status {
+            BackendSinkStatus::Ok | BackendSinkStatus::Lagging | BackendSinkStatus::CatchingUp => {
+                state.status = BackendSinkStatus::Unreachable;
                 true
             }
             _ => false,
         }
     }
 
-    /// Sink-side: a flush succeeded with an empty queue. Returns true on the
-    /// transition back to Ok so the caller can schedule catch-up replay.
+    /// Sink-side: a flush succeeded with an empty queue. Recovery enters
+    /// catch-up; only the supervisor's durability barrier may promote to Ok.
     pub(crate) fn mark_recovered(&self) -> bool {
-        let mut status = self.status.lock().expect("backend status mutex poisoned");
-        match *status {
+        let mut state = self.state.lock().expect("backend status mutex poisoned");
+        match state.status {
             BackendSinkStatus::Lagging | BackendSinkStatus::Unreachable => {
-                *status = BackendSinkStatus::Ok;
+                state.status = BackendSinkStatus::CatchingUp;
                 true
             }
             _ => false,
         }
     }
+
+    /// Sink-side: an admitted live batch was rejected before insert. Invalidate
+    /// every queued live checkpoint from the same admission epoch. Returning
+    /// true means an `Ok` backend re-entered catch-up and needs a wake-up.
+    pub(crate) fn invalidate_checkpoint_authority(&self, epoch: Option<u64>) -> bool {
+        let mut state = self.state.lock().expect("backend status mutex poisoned");
+        if epoch.is_some_and(|epoch| state.drop_epoch != epoch) {
+            return false;
+        }
+        state.drop_epoch = state.drop_epoch.saturating_add(1);
+        state.dropped_batches = state.dropped_batches.saturating_add(1);
+        if state.status == BackendSinkStatus::Ok {
+            state.status = BackendSinkStatus::CatchingUp;
+            return true;
+        }
+        false
+    }
+
+    pub(crate) fn can_persist_backend_checkpoint(&self, epoch: u64) -> bool {
+        let state = self.state.lock().expect("backend status mutex poisoned");
+        state.status == BackendSinkStatus::Ok && state.drop_epoch == epoch
+    }
+
+    fn begin_catch_up(&self) -> u64 {
+        let mut state = self.state.lock().expect("backend status mutex poisoned");
+        state.status = BackendSinkStatus::CatchingUp;
+        state.drop_epoch
+    }
+
+    fn catch_up_epoch(&self) -> Option<u64> {
+        let state = self.state.lock().expect("backend status mutex poisoned");
+        (state.status == BackendSinkStatus::CatchingUp).then_some(state.drop_epoch)
+    }
+
+    fn try_mark_caught_up(&self, expected_epoch: u64) -> bool {
+        let mut state = self.state.lock().expect("backend status mutex poisoned");
+        if state.status == BackendSinkStatus::CatchingUp && state.drop_epoch == expected_epoch {
+            state.status = BackendSinkStatus::Ok;
+            return true;
+        }
+        false
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackendForwardOutcome {
+    Queued,
+    DroppedWhilePaused,
+    Overflowed,
+    Closed,
 }
 
 /// Backend status cells keyed by backend name, shared with the default
 /// sink's heartbeat. `BTreeMap` keeps the heartbeat JSON deterministic.
 pub(crate) type StatusRegistry = Arc<Mutex<BTreeMap<String, Arc<BackendSinkCell>>>>;
-
-/// Checkpoint floor for the next catch-up replay pass, written by the
-/// backend's sink task at the recovery transition and taken by its
-/// supervisor when the pass is scheduled. Replay must never resume from the
-/// live-updating checkpoint map: live batches carry the default pipeline's
-/// offsets, and adopting one for a file the pass has not covered yet would
-/// silently skip the very span the pass exists to recover.
-pub(crate) type ReplayFloor = Arc<Mutex<Option<HashMap<String, Checkpoint>>>>;
 
 /// JSON-encoded `{backend: status}` map for the heartbeat's `backend_sinks`
 /// column; `None` when no backend sinks exist (so default-only installs
@@ -434,7 +541,14 @@ pub(crate) fn spawn_tee_router(
             ensure_backend(&name, &context, &mut handles);
         }
 
-        while let Some(SinkMessage::Batch(mut batch)) = rx.recv().await {
+        while let Some(message) = rx.recv().await {
+            let mut batch = match message {
+                SinkMessage::Batch(batch) => batch,
+                SinkMessage::BackendBatch { .. } | SinkMessage::FlushBarrier(_) => {
+                    error!("processor channel received a backend-only sink message");
+                    continue;
+                }
+            };
             redact_default_batch_if_enabled(&context.config, &context.redaction, &mut batch);
 
             let targets = {
@@ -583,7 +697,7 @@ fn ensure_backend<'a>(
             .insert(name.to_string(), cell.clone());
 
         if context.config.identity.author.is_empty() {
-            cell.set_status(BackendSinkStatus::DisabledMissingIdentityAuthor);
+            cell.disable_missing_identity_author();
             warn!(
                 backend = name,
                 "mirror sink disabled: [identity].author is required for non-default backends"
@@ -620,33 +734,20 @@ fn forward_to_backend(handle: &BackendHandle, batch: &RowBatch) {
         return;
     };
 
-    if !cell.is_live() || cell.status() != BackendSinkStatus::Ok {
-        // Not accepting (connecting / lagging / unreachable / disabled):
-        // drop the mirror copy. Replay recovers it from the source file.
-        cell.record_drop();
-        return;
-    }
-
-    match tx.try_send(SinkMessage::Batch(batch.clone())) {
-        Ok(()) => {}
-        Err(mpsc::error::TrySendError::Full(_)) => {
-            cell.record_drop();
-            if cell.mark_overflow() {
-                warn!(
-                    backend = cell.name(),
-                    "mirror queue full; backend marked lagging and live mirroring paused \
-                     (catch-up replay will recover the gap once it drains)"
-                );
-            }
+    match cell.try_forward(tx, batch) {
+        BackendForwardOutcome::Queued | BackendForwardOutcome::DroppedWhilePaused => {}
+        BackendForwardOutcome::Overflowed => {
+            warn!(
+                backend = cell.name(),
+                "mirror queue full; replay epoch invalidated and live mirroring paused \
+                 until catch-up closes the dropped gap"
+            );
         }
-        Err(mpsc::error::TrySendError::Closed(_)) => {
-            cell.record_drop();
-            if cell.mark_flush_failure() {
-                warn!(
-                    backend = cell.name(),
-                    "mirror sink channel closed unexpectedly; backend marked unreachable"
-                );
-            }
+        BackendForwardOutcome::Closed => {
+            warn!(
+                backend = cell.name(),
+                "mirror sink channel closed unexpectedly; backend marked unreachable"
+            );
         }
     }
 }
@@ -656,7 +757,7 @@ fn forward_to_backend(handle: &BackendHandle, batch: &RowBatch) {
 /// load from the backend's own database, sink task spawn, then catch-up
 /// replay passes re-armed on every recovery.
 fn spawn_backend_supervisor(
-    backend_cfg: ClickHouseConfig,
+    mut backend_cfg: ClickHouseConfig,
     cell: Arc<BackendSinkCell>,
     replay_tx: mpsc::Sender<SinkMessage>,
     backend_rx: mpsc::Receiver<SinkMessage>,
@@ -665,10 +766,14 @@ fn spawn_backend_supervisor(
     tokio::spawn(async move {
         let name = cell.name().to_string();
         let allow_newer_server = backend_cfg.allow_newer_server;
+        // A replay barrier may only acknowledge after every earlier row is
+        // inserted. Preserve async batching, but never allow a named mirror
+        // backend to acknowledge an async insert before ClickHouse flushes it.
+        backend_cfg.wait_for_async_insert = true;
         let client = match ClickHouseClient::new(backend_cfg) {
             Ok(client) => client,
             Err(exc) => {
-                cell.set_status(BackendSinkStatus::Unreachable);
+                cell.mark_unreachable();
                 error!(backend = %name, "failed to construct clickhouse client: {exc}");
                 return;
             }
@@ -681,14 +786,14 @@ fn spawn_backend_supervisor(
                         Ok(()) => break,
                         Err(exc) => {
                             // Terminal until restart; the default sink is unaffected.
-                            cell.set_status(BackendSinkStatus::DisabledSkew);
+                            cell.disable_skew();
                             error!(backend = %name, "backend sink disabled (schema skew): {exc}");
                             return;
                         }
                     }
                 }
                 Err(exc) => {
-                    cell.set_status(BackendSinkStatus::Unreachable);
+                    cell.mark_unreachable();
                     warn!(
                         backend = %name,
                         "schema handshake failed; retrying in {}s: {exc}",
@@ -710,7 +815,7 @@ fn spawn_backend_supervisor(
             match crate::load_checkpoints(&client, true, Some(&host)).await {
                 Ok(map) => break map,
                 Err(exc) => {
-                    cell.set_status(BackendSinkStatus::Unreachable);
+                    cell.mark_unreachable();
                     warn!(
                         backend = %name,
                         "failed to load backend checkpoints; retrying in {}s: {exc}",
@@ -720,16 +825,10 @@ fn spawn_backend_supervisor(
                 }
             }
         };
-        // The durable checkpoints, snapshotted before the sink can advance
-        // them, are the first replay pass's floor: the pass must resume
-        // from state the backend has actually flushed, never from the live
-        // map (see `ReplayFloor`).
-        let mut floor = Arc::new(RwLock::new(durable.clone()));
         let checkpoints = Arc::new(RwLock::new(durable));
 
         let metrics = Arc::new(Metrics::default());
         let replay_notify = Arc::new(Notify::new());
-        let replay_floor: ReplayFloor = Arc::new(Mutex::new(None));
         spawn_sink_task(
             context.config.as_ref().clone(),
             client,
@@ -742,72 +841,87 @@ fn spawn_backend_supervisor(
                 cell: cell.clone(),
                 resolver: context.resolver.clone(),
                 replay_notify: replay_notify.clone(),
-                replay_floor: replay_floor.clone(),
                 redactor: context.redaction.redactor.clone(),
                 redactions: context.redaction.audit.clone(),
             },
         );
 
-        // Go live before replaying: every batch the router forwards from
-        // here on covers file state newer than the snapshot floor above, so
-        // the pass and live mirroring overlap rather than gap — the pass
-        // closes everything between the floor and "now" (duplicate spans
-        // collapse via event-UID ReplacingMergeTree, like the rest of the
-        // pipeline).
-        cell.set_status(BackendSinkStatus::Ok);
-        cell.mark_live();
-        info!(backend = %name, "backend sink live; starting catch-up replay");
+        // Live rows may drain as checkpoint-suppressed deltas while replay and
+        // an ordered sink barrier establish a durable contiguous checkpoint.
+        // This prevents a newer live checkpoint from surviving a crash ahead
+        // of a dropped span without requiring a replay-length quiet window.
+        cell.begin_catch_up();
+        info!(backend = %name, "backend sink ready; starting catch-up replay");
 
         let mut reported_lost = HashSet::<String>::new();
         loop {
-            run_replay_pass(
+            let Some(epoch) = cell.catch_up_epoch() else {
+                replay_notify.notified().await;
+                continue;
+            };
+
+            let replay_complete = run_replay_pass(
                 &context.config,
                 context.sources.as_slice(),
-                &floor,
+                &checkpoints,
                 &replay_tx,
                 &metrics,
                 &name,
                 &mut reported_lost,
             )
             .await;
-            // Re-arm on the next lagging/unreachable -> ok recovery. The
-            // notify holds a permit, so a recovery that fires mid-pass
-            // immediately schedules another pass for the span it missed.
-            replay_notify.notified().await;
-            // Adopt the floor the sink captured at the recovery transition
-            // (by now the live map may already carry post-recovery
-            // checkpoints that jump the dropped span). A missing capture
-            // keeps the previous, lower floor — which only ever means
-            // re-reading more, never skipping.
-            if let Some(captured) = replay_floor
-                .lock()
-                .expect("replay floor mutex poisoned")
-                .take()
-            {
-                floor = Arc::new(RwLock::new(captured));
+
+            if !replay_complete {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
             }
-            info!(backend = %name, "backend recovered; replaying to catch up");
+
+            let (barrier_tx, barrier_rx) = tokio::sync::oneshot::channel();
+            if replay_tx
+                .send(SinkMessage::FlushBarrier(barrier_tx))
+                .await
+                .is_err()
+            {
+                cell.mark_flush_failure();
+                error!(backend = %name, "mirror sink closed before replay durability barrier");
+                return;
+            }
+            if barrier_rx.await.is_err() {
+                cell.mark_flush_failure();
+                error!(backend = %name, "mirror sink closed before replay durability barrier");
+                return;
+            }
+
+            if cell.try_mark_caught_up(epoch) {
+                info!(
+                    backend = %name,
+                    "backend replay reached a durable fixed point; live mirroring enabled"
+                );
+                continue;
+            }
+
+            // A routed batch was dropped while this pass was running, or the
+            // sink experienced another outage. Re-read from the now-durable
+            // checkpoint map; replay-stable event IDs make the overlap safe.
+            tokio::task::yield_now().await;
         }
     })
 }
 
-/// One targeted catch-up pass: re-enqueue every tracked file against a
-/// floor snapshot of the backend's own checkpoints (never the live map the
-/// sink advances — see `ReplayFloor`). `process_file` early-exits for
-/// caught-up files (a stat + offset compare), so a pass over a converged
-/// tree is cheap; files the backend has never seen are read in full,
-/// filtered at the sink, and checkpointed so the next pass's floor skips
-/// them.
+/// One targeted catch-up pass. Live deltas may share the sink while this runs,
+/// but only replay messages persist checkpoints. An ordered sink barrier makes
+/// every replay checkpoint update durable before promotion.
 #[allow(clippy::too_many_arguments)]
 async fn run_replay_pass(
     config: &AppConfig,
     sources: &[IngestSource],
-    floor: &Arc<RwLock<HashMap<String, Checkpoint>>>,
+    checkpoints: &Arc<RwLock<HashMap<String, Checkpoint>>>,
     tx: &mpsc::Sender<SinkMessage>,
     metrics: &Arc<Metrics>,
     backend: &str,
     reported_lost: &mut HashSet<String>,
-) {
+) -> bool {
+    let mut complete = true;
     for source in sources {
         let files = match enumerate_tracked_files(&source.glob, source.format) {
             Ok(files) => files,
@@ -817,6 +931,7 @@ async fn run_replay_pass(
                     source = %source.name,
                     "replay enumerate failed: {exc}"
                 );
+                complete = false;
                 continue;
             }
         };
@@ -828,7 +943,7 @@ async fn run_replay_pass(
         // trip this warning.
         {
             let enumerated: HashSet<&str> = files.iter().map(String::as_str).collect();
-            let map = floor.read().await;
+            let map = checkpoints.read().await;
             for cp in map.values() {
                 if cp.source_name == source.name
                     && !enumerated.contains(cp.source_file.as_str())
@@ -845,8 +960,8 @@ async fn run_replay_pass(
             }
         }
 
-        // Replay reads against this backend's own floor, not the live
-        // pipeline's, so it gets a fresh volatile map: every file scans.
+        // Each pass gets a fresh volatile poll map. Durable offsets/cursors
+        // still come from the backend checkpoint map.
         let poll_state = crate::sqlite_poll::VolatilePollMap::new();
         for path in files {
             let work = WorkItem {
@@ -861,13 +976,14 @@ async fn run_replay_pass(
             if let Err(exc) = process_file(
                 config,
                 &work,
-                floor.clone(),
+                checkpoints.clone(),
                 &poll_state,
                 tx.clone(),
                 metrics,
             )
             .await
             {
+                complete = false;
                 warn!(
                     backend,
                     source = %work.source_name,
@@ -877,6 +993,7 @@ async fn run_replay_pass(
             }
         }
     }
+    complete
 }
 
 #[cfg(test)]
@@ -894,7 +1011,7 @@ mod tests {
     use serde_json::json;
     use std::fs;
     use std::path::PathBuf;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
     use tokio::time::timeout;
 
@@ -1166,29 +1283,28 @@ mod tests {
         let cell = BackendSinkCell::new("team-ch");
         assert_eq!(cell.status(), BackendSinkStatus::Connecting);
 
-        cell.set_status(BackendSinkStatus::Ok);
-        assert!(
-            cell.mark_overflow(),
-            "first overflow transitions to lagging"
-        );
-        assert!(!cell.mark_overflow(), "subsequent overflows are silent");
-        assert_eq!(cell.status(), BackendSinkStatus::Lagging);
+        let epoch = cell.begin_catch_up();
+        assert_eq!(cell.status(), BackendSinkStatus::CatchingUp);
+        assert!(cell.try_mark_caught_up(epoch));
+        assert_eq!(cell.status(), BackendSinkStatus::Ok);
 
         assert!(cell.mark_flush_failure());
         assert!(!cell.mark_flush_failure());
         assert_eq!(cell.status(), BackendSinkStatus::Unreachable);
 
         assert!(cell.mark_recovered());
-        assert!(!cell.mark_recovered(), "recovery from ok is a no-op");
-        assert_eq!(cell.status(), BackendSinkStatus::Ok);
+        assert!(
+            !cell.mark_recovered(),
+            "recovery from catching up is a no-op"
+        );
+        assert_eq!(cell.status(), BackendSinkStatus::CatchingUp);
     }
 
     #[test]
     fn disabled_skew_is_terminal() {
         let cell = BackendSinkCell::new("team-ch");
-        cell.set_status(BackendSinkStatus::DisabledSkew);
+        cell.set_status_for_test(BackendSinkStatus::DisabledSkew);
 
-        assert!(!cell.mark_overflow());
         assert!(!cell.mark_flush_failure());
         assert!(!cell.mark_recovered());
         assert_eq!(cell.status(), BackendSinkStatus::DisabledSkew);
@@ -1197,9 +1313,8 @@ mod tests {
     #[test]
     fn disabled_missing_identity_author_is_terminal() {
         let cell = BackendSinkCell::new("team-ch");
-        cell.set_status(BackendSinkStatus::DisabledMissingIdentityAuthor);
+        cell.set_status_for_test(BackendSinkStatus::DisabledMissingIdentityAuthor);
 
-        assert!(!cell.mark_overflow());
         assert!(!cell.mark_flush_failure());
         assert!(!cell.mark_recovered());
         assert_eq!(
@@ -1215,11 +1330,11 @@ mod tests {
         assert_eq!(backend_sinks_json(&registry), None);
 
         let lagging = Arc::new(BackendSinkCell::new("b-lagging"));
-        lagging.set_status(BackendSinkStatus::Lagging);
+        lagging.set_status_for_test(BackendSinkStatus::Lagging);
         let disabled = Arc::new(BackendSinkCell::new("c-disabled"));
-        disabled.set_status(BackendSinkStatus::DisabledMissingIdentityAuthor);
+        disabled.set_status_for_test(BackendSinkStatus::DisabledMissingIdentityAuthor);
         let ok = Arc::new(BackendSinkCell::new("a-ok"));
-        ok.set_status(BackendSinkStatus::Ok);
+        ok.set_status_for_test(BackendSinkStatus::Ok);
         {
             let mut cells = registry.lock().expect("registry mutex poisoned");
             cells.insert("b-lagging".to_string(), lagging);
@@ -1239,8 +1354,7 @@ mod tests {
     async fn forward_never_blocks_and_marks_overflow_as_lagging() {
         let (tx, mut backend_rx) = mpsc::channel::<SinkMessage>(1);
         let cell = Arc::new(BackendSinkCell::new("team-ch"));
-        cell.set_status(BackendSinkStatus::Ok);
-        cell.mark_live();
+        cell.set_status_for_test(BackendSinkStatus::Ok);
         let handle = BackendHandle::Active {
             tx,
             cell: cell.clone(),
@@ -1258,6 +1372,166 @@ mod tests {
             backend_rx.try_recv().is_err(),
             "overflowed batches are dropped, not queued"
         );
+
+        assert!(cell.mark_recovered());
+        assert_eq!(cell.status(), BackendSinkStatus::CatchingUp);
+        forward_to_backend(&handle, &batch);
+        assert!(
+            matches!(
+                backend_rx.try_recv(),
+                Ok(SinkMessage::BackendBatch {
+                    persist_checkpoint: false,
+                    ..
+                })
+            ),
+            "catch-up admits live rows without letting them advance checkpoints"
+        );
+        assert_eq!(cell.dropped_batches(), 2);
+    }
+
+    #[tokio::test]
+    async fn catch_up_admits_deltas_but_overflow_invalidates_promotion() {
+        let (tx, mut backend_rx) = mpsc::channel::<SinkMessage>(1);
+        let cell = Arc::new(BackendSinkCell::new("team-ch"));
+        let handle = BackendHandle::Active {
+            tx,
+            cell: cell.clone(),
+        };
+        let batch = mixed_session_batch();
+
+        let first_epoch = cell.begin_catch_up();
+        forward_to_backend(&handle, &batch);
+        assert!(matches!(
+            backend_rx.try_recv(),
+            Ok(SinkMessage::BackendBatch {
+                persist_checkpoint: false,
+                ..
+            })
+        ));
+        assert!(
+            cell.try_mark_caught_up(first_epoch),
+            "accepted catch-up deltas must not require a replay-length quiet window"
+        );
+
+        cell.mark_flush_failure();
+        assert!(cell.mark_recovered());
+        let overflow_epoch = cell.catch_up_epoch().expect("catch-up epoch");
+        forward_to_backend(&handle, &batch); // fills the bounded delta path
+        forward_to_backend(&handle, &batch); // actual drop invalidates this pass
+        assert!(
+            !cell.try_mark_caught_up(overflow_epoch),
+            "a catch-up delta overflow must reject promotion"
+        );
+        assert_eq!(cell.dropped_batches(), 1);
+        assert!(matches!(
+            backend_rx.try_recv(),
+            Ok(SinkMessage::BackendBatch {
+                persist_checkpoint: false,
+                ..
+            })
+        ));
+
+        let second_epoch = cell.catch_up_epoch().expect("still catching up");
+        assert!(cell.try_mark_caught_up(second_epoch));
+        forward_to_backend(&handle, &batch);
+        assert!(
+            matches!(
+                backend_rx.try_recv(),
+                Ok(SinkMessage::BackendBatch {
+                    persist_checkpoint: true,
+                    ..
+                })
+            ),
+            "a router arriving after atomic promotion must enter the live queue"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn continuous_in_capacity_deltas_do_not_block_catch_up_promotion() {
+        let (tx, mut backend_rx) = mpsc::channel::<SinkMessage>(8);
+        let cell = Arc::new(BackendSinkCell::new("team-ch"));
+        let epoch = cell.begin_catch_up();
+        let accepted = Arc::new(AtomicUsize::new(0));
+
+        let consumer_accepted = accepted.clone();
+        let consumer = tokio::spawn(async move {
+            while let Some(message) = backend_rx.recv().await {
+                match message {
+                    SinkMessage::BackendBatch {
+                        batch,
+                        persist_checkpoint: false,
+                        ..
+                    } => {
+                        assert!(
+                            batch.checkpoint.is_some(),
+                            "delta keeps the end-of-scan boundary for sink finalization"
+                        );
+                        consumer_accepted.fetch_add(1, Ordering::Relaxed);
+                    }
+                    SinkMessage::Batch(_)
+                    | SinkMessage::BackendBatch {
+                        persist_checkpoint: true,
+                        ..
+                    } => {}
+                    SinkMessage::FlushBarrier(barrier) => {
+                        let _ = barrier.send(());
+                    }
+                }
+            }
+        });
+
+        let producer_cell = cell.clone();
+        let producer_tx = tx.clone();
+        let producer = tokio::spawn(async move {
+            let mut batch = mixed_session_batch();
+            batch.checkpoint = Some(Checkpoint {
+                source_name: "source-a".to_string(),
+                source_file: "/tmp/source-a.jsonl".to_string(),
+                source_inode: 1,
+                source_generation: 1,
+                last_offset: 100,
+                last_line_no: 1,
+                status: "active".to_string(),
+                ..Default::default()
+            });
+            while producer_cell.status() == BackendSinkStatus::CatchingUp {
+                assert_eq!(
+                    producer_cell.try_forward(&producer_tx, &batch),
+                    BackendForwardOutcome::Queued,
+                    "in-capacity live traffic must stay on the bounded delta path"
+                );
+                tokio::task::yield_now().await;
+            }
+        });
+
+        timeout(Duration::from_secs(2), async {
+            while accepted.load(Ordering::Relaxed) < 20 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("continuous delta admission made progress");
+
+        let (barrier_tx, barrier_rx) = tokio::sync::oneshot::channel();
+        tx.send(SinkMessage::FlushBarrier(barrier_tx))
+            .await
+            .expect("queue replay barrier");
+        barrier_rx.await.expect("barrier sender dropped");
+        assert!(
+            cell.try_mark_caught_up(epoch),
+            "accepted deltas do not invalidate fixed-point promotion"
+        );
+        timeout(Duration::from_secs(2), producer)
+            .await
+            .expect("producer observes promotion")
+            .expect("producer does not panic");
+        assert_eq!(cell.dropped_batches(), 0);
+
+        drop(tx);
+        timeout(Duration::from_secs(2), consumer)
+            .await
+            .expect("consumer exits")
+            .expect("consumer does not panic");
     }
 
     #[tokio::test]
@@ -1283,7 +1557,7 @@ mod tests {
     #[test]
     fn forward_disabled_backend_is_noop_without_drop_accounting() {
         let cell = Arc::new(BackendSinkCell::new("team-ch"));
-        cell.set_status(BackendSinkStatus::DisabledMissingIdentityAuthor);
+        cell.set_status_for_test(BackendSinkStatus::DisabledMissingIdentityAuthor);
         let handle = BackendHandle::Disabled { cell: cell.clone() };
 
         forward_to_backend(&handle, &mixed_session_batch());
@@ -1320,7 +1594,10 @@ mod tests {
             cell.status(),
             BackendSinkStatus::DisabledMissingIdentityAuthor
         );
-        assert!(!cell.is_live());
+        assert_eq!(
+            cell.status(),
+            BackendSinkStatus::DisabledMissingIdentityAuthor
+        );
     }
 
     async fn wait_for_status(
@@ -1441,7 +1718,7 @@ mod tests {
             .await,
             "connection-refused handshake must surface as unreachable"
         );
-        assert!(!cell.is_live());
+        assert_ne!(cell.status(), BackendSinkStatus::Ok);
         handle.abort();
     }
 
@@ -1519,7 +1796,7 @@ mod tests {
             .await,
             "server-ahead skew with allow_newer_server=false must disable the sink"
         );
-        assert!(!cell.is_live());
+        assert_ne!(cell.status(), BackendSinkStatus::Ok);
         assert!(
             state
                 .write_statements
@@ -1596,7 +1873,10 @@ mod tests {
         let SinkMessage::Batch(batch) = timeout(Duration::from_millis(200), rx.recv())
             .await
             .expect("replay batch within timeout")
-            .expect("replay batch present");
+            .expect("replay batch present")
+        else {
+            panic!("replay processor emitted a sink control message")
+        };
         assert_eq!(batch.raw_rows.len(), 2);
         let checkpoint = batch.checkpoint.clone().expect("replay checkpoint");
 

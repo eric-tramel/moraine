@@ -5,8 +5,8 @@ use crate::normalize::finalize_batch_event_identities;
 use crate::redaction::{RedactionAudit, SecretRedactor};
 use crate::sources::shared::truncate_chars;
 use crate::tee::{
-    backend_sinks_json, filter_batch_for_backend, BackendSinkCell, ReplayFloor,
-    SharedRouteResolver, StatusRegistry,
+    backend_sinks_json, filter_batch_for_backend, BackendSinkCell, SharedRouteResolver,
+    StatusRegistry,
 };
 use crate::{
     DispatchState, Metrics, SinkMessage, WATCHER_BACKEND_MIXED, WATCHER_BACKEND_NATIVE,
@@ -18,7 +18,7 @@ use moraine_clickhouse::{is_oversized_json_each_row_insert_error, ClickHouseClie
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -28,6 +28,18 @@ struct IdentityScope {
     source_name: String,
     source_file: String,
     source_generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum IdentityLane {
+    Durable,
+    BackendLive,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct IdentityMapKey {
+    scope: IdentityScope,
+    lane: IdentityLane,
 }
 
 fn batch_identity_scope(batch: &RowBatch) -> Option<IdentityScope> {
@@ -193,13 +205,9 @@ pub(crate) enum SinkRole {
     Backend {
         cell: Arc<BackendSinkCell>,
         resolver: SharedRouteResolver,
-        /// Signalled on the lagging/unreachable -> ok transition so the
+        /// Signalled on the lagging/unreachable -> catching-up transition so the
         /// backend's supervisor schedules a catch-up replay pass.
         replay_notify: Arc<Notify>,
-        /// Checkpoint floor handed to that pass, captured at the same
-        /// transition (see `note_flush_outcome` for why it must be taken
-        /// here, inside the sink task, and not when the supervisor wakes).
-        replay_floor: ReplayFloor,
         redactor: Arc<SecretRedactor>,
         redactions: Arc<RedactionAudit>,
     },
@@ -233,16 +241,10 @@ impl SinkAuthorConfig {
 /// Backend-role health bookkeeping after a flush attempt; no-op for the
 /// default sink. Recovery requires a drained queue so one successful flush
 /// mid-backlog does not trigger a replay storm.
-async fn note_flush_outcome(
-    role: &SinkRole,
-    checkpoints: &Arc<RwLock<HashMap<String, Checkpoint>>>,
-    flush_ok: bool,
-    queue_drained: bool,
-) {
+fn note_flush_outcome(role: &SinkRole, flush_ok: bool, queue_drained: bool) {
     let SinkRole::Backend {
         cell,
         replay_notify,
-        replay_floor,
         ..
     } = role
     else {
@@ -261,14 +263,6 @@ async fn note_flush_outcome(
     }
 
     if queue_drained && cell.mark_recovered() {
-        // Capture the replay floor BEFORE signalling the supervisor. This
-        // sink task is the checkpoint map's only writer and has not yet
-        // accepted any post-recovery batch, so the snapshot cannot contain
-        // a live-forwarded checkpoint that jumps past the outage's dropped
-        // span — the gap the scheduled pass exists to close. Snapshotting
-        // when the supervisor wakes instead would race the next live flush.
-        let floor = checkpoints.read().await.clone();
-        *replay_floor.lock().expect("replay floor mutex poisoned") = Some(floor);
         info!(
             backend = cell.name(),
             dropped_batches = cell.dropped_batches(),
@@ -360,7 +354,9 @@ pub(crate) fn spawn_sink_task(
             config.ingest.ack_observation && matches!(&role, SinkRole::Default { .. }),
         );
         let mut pending_ack = PendingAckBatch::default();
-        let mut identity_maps = HashMap::<IdentityScope, HashMap<String, String>>::new();
+        let mut pending_flush_barrier: Option<tokio::sync::oneshot::Sender<()>> = None;
+        let mut identity_maps = HashMap::<IdentityMapKey, HashMap<String, String>>::new();
+        let mut rejected_scopes = HashSet::<IdentityMapKey>::new();
 
         // Mirror sinks share one ingest_checkpoints table per team backend,
         // so their rows are scoped per host (migration 018; guaranteed
@@ -417,10 +413,14 @@ pub(crate) fn spawn_sink_task(
                     &mut pending_ack,
                 )
                 .await;
-                note_flush_outcome(&role, &checkpoints, flush_ok, rx.is_empty()).await;
+                let barrier_waiting = pending_flush_barrier.is_some();
+                note_flush_outcome(&role, flush_ok, barrier_waiting || rx.is_empty());
                 if flush_ok {
                     pending_batch_bytes = 0;
                     throttling_flush_retries = false;
+                    if let Some(barrier) = pending_flush_barrier.take() {
+                        let _ = barrier.send(());
+                    }
                     info!("flush retry succeeded; resuming sink intake");
                 } else {
                     tokio::select! {
@@ -436,7 +436,32 @@ pub(crate) fn spawn_sink_task(
             tokio::select! {
                 maybe_msg = rx.recv() => {
                     match maybe_msg {
-                        Some(SinkMessage::Batch(batch)) => {
+                        Some(message @ (SinkMessage::Batch(_) | SinkMessage::BackendBatch { .. })) => {
+                            let (batch, persist_checkpoint, backend_epoch, identity_lane) = match message {
+                                SinkMessage::Batch(batch) => {
+                                    (batch, true, None, IdentityLane::Durable)
+                                }
+                                SinkMessage::BackendBatch {
+                                    batch,
+                                    epoch,
+                                    persist_checkpoint,
+                                } => {
+                                    let SinkRole::Backend { cell, .. } = &role else {
+                                        tracing::error!(
+                                            "default sink received a backend-only batch"
+                                        );
+                                        continue;
+                                    };
+                                    (
+                                        batch,
+                                        persist_checkpoint
+                                            && cell.can_persist_backend_checkpoint(epoch),
+                                        Some(epoch),
+                                        IdentityLane::BackendLive,
+                                    )
+                                }
+                                SinkMessage::FlushBarrier(_) => unreachable!(),
+                            };
                             // Mirror sinks only buffer the sessions routed to
                             // them; the default sink takes batches whole.
                             let mut batch = match &role {
@@ -459,11 +484,29 @@ pub(crate) fn spawn_sink_task(
                             };
                             author.apply_to_batch(&mut batch);
                             let identity_scope = batch_identity_scope(&batch);
+                            let identity_key = identity_scope.clone().map(|scope| IdentityMapKey {
+                                scope,
+                                lane: identity_lane,
+                            });
+                            let backend_role = matches!(&role, SinkRole::Backend { .. });
                             let scan_complete = batch.checkpoint.is_some();
-                            let finalization = if let Some(scope) = identity_scope.as_ref() {
+                            if backend_role
+                                && identity_key
+                                    .as_ref()
+                                    .is_some_and(|key| rejected_scopes.contains(key))
+                            {
+                                if scan_complete {
+                                    if let Some(key) = identity_key.as_ref() {
+                                        rejected_scopes.remove(key);
+                                        identity_maps.remove(key);
+                                    }
+                                }
+                                continue;
+                            }
+                            let finalization = if let Some(key) = identity_key.as_ref() {
                                 finalize_batch_event_identities(
                                     &mut batch,
-                                    identity_maps.entry(scope.clone()).or_default(),
+                                    identity_maps.entry(key.clone()).or_default(),
                                 )
                             } else {
                                 finalize_batch_event_identities(
@@ -471,16 +514,33 @@ pub(crate) fn spawn_sink_task(
                                     &mut HashMap::new(),
                                 )
                             };
-                            if scan_complete {
-                                if let Some(scope) = identity_scope.as_ref() {
-                                    identity_maps.remove(scope);
-                                }
-                            }
                             if let Err(error) = finalization {
+                                if let SinkRole::Backend {
+                                    cell,
+                                    replay_notify,
+                                    ..
+                                } = &role
+                                {
+                                    if cell.invalidate_checkpoint_authority(backend_epoch) {
+                                        replay_notify.notify_one();
+                                    }
+                                }
+                                if let Some(key) = identity_key.as_ref() {
+                                    identity_maps.remove(key);
+                                    if backend_role && !scan_complete {
+                                        rejected_scopes.insert(key.clone());
+                                    }
+                                }
                                 warn!(
                                     "rejecting malformed normalized batch before insert: {error:#}"
                                 );
                                 continue;
+                            }
+                            if scan_complete {
+                                if let Some(key) = identity_key.as_ref() {
+                                    identity_maps.remove(key);
+                                    rejected_scopes.remove(key);
+                                }
                             }
                             pending_batch_bytes =
                                 pending_batch_bytes.saturating_add(batch.approx_bytes());
@@ -488,8 +548,10 @@ pub(crate) fn spawn_sink_task(
                             event_rows.extend(batch.event_rows);
                             link_rows.extend(batch.link_rows);
                             error_rows.extend(batch.error_rows);
-                            if let Some(cp) = batch.checkpoint {
-                                merge_checkpoint(&mut checkpoint_updates, cp);
+                            if persist_checkpoint {
+                                if let Some(cp) = batch.checkpoint {
+                                    merge_checkpoint(&mut checkpoint_updates, cp);
+                                }
                             }
 
                             let total_rows =
@@ -517,7 +579,7 @@ pub(crate) fn spawn_sink_task(
                     &ack_observer,
                     &mut pending_ack,
                                 ).await;
-                                note_flush_outcome(&role, &checkpoints, flush_ok, rx.is_empty()).await;
+                                note_flush_outcome(&role, flush_ok, rx.is_empty());
                                 if !flush_ok {
                                     if !throttling_flush_retries {
                                         warn!(
@@ -529,6 +591,47 @@ pub(crate) fn spawn_sink_task(
                                 } else {
                                     pending_batch_bytes = 0;
                                 }
+                            }
+                        }
+                        Some(SinkMessage::FlushBarrier(barrier)) => {
+                            if has_pending_data(
+                                &raw_rows,
+                                &event_rows,
+                                &link_rows,
+                                &error_rows,
+                                &checkpoint_updates,
+                            ) {
+                                let flush_ok = flush_pending_with_ack(
+                                    &clickhouse,
+                                    &checkpoints,
+                                    &metrics,
+                                    &mut raw_rows,
+                                    &mut event_rows,
+                                    &mut link_rows,
+                                    &mut error_rows,
+                                    &mut checkpoint_updates,
+                                    checkpoint_cursor_columns,
+                                    &checkpoint_host,
+                                    &ack_observer,
+                                    &mut pending_ack,
+                                )
+                                .await;
+                                // The barrier is the ordered drain point for
+                                // every earlier message, even if later live
+                                // deltas are already queued behind it.
+                                note_flush_outcome(&role, flush_ok, true);
+                                if flush_ok {
+                                    pending_batch_bytes = 0;
+                                    let _ = barrier.send(());
+                                } else {
+                                    pending_flush_barrier = Some(barrier);
+                                    throttling_flush_retries = true;
+                                }
+                            } else {
+                                // FIFO delivery means all preceding batches
+                                // have already crossed the durable flush path.
+                                note_flush_outcome(&role, true, true);
+                                let _ = barrier.send(());
                             }
                         }
                         None => break,
@@ -550,7 +653,7 @@ pub(crate) fn spawn_sink_task(
                     &ack_observer,
                     &mut pending_ack,
                         ).await;
-                        note_flush_outcome(&role, &checkpoints, flush_ok, rx.is_empty()).await;
+                        note_flush_outcome(&role, flush_ok, rx.is_empty());
                         if !flush_ok {
                             if !throttling_flush_retries {
                                 warn!(
@@ -592,7 +695,12 @@ pub(crate) fn spawn_sink_task(
                 &mut pending_ack,
             )
             .await;
-            note_flush_outcome(&role, &checkpoints, flush_ok, true).await;
+            note_flush_outcome(&role, flush_ok, true);
+            if flush_ok {
+                if let Some(barrier) = pending_flush_barrier.take() {
+                    let _ = barrier.send(());
+                }
+            }
         }
     })
 }
@@ -1544,6 +1652,45 @@ mod tests {
         }
     }
 
+    fn backend_role(cell: Arc<BackendSinkCell>, replay_notify: Arc<Notify>) -> SinkRole {
+        let mut config = moraine_config::AppConfig::default();
+        config.backends.insert(
+            "team-ch".to_string(),
+            moraine_config::ClickHouseConfig::default(),
+        );
+        config.routes.push(moraine_config::RouteConfig {
+            dir: "/work/team/**".to_string(),
+            backend: "team-ch".to_string(),
+            mode: moraine_config::ROUTE_MODE_MIRROR.to_string(),
+        });
+        SinkRole::Backend {
+            cell,
+            resolver: Arc::new(Mutex::new(crate::tee::RouteResolver::new(Arc::new(config)))),
+            replay_notify,
+            redactor: test_redactor(),
+            redactions: test_redaction_audit(),
+        }
+    }
+
+    fn routed_batch(id: u64, checkpoint: Checkpoint) -> RowBatch {
+        let mut batch = RowBatch::default();
+        batch.raw_rows.push(json!({
+            "id": id,
+            "session_id": "team-session",
+            "cwd": "/work/team/project",
+        }));
+        batch.checkpoint = Some(checkpoint);
+        batch
+    }
+
+    fn backend_batch(batch: RowBatch, epoch: u64, persist_checkpoint: bool) -> SinkMessage {
+        SinkMessage::BackendBatch {
+            batch,
+            epoch,
+            persist_checkpoint,
+        }
+    }
+
     fn fixed_monotonic_timestamp() -> Option<u64> {
         Some(42_000_000)
     }
@@ -1783,6 +1930,713 @@ mod tests {
         );
 
         handle.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn flush_barrier_waits_for_subthreshold_checkpoint_durability() {
+        let (clickhouse, mock_state) = spawn_mock_clickhouse("").await;
+        let mut config = moraine_config::AppConfig::default();
+        config.ingest.batch_size = usize::MAX;
+        config.ingest.flush_interval_seconds = 60.0;
+        config.ingest.heartbeat_interval_seconds = 60.0;
+
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let metrics = Arc::new(Metrics::default());
+        let (tx, rx) = mpsc::channel(4);
+        let handle = spawn_sink_task(
+            config,
+            clickhouse,
+            checkpoints.clone(),
+            metrics,
+            rx,
+            true,
+            SinkAuthorConfig::fully_supported(String::new()),
+            default_role(),
+        );
+
+        let checkpoint = sample_checkpoint();
+        let key = checkpoint_key(&checkpoint.source_name, &checkpoint.source_file);
+        let mut batch = RowBatch::default();
+        batch.checkpoint = Some(checkpoint.clone());
+        tx.send(SinkMessage::Batch(batch))
+            .await
+            .expect("queue checkpoint-only replay batch");
+        let (barrier_tx, barrier_rx) = tokio::sync::oneshot::channel();
+        tx.send(SinkMessage::FlushBarrier(barrier_tx))
+            .await
+            .expect("queue replay barrier");
+
+        timeout(Duration::from_secs(2), barrier_rx)
+            .await
+            .expect("barrier acknowledgement timeout")
+            .expect("sink closed before barrier acknowledgement");
+
+        assert_eq!(
+            checkpoints.read().await.get(&key).map(|cp| cp.last_offset),
+            Some(checkpoint.last_offset),
+            "barrier ACK requires the in-memory durable checkpoint map to advance"
+        );
+        assert_eq!(
+            mock_state.rows("ingest_checkpoints").len(),
+            1,
+            "barrier must force a subthreshold checkpoint insert"
+        );
+
+        drop(tx);
+        timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("sink exits after channel close")
+            .expect("sink task does not panic");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn flush_barrier_ack_survives_retry_and_never_precedes_checkpoint() {
+        let state = MockClickHouseState::with_permanent_failure(
+            "ingest_checkpoints",
+            "intentional checkpoint outage",
+        );
+        let (clickhouse, mock_state) = spawn_mock_clickhouse_with_state(state).await;
+        let mut config = moraine_config::AppConfig::default();
+        config.ingest.batch_size = usize::MAX;
+        config.ingest.flush_interval_seconds = 0.05;
+        config.ingest.heartbeat_interval_seconds = 60.0;
+
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let metrics = Arc::new(Metrics::default());
+        let (tx, rx) = mpsc::channel(4);
+        let handle = spawn_sink_task(
+            config,
+            clickhouse,
+            checkpoints.clone(),
+            metrics,
+            rx,
+            true,
+            SinkAuthorConfig::fully_supported(String::new()),
+            default_role(),
+        );
+
+        let checkpoint = sample_checkpoint();
+        let key = checkpoint_key(&checkpoint.source_name, &checkpoint.source_file);
+        let mut batch = RowBatch::default();
+        batch.checkpoint = Some(checkpoint);
+        tx.send(SinkMessage::Batch(batch))
+            .await
+            .expect("queue replay");
+        let (barrier_tx, mut barrier_rx) = tokio::sync::oneshot::channel();
+        tx.send(SinkMessage::FlushBarrier(barrier_tx))
+            .await
+            .expect("queue barrier");
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while mock_state.call_count("ingest_checkpoints") == 0 && Instant::now() < deadline {
+            tokio::task::yield_now().await;
+        }
+        assert!(mock_state.call_count("ingest_checkpoints") > 0);
+        assert!(
+            timeout(Duration::from_millis(50), &mut barrier_rx)
+                .await
+                .is_err(),
+            "failed checkpoint insert must not acknowledge the barrier"
+        );
+        mock_state
+            .fail_always_by_table
+            .lock()
+            .expect("mock fail_always mutex poisoned")
+            .remove("ingest_checkpoints");
+        timeout(Duration::from_secs(2), barrier_rx)
+            .await
+            .expect("barrier retry timeout")
+            .expect("barrier sender dropped");
+        assert_eq!(
+            checkpoints.read().await.get(&key).map(|cp| cp.last_offset),
+            Some(100)
+        );
+        assert_eq!(mock_state.rows("ingest_checkpoints").len(), 1);
+
+        drop(tx);
+        timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("sink exits")
+            .expect("sink task does not panic");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn flush_barrier_reports_rejected_batch_and_withholds_its_checkpoint() {
+        let (clickhouse, mock_state) = spawn_mock_clickhouse("").await;
+        let mut config = moraine_config::AppConfig::default();
+        config.ingest.batch_size = usize::MAX;
+        config.ingest.flush_interval_seconds = 60.0;
+        config.ingest.heartbeat_interval_seconds = 60.0;
+
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let metrics = Arc::new(Metrics::default());
+        let (tx, rx) = mpsc::channel(4);
+        let handle = spawn_sink_task(
+            config,
+            clickhouse,
+            checkpoints.clone(),
+            metrics,
+            rx,
+            true,
+            SinkAuthorConfig::fully_supported(String::new()),
+            default_role(),
+        );
+
+        let checkpoint = sample_checkpoint();
+        let key = checkpoint_key(&checkpoint.source_name, &checkpoint.source_file);
+        let mut malformed = RowBatch::default();
+        malformed
+            .event_rows
+            .push(json!({"session_id": "missing-event-uid"}));
+        malformed.checkpoint = Some(checkpoint);
+        tx.send(SinkMessage::Batch(malformed))
+            .await
+            .expect("queue malformed replay batch");
+        let (barrier_tx, barrier_rx) = tokio::sync::oneshot::channel();
+        tx.send(SinkMessage::FlushBarrier(barrier_tx))
+            .await
+            .expect("queue barrier");
+
+        timeout(Duration::from_secs(2), barrier_rx)
+            .await
+            .expect("barrier timeout")
+            .expect("barrier sender dropped");
+        assert!(checkpoints.read().await.get(&key).is_none());
+        assert!(mock_state.rows("ingest_checkpoints").is_empty());
+
+        drop(tx);
+        timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("sink exits")
+            .expect("sink task does not panic");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn default_sink_does_not_quarantine_the_rest_of_a_rejected_scan() {
+        let (clickhouse, _) = spawn_mock_clickhouse("").await;
+        let mut config = moraine_config::AppConfig::default();
+        config.ingest.batch_size = usize::MAX;
+        config.ingest.flush_interval_seconds = 60.0;
+        config.ingest.heartbeat_interval_seconds = 60.0;
+
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let (tx, rx) = mpsc::channel(4);
+        let handle = spawn_sink_task(
+            config,
+            clickhouse,
+            checkpoints.clone(),
+            Arc::new(Metrics::default()),
+            rx,
+            true,
+            SinkAuthorConfig::fully_supported(String::new()),
+            default_role(),
+        );
+
+        let checkpoint = sample_checkpoint();
+        let key = checkpoint_key(&checkpoint.source_name, &checkpoint.source_file);
+        let mut malformed_non_final = RowBatch::default();
+        malformed_non_final.event_rows.push(json!({
+            "session_id": "default-session",
+            "source_name": checkpoint.source_name,
+            "source_file": checkpoint.source_file,
+            "source_generation": checkpoint.source_generation,
+        }));
+        tx.send(SinkMessage::Batch(malformed_non_final))
+            .await
+            .expect("queue malformed default chunk");
+
+        let mut final_boundary = RowBatch::default();
+        final_boundary.checkpoint = Some(checkpoint.clone());
+        tx.send(SinkMessage::Batch(final_boundary))
+            .await
+            .expect("queue default scan boundary");
+        let (barrier_tx, barrier_rx) = tokio::sync::oneshot::channel();
+        tx.send(SinkMessage::FlushBarrier(barrier_tx))
+            .await
+            .expect("queue default barrier");
+        timeout(Duration::from_secs(2), barrier_rx)
+            .await
+            .expect("default barrier timeout")
+            .expect("default barrier sender dropped");
+
+        assert_eq!(
+            checkpoints.read().await.get(&key).map(|cp| cp.last_offset),
+            Some(checkpoint.last_offset),
+            "mirror recovery bookkeeping must not change default-sink scan behavior"
+        );
+
+        drop(tx);
+        timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("sink exits")
+            .expect("sink task does not panic");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn backend_delta_preserves_scan_boundary_without_persisting_checkpoint() {
+        let (clickhouse, mock_state) = spawn_mock_clickhouse("").await;
+        let mut config = moraine_config::AppConfig::default();
+        config.ingest.batch_size = usize::MAX;
+        config.ingest.flush_interval_seconds = 60.0;
+        config.ingest.heartbeat_interval_seconds = 60.0;
+
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let metrics = Arc::new(Metrics::default());
+        let cell = Arc::new(BackendSinkCell::new("team-ch"));
+        cell.set_status_for_test(crate::tee::BackendSinkStatus::CatchingUp);
+        let (tx, rx) = mpsc::channel(8);
+        let handle = spawn_sink_task(
+            config,
+            clickhouse,
+            checkpoints.clone(),
+            metrics,
+            rx,
+            true,
+            SinkAuthorConfig::fully_supported(String::new()),
+            backend_role(cell, Arc::new(Notify::new())),
+        );
+
+        let checkpoint = sample_checkpoint();
+        let key = checkpoint_key(&checkpoint.source_name, &checkpoint.source_file);
+        let mut malformed_non_final = RowBatch::default();
+        malformed_non_final.event_rows.push(json!({
+            "session_id": "team-session",
+            "source_name": checkpoint.source_name,
+            "source_file": checkpoint.source_file,
+            "source_generation": checkpoint.source_generation,
+            "cwd": "/work/team/project",
+        }));
+        tx.send(backend_batch(malformed_non_final, 0, false))
+            .await
+            .expect("queue rejected non-final delta");
+
+        let mut final_boundary = RowBatch::default();
+        final_boundary.checkpoint = Some(checkpoint.clone());
+        tx.send(backend_batch(final_boundary, 0, false))
+            .await
+            .expect("queue final delta boundary");
+        let (barrier_tx, barrier_rx) = tokio::sync::oneshot::channel();
+        tx.send(SinkMessage::FlushBarrier(barrier_tx))
+            .await
+            .expect("queue first barrier");
+        timeout(Duration::from_secs(2), barrier_rx)
+            .await
+            .expect("first barrier timeout")
+            .expect("first barrier sender dropped");
+        assert!(checkpoints.read().await.get(&key).is_none());
+        assert!(mock_state.rows("ingest_checkpoints").is_empty());
+
+        let mut next_scan = RowBatch::default();
+        next_scan.event_rows.push(json!({
+            "event_uid": "next-scan-event",
+            "session_id": "team-session",
+            "source_name": checkpoint.source_name,
+            "source_file": checkpoint.source_file,
+            "source_generation": checkpoint.source_generation,
+            "harness": "test",
+            "event_kind": "message",
+            "actor_kind": "user",
+            "payload_type": "text",
+            "text_content": "recovered",
+            "cwd": "/work/team/project",
+        }));
+        next_scan.checkpoint = Some(checkpoint);
+        tx.send(backend_batch(next_scan, 1, false))
+            .await
+            .expect("queue next scan delta");
+        let (barrier_tx, barrier_rx) = tokio::sync::oneshot::channel();
+        tx.send(SinkMessage::FlushBarrier(barrier_tx))
+            .await
+            .expect("queue second barrier");
+        timeout(Duration::from_secs(2), barrier_rx)
+            .await
+            .expect("second barrier timeout")
+            .expect("second barrier sender dropped");
+        assert!(checkpoints.read().await.get(&key).is_none());
+        assert!(mock_state.rows("ingest_checkpoints").is_empty());
+        assert_eq!(mock_state.rows("events").len(), 1);
+
+        drop(tx);
+        timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("sink exits")
+            .expect("sink task does not panic");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn replay_and_live_identity_maps_are_isolated() {
+        let (clickhouse, mock_state) = spawn_mock_clickhouse("").await;
+        let mut config = moraine_config::AppConfig::default();
+        config.ingest.batch_size = usize::MAX;
+        config.ingest.flush_interval_seconds = 60.0;
+        config.ingest.heartbeat_interval_seconds = 60.0;
+
+        let cell = Arc::new(BackendSinkCell::new("team-ch"));
+        cell.set_status_for_test(crate::tee::BackendSinkStatus::CatchingUp);
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let (tx, rx) = mpsc::channel(8);
+        let handle = spawn_sink_task(
+            config,
+            clickhouse,
+            checkpoints,
+            Arc::new(Metrics::default()),
+            rx,
+            true,
+            SinkAuthorConfig::fully_supported(String::new()),
+            backend_role(cell, Arc::new(Notify::new())),
+        );
+
+        let checkpoint = sample_checkpoint();
+        let source_fields = json!({
+            "source_name": checkpoint.source_name,
+            "source_file": checkpoint.source_file,
+            "source_generation": checkpoint.source_generation,
+        });
+        let mut replay_request = RowBatch::default();
+        replay_request.event_rows.push(json!({
+            "event_uid": "request-provisional",
+            "harness": "nac",
+            "session_id": "team-session",
+            "event_kind": "tool_call",
+            "actor_kind": "assistant",
+            "payload_type": "tool_use",
+            "tool_call_id": "call-1",
+            "tool_name": "Read",
+            "tool_phase": "request",
+            "text_content": "request",
+            "payload_json": "{}",
+            "cwd": "/work/team/project",
+            "source_name": source_fields["source_name"],
+            "source_file": source_fields["source_file"],
+            "source_generation": source_fields["source_generation"],
+        }));
+        tx.send(SinkMessage::Batch(replay_request))
+            .await
+            .expect("queue non-final replay request");
+
+        let mut live_boundary = RowBatch::default();
+        live_boundary.checkpoint = Some(checkpoint.clone());
+        tx.send(backend_batch(live_boundary, 0, false))
+            .await
+            .expect("queue interleaved live scan boundary");
+
+        let mut replay_response = RowBatch::default();
+        replay_response.event_rows.push(json!({
+            "event_uid": "response-provisional",
+            "origin_event_id": "request-provisional",
+            "harness": "nac",
+            "session_id": "team-session",
+            "event_kind": "tool_result",
+            "actor_kind": "tool",
+            "payload_type": "tool_result",
+            "tool_call_id": "call-1",
+            "tool_name": "Read",
+            "tool_phase": "response",
+            "text_content": "response",
+            "payload_json": "{\"request_event_uid\":\"request-provisional\"}",
+            "cwd": "/work/team/project",
+            "source_name": source_fields["source_name"],
+            "source_file": source_fields["source_file"],
+            "source_generation": source_fields["source_generation"],
+        }));
+        replay_response.checkpoint = Some(checkpoint);
+        tx.send(SinkMessage::Batch(replay_response))
+            .await
+            .expect("queue final replay response");
+        let (barrier_tx, barrier_rx) = tokio::sync::oneshot::channel();
+        tx.send(SinkMessage::FlushBarrier(barrier_tx))
+            .await
+            .expect("queue identity barrier");
+        timeout(Duration::from_secs(2), barrier_rx)
+            .await
+            .expect("identity barrier timeout")
+            .expect("identity barrier sender dropped");
+
+        let events = mock_state.rows("events");
+        let request_uid = events
+            .iter()
+            .find(|event| event["event_kind"] == "tool_call")
+            .and_then(|event| event["event_uid"].as_str())
+            .expect("persisted request UID");
+        let response = events
+            .iter()
+            .find(|event| event["event_kind"] == "tool_result")
+            .expect("persisted response");
+        assert_eq!(response["origin_event_id"], request_uid);
+        assert_ne!(response["origin_event_id"], "request-provisional");
+
+        drop(tx);
+        timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("sink exits")
+            .expect("sink task does not panic");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn backend_delta_cannot_advance_checkpoint_across_restart_gap() {
+        let (clickhouse, mock_state) = spawn_mock_clickhouse("").await;
+        let mut config = moraine_config::AppConfig::default();
+        config.ingest.batch_size = usize::MAX;
+        config.ingest.flush_interval_seconds = 60.0;
+        config.ingest.heartbeat_interval_seconds = 60.0;
+
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let metrics = Arc::new(Metrics::default());
+        let cell = Arc::new(BackendSinkCell::new("team-ch"));
+        cell.set_status_for_test(crate::tee::BackendSinkStatus::CatchingUp);
+        let (tx, rx) = mpsc::channel(8);
+        let handle = spawn_sink_task(
+            config.clone(),
+            clickhouse.clone(),
+            checkpoints.clone(),
+            metrics,
+            rx,
+            true,
+            SinkAuthorConfig::fully_supported(String::new()),
+            backend_role(cell, Arc::new(Notify::new())),
+        );
+
+        let mut replay_checkpoint = sample_checkpoint();
+        replay_checkpoint.last_offset = 50;
+        let key = checkpoint_key(
+            &replay_checkpoint.source_name,
+            &replay_checkpoint.source_file,
+        );
+        tx.send(SinkMessage::Batch(routed_batch(
+            1,
+            replay_checkpoint.clone(),
+        )))
+        .await
+        .expect("queue replay gap");
+        let mut live_checkpoint = replay_checkpoint.clone();
+        live_checkpoint.last_offset = 100;
+        tx.send(backend_batch(
+            routed_batch(2, live_checkpoint.clone()),
+            0,
+            false,
+        ))
+        .await
+        .expect("queue live delta");
+        let (barrier_tx, barrier_rx) = tokio::sync::oneshot::channel();
+        tx.send(SinkMessage::FlushBarrier(barrier_tx))
+            .await
+            .expect("queue first barrier");
+        timeout(Duration::from_secs(2), barrier_rx)
+            .await
+            .expect("first barrier timeout")
+            .expect("first barrier sender dropped");
+        assert_eq!(
+            checkpoints.read().await.get(&key).map(|cp| cp.last_offset),
+            Some(50),
+            "a live delta must not over-assert coverage beyond the replayed gap"
+        );
+
+        drop(tx);
+        timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("first sink exits")
+            .expect("first sink does not panic");
+
+        let reloaded = Arc::new(RwLock::new(checkpoints.read().await.clone()));
+        let restarted_cell = Arc::new(BackendSinkCell::new("team-ch"));
+        restarted_cell.set_status_for_test(crate::tee::BackendSinkStatus::CatchingUp);
+        let (tx, rx) = mpsc::channel(4);
+        let restarted = spawn_sink_task(
+            config,
+            clickhouse,
+            reloaded.clone(),
+            Arc::new(Metrics::default()),
+            rx,
+            true,
+            SinkAuthorConfig::fully_supported(String::new()),
+            backend_role(restarted_cell, Arc::new(Notify::new())),
+        );
+        tx.send(SinkMessage::Batch(routed_batch(2, live_checkpoint)))
+            .await
+            .expect("replay missing delta after restart");
+        let (barrier_tx, barrier_rx) = tokio::sync::oneshot::channel();
+        tx.send(SinkMessage::FlushBarrier(barrier_tx))
+            .await
+            .expect("queue restart barrier");
+        timeout(Duration::from_secs(2), barrier_rx)
+            .await
+            .expect("restart barrier timeout")
+            .expect("restart barrier sender dropped");
+        assert_eq!(
+            reloaded.read().await.get(&key).map(|cp| cp.last_offset),
+            Some(100),
+            "restart replay must close the gap before advancing its checkpoint"
+        );
+        assert_eq!(mock_state.rows("raw_events").len(), 3);
+
+        drop(tx);
+        timeout(Duration::from_secs(2), restarted)
+            .await
+            .expect("restarted sink exits")
+            .expect("restarted sink does not panic");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rejected_backend_batch_revokes_queued_checkpoint_authority() {
+        let (clickhouse, mock_state) = spawn_mock_clickhouse("").await;
+        let mut config = moraine_config::AppConfig::default();
+        config.ingest.batch_size = usize::MAX;
+        config.ingest.flush_interval_seconds = 60.0;
+        config.ingest.heartbeat_interval_seconds = 60.0;
+
+        let cell = Arc::new(BackendSinkCell::new("team-ch"));
+        cell.set_status_for_test(crate::tee::BackendSinkStatus::Ok);
+        let replay_notify = Arc::new(Notify::new());
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let (tx, rx) = mpsc::channel(4);
+        let handle = spawn_sink_task(
+            config,
+            clickhouse,
+            checkpoints.clone(),
+            Arc::new(Metrics::default()),
+            rx,
+            true,
+            SinkAuthorConfig::fully_supported(String::new()),
+            backend_role(cell.clone(), replay_notify.clone()),
+        );
+
+        let mut malformed_delta = RowBatch::default();
+        malformed_delta.event_rows.push(json!({
+            "session_id": "team-session",
+            "cwd": "/work/team/project",
+        }));
+        tx.send(backend_batch(malformed_delta, 0, false))
+            .await
+            .expect("queue stale catch-up delta");
+
+        let mut live_checkpoint = sample_checkpoint();
+        live_checkpoint.last_offset = 200;
+        let key = checkpoint_key(&live_checkpoint.source_name, &live_checkpoint.source_file);
+        tx.send(backend_batch(
+            routed_batch(2, live_checkpoint.clone()),
+            0,
+            true,
+        ))
+        .await
+        .expect("queue post-promotion live batch");
+        let (barrier_tx, barrier_rx) = tokio::sync::oneshot::channel();
+        tx.send(SinkMessage::FlushBarrier(barrier_tx))
+            .await
+            .expect("queue invalidation barrier");
+
+        timeout(Duration::from_secs(2), barrier_rx)
+            .await
+            .expect("invalidation barrier timeout")
+            .expect("invalidation barrier sender dropped");
+        assert_eq!(
+            cell.status(),
+            crate::tee::BackendSinkStatus::CatchingUp,
+            "a rejected stale delta must revoke the prior promotion"
+        );
+        assert!(checkpoints.read().await.get(&key).is_none());
+        assert!(mock_state.rows("ingest_checkpoints").is_empty());
+        assert!(
+            timeout(Duration::from_millis(200), replay_notify.notified())
+                .await
+                .is_ok(),
+            "rejection after promotion must wake replay"
+        );
+
+        tx.send(SinkMessage::Batch(routed_batch(2, live_checkpoint)))
+            .await
+            .expect("queue recovery replay");
+        let (barrier_tx, barrier_rx) = tokio::sync::oneshot::channel();
+        tx.send(SinkMessage::FlushBarrier(barrier_tx))
+            .await
+            .expect("queue recovery barrier");
+        timeout(Duration::from_secs(2), barrier_rx)
+            .await
+            .expect("recovery barrier timeout")
+            .expect("recovery barrier sender dropped");
+        assert_eq!(
+            checkpoints.read().await.get(&key).map(|cp| cp.last_offset),
+            Some(200)
+        );
+
+        drop(tx);
+        timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("sink exits")
+            .expect("sink task does not panic");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn empty_barrier_recovers_after_retry_drains_with_barrier_queued() {
+        let state =
+            MockClickHouseState::with_permanent_failure("raw_events", "intentional backend outage");
+        let (clickhouse, mock_state) = spawn_mock_clickhouse_with_state(state).await;
+        let mut config = moraine_config::AppConfig::default();
+        config.ingest.batch_size = 1;
+        config.ingest.flush_interval_seconds = 0.05;
+        config.ingest.heartbeat_interval_seconds = 60.0;
+
+        let cell = Arc::new(BackendSinkCell::new("team-ch"));
+        cell.set_status_for_test(crate::tee::BackendSinkStatus::Ok);
+        let replay_notify = Arc::new(Notify::new());
+        let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+        let (tx, rx) = mpsc::channel(4);
+        let handle = spawn_sink_task(
+            config,
+            clickhouse,
+            checkpoints,
+            Arc::new(Metrics::default()),
+            rx,
+            true,
+            SinkAuthorConfig::fully_supported(String::new()),
+            backend_role(cell.clone(), replay_notify.clone()),
+        );
+
+        tx.send(SinkMessage::Batch(routed_batch(1, sample_checkpoint())))
+            .await
+            .expect("queue failing batch");
+        let (barrier_tx, barrier_rx) = tokio::sync::oneshot::channel();
+        tx.send(SinkMessage::FlushBarrier(barrier_tx))
+            .await
+            .expect("queue barrier behind failed flush");
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while cell.status() != crate::tee::BackendSinkStatus::Unreachable
+            && Instant::now() < deadline
+        {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            cell.status(),
+            crate::tee::BackendSinkStatus::Unreachable,
+            "the first flush must place the backend in unreachable"
+        );
+        mock_state
+            .fail_always_by_table
+            .lock()
+            .expect("mock fail_always mutex poisoned")
+            .remove("raw_events");
+
+        timeout(Duration::from_secs(3), barrier_rx)
+            .await
+            .expect("barrier recovery timeout")
+            .expect("barrier sender dropped");
+        assert_eq!(
+            cell.status(),
+            crate::tee::BackendSinkStatus::CatchingUp,
+            "an empty ordered barrier must complete recovery after retry drained"
+        );
+        assert!(
+            timeout(Duration::from_millis(200), replay_notify.notified())
+                .await
+                .is_ok(),
+            "barrier recovery must wake the catch-up supervisor"
+        );
+
+        drop(tx);
+        timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("sink exits")
+            .expect("sink task does not panic");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2387,7 +3241,6 @@ mod tests {
                 cell: Arc::new(BackendSinkCell::new("team-ch")),
                 resolver,
                 replay_notify: Arc::new(Notify::new()),
-                replay_floor: Arc::new(Mutex::new(None)),
                 redactor: test_redactor(),
                 redactions: redactions.clone(),
             },
@@ -2509,48 +3362,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recovery_captures_the_replay_floor_before_post_recovery_flushes() {
+    async fn durable_drain_enters_catch_up_and_notifies_supervisor() {
         let cell = Arc::new(BackendSinkCell::new("team-ch"));
-        cell.set_status(crate::tee::BackendSinkStatus::Lagging);
+        cell.set_status_for_test(crate::tee::BackendSinkStatus::Lagging);
         let replay_notify = Arc::new(Notify::new());
-        let replay_floor: ReplayFloor = Arc::new(Mutex::new(None));
         let role = SinkRole::Backend {
-            cell,
+            cell: cell.clone(),
             resolver: Arc::new(Mutex::new(crate::tee::RouteResolver::new(Arc::new(
                 moraine_config::AppConfig::default(),
             )))),
             replay_notify: replay_notify.clone(),
-            replay_floor: replay_floor.clone(),
             redactor: test_redactor(),
             redactions: test_redaction_audit(),
         };
 
-        let checkpoint = sample_checkpoint(); // offset 100
-        let key = checkpoint_key(&checkpoint.source_name, &checkpoint.source_file);
-        let checkpoints = Arc::new(RwLock::new(HashMap::from([(
-            key.clone(),
-            checkpoint.clone(),
-        )])));
+        note_flush_outcome(&role, true, true);
 
-        note_flush_outcome(&role, &checkpoints, true, true).await;
-
-        // A live batch flushed after recovery jumps the map past the outage
-        // gap; the floor captured at the transition must not move with it.
-        {
-            let mut state = checkpoints.write().await;
-            let entry = state.get_mut(&key).expect("checkpoint present");
-            entry.last_offset = 900;
-        }
-
-        let floor = replay_floor
-            .lock()
-            .expect("replay floor mutex poisoned")
-            .take()
-            .expect("recovery must capture a replay floor");
         assert_eq!(
-            floor.get(&key).map(|cp| cp.last_offset),
-            Some(100),
-            "the floor reflects what the backend had flushed at recovery"
+            cell.status(),
+            crate::tee::BackendSinkStatus::CatchingUp,
+            "durable drain must pause live admission until replay's barrier"
         );
         assert!(
             timeout(Duration::from_millis(100), replay_notify.notified())
