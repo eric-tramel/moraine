@@ -63,7 +63,7 @@ SELECT e.* REPLACE (
   JSONMergePatch(
     if(JSONType(e.payload_json) = 'Object',
        e.payload_json,
-       toJSONString(tuple(e.payload_json AS source_payload))),
+       concat('{"source_payload":', toJSONString(e.payload_json), '}')),
     concat('{"moraine_tool_io":', t.tool_json, '}')
   ) AS payload_json
 )
@@ -97,9 +97,49 @@ ALL INNER JOIN
     ) AS tool_json
   FROM
   (
-    SELECT * FROM moraine.tool_io_events_content_authority_031_frozen FINAL
+    SELECT
+      event_uid,
+      tool_call_id,
+      parent_tool_call_id,
+      tool_name,
+      tool_phase,
+      tool_error,
+      input_json,
+      output_json,
+      output_text,
+      input_bytes,
+      output_bytes,
+      input_preview,
+      output_preview,
+      io_hash,
+      project_id,
+      repo_rel_path,
+      worktree_root,
+      source_ref,
+      event_version
+    FROM moraine.tool_io_events_content_authority_031_frozen FINAL
     UNION ALL
-    SELECT * FROM moraine.tool_io FINAL
+    SELECT
+      event_uid,
+      tool_call_id,
+      parent_tool_call_id,
+      tool_name,
+      tool_phase,
+      tool_error,
+      input_json,
+      output_json,
+      output_text,
+      input_bytes,
+      output_bytes,
+      input_preview,
+      output_preview,
+      io_hash,
+      project_id,
+      repo_rel_path,
+      worktree_root,
+      source_ref,
+      event_version
+    FROM moraine.tool_io FINAL
   ) AS tool_source
   GROUP BY event_uid
 ) AS t ON t.event_uid = e.event_uid
