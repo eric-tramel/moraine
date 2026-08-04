@@ -1688,8 +1688,42 @@ mod tests {
         let exchange = position(
             "EXCHANGE TABLES other_db.tool_io\nAND other_db.tool_io_events_content_authority_031_frozen",
         );
-        let fold =
-            position("SELECT * FROM other_db.tool_io_events_content_authority_031_frozen FINAL");
+        let canonical_tool_projection = [
+            "event_uid",
+            "tool_call_id",
+            "parent_tool_call_id",
+            "tool_name",
+            "tool_phase",
+            "tool_error",
+            "input_json",
+            "output_json",
+            "output_text",
+            "input_bytes",
+            "output_bytes",
+            "input_preview",
+            "output_preview",
+            "io_hash",
+            "project_id",
+            "repo_rel_path",
+            "worktree_root",
+            "source_ref",
+            "event_version",
+        ]
+        .join(",\n      ");
+        let frozen_fold = format!(
+            "SELECT\n      {canonical_tool_projection}\n    \
+             FROM other_db.tool_io_events_content_authority_031_frozen FINAL"
+        );
+        let live_fold =
+            format!("SELECT\n      {canonical_tool_projection}\n    FROM other_db.tool_io FINAL");
+        let fold = position(&frozen_fold);
+        assert!(
+            sql.contains(&live_fold),
+            "both tool sources must use the same name-based projection"
+        );
+        assert!(!sql
+            .contains("SELECT * FROM other_db.tool_io_events_content_authority_031_frozen FINAL"));
+        assert!(!sql.contains("SELECT * FROM other_db.tool_io FINAL"));
         let drop_staging = position("DROP TABLE IF EXISTS other_db.tool_io");
         let truncate = position(
             "TRUNCATE TABLE IF EXISTS other_db.tool_io_events_content_authority_031_frozen",
@@ -1702,8 +1736,10 @@ mod tests {
                 && fold < drop_staging
                 && drop_staging < truncate
         );
-        assert!(sql.contains("UNION ALL\n    SELECT * FROM other_db.tool_io FINAL"));
+        assert!(sql.contains("UNION ALL\n    SELECT\n"));
         assert!(sql.contains("WHERE NOT JSONHas(e.payload_json, 'moraine_tool_io')"));
+        assert!(sql.contains(r#"concat('{"source_payload":', toJSONString(e.payload_json), '}')"#));
+        assert!(!sql.contains("toJSONString(tuple(e.payload_json AS source_payload))"));
         assert!(!sql.contains("RENAME TABLE IF EXISTS"));
         assert!(!sql
             .contains("DROP TABLE IF EXISTS other_db.tool_io_events_content_authority_031_frozen"));
