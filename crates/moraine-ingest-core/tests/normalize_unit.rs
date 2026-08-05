@@ -255,6 +255,151 @@ fn codex_token_count_alias_codex_maps_to_xhigh() {
 }
 
 #[test]
+fn codex_token_count_prefers_inherited_model_over_generic_limit_id() {
+    let token_record = json!({
+        "timestamp": "2026-08-05T18:00:00.000Z",
+        "type": "event_msg",
+        "payload": {
+            "type": "token_count",
+            "info": {
+                "last_token_usage": {
+                    "input_tokens": 1200,
+                    "output_tokens": 34,
+                    "cached_input_tokens": 1000
+                }
+            },
+            "rate_limits": {
+                "limit_id": "codex",
+                "limit_name": null,
+                "plan_type": "pro"
+            }
+        }
+    });
+
+    for model in ["gpt-5.6-sol", "codex-auto-review"] {
+        let turn_context = json!({
+            "timestamp": "2026-08-05T17:59:59.000Z",
+            "type": "turn_context",
+            "payload": {
+                "turn_id": format!("turn-{model}"),
+                "model": model
+            }
+        });
+        let context = normalize_record(
+            &turn_context,
+            "codex",
+            "codex",
+            "/Users/test/.codex/sessions/2026/08/05/session.jsonl",
+            1,
+            1,
+            3,
+            3,
+            "",
+            "",
+            "",
+        )
+        .expect("turn context should establish the active model");
+
+        let normalize_token = || {
+            normalize_record(
+                &token_record,
+                "codex",
+                "codex",
+                "/Users/test/.codex/sessions/2026/08/05/session.jsonl",
+                1,
+                1,
+                4,
+                4,
+                &context.session_hint,
+                &context.model_hint,
+                &context.cwd_hint,
+            )
+            .expect("codex token count should inherit the active model")
+        };
+        let out = normalize_token();
+        let replayed = normalize_token();
+
+        let row = out.event_rows[0].as_object().unwrap();
+        let replayed_row = replayed.event_rows[0].as_object().unwrap();
+        assert_eq!(row.get("model").and_then(Value::as_str), Some(model));
+        assert_eq!(row.get("input_tokens").and_then(Value::as_u64), Some(1200));
+        assert_eq!(row.get("output_tokens").and_then(Value::as_u64), Some(34));
+        assert_eq!(
+            row.get("event_uid"),
+            replayed_row.get("event_uid"),
+            "replaying the same source record must preserve its replacement key"
+        );
+    }
+}
+
+#[test]
+fn codex_token_count_explicit_model_outranks_inherited_model() {
+    let mut record = json!({
+        "timestamp": "2026-08-05T18:00:00.000Z",
+        "type": "event_msg",
+        "payload": {
+            "type": "token_count",
+            "model": "gpt-5.4",
+            "info": {
+                "last_token_usage": {
+                    "input_tokens": 1200,
+                    "output_tokens": 34,
+                    "cached_input_tokens": 1000
+                }
+            },
+            "rate_limits": {
+                "limit_id": "codex",
+                "limit_name": null,
+                "plan_type": "pro"
+            }
+        }
+    });
+
+    let payload_model = normalize_record(
+        &record,
+        "codex",
+        "codex",
+        "/Users/test/.codex/sessions/2026/08/05/session.jsonl",
+        1,
+        1,
+        4,
+        4,
+        "",
+        "gpt-5.6-sol",
+        "",
+    )
+    .expect("explicit payload model should normalize");
+    assert_eq!(
+        payload_model.event_rows[0]
+            .get("model")
+            .and_then(Value::as_str),
+        Some("gpt-5.4")
+    );
+
+    record["payload"]["rate_limits"]["limit_name"] = json!("GPT-5.3-Codex-Spark");
+    let limit_name = normalize_record(
+        &record,
+        "codex",
+        "codex",
+        "/Users/test/.codex/sessions/2026/08/05/session.jsonl",
+        1,
+        1,
+        4,
+        4,
+        "",
+        "gpt-5.6-sol",
+        "",
+    )
+    .expect("explicit limit name should normalize");
+    assert_eq!(
+        limit_name.event_rows[0]
+            .get("model")
+            .and_then(Value::as_str),
+        Some("gpt-5.3-codex-spark")
+    );
+}
+
+#[test]
 fn codex_custom_tool_call_promotes_tool_fields() {
     let record = json!({
         "timestamp": "2026-02-15T03:50:50.838Z",
