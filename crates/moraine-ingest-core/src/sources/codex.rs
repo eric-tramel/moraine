@@ -517,15 +517,18 @@ fn resolve_codex_token_count_model(record: &CodexRecord<'_>) -> String {
             .payload_field("rate_limits")
             .and_then(|v| v.get("limit_id")),
     );
+    let inherited_model = canonicalize_model("codex", record.model_hint);
 
     if !model.is_empty() {
         canonicalize_model("codex", &model)
     } else if !fallback_model.is_empty() {
         canonicalize_model("codex", &fallback_model)
+    } else if !inherited_model.is_empty() {
+        inherited_model
     } else if !fallback_limit_id.is_empty() {
         canonicalize_model("codex", &fallback_limit_id)
     } else {
-        canonicalize_model("codex", record.model_hint)
+        String::new()
     }
 }
 
