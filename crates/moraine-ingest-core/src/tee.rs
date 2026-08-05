@@ -756,8 +756,18 @@ fn forward_to_backend(handle: &BackendHandle, batch: &RowBatch) {
 /// non-default backend — skew disables the sink loudly instead), checkpoint
 /// load from the backend's own database, sink task spawn, then catch-up
 /// replay passes re-armed on every recovery.
-fn spawn_backend_supervisor(
+fn build_named_backend_clickhouse_client(
     mut backend_cfg: ClickHouseConfig,
+) -> anyhow::Result<ClickHouseClient> {
+    // A replay barrier may only acknowledge after every earlier row is
+    // inserted. Preserve async batching, but never allow a named mirror
+    // backend to acknowledge an async insert before ClickHouse flushes it.
+    backend_cfg.wait_for_async_insert = true;
+    ClickHouseClient::new(backend_cfg)
+}
+
+fn spawn_backend_supervisor(
+    backend_cfg: ClickHouseConfig,
     cell: Arc<BackendSinkCell>,
     replay_tx: mpsc::Sender<SinkMessage>,
     backend_rx: mpsc::Receiver<SinkMessage>,
@@ -766,11 +776,7 @@ fn spawn_backend_supervisor(
     tokio::spawn(async move {
         let name = cell.name().to_string();
         let allow_newer_server = backend_cfg.allow_newer_server;
-        // A replay barrier may only acknowledge after every earlier row is
-        // inserted. Preserve async batching, but never allow a named mirror
-        // backend to acknowledge an async insert before ClickHouse flushes it.
-        backend_cfg.wait_for_async_insert = true;
-        let client = match ClickHouseClient::new(backend_cfg) {
+        let client = match build_named_backend_clickhouse_client(backend_cfg) {
             Ok(client) => client,
             Err(exc) => {
                 cell.mark_unreachable();
@@ -1720,6 +1726,104 @@ mod tests {
         );
         assert_ne!(cell.status(), BackendSinkStatus::Ok);
         handle.abort();
+    }
+
+    #[derive(Clone, Default)]
+    struct DurabilityRequestState {
+        params: Arc<Mutex<Vec<HashMap<String, String>>>>,
+    }
+
+    async fn durability_request_handler(
+        State(state): State<DurabilityRequestState>,
+        Query(params): Query<HashMap<String, String>>,
+    ) -> (StatusCode, String) {
+        state
+            .params
+            .lock()
+            .expect("durability request mutex poisoned")
+            .push(params);
+        (StatusCode::OK, String::new())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn named_backend_forces_wait_for_async_insert_without_changing_default_policy() {
+        let state = DurabilityRequestState::default();
+        let app = Router::new()
+            .route("/", post(durability_request_handler))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind durability request listener");
+        let addr = listener.local_addr().expect("durability request addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let mut config = backend_cfg_for(format!("http://{addr}"));
+        config.async_insert = true;
+        config.wait_for_async_insert = false;
+        let named_client = build_named_backend_clickhouse_client(config.clone())
+            .expect("construct named backend client");
+        let default_client =
+            crate::build_ingest_clickhouse_client(config).expect("construct default ingest client");
+
+        named_client
+            .request_text(
+                "INSERT INTO named_probe FORMAT JSONEachRow",
+                Some(b"{}\n".to_vec()),
+                None,
+                true,
+                Some("JSONEachRow"),
+            )
+            .await
+            .expect("named backend request");
+        default_client
+            .request_text(
+                "INSERT INTO default_probe FORMAT JSONEachRow",
+                Some(b"{}\n".to_vec()),
+                None,
+                true,
+                Some("JSONEachRow"),
+            )
+            .await
+            .expect("default backend request");
+
+        let requests = state
+            .params
+            .lock()
+            .expect("durability request mutex poisoned");
+        let params_for = |needle: &str| {
+            requests
+                .iter()
+                .find(|params| {
+                    params
+                        .get("query")
+                        .is_some_and(|query| query.contains(needle))
+                })
+                .unwrap_or_else(|| panic!("missing request for {needle}"))
+        };
+        let named_params = params_for("named_probe");
+        let default_params = params_for("default_probe");
+
+        assert_eq!(
+            named_params.get("async_insert").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            named_params
+                .get("wait_for_async_insert")
+                .map(String::as_str),
+            Some("1"),
+            "named backend must override wait_for_async_insert=false for barrier durability"
+        );
+        assert_eq!(
+            default_params.get("async_insert").map(String::as_str),
+            Some("1")
+        );
+        assert!(
+            !default_params.contains_key("wait_for_async_insert"),
+            "the default backend must retain wait_for_async_insert=false"
+        );
     }
 
     #[derive(Clone, Default)]
