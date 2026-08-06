@@ -6,16 +6,16 @@ MCP server so agents can search prior sessions.
 
 Use Moraine when you want a private record of what your agents did across
 harnesses such as Codex, Claude Code, Qwen Code, Cursor, Kiro CLI, Kimi CLI,
-NAC, OpenCode, Hermes, and Pi Coding Agent. The default setup runs on your
-machine and writes runtime state under `~/.moraine`.
+NAC, OpenCode, Hermes, Pi Coding Agent, and Prime Agent. The default setup runs
+on your machine and writes runtime state under `~/.moraine`.
 
 ## What You Get
 
 - **Unified trace database.** Conversation turns, tool calls, token counts, and
   timestamps land in ClickHouse under a consistent schema.
 - **Realtime local ingest.** Moraine watches Codex, Claude Code, Qwen Code,
-  Cursor, Kiro CLI, Kimi CLI, NAC, OpenCode, Hermes, and Pi Coding Agent session
-  stores and backfills existing history on startup.
+  Cursor, Kiro CLI, Kimi CLI, NAC, OpenCode, Hermes, Pi Coding Agent, and Prime
+  Agent session stores and backfills existing history on startup.
 - **Monitor UI.** Browse sessions, inspect indexing health, and check what has
   been captured at `http://127.0.0.1:8080`.
 - **MCP retrieval.** Agents can search prior decisions, fixes, errors, and
@@ -44,6 +44,7 @@ Moraine ships session trace ingestion adapters for these agent harnesses:
 | [Cursor](https://cursor.com/docs) | `cursor` | Agent transcript JSONL under `~/.cursor/projects` (default on); Cursor IDE chat history from `state.vscdb` SQLite databases (default on; `cursor_sqlite` format) |
 | [Hermes](https://hermes-agent.nousresearch.com/docs/) | `hermes` | Live session JSON and trajectory JSONL traces |
 | [Pi Coding Agent](https://pi.dev/docs/latest) / OMP | `pi-coding-agent` | JSONL session trees under `~/.pi/agent/sessions` and `~/.omp/agent/sessions` |
+| [Prime Agent](https://github.com/PrimeIntellect-ai/prime-agent) | `prime-agent` | Root JSONL sessions under `~/.prime/agent/sessions` and RLM child transcripts under `~/.prime/agent/session-artifacts` |
 
 ## Where To Start
 

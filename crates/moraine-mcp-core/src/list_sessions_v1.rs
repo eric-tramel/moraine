@@ -228,6 +228,7 @@ fn readable_harness(harness: &str) -> &str {
         "nac" => "NAC",
         "opencode" => "OpenCode",
         "pi-coding-agent" => "Pi Coding Agent",
+        "prime-agent" => "Prime Agent",
         "qwen-code" => "Qwen Code",
         _ => harness,
     }
@@ -690,6 +691,7 @@ mod tests {
             ("nac", "NAC"),
             ("opencode", "OpenCode"),
             ("pi-coding-agent", "Pi Coding Agent"),
+            ("prime-agent", "Prime Agent"),
             ("qwen-code", "Qwen Code"),
             ("future-harness", "future-harness"),
         ];

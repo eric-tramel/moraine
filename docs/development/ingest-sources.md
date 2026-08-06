@@ -25,6 +25,7 @@ all rows that leave the adapter.
 | `cursor` | `sources/cursor.rs` | `cursor` | `jsonl` or `cursor_sqlite` | Cursor Agent transcripts under `agent-transcripts/`; text blocks, tool-use blocks, and local file references. Also normalizes the synthetic `cursor_composer`/`cursor_bubble` records produced by polling `state.vscdb` (see SQLite-Polled Sources below); composer names become `session_meta` events that carry the session title. |
 | `hermes` | `sources/hermes.rs` | record-derived | `jsonl` or `session_json` | ShareGPT trajectories and live Hermes session JSON with vendor/model splitting. |
 | `pi-coding-agent` | `sources/pi.rs` | record-derived | `jsonl` | Pi and OMP session JSONL trees, model/thinking metadata, assistant tool calls, tool results, and parent links. |
+| `prime-agent` | `sources/prime_agent.rs` | record-derived | `jsonl` | Prime Agent root and RLM-child transcripts. A private `pi_family` policy shares stable v3 message/tool normalization while keeping orchestration/state/unknown records raw-only and marking canonical child sessions as substreams. |
 
 ### Local macOS Claude Cowork
 

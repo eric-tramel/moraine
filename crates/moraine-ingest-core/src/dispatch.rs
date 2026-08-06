@@ -4,6 +4,9 @@ use crate::normalize::{normalize_record, normalize_record_with_ts_hint};
 use crate::progress::unix_ms_now;
 use crate::sources::claude_code::cowork_session_path;
 use crate::sources::kiro_cli::{load_kiro_session_metadata, KiroSessionMetadata};
+use crate::sources::prime_agent::{
+    canonical_uuid_from_jsonl_path, ROOT_SOURCE_NAME, SUBAGENT_SOURCE_NAME,
+};
 use crate::sources::shared::{format_record_ts, infer_vendor_from_base_url, parse_record_ts};
 use crate::sqlite_poll::VolatilePollMap;
 use crate::{DispatchState, Metrics, SinkMessage, WorkItem};
@@ -117,6 +120,79 @@ pub(crate) fn work_item_is_ingestable(work: &WorkItem) -> bool {
     )
 }
 
+fn prime_default_path_is_ingestable(
+    source_name: &str,
+    harness: &str,
+    format: SourceFormat,
+    source_glob: &str,
+    path: &str,
+) -> Option<bool> {
+    use std::path::{Component, Path, PathBuf};
+
+    if harness != "prime-agent" || format != SourceFormat::Jsonl {
+        return None;
+    }
+
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("~"));
+    let (canonical_glob, kind) = match source_name {
+        ROOT_SOURCE_NAME => (
+            home.join(".prime/agent/sessions/*.jsonl"),
+            PrimeDefaultPathKind::Root,
+        ),
+        SUBAGENT_SOURCE_NAME => (
+            home.join(".prime/agent/session-artifacts/**/sub-*/*.jsonl"),
+            PrimeDefaultPathKind::Subagent,
+        ),
+        _ => return None,
+    };
+    if Path::new(source_glob) != canonical_glob {
+        return None;
+    }
+
+    let candidate = Path::new(path);
+    if canonical_uuid_from_jsonl_path(path).is_none() {
+        return Some(false);
+    }
+    let root = match kind {
+        PrimeDefaultPathKind::Root => canonical_glob.parent()?,
+        PrimeDefaultPathKind::Subagent => canonical_glob.parent()?.parent()?.parent()?,
+    };
+
+    match kind {
+        PrimeDefaultPathKind::Root => Some(candidate.parent() == Some(root)),
+        PrimeDefaultPathKind::Subagent => {
+            let Ok(relative) = candidate.strip_prefix(root) else {
+                return Some(false);
+            };
+            if relative
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+            {
+                return Some(false);
+            }
+            let Some(parent_name) = candidate
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str())
+            else {
+                return Some(false);
+            };
+            let Some(child_id) = parent_name.strip_prefix("sub-") else {
+                return Some(false);
+            };
+            Some(child_id.len() == 8 && child_id.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PrimeDefaultPathKind {
+    Root,
+    Subagent,
+}
+
 fn path_is_ingestable(
     source_name: &str,
     harness: &str,
@@ -129,6 +205,12 @@ fn path_is_ingestable(
             "dropping non-canonical work item {} (format {})",
             path, format
         );
+        return false;
+    }
+    if prime_default_path_is_ingestable(source_name, harness, format, source_glob, path)
+        == Some(false)
+    {
+        debug!("skipping non-transcript Prime Agent path {}", path);
         return false;
     }
     if source_name == "claude-cowork" && cowork_session_path(path).is_none() {
@@ -1103,7 +1185,9 @@ pub(crate) async fn process_file(
     let mut reader = BufReader::new(file);
     let mut offset = checkpoint.last_offset;
     let mut line_no = checkpoint.last_line_no;
-    let initial_hints = if checkpoint.last_offset > 0 || work.harness == "pi-coding-agent" {
+    let initial_hints = if checkpoint.last_offset > 0
+        || matches!(work.harness.as_str(), "pi-coding-agent" | "prime-agent")
+    {
         infer_initial_source_hints(source_file, &work.source_name, &work.harness)
     } else {
         InitialSourceHints::default()
@@ -1880,6 +1964,7 @@ mod tests {
         SESSION_JSON_GENERATION, SESSION_JSON_INODE,
     };
     use crate::model::Checkpoint;
+    use crate::sources::prime_agent::{ROOT_SOURCE_NAME, SUBAGENT_SOURCE_NAME};
     use crate::sqlite_poll::VolatilePollMap;
     use crate::{DispatchState, Metrics, SinkMessage, WorkItem};
     use moraine_config::SourceFormat;
@@ -2273,6 +2358,150 @@ mod tests {
             .try_recv()
             .expect("real session transcript must be forwarded");
         assert_eq!(forwarded.key(), session.key());
+        assert_eq!(metrics.queue_depth.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn prime_default_sources_accept_only_canonical_transcript_paths() {
+        let prime_root = PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| "~".into()))
+            .join(".prime/agent");
+        let sessions = prime_root.join("sessions");
+        let artifacts = prime_root.join("session-artifacts");
+        let root_glob = sessions.join("*.jsonl").to_string_lossy().into_owned();
+        let child_glob = artifacts
+            .join("**/sub-*/*.jsonl")
+            .to_string_lossy()
+            .into_owned();
+        let root = |path: &Path| WorkItem {
+            source_name: ROOT_SOURCE_NAME.to_string(),
+            harness: "prime-agent".to_string(),
+            format: SourceFormat::Jsonl,
+            source_glob: root_glob.clone(),
+            path: path.to_string_lossy().into_owned(),
+        };
+        let child = |path: &Path| WorkItem {
+            source_name: SUBAGENT_SOURCE_NAME.to_string(),
+            harness: "prime-agent".to_string(),
+            format: SourceFormat::Jsonl,
+            source_glob: child_glob.clone(),
+            path: path.to_string_lossy().into_owned(),
+        };
+        let root_id = "12345678-1234-4234-8234-123456789abc";
+        let child_id = "abcdefab-cdef-4abc-8def-abcdefabcdef";
+
+        assert!(work_item_is_ingestable(&root(
+            &sessions.join(format!("{root_id}.jsonl"))
+        )));
+        assert!(!work_item_is_ingestable(&root(
+            &sessions.join("legacy").join(format!("{root_id}.jsonl"))
+        )));
+        assert!(!work_item_is_ingestable(&root(
+            &sessions.join("not-a-session.jsonl")
+        )));
+        assert!(!work_item_is_ingestable(&root(
+            &sessions.join("019FD4F8-5DE9-73FB-B00C-D5A0C9E2D620.jsonl")
+        )));
+
+        assert!(work_item_is_ingestable(&child(
+            &artifacts
+                .join(root_id)
+                .join("sub-ce0de280")
+                .join(format!("{child_id}.jsonl"))
+        )));
+        assert!(work_item_is_ingestable(&child(
+            &artifacts
+                .join(root_id)
+                .join("session-artifacts")
+                .join(child_id)
+                .join("sub-abcdef12")
+                .join(format!("{root_id}.jsonl"))
+        )));
+        assert!(!work_item_is_ingestable(&child(
+            &artifacts.join(root_id).join("rlm-subagents.jsonl")
+        )));
+        assert!(!work_item_is_ingestable(&child(
+            &artifacts
+                .join(root_id)
+                .join("sub-nothex12")
+                .join(format!("{child_id}.jsonl"))
+        )));
+        assert!(!work_item_is_ingestable(&child(
+            &artifacts
+                .join(root_id)
+                .join("sub-ce0de280")
+                .join("not-a-session.jsonl")
+        )));
+        assert!(!work_item_is_ingestable(&child(
+            &PathBuf::from("/tmp")
+                .join("sub-ce0de280")
+                .join(format!("{child_id}.jsonl"))
+        )));
+
+        let custom = WorkItem {
+            source_glob: "/tmp/prime/**/*.jsonl".to_string(),
+            path: "/tmp/prime/arbitrary.jsonl".to_string(),
+            ..root(Path::new("/tmp/unused.jsonl"))
+        };
+        assert!(
+            work_item_is_ingestable(&custom),
+            "a custom glob reusing the source name is not setup-owned and remains configurable"
+        );
+
+        let suffix_collision = WorkItem {
+            source_glob: "/mnt/archive/.prime/agent/sessions/*.jsonl".to_string(),
+            path: "/mnt/archive/.prime/agent/sessions/not-a-session.jsonl".to_string(),
+            ..root(Path::new("/tmp/unused.jsonl"))
+        };
+        assert!(
+            work_item_is_ingestable(&suffix_collision),
+            "a near-match custom archive is not the expanded setup-owned default"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn enqueue_work_drops_prime_artifact_journal_but_forwards_child() {
+        let dispatch = Arc::new(Mutex::new(DispatchState::default()));
+        let metrics = Arc::new(Metrics::default());
+        let (process_tx, mut process_rx) = mpsc::channel::<WorkItem>(8);
+        let root_id = "12345678-1234-4234-8234-123456789abc";
+        let child_id = "abcdefab-cdef-4abc-8def-abcdefabcdef";
+        let base = PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| "~".into()))
+            .join(".prime/agent/session-artifacts");
+        let journal = WorkItem {
+            source_name: SUBAGENT_SOURCE_NAME.to_string(),
+            harness: "prime-agent".to_string(),
+            format: SourceFormat::Jsonl,
+            source_glob: base.join("**/sub-*/*.jsonl").to_string_lossy().into_owned(),
+            path: base
+                .join(root_id)
+                .join("rlm-subagents.jsonl")
+                .to_string_lossy()
+                .into_owned(),
+        };
+
+        enqueue_work(journal.clone(), &process_tx, &dispatch, &metrics).await;
+        assert!(process_rx.try_recv().is_err());
+        assert!(dispatch
+            .lock()
+            .expect("dispatch mutex poisoned")
+            .item_by_key
+            .is_empty());
+        assert_eq!(metrics.queue_depth.load(Ordering::Relaxed), 0);
+
+        let child = WorkItem {
+            path: base
+                .join(root_id)
+                .join("sub-ce0de280")
+                .join(format!("{child_id}.jsonl"))
+                .to_string_lossy()
+                .into_owned(),
+            ..journal
+        };
+        enqueue_work(child.clone(), &process_tx, &dispatch, &metrics).await;
+        assert_eq!(
+            process_rx.try_recv().expect("canonical child queued").key(),
+            child.key()
+        );
         assert_eq!(metrics.queue_depth.load(Ordering::Relaxed), 1);
     }
 
@@ -3276,6 +3505,89 @@ mod tests {
             batch.raw_rows[0].get("cwd").and_then(Value::as_str),
             Some("/repo"),
             "resumed records inherit the session cwd from the file head"
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn process_file_recovers_prime_session_hints_when_resuming_mid_file() {
+        let path = unique_test_file("prime-resume-hints");
+        let session_id = "12345678-1234-4234-8234-123456789abc";
+        let header = json!({
+            "type": "session",
+            "version": 3,
+            "id": session_id,
+            "timestamp": "2026-08-06T02:48:57.000Z",
+            "cwd": "/repo/prime"
+        })
+        .to_string();
+        let tail = json!({
+            "type": "message",
+            "id": "deadbeef",
+            "parentId": null,
+            "timestamp": "2026-08-06T02:48:58.000Z",
+            "message": {"role": "user", "content": "resumed prime message", "timestamp": 1785984538000_i64}
+        })
+        .to_string();
+        fs::write(&path, format!("{header}\n{tail}\n")).expect("write Prime resume fixture");
+
+        let source_file = path.to_string_lossy().to_string();
+        let work = WorkItem {
+            source_name: ROOT_SOURCE_NAME.to_string(),
+            harness: "prime-agent".to_string(),
+            format: SourceFormat::Jsonl,
+            source_glob: String::new(),
+            path: source_file.clone(),
+        };
+        let meta = fs::metadata(&path).expect("fixture metadata");
+        let inode = source_inode_for_file(&source_file, &meta);
+        let checkpoints = Arc::new(RwLock::new(HashMap::<String, Checkpoint>::new()));
+        checkpoints.write().await.insert(
+            crate::checkpoint::checkpoint_key(&work.source_name, &source_file),
+            Checkpoint {
+                source_name: work.source_name.clone(),
+                source_file: source_file.clone(),
+                source_inode: inode,
+                source_generation: 1,
+                last_offset: (header.len() + 1) as u64,
+                last_line_no: 1,
+                status: "active".to_string(),
+                ..Default::default()
+            },
+        );
+        let config = moraine_config::AppConfig::default();
+        let metrics = Arc::new(Metrics::default());
+        let (sink_tx, mut sink_rx) = mpsc::channel::<SinkMessage>(16);
+
+        process_file(
+            &config,
+            &work,
+            checkpoints,
+            &VolatilePollMap::new(),
+            sink_tx,
+            &metrics,
+        )
+        .await
+        .expect("resumed Prime file should process");
+
+        let batches = drain_batches(&mut sink_rx).await;
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+        assert_eq!(batch.raw_rows.len(), 1);
+        assert_eq!(
+            batch.raw_rows[0].get("session_id").and_then(Value::as_str),
+            Some(session_id)
+        );
+        assert_eq!(
+            batch.raw_rows[0].get("cwd").and_then(Value::as_str),
+            Some("/repo/prime")
+        );
+        assert_eq!(
+            batch.event_rows[0]
+                .get("session_id")
+                .and_then(Value::as_str),
+            Some(session_id)
         );
 
         let _ = fs::remove_file(&path);
