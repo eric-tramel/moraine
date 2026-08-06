@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use anyhow::{anyhow, Context as _, Result};
 use moraine_clickhouse::{
@@ -72,16 +72,82 @@ type SharedInitialization = std::result::Result<Arc<BackendRepository>, Arc<str>
 
 struct BuildAttempt {
     result: watch::Sender<Option<SharedInitialization>>,
+    lifecycle: StdMutex<BuildAttemptLifecycle>,
+}
+
+struct BuildAttemptLifecycle {
+    accepting_waiters: bool,
+    waiter_count: usize,
+    build_abort: Option<tokio::task::AbortHandle>,
 }
 
 impl BuildAttempt {
     fn new() -> Self {
         let (result, _) = watch::channel(None);
-        Self { result }
+        Self {
+            result,
+            lifecycle: StdMutex::new(BuildAttemptLifecycle {
+                accepting_waiters: true,
+                waiter_count: 0,
+                build_abort: None,
+            }),
+        }
     }
 
+    fn try_waiter(self: &Arc<Self>) -> Option<BuildWaiter> {
+        let mut lifecycle = self.lifecycle.lock().expect("build attempt lock poisoned");
+        if !lifecycle.accepting_waiters {
+            return None;
+        }
+        lifecycle.waiter_count += 1;
+        Some(BuildWaiter {
+            attempt: self.clone(),
+        })
+    }
+
+    fn set_build_abort(&self, build_abort: tokio::task::AbortHandle) {
+        let mut lifecycle = self.lifecycle.lock().expect("build attempt lock poisoned");
+        debug_assert!(lifecycle.build_abort.is_none());
+        if lifecycle.accepting_waiters {
+            lifecycle.build_abort = Some(build_abort);
+        } else {
+            build_abort.abort();
+        }
+    }
+
+    fn release_waiter(&self) {
+        let build_abort = {
+            let mut lifecycle = self.lifecycle.lock().expect("build attempt lock poisoned");
+            debug_assert!(lifecycle.waiter_count > 0);
+            lifecycle.waiter_count -= 1;
+            if lifecycle.waiter_count == 0 {
+                lifecycle.accepting_waiters = false;
+                lifecycle.build_abort.take()
+            } else {
+                None
+            }
+        };
+        if let Some(build_abort) = build_abort {
+            build_abort.abort();
+        }
+    }
+
+    #[cfg(test)]
+    fn waiter_count(&self) -> usize {
+        self.lifecycle
+            .lock()
+            .expect("build attempt lock poisoned")
+            .waiter_count
+    }
+}
+
+struct BuildWaiter {
+    attempt: Arc<BuildAttempt>,
+}
+
+impl BuildWaiter {
     async fn wait(&self) -> Result<Arc<BackendRepository>> {
-        let mut result = self.result.subscribe();
+        let mut result = self.attempt.result.subscribe();
         loop {
             if let Some(result) = result.borrow_and_update().clone() {
                 return result.map_err(|message| anyhow!(message.to_string()));
@@ -91,6 +157,12 @@ impl BuildAttempt {
                 .await
                 .map_err(|_| anyhow!("backend repository initialization ended without a result"))?;
         }
+    }
+}
+
+impl Drop for BuildWaiter {
+    fn drop(&mut self) {
+        self.attempt.release_waiter();
     }
 }
 
@@ -139,54 +211,68 @@ impl BackendSlot {
         repo_config: RepoConfig,
         user_agent: Arc<str>,
     ) -> Result<Arc<BackendRepository>> {
-        let attempt = {
+        let waiter = {
             let mut state = self.state.lock().await;
             match &*state {
                 SlotState::Ready(repository) => return Ok(repository.clone()),
-                SlotState::Building(attempt) => attempt.clone(),
-                SlotState::Empty => {
-                    let attempt = Arc::new(BuildAttempt::new());
-                    *state = SlotState::Building(attempt.clone());
-
-                    let slot = self.clone();
-                    let published_attempt = attempt.clone();
-                    tokio::spawn(async move {
-                        let build_slot = slot.clone();
-                        let build = tokio::spawn(async move {
-                            build_slot.build(repo_config, &user_agent).await
-                        });
-                        let result = match build.await {
-                            Ok(result) => {
-                                result.map_err(|error| Arc::<str>::from(error.to_string()))
-                            }
-                            Err(error) => Err(Arc::<str>::from(format!(
-                                "backend repository initialization task failed: {error}"
-                            ))),
-                        };
-
-                        // Retain the result even if every initiating caller was
-                        // cancelled before subscribing to this attempt.
-                        published_attempt.result.send_replace(Some(result.clone()));
-
-                        let mut state = slot.state.lock().await;
-                        let is_current_attempt = matches!(
-                            &*state,
-                            SlotState::Building(current)
-                                if Arc::ptr_eq(current, &published_attempt)
-                        );
-                        if is_current_attempt {
-                            *state = match result {
-                                Ok(repository) => SlotState::Ready(repository),
-                                Err(_) => SlotState::Empty,
-                            };
-                        }
-                    });
-                    attempt
-                }
+                SlotState::Building(attempt) => match attempt.try_waiter() {
+                    Some(waiter) => waiter,
+                    None => self.start_build(&mut state, repo_config, user_agent),
+                },
+                SlotState::Empty => self.start_build(&mut state, repo_config, user_agent),
             }
         };
 
-        attempt.wait().await
+        waiter.wait().await
+    }
+
+    fn start_build(
+        self: &Arc<Self>,
+        state: &mut SlotState,
+        repo_config: RepoConfig,
+        user_agent: Arc<str>,
+    ) -> BuildWaiter {
+        let attempt = Arc::new(BuildAttempt::new());
+        let waiter = attempt
+            .try_waiter()
+            .expect("a new build attempt accepts its initiating waiter");
+        *state = SlotState::Building(attempt.clone());
+
+        let build_slot = self.clone();
+        let build = tokio::spawn(async move { build_slot.build(repo_config, &user_agent).await });
+        attempt.set_build_abort(build.abort_handle());
+
+        let slot = self.clone();
+        let published_attempt = attempt.clone();
+        tokio::spawn(async move {
+            let result = match build.await {
+                Ok(result) => result.map_err(|error| Arc::<str>::from(error.to_string())),
+                Err(error) => Err(Arc::<str>::from(format!(
+                    "backend repository initialization task failed: {error}"
+                ))),
+            };
+
+            // Publish the slot state before waking waiters. Otherwise the last
+            // waiter could return and retire this attempt while it still
+            // appears to be building, allowing a racing caller to duplicate a
+            // successful initialization.
+            let mut state = slot.state.lock().await;
+            let is_current_attempt = matches!(
+                &*state,
+                SlotState::Building(current) if Arc::ptr_eq(current, &published_attempt)
+            );
+            if is_current_attempt {
+                *state = match &result {
+                    Ok(repository) => SlotState::Ready(repository.clone()),
+                    Err(_) => SlotState::Empty,
+                };
+            }
+            drop(state);
+
+            published_attempt.result.send_replace(Some(result));
+        });
+
+        waiter
     }
 
     async fn build(
@@ -225,8 +311,9 @@ impl BackendSlot {
 /// One slot is predeclared for every normalized backend. The default slot is
 /// constructed without a remote schema handshake because Moraine owns and
 /// migrates it. Every named slot is checked exactly once per successful
-/// initialization. Concurrent callers share an in-flight result; failures are
-/// returned to those callers but are not cached, so a later call retries.
+/// initialization. Concurrent callers share an in-flight result while at least
+/// one caller is still waiting. An abandoned attempt is cancelled once its last
+/// waiter disappears. Failures are not cached, so a later call retries.
 pub struct BackendRepositoryRouter {
     config: Arc<AppConfig>,
     repo_config: RepoConfig,
@@ -463,6 +550,7 @@ mod tests {
         versions: Vec<String>,
         fail_first: AtomicBool,
         requests: AtomicUsize,
+        cleanup_polls: AtomicUsize,
         captured: StdMutex<Vec<CapturedRequest>>,
         first_request_block: Option<FirstRequestBlock>,
     }
@@ -508,6 +596,21 @@ mod tests {
                 );
             }
 
+            if query.starts_with("KILL QUERY") {
+                return (StatusCode::OK, String::new());
+            }
+            if query.contains("FROM system.processes") {
+                let body = if state.cleanup_polls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    query
+                        .split('\'')
+                        .nth(1)
+                        .map(|query_id| json!({"query_id": query_id}).to_string())
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                return (StatusCode::OK, body);
+            }
             if query.contains("FROM system.tables") {
                 return (
                     StatusCode::OK,
@@ -534,6 +637,7 @@ mod tests {
             versions,
             fail_first: AtomicBool::new(fail_first),
             requests: AtomicUsize::new(0),
+            cleanup_polls: AtomicUsize::new(0),
             captured: StdMutex::new(Vec::new()),
             first_request_block,
         });
@@ -833,6 +937,143 @@ mod tests {
             .expect("successful slot is cached");
         assert!(Arc::ptr_eq(&recovered, &cached));
         assert_eq!(data_request_count(&state), 3);
+    }
+
+    async fn wait_for_owner_count(runtime: &QueryRuntime, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while runtime.active_owner_count() != expected {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("query owner count did not converge");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn named_slot_cancels_initialization_when_its_only_waiter_is_dropped() {
+        let reached = Arc::new(Barrier::new(2));
+        let release = Arc::new(Notify::new());
+        let (url, _state) = spawn_schema_server(
+            true,
+            bundled_versions(),
+            false,
+            Some(FirstRequestBlock {
+                reached: reached.clone(),
+                release: release.clone(),
+            }),
+        )
+        .await;
+        let query_runtime = QueryRuntime::new();
+        let router = Arc::new(
+            BackendRepositoryRouter::new(
+                routed_config(url, false),
+                RepoConfig::default(),
+                query_runtime.clone(),
+                "moraine-backend/test",
+            )
+            .expect("router"),
+        );
+
+        let caller = {
+            let router = router.clone();
+            tokio::spawn(async move {
+                router
+                    .repository_for_project_dir(Some("/work/team/project"))
+                    .await
+            })
+        };
+        reached.wait().await;
+        assert_eq!(query_runtime.active_owner_count(), 1);
+
+        caller.abort();
+        match caller.await {
+            Err(error) => assert!(error.is_cancelled()),
+            Ok(_) => panic!("caller must be aborted"),
+        }
+        wait_for_owner_count(&query_runtime, 0).await;
+
+        // Let the test server retire a handler if its HTTP stack retained the
+        // disconnected request. The abandoned build itself is already gone.
+        release.notify_waiters();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn named_slot_keeps_shared_initialization_for_a_remaining_waiter() {
+        let reached = Arc::new(Barrier::new(2));
+        let release = Arc::new(Notify::new());
+        let (url, state) = spawn_schema_server(
+            true,
+            bundled_versions(),
+            false,
+            Some(FirstRequestBlock {
+                reached: reached.clone(),
+                release: release.clone(),
+            }),
+        )
+        .await;
+        let query_runtime = QueryRuntime::new();
+        let router = Arc::new(
+            BackendRepositoryRouter::new(
+                routed_config(url, false),
+                RepoConfig::default(),
+                query_runtime.clone(),
+                "moraine-backend/test",
+            )
+            .expect("router"),
+        );
+
+        let first = {
+            let router = router.clone();
+            tokio::spawn(async move {
+                router
+                    .repository_for_project_dir(Some("/work/team/project"))
+                    .await
+            })
+        };
+        reached.wait().await;
+        let second = {
+            let router = router.clone();
+            tokio::spawn(async move {
+                router
+                    .repository_for_project_dir(Some("/work/team/project"))
+                    .await
+            })
+        };
+
+        let slot = router.slots.get("team-ch").expect("named slot").clone();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let waiter_count = {
+                    let state = slot.state.lock().await;
+                    match &*state {
+                        SlotState::Building(attempt) => attempt.waiter_count(),
+                        _ => 0,
+                    }
+                };
+                if waiter_count == 2 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("second waiter must join shared initialization");
+
+        first.abort();
+        match first.await {
+            Err(error) => assert!(error.is_cancelled()),
+            Ok(_) => panic!("first caller must be aborted"),
+        }
+        assert_eq!(query_runtime.active_owner_count(), 1);
+
+        release.notify_one();
+        let repository = second
+            .await
+            .expect("second caller task")
+            .expect("remaining waiter keeps initialization alive");
+        assert_eq!(repository.backend_name(), "team-ch");
+        wait_for_owner_count(&query_runtime, 0).await;
+        assert_eq!(data_request_count(&state), 2);
     }
 
     #[tokio::test(flavor = "multi_thread")]

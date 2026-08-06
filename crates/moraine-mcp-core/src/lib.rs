@@ -1945,17 +1945,27 @@ async fn serve_socket_connection(state: SocketState, stream: tokio::net::UnixStr
 
     let mut shutdown = state.shutdown.clone();
     let peer_fd = stream.as_raw_fd();
+    let peer_disconnected = wait_for_socket_disconnect(peer_fd);
+    tokio::pin!(peer_disconnected);
 
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
-    let Some(first_line) = private_proxy::read_server_first_line(&mut reader).await? else {
+    let first_line = tokio::select! {
+        first_line = private_proxy::read_server_first_line(&mut reader) => first_line?,
+        _ = &mut peer_disconnected => return Ok(()),
+    };
+    let Some(first_line) = first_line else {
         return Ok(());
     };
 
     let (backend, replay_first_line, negotiated, launch_dir) =
         match private_proxy::classify_server_first_line(&first_line) {
             ServerFirstLine::Route { cwd } => {
-                match state.router.repository_for_project_dir(Some(&cwd)).await {
+                let selected = tokio::select! {
+                    selected = state.router.repository_for_project_dir(Some(&cwd)) => selected,
+                    _ = &mut peer_disconnected => return Ok(()),
+                };
+                match selected {
                     Ok(backend) => (
                         backend,
                         None,
@@ -1964,17 +1974,26 @@ async fn serve_socket_connection(state: SocketState, stream: tokio::net::UnixStr
                     ),
                     Err(error) => {
                         let message = format!("{error:#}");
-                        private_proxy::write_route_error(&mut write_half, &message).await?;
+                        tokio::select! {
+                            result = private_proxy::write_route_error(&mut write_half, &message) => result?,
+                            _ = &mut peer_disconnected => return Ok(()),
+                        }
                         return Ok(());
                     }
                 }
             }
             ServerFirstLine::Incompatible => {
-                private_proxy::write_incompatible_error(&mut write_half).await?;
+                tokio::select! {
+                    result = private_proxy::write_incompatible_error(&mut write_half) => result?,
+                    _ = &mut peer_disconnected => return Ok(()),
+                }
                 return Ok(());
             }
             ServerFirstLine::Raw => {
-                let backend = state.router.default_repository().await?;
+                let backend = tokio::select! {
+                    backend = state.router.default_repository() => backend?,
+                    _ = &mut peer_disconnected => return Ok(()),
+                };
                 (
                     backend,
                     Some(first_line),
@@ -1987,7 +2006,11 @@ async fn serve_socket_connection(state: SocketState, stream: tokio::net::UnixStr
     let prewarm_started = match state.prewarm_gates.for_backend(backend.backend_name()) {
         Ok(gate) => gate,
         Err(error) if negotiated => {
-            private_proxy::write_route_error(&mut write_half, &error.to_string()).await?;
+            let message = error.to_string();
+            tokio::select! {
+                result = private_proxy::write_route_error(&mut write_half, &message) => result?,
+                _ = &mut peer_disconnected => return Ok(()),
+            }
             return Ok(());
         }
         Err(error) => return Err(error),
@@ -2001,7 +2024,10 @@ async fn serve_socket_connection(state: SocketState, stream: tokio::net::UnixStr
         state.router.query_runtime(),
     );
     if negotiated {
-        private_proxy::write_ack(&mut write_half).await?;
+        tokio::select! {
+            result = private_proxy::write_ack(&mut write_half) => result?,
+            _ = &mut peer_disconnected => return Ok(()),
+        }
     }
     serve_connection_with_lifecycle(
         app_state,
@@ -2013,7 +2039,7 @@ async fn serve_socket_connection(state: SocketState, stream: tokio::net::UnixStr
                 let _ = shutdown.changed().await;
             }
         },
-        wait_for_socket_disconnect(peer_fd),
+        peer_disconnected,
     )
     .await
 }
@@ -3639,6 +3665,147 @@ mod tests {
             .await
             .expect("incompatible server task")
             .expect("incompatible server shutdown");
+    }
+
+    #[cfg(unix)]
+    async fn spawn_blocked_schema_server() -> (
+        String,
+        Arc<tokio::sync::Notify>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind blocked schema server");
+        let address = listener.local_addr().expect("schema server address");
+        let first_request = Arc::new(tokio::sync::Notify::new());
+        let child_query_id = Arc::new(StdMutex::new(None::<String>));
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server = {
+            let first_request = first_request.clone();
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut stream, _)) = listener.accept().await else {
+                        break;
+                    };
+                    let request_index = accepted.fetch_add(1, Ordering::SeqCst);
+                    let first_request = first_request.clone();
+                    let child_query_id = child_query_id.clone();
+                    tokio::spawn(async move {
+                        let mut request = Vec::new();
+                        let mut chunk = [0_u8; 1024];
+                        loop {
+                            let read = stream.read(&mut chunk).await.expect("read schema request");
+                            if read == 0 {
+                                return;
+                            }
+                            request.extend_from_slice(&chunk[..read]);
+                            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+
+                        if request_index == 0 {
+                            let request_text = String::from_utf8_lossy(&request);
+                            let query_id = request_text
+                                .split("query_id=")
+                                .nth(1)
+                                .and_then(|tail| tail.split(['&', ' ']).next())
+                                .expect("schema query id")
+                                .to_string();
+                            *child_query_id.lock().expect("child query id lock") = Some(query_id);
+                            first_request.notify_one();
+                            pending::<()>().await;
+                        }
+
+                        // Query-owner cleanup uses four requests in the happy
+                        // path: KILL, visible process poll, KILL, empty poll.
+                        let body = if request_index == 2 {
+                            let query_id = child_query_id
+                                .lock()
+                                .expect("child query id lock")
+                                .clone()
+                                .expect("captured schema query id");
+                            format!("{{\"query_id\":\"{query_id}\"}}\n")
+                        } else {
+                            String::new()
+                        };
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        stream
+                            .write_all(response.as_bytes())
+                            .await
+                            .expect("write schema response");
+                    });
+                }
+            })
+        };
+        (format!("http://{address}"), first_request, server)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pre_ack_disconnect_cancels_the_only_named_backend_waiter() {
+        use tokio::io::AsyncWriteExt;
+
+        let (url, schema_started, schema_server) = spawn_blocked_schema_server().await;
+        let mut cfg = AppConfig::default();
+        cfg.backends.insert(
+            "team-ch".to_string(),
+            moraine_config::ClickHouseConfig {
+                url,
+                database: "moraine_team".to_string(),
+                ..Default::default()
+            },
+        );
+        cfg.routes.push(moraine_config::RouteConfig {
+            dir: "/work/team/**".to_string(),
+            backend: "team-ch".to_string(),
+            mode: moraine_config::ROUTE_MODE_MIRROR.to_string(),
+        });
+        let cfg = Arc::new(cfg);
+        let query_runtime = QueryRuntime::new();
+        let router = Arc::new(
+            BackendRepositoryRouter::new(
+                cfg.clone(),
+                RepoConfig::default(),
+                query_runtime.clone(),
+                "moraine-mcp/test",
+            )
+            .expect("lazy routed router"),
+        );
+        let (sock, shutdown_tx, server) =
+            spawn_test_socket("pre-ack-disconnect", cfg, router).await;
+
+        let mut stream = connect_to_test_socket(&sock).await;
+        stream
+            .write_all(
+                b"{\"jsonrpc\":\"2.0\",\"id\":\"moraine-route-v1\",\"method\":\"moraine/private/route\",\"params\":{\"version\":1,\"cwd\":\"/work/team/project\"}}\n",
+            )
+            .await
+            .expect("write private route request");
+        schema_started.notified().await;
+        assert_eq!(query_runtime.active_owner_count(), 1);
+
+        drop(stream);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while query_runtime.active_owner_count() != 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("disconnected pre-ACK waiter must cancel schema initialization");
+
+        shutdown_tx.send(()).expect("shutdown disconnect server");
+        server
+            .await
+            .expect("disconnect server task")
+            .expect("disconnect server shutdown");
+        schema_server.abort();
     }
 
     #[cfg(unix)]
