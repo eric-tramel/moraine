@@ -27,6 +27,13 @@ There is no session-detail backend route. In particular,
 must use the records returned by `/api/v1/sessions`; it must not infer a detail
 route from the collection URL.
 
+Session `title` uses the shared display-label precedence: explicit metadata
+title/name, then the first genuine Codex `event_msg/user_message`, followed by
+existing metadata and a privacy-safe descriptor. Injected Codex
+`response_item/message role=user` content is not eligible for the prompt tier.
+Prompt-derived labels are trimmed to the first line and capped at 120 Unicode
+scalar values plus an ellipsis.
+
 ## Capabilities Contract
 
 `GET /api/v1/capabilities` returns HTTP `200` with this contract:

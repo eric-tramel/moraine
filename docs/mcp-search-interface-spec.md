@@ -841,13 +841,17 @@ session metadata only:
 }
 ```
 
-`list_sessions` must not return event snippets, transcript text, or event
+`list_sessions` must not return raw event snippets, transcript fields, or event
 payloads. To inspect a listed session, pass `open.session_id` to `open`.
 The returned `session.harness` and `session.source` identify the normalized
 harness and configured ingest source that the corresponding filters match.
-When a session has no explicit title, summary, or slug, `session.display_label`
-uses already exposed metadata such as harness, mode, update time, and turn count
-rather than transcript text.
+`session.display_label` is the only bounded content-derived exception: it
+prefers an explicit title/name, then the first Codex event whose normalized
+provenance is `actor_kind=user`, `event_kind=event_msg`, and
+`payload_type=user_message`. That preview is trimmed to its first line and at
+most 120 Unicode scalar values plus an ellipsis. Existing title, summary, and
+slug metadata follow; the final fallback uses only harness, mode, update time,
+and turn count.
 
 ## Tool: `file_attention`
 
