@@ -14,7 +14,9 @@ use crate::{
 };
 use anyhow::Context;
 use chrono::{DateTime, Utc};
-use moraine_clickhouse::{is_oversized_json_each_row_insert_error, ClickHouseClient};
+use moraine_clickhouse::{
+    is_oversized_json_each_row_insert_error, ClickHouseClient, QueryOwner, QueryWorkload,
+};
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -1120,10 +1122,15 @@ async fn emit_heartbeat(clickhouse: &ClickHouseClient, metrics: &Arc<Metrics>, r
         }
     }
 
-    if let Err(exc) = clickhouse
-        .insert_json_rows("ingest_heartbeats", &[heartbeat])
-        .await
-    {
+    let insert = match QueryOwner::new(&clickhouse.runtime(), QueryWorkload::Background) {
+        Ok(owner) => {
+            owner
+                .scope(clickhouse.insert_json_rows("ingest_heartbeats", &[heartbeat]))
+                .await
+        }
+        Err(error) => Err(error.into()),
+    };
+    if let Err(exc) = insert {
         warn!("heartbeat insert failed: {exc}");
     }
 }
@@ -1246,79 +1253,102 @@ async fn flush_pending_with_ack(
         );
     }
 
-    let flush_result = async {
-        if !raw_rows.is_empty() {
-            clickhouse
-                .insert_json_rows("raw_events", raw_rows)
+    let first_pending_stage = if !raw_rows.is_empty() {
+        SinkStage::RawEvents
+    } else if !event_rows.is_empty() {
+        SinkStage::Events
+    } else if !link_rows.is_empty() {
+        SinkStage::EventLinks
+    } else if !error_rows.is_empty() {
+        SinkStage::IngestErrors
+    } else {
+        SinkStage::IngestCheckpoints
+    };
+    let flush_result = match QueryOwner::new(&clickhouse.runtime(), QueryWorkload::Background) {
+        Ok(owner) => {
+            owner
+                .scope(async {
+                    if !raw_rows.is_empty() {
+                        clickhouse
+                            .insert_json_rows("raw_events", raw_rows)
+                            .await
+                            .map_err(|error| SinkFlushFailure::new(SinkStage::RawEvents, error))?;
+                        metrics
+                            .raw_rows_written
+                            .fetch_add(raw_rows.len() as u64, Ordering::Relaxed);
+                        if let Some((p50_ms, p95_ms)) =
+                            compute_append_to_visible_stats(raw_rows, Utc::now())
+                        {
+                            metrics
+                                .append_to_visible_p50_ms
+                                .store(p50_ms as u64, Ordering::Relaxed);
+                            metrics
+                                .append_to_visible_p95_ms
+                                .store(p95_ms as u64, Ordering::Relaxed);
+                        }
+                        raw_rows.clear();
+                    }
+
+                    if !event_rows.is_empty() {
+                        clickhouse
+                            .insert_json_rows_sync("events", event_rows)
+                            .await
+                            .map_err(|error| SinkFlushFailure::new(SinkStage::Events, error))?;
+                        metrics
+                            .event_rows_written
+                            .fetch_add(event_rows.len() as u64, Ordering::Relaxed);
+                        if ack_observer.enabled {
+                            pending_ack.extend(event_rows);
+                        }
+                        event_rows.clear();
+                    }
+
+                    if !link_rows.is_empty() {
+                        clickhouse
+                            .insert_json_rows("event_links", link_rows)
+                            .await
+                            .map_err(|error| SinkFlushFailure::new(SinkStage::EventLinks, error))?;
+                        link_rows.clear();
+                    }
+
+                    if !error_rows.is_empty() {
+                        clickhouse
+                            .insert_json_rows("ingest_errors", error_rows)
+                            .await
+                            .map_err(|error| {
+                                SinkFlushFailure::new(SinkStage::IngestErrors, error)
+                            })?;
+                        metrics
+                            .err_rows_written
+                            .fetch_add(error_rows.len() as u64, Ordering::Relaxed);
+                        error_rows.clear();
+                    }
+
+                    if !checkpoint_rows.is_empty() {
+                        commit_checkpoint_updates(
+                            clickhouse,
+                            checkpoints,
+                            metrics,
+                            &checkpoint_rows,
+                            checkpoint_updates,
+                            checkpoint_cursor_columns,
+                        )
+                        .await
+                        .map_err(|error| {
+                            SinkFlushFailure::new(SinkStage::IngestCheckpoints, error)
+                        })?;
+                        checkpoint_updates.clear();
+                    }
+
+                    metrics
+                        .last_flush_ms
+                        .store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
+                    Ok::<(), SinkFlushFailure>(())
+                })
                 .await
-                .map_err(|error| SinkFlushFailure::new(SinkStage::RawEvents, error))?;
-            metrics
-                .raw_rows_written
-                .fetch_add(raw_rows.len() as u64, Ordering::Relaxed);
-            if let Some((p50_ms, p95_ms)) = compute_append_to_visible_stats(raw_rows, Utc::now()) {
-                metrics
-                    .append_to_visible_p50_ms
-                    .store(p50_ms as u64, Ordering::Relaxed);
-                metrics
-                    .append_to_visible_p95_ms
-                    .store(p95_ms as u64, Ordering::Relaxed);
-            }
-            raw_rows.clear();
         }
-
-        if !event_rows.is_empty() {
-            clickhouse
-                .insert_json_rows_sync("events", event_rows)
-                .await
-                .map_err(|error| SinkFlushFailure::new(SinkStage::Events, error))?;
-            metrics
-                .event_rows_written
-                .fetch_add(event_rows.len() as u64, Ordering::Relaxed);
-            if ack_observer.enabled {
-                pending_ack.extend(event_rows);
-            }
-            event_rows.clear();
-        }
-
-        if !link_rows.is_empty() {
-            clickhouse
-                .insert_json_rows("event_links", link_rows)
-                .await
-                .map_err(|error| SinkFlushFailure::new(SinkStage::EventLinks, error))?;
-            link_rows.clear();
-        }
-
-        if !error_rows.is_empty() {
-            clickhouse
-                .insert_json_rows("ingest_errors", error_rows)
-                .await
-                .map_err(|error| SinkFlushFailure::new(SinkStage::IngestErrors, error))?;
-            metrics
-                .err_rows_written
-                .fetch_add(error_rows.len() as u64, Ordering::Relaxed);
-            error_rows.clear();
-        }
-
-        if !checkpoint_rows.is_empty() {
-            commit_checkpoint_updates(
-                clickhouse,
-                checkpoints,
-                metrics,
-                &checkpoint_rows,
-                checkpoint_updates,
-                checkpoint_cursor_columns,
-            )
-            .await
-            .map_err(|error| SinkFlushFailure::new(SinkStage::IngestCheckpoints, error))?;
-            checkpoint_updates.clear();
-        }
-
-        metrics
-            .last_flush_ms
-            .store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
-        Ok::<(), SinkFlushFailure>(())
-    }
-    .await;
+        Err(error) => Err(SinkFlushFailure::new(first_pending_stage, error.into())),
+    };
 
     match flush_result {
         Ok(()) => {
@@ -1347,25 +1377,48 @@ async fn flush_pending_with_ack(
                     "non-retryable oversized JSONEachRow insert failure; recording compact ingest error, committing checkpoint, and dropping pending batch: {}",
                     failure.error
                 );
-                if let Err(error) = record_non_retryable_sink_error(
-                    clickhouse,
-                    metrics,
-                    failure.stage,
-                    &error_text,
-                    PendingSinkData {
-                        raw_rows,
-                        event_rows,
-                        link_rows,
-                        error_rows,
-                        checkpoint_updates,
-                    },
-                )
-                .await
-                {
-                    let last_error = format!(
-                        "failed to record non-retryable sink error at {}: {error}",
-                        failure.stage.table()
-                    );
+                let repair_result =
+                    match QueryOwner::new(&clickhouse.runtime(), QueryWorkload::Background) {
+                        Ok(owner) => {
+                            owner
+                                .scope(async {
+                                    record_non_retryable_sink_error(
+                                        clickhouse,
+                                        metrics,
+                                        failure.stage,
+                                        &error_text,
+                                        PendingSinkData {
+                                            raw_rows,
+                                            event_rows,
+                                            link_rows,
+                                            error_rows,
+                                            checkpoint_updates,
+                                        },
+                                    )
+                                    .await?;
+                                    commit_checkpoint_updates(
+                                        clickhouse,
+                                        checkpoints,
+                                        metrics,
+                                        &checkpoint_rows,
+                                        checkpoint_updates,
+                                        checkpoint_cursor_columns,
+                                    )
+                                    .await
+                                    .with_context(|| {
+                                        format!(
+                                    "failed to checkpoint after non-retryable sink failure at {}",
+                                    failure.stage.table()
+                                )
+                                    })?;
+                                    Ok::<(), anyhow::Error>(())
+                                })
+                                .await
+                        }
+                        Err(error) => Err(error.into()),
+                    };
+                if let Err(error) = repair_result {
+                    let last_error = error.to_string();
                     *metrics
                         .last_error
                         .lock()
@@ -1373,32 +1426,7 @@ async fn flush_pending_with_ack(
                     warn!(
                         sink_stage = failure.stage.table(),
                         original_error = %failure.error,
-                        "{last_error}"
-                    );
-                    return false;
-                }
-                if let Err(error) = commit_checkpoint_updates(
-                    clickhouse,
-                    checkpoints,
-                    metrics,
-                    &checkpoint_rows,
-                    checkpoint_updates,
-                    checkpoint_cursor_columns,
-                )
-                .await
-                {
-                    let last_error = format!(
-                        "failed to checkpoint after non-retryable sink failure at {}: {error}",
-                        failure.stage.table()
-                    );
-                    *metrics
-                        .last_error
-                        .lock()
-                        .expect("metrics last_error mutex poisoned") = last_error.clone();
-                    warn!(
-                        sink_stage = failure.stage.table(),
-                        original_error = %failure.error,
-                        "{last_error}"
+                        "non-retryable sink repair failed: {last_error}"
                     );
                     return false;
                 }
@@ -1453,6 +1481,7 @@ mod tests {
         rows_by_table: Arc<Mutex<HashMap<String, Vec<Value>>>>,
         fail_once_by_table: Arc<Mutex<HashMap<String, usize>>>,
         fail_always_by_table: Arc<Mutex<HashMap<String, String>>>,
+        query_ids: Arc<Mutex<Vec<String>>>,
     }
 
     impl MockClickHouseState {
@@ -1496,6 +1525,13 @@ mod tests {
                 .cloned()
                 .unwrap_or_default()
         }
+
+        fn query_ids(&self) -> Vec<String> {
+            self.query_ids
+                .lock()
+                .expect("mock query ids mutex poisoned")
+                .clone()
+        }
     }
 
     fn inserted_table_name(query: &str) -> Option<&'static str> {
@@ -1524,6 +1560,16 @@ mod tests {
         body: String,
     ) -> (StatusCode, String) {
         let query = params.get("query").cloned().unwrap_or_default();
+        state
+            .query_ids
+            .lock()
+            .expect("mock query ids mutex poisoned")
+            .push(
+                params
+                    .get("query_id")
+                    .expect("sink request must carry a query id")
+                    .clone(),
+            );
         let Some(table) = inserted_table_name(&query) else {
             return (
                 StatusCode::BAD_REQUEST,
@@ -1693,6 +1739,78 @@ mod tests {
 
     fn fixed_monotonic_timestamp() -> Option<u64> {
         Some(42_000_000)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn spawned_flush_establishes_one_background_owner_for_all_statements() {
+        let (clickhouse, state) =
+            spawn_mock_clickhouse_with_state(MockClickHouseState::default()).await;
+        let runtime = clickhouse.runtime();
+        let caller = QueryOwner::new(&runtime, QueryWorkload::Internal)
+            .expect("create unrelated caller owner");
+
+        let task = caller
+            .scope(async move {
+                tokio::spawn(async move {
+                    let checkpoints = Arc::new(RwLock::new(HashMap::new()));
+                    let metrics = Arc::new(Metrics::default());
+                    let mut raw_rows = vec![json!({"event_uid": "raw-1"})];
+                    let mut event_rows = vec![json!({"event_uid": "event-1"})];
+                    let mut link_rows = Vec::new();
+                    let mut error_rows = Vec::new();
+                    let mut checkpoint_updates = HashMap::new();
+                    flush_pending(
+                        &clickhouse,
+                        &checkpoints,
+                        &metrics,
+                        &mut raw_rows,
+                        &mut event_rows,
+                        &mut link_rows,
+                        &mut error_rows,
+                        &mut checkpoint_updates,
+                        true,
+                        "",
+                    )
+                    .await
+                })
+                .await
+                .expect("spawned flush task joins")
+            })
+            .await;
+        assert!(task, "spawned flush succeeds");
+
+        let query_ids = state.query_ids();
+        assert_eq!(
+            query_ids.len(),
+            2,
+            "raw and event inserts share one attempt"
+        );
+        assert!(
+            query_ids
+                .iter()
+                .all(|id| id.starts_with("moraine-background-")),
+            "spawned operation must establish its own background owner: {query_ids:?}"
+        );
+        let logical_ids: Vec<_> = query_ids
+            .iter()
+            .map(|id| id.rsplit_once('-').expect("child query suffix").0)
+            .collect();
+        assert_eq!(logical_ids[0], logical_ids[1]);
+        assert_eq!(runtime.active_owner_count(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn heartbeat_establishes_a_background_owner() {
+        let (clickhouse, state) =
+            spawn_mock_clickhouse_with_state(MockClickHouseState::default()).await;
+        let runtime = clickhouse.runtime();
+
+        emit_heartbeat(&clickhouse, &Arc::new(Metrics::default()), &default_role()).await;
+
+        let query_ids = state.query_ids();
+        assert_eq!(query_ids.len(), 1);
+        assert!(query_ids[0].starts_with("moraine-background-"));
+        assert_eq!(runtime.active_owner_count(), 0);
     }
 
     #[test]

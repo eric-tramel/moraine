@@ -91,6 +91,16 @@ async_insert = true
 wait_for_async_insert = true
 ```
 
+`timeout_seconds` bounds only connection establishment. It is not an elapsed
+query timeout, so a slow but connected remote query is not cut off after 30
+seconds. Admitted queries run until completion, caller cancellation or full
+disconnect, service shutdown, or an explicitly supplied internal absolute
+deadline. Abandoned work is cancelled best effort through a separate
+administrative connection, with cleanup bounded to five seconds. Ensure the
+configured user can inspect `system.processes` and execute `KILL QUERY` for its
+own Moraine queries if you want remote cancellation to remove server work; an
+authorization failure is logged but does not make shutdown wait indefinitely.
+
 Set `CLICKHOUSE_PASSWORD` in the process environment before starting Moraine.
 Environment injectors can supply it without writing the resolved value to disk:
 

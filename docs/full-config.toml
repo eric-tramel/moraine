@@ -25,7 +25,9 @@ username = "default"
 # ClickHouse string field can instead use { env = "VARIABLE_NAME" }.
 password = ""
 
-# Per-request ClickHouse HTTP timeout, in seconds.
+# ClickHouse connection-establishment timeout, in seconds. This is not a query
+# execution deadline: admitted work runs until completion, caller cancellation
+# or disconnect, shutdown, or an explicitly supplied absolute caller deadline.
 timeout_seconds = 30.0
 
 # Compress non-empty ClickHouse HTTP request bodies. Supported values are

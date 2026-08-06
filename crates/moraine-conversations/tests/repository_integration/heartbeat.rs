@@ -213,7 +213,7 @@ async fn heartbeat_propagates_column_probe_and_latest_read_errors() {
         .expect_err("column probe failure propagates");
     assert!(probe_error
         .to_string()
-        .contains("heartbeat column probe failed"));
+        .contains("ClickHouse request was rejected"));
     assert_script_consumed(&probe_state, 1);
 
     let (read_repo, read_state) = build_scripted_repo(vec![
@@ -233,7 +233,7 @@ async fn heartbeat_propagates_column_probe_and_latest_read_errors() {
         .expect_err("heartbeat read failure propagates");
     assert!(read_error
         .to_string()
-        .contains("heartbeat latest read failed"));
+        .contains("ClickHouse request was rejected"));
     assert_script_consumed(&read_state, 2);
 }
 

@@ -60,7 +60,7 @@ async fn store_health_maps_all_successful_probe_facts() {
     assert_script_consumed(&state, 4);
 }
 #[tokio::test(flavor = "multi_thread")]
-async fn store_health_keeps_each_probe_failure_independent() {
+async fn store_health_backend_failure_cancels_remaining_owner_children() {
     let responses = vec![
         ScriptedResponse::failure(&["SELECT 1"], "health ping failed"),
         ScriptedResponse::failure(&["SELECT version() AS version"], "health version failed"),
@@ -76,21 +76,12 @@ async fn store_health_keeps_each_probe_failure_independent() {
 
     assert!(matches!(
         health.ping,
-        StoreProbe::Failed { ref message } if message.contains("health ping failed")
+        StoreProbe::Failed { ref message } if message.contains("ClickHouse request was rejected")
     ));
-    assert!(matches!(
-        health.version,
-        StoreProbe::Failed { ref message } if message.contains("health version failed")
-    ));
-    assert!(matches!(
-        health.database_exists,
-        StoreProbe::Failed { ref message } if message.contains("health database failed")
-    ));
-    assert!(matches!(
-        health.connections,
-        StoreProbe::Failed { ref message } if message.contains("health connections failed")
-    ));
-    assert_script_consumed(&state, 4);
+    assert!(matches!(health.version, StoreProbe::Failed { .. }));
+    assert!(matches!(health.database_exists, StoreProbe::Failed { .. }));
+    assert!(matches!(health.connections, StoreProbe::Failed { .. }));
+    assert_eq!(state.queries.lock().expect("query lock").len(), 1);
 }
 #[tokio::test(flavor = "multi_thread")]
 async fn diagnostics_maps_doctor_partial_report_and_ping_short_circuit() {
@@ -142,24 +133,16 @@ async fn diagnostics_maps_doctor_partial_report_and_ping_short_circuit() {
     assert!(diagnostics.healthy);
     assert!(diagnostics.version.is_none());
     assert_eq!(diagnostics.database, "moraine");
-    assert!(diagnostics.database_exists);
+    assert!(!diagnostics.database_exists);
     assert!(diagnostics.applied_schema_versions.is_empty());
-    assert!(!diagnostics.pending_schema_versions.is_empty());
-    assert_eq!(
-        diagnostics.missing_tables,
-        vec![
-            "ingest_errors",
-            "mcp_event_locator",
-            "mcp_event_navigation",
-            "file_attention_project_roots",
-        ]
-    );
+    assert!(diagnostics.pending_schema_versions.is_empty());
+    assert!(diagnostics.missing_tables.is_empty());
     assert_eq!(diagnostics.errors.len(), 2);
     assert!(diagnostics.errors[0].contains("version query failed"));
-    assert!(diagnostics.errors[0].contains("doctor version probe failed"));
-    assert!(diagnostics.errors[1].contains("failed to read migration ledger"));
-    assert!(diagnostics.errors[1].contains("doctor ledger read failed"));
-    assert_script_consumed(&state, 5);
+    assert!(diagnostics.errors[0].contains("ClickHouse request was rejected"));
+    assert!(diagnostics.errors[1].contains("database existence query failed"));
+    assert!(diagnostics.errors[1].contains("query owner is no longer active"));
+    assert_eq!(state.queries.lock().expect("query lock").len(), 2);
 
     let (down_repo, down_state) = build_scripted_repo(vec![ScriptedResponse::failure(
         &["SELECT 1"],
@@ -179,6 +162,6 @@ async fn diagnostics_maps_doctor_partial_report_and_ping_short_circuit() {
     assert!(down.missing_tables.is_empty());
     assert_eq!(down.errors.len(), 1);
     assert!(down.errors[0].contains("ping failed"));
-    assert!(down.errors[0].contains("doctor ping unavailable"));
+    assert!(down.errors[0].contains("ClickHouse request was rejected"));
     assert_script_consumed(&down_state, 1);
 }

@@ -1732,10 +1732,27 @@ fn normalize_config(mut cfg: AppConfig) -> Result<AppConfig> {
         resolve_runtime_subdir(&cfg.runtime.pids_dir, &cfg.mcp.central_socket_path);
 
     normalize_backends_and_routes(&mut cfg)?;
+    validate_clickhouse_connect_timeouts(&cfg)?;
     normalize_redaction(&mut cfg)?;
     normalize_identity(&mut cfg);
 
     Ok(cfg)
+}
+
+fn validate_clickhouse_connect_timeouts(cfg: &AppConfig) -> Result<()> {
+    for (name, backend) in &cfg.backends {
+        if !backend.timeout_seconds.is_finite() || backend.timeout_seconds <= 0.0 {
+            let field = if name == DEFAULT_BACKEND_NAME {
+                "clickhouse.timeout_seconds".to_string()
+            } else {
+                format!("backends.{name}.timeout_seconds")
+            };
+            return Err(anyhow::anyhow!(
+                "{field} must be finite and greater than zero"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn normalize_identity(cfg: &mut AppConfig) {
@@ -2862,6 +2879,49 @@ ruleset = "custom"
         assert_eq!(
             cfg.backends[DEFAULT_BACKEND_NAME].request_compression,
             ClickHouseRequestCompression::None
+        );
+    }
+
+    #[test]
+    fn clickhouse_connect_timeout_must_be_finite_and_positive() {
+        for (label, value) in [
+            ("zero", "0.0"),
+            ("negative", "-1.0"),
+            ("nan", "nan"),
+            ("positive-infinity", "inf"),
+            ("negative-infinity", "-inf"),
+        ] {
+            let path = write_temp_config(
+                &format!("[clickhouse]\ntimeout_seconds = {value}\n"),
+                &format!("clickhouse-connect-timeout-{label}"),
+            );
+            let error = load_config(&path).expect_err("invalid connect timeout must fail");
+            std::fs::remove_file(&path).ok();
+            assert!(
+                error
+                    .to_string()
+                    .contains("clickhouse.timeout_seconds must be finite and greater than zero"),
+                "unexpected error for {value}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn named_backend_connect_timeout_must_be_finite_and_positive() {
+        let path = write_temp_config(
+            r#"
+[backends.remote]
+timeout_seconds = 0
+"#,
+            "named-backend-connect-timeout",
+        );
+        let error = load_config(&path).expect_err("invalid named backend timeout must fail");
+        std::fs::remove_file(&path).ok();
+        assert!(
+            error
+                .to_string()
+                .contains("backends.remote.timeout_seconds must be finite and greater than zero"),
+            "unexpected error: {error:#}"
         );
     }
 

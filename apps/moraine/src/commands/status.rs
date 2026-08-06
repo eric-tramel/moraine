@@ -34,6 +34,35 @@ fn unix_now_ms() -> i64 {
 struct RequiredNullable<T>(Option<T>);
 
 #[derive(Debug, serde::Deserialize)]
+struct DaemonErrorResponse {
+    ok: bool,
+    code: String,
+    error: String,
+}
+
+#[derive(Debug)]
+struct DaemonStatusReadError {
+    error: anyhow::Error,
+    compatibility_fallback: bool,
+}
+
+impl DaemonStatusReadError {
+    fn fatal(error: anyhow::Error) -> Self {
+        Self {
+            error,
+            compatibility_fallback: false,
+        }
+    }
+
+    fn compatibility(error: anyhow::Error) -> Self {
+        Self {
+            error,
+            compatibility_fallback: true,
+        }
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
 struct DaemonStatusResponse {
     ok: bool,
     clickhouse: DaemonClickhouseStatus,
@@ -200,27 +229,48 @@ fn daemon_status_data(payload: DaemonStatusResponse) -> Result<StatusData> {
     })
 }
 
-async fn read_daemon_status(cfg: &AppConfig, timeout: Duration) -> Result<StatusData> {
+async fn read_daemon_status(
+    cfg: &AppConfig,
+    timeout: Duration,
+) -> std::result::Result<StatusData, DaemonStatusReadError> {
     let api_url = monitor_api_status_url(cfg);
     let client = reqwest::Client::builder()
         .no_proxy()
         .connect_timeout(timeout)
         .timeout(timeout)
         .build()
-        .context("build daemon status API client")?;
+        .context("build daemon status API client")
+        .map_err(DaemonStatusReadError::fatal)?;
     let mut response = client
         .get(&api_url)
         .header(reqwest::header::ACCEPT, "application/json")
         .send()
         .await
-        .with_context(|| format!("request {api_url}"))?
-        .error_for_status()
-        .with_context(|| format!("request {api_url}"))?;
-    if response
+        .with_context(|| format!("request {api_url}"))
+        .map_err(DaemonStatusReadError::fatal)?;
+    let status = response.status();
+
+    // A listening pre-unification monitor has no canonical v1 route. This is
+    // the only HTTP status that proves the request was rejected before query
+    // admission and is therefore safe to serve through the compatibility path.
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Err(DaemonStatusReadError::compatibility(anyhow::anyhow!(
+            "request {api_url} returned {status}"
+        )));
+    }
+
+    let oversized = response
         .content_length()
-        .is_some_and(|length| length > STATUS_API_MAX_RESPONSE_BYTES as u64)
-    {
-        bail!("daemon status API response exceeds {STATUS_API_MAX_RESPONSE_BYTES} bytes");
+        .is_some_and(|length| length > STATUS_API_MAX_RESPONSE_BYTES as u64);
+    if oversized {
+        let error = anyhow::anyhow!(
+            "daemon status API response exceeds {STATUS_API_MAX_RESPONSE_BYTES} bytes"
+        );
+        return Err(if status.is_success() {
+            DaemonStatusReadError::compatibility(error)
+        } else {
+            DaemonStatusReadError::fatal(error)
+        });
     }
     let capacity = response
         .content_length()
@@ -230,16 +280,38 @@ async fn read_daemon_status(cfg: &AppConfig, timeout: Duration) -> Result<Status
     while let Some(chunk) = response
         .chunk()
         .await
-        .with_context(|| format!("read {api_url} response"))?
+        .with_context(|| format!("read {api_url} response"))
+        .map_err(DaemonStatusReadError::fatal)?
     {
         if chunk.len() > STATUS_API_MAX_RESPONSE_BYTES - body.len() {
-            bail!("daemon status API response exceeds {STATUS_API_MAX_RESPONSE_BYTES} bytes");
+            let error = anyhow::anyhow!(
+                "daemon status API response exceeds {STATUS_API_MAX_RESPONSE_BYTES} bytes"
+            );
+            return Err(if status.is_success() {
+                DaemonStatusReadError::compatibility(error)
+            } else {
+                DaemonStatusReadError::fatal(error)
+            });
         }
         body.extend_from_slice(&chunk);
     }
+
+    if !status.is_success() {
+        let error = match serde_json::from_slice::<DaemonErrorResponse>(&body) {
+            Ok(payload) if !payload.ok => anyhow::anyhow!(
+                "daemon status API returned {status} ({}): {}",
+                payload.code,
+                payload.error
+            ),
+            _ => anyhow::anyhow!("daemon status API returned {status}"),
+        };
+        return Err(DaemonStatusReadError::fatal(error));
+    }
+
     let payload = serde_json::from_slice(&body)
-        .with_context(|| format!("decode {api_url} response as JSON"))?;
-    daemon_status_data(payload)
+        .with_context(|| format!("decode {api_url} response as JSON"))
+        .map_err(DaemonStatusReadError::compatibility)?;
+    daemon_status_data(payload).map_err(DaemonStatusReadError::compatibility)
 }
 
 fn build_status_notes(
@@ -342,7 +414,7 @@ async fn read_preferred_status(
     if api_available {
         match read_daemon_status(cfg, timeout).await {
             Ok(status) => return Ok(status),
-            Err(error) => {
+            Err(error) if error.compatibility_fallback => {
                 let (report, heartbeat, ingest_status) = read_repository_status(repository).await?;
                 return Ok(StatusData {
                     report,
@@ -350,11 +422,13 @@ async fn read_preferred_status(
                     ingest_status,
                     source: StatusDataSource::DirectDb,
                     fallback_note: Some(format!(
-                        "daemon status API failed ({error:#}); using direct DB fallback"
+                        "daemon status API is incompatible ({}); using direct DB fallback",
+                        error.error
                     )),
                     clickhouse_health_url: cfg.clickhouse.url.clone(),
                 });
             }
+            Err(error) => return Err(error.error),
         }
     }
 
@@ -508,9 +582,14 @@ mod tests {
         .to_string()
     }
 
-    fn spawn_api_response(body: &str, delay: Duration) -> (u16, thread::JoinHandle<String>) {
+    fn spawn_api_response_with_status(
+        status: &str,
+        body: &str,
+        delay: Duration,
+    ) -> (u16, thread::JoinHandle<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind daemon API fixture");
         let port = listener.local_addr().expect("daemon API address").port();
+        let status = status.to_string();
         let body = body.to_string();
         let worker = thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept daemon API request");
@@ -521,7 +600,7 @@ mod tests {
             let request_len = stream.read(&mut request).expect("read daemon API request");
             thread::sleep(delay);
             let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 body.len(),
                 body
             );
@@ -529,6 +608,10 @@ mod tests {
             String::from_utf8_lossy(&request[..request_len]).into_owned()
         });
         (port, worker)
+    }
+
+    fn spawn_api_response(body: &str, delay: Duration) -> (u16, thread::JoinHandle<String>) {
+        spawn_api_response_with_status("200 OK", body, delay)
     }
 
     async fn status_json(heartbeat: RepoResult<IngestHeartbeatRead>) -> Value {
@@ -731,26 +814,86 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn daemon_api_timeout_is_bounded_and_falls_back() {
+    async fn daemon_api_timeout_is_bounded_without_direct_db_replay() {
         let repository = test_repository();
         let (port, worker) =
             spawn_api_response(&daemon_status_body(true), Duration::from_millis(300));
         let started = Instant::now();
-        let status = read_preferred_status(
+        let error = read_preferred_status(
             &test_config(port),
             &repository,
             true,
             Duration::from_millis(20),
         )
         .await
-        .expect("fall back after daemon timeout");
+        .err()
+        .expect("daemon transport timeout must remain visible");
         let elapsed = started.elapsed();
 
-        assert_eq!(status.source, StatusDataSource::DirectDb);
+        assert!(error.to_string().contains("request http://127.0.0.1:"));
         assert!(
             elapsed < Duration::from_millis(250),
             "API timeout took {elapsed:?}"
         );
+        let calls = repository.calls();
+        assert_eq!(calls.read_store_diagnostics, 0);
+        assert_eq!(calls.latest_ingest_heartbeat, 0);
+        assert!(calls.ingest_status.is_empty());
+        worker.join().expect("daemon API worker");
+    }
+
+    #[tokio::test]
+    async fn typed_daemon_failures_remain_visible_without_direct_db_replay() {
+        for (status_line, code) in [
+            ("499 Client Closed Request", "cancelled"),
+            ("504 Gateway Timeout", "deadline_exceeded"),
+            ("429 Too Many Requests", "resource_exhausted"),
+            ("503 Service Unavailable", "backend_failure"),
+        ] {
+            let repository = test_repository();
+            let body = json!({"ok": false, "code": code, "error": "typed failure"}).to_string();
+            let (port, worker) =
+                spawn_api_response_with_status(status_line, &body, Duration::from_millis(0));
+
+            let error = read_preferred_status(
+                &test_config(port),
+                &repository,
+                true,
+                Duration::from_secs(1),
+            )
+            .await
+            .err()
+            .expect("typed daemon failure must remain visible");
+
+            assert!(error.to_string().contains(code), "{error:#}");
+            assert!(error.to_string().contains("typed failure"), "{error:#}");
+            let calls = repository.calls();
+            assert_eq!(calls.read_store_diagnostics, 0);
+            assert_eq!(calls.latest_ingest_heartbeat, 0);
+            assert!(calls.ingest_status.is_empty());
+            worker.join().expect("daemon API worker");
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_daemon_without_canonical_status_route_uses_direct_db() {
+        let repository = test_repository();
+        let (port, worker) =
+            spawn_api_response_with_status("404 Not Found", "not found", Duration::from_millis(0));
+        let status = read_preferred_status(
+            &test_config(port),
+            &repository,
+            true,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("legacy daemon remains compatible");
+
+        assert_eq!(status.source, StatusDataSource::DirectDb);
+        assert!(status
+            .fallback_note
+            .as_deref()
+            .is_some_and(|note| note.contains("is incompatible")));
         let calls = repository.calls();
         assert_eq!(calls.read_store_diagnostics, 1);
         assert_eq!(calls.latest_ingest_heartbeat, 1);

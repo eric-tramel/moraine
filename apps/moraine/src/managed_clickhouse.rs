@@ -1,5 +1,5 @@
 use anyhow::{anyhow, bail, Context, Result};
-use moraine_clickhouse::ClickHouseClient;
+use moraine_clickhouse::{ClickHouseClient, QueryOwner, QueryRuntime, QueryWorkload};
 use moraine_config::{AppConfig, LoadedConfigPath};
 use reqwest::{Client, Url};
 use sha2::{Digest, Sha256};
@@ -540,7 +540,6 @@ fn prompt_install_clickhouse(version: &str) -> Result<bool> {
 pub(crate) enum ClickHouseStartupProgress {
     ProbingEndpoint {
         elapsed: Duration,
-        timeout: Duration,
     },
     EndpointProbeFinished,
     WaitingForHealth {
@@ -566,28 +565,14 @@ where
         started.elapsed().min(progress_timeout),
         progress_timeout,
     ));
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    if remaining.is_zero() {
-        bail!(
-            "clickhouse health probe timed out after {:.1}s",
-            progress_timeout.as_secs_f64()
-        );
-    }
-    let ping = timeout(remaining, client.ping());
+    let owner = QueryOwner::with_deadline(&client.runtime(), QueryWorkload::Internal, deadline)?;
+    let ping = owner.scope(client.ping());
     tokio::pin!(ping);
     let mut ticker = interval_at(Instant::now() + refresh_interval, refresh_interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
         tokio::select! {
-            result = &mut ping => {
-                return match result {
-                    Ok(result) => result,
-                    Err(_) => bail!(
-                        "clickhouse health probe timed out after {:.1}s",
-                        progress_timeout.as_secs_f64()
-                    ),
-                };
-            }
+            result = &mut ping => return result,
             _ = ticker.tick() => {
                 on_progress(event(
                     started.elapsed().min(progress_timeout),
@@ -598,15 +583,19 @@ where
     }
 }
 
-async fn wait_for_clickhouse(cfg: &AppConfig) -> Result<()> {
-    wait_for_clickhouse_with_progress(cfg, &mut |_| {}).await
+async fn wait_for_clickhouse(cfg: &AppConfig, query_runtime: &QueryRuntime) -> Result<()> {
+    wait_for_clickhouse_with_progress(cfg, query_runtime, &mut |_| {}).await
 }
 
-async fn wait_for_clickhouse_with_progress<F>(cfg: &AppConfig, on_progress: &mut F) -> Result<()>
+async fn wait_for_clickhouse_with_progress<F>(
+    cfg: &AppConfig,
+    query_runtime: &QueryRuntime,
+    on_progress: &mut F,
+) -> Result<()>
 where
     F: FnMut(ClickHouseStartupProgress),
 {
-    let client = ClickHouseClient::new(cfg.clickhouse.clone())?;
+    let client = ClickHouseClient::new_with_runtime(cfg.clickhouse.clone(), query_runtime.clone())?;
     let startup_timeout =
         Duration::from_secs_f64(cfg.runtime.clickhouse_start_timeout_seconds.max(1.0));
     let interval = Duration::from_millis(cfg.runtime.healthcheck_interval_ms.max(100));
@@ -1096,8 +1085,13 @@ fn spawn_clickhouse_generation(
     Ok((child, forwarders))
 }
 
+struct GenerationEnvironment<'a> {
+    config: &'a AppConfig,
+    query_runtime: &'a QueryRuntime,
+}
+
 async fn run_generation(
-    cfg: &AppConfig,
+    environment: GenerationEnvironment<'_>,
     server_bin: &Path,
     config_path: &Path,
     generation: u64,
@@ -1105,6 +1099,8 @@ async fn run_generation(
     signals: &mut ShutdownSignals,
     log: &SupervisorLog,
 ) -> Result<GenerationOutcome> {
+    let cfg = environment.config;
+    let query_runtime = environment.query_runtime;
     let (mut child, mut forwarders) =
         match spawn_clickhouse_generation(server_bin, config_path, log) {
             Ok(generation) => generation,
@@ -1128,7 +1124,7 @@ async fn run_generation(
     )
     .await?;
 
-    let readiness = wait_for_clickhouse(cfg);
+    let readiness = wait_for_clickhouse(cfg, query_runtime);
     tokio::pin!(readiness);
     let startup_outcome = loop {
         let outcome = tokio::select! {
@@ -1298,6 +1294,7 @@ fn next_failure_count(
 
 async fn supervise_clickhouse(
     cfg: &AppConfig,
+    query_runtime: &QueryRuntime,
     server_bin: &Path,
     config_path: &Path,
     policy: SupervisorPolicy,
@@ -1332,7 +1329,10 @@ async fn supervise_clickhouse(
         }
 
         let outcome = run_generation(
-            cfg,
+            GenerationEnvironment {
+                config: cfg,
+                query_runtime,
+            },
             server_bin,
             config_path,
             generation,
@@ -1383,12 +1383,13 @@ async fn stop_new_supervisor(child: &mut Child, pid_file: &Path, pid: u32) -> Re
 async fn wait_for_supervisor_startup_with_progress<F>(
     supervisor: &mut Child,
     cfg: &AppConfig,
+    query_runtime: &QueryRuntime,
     on_progress: &mut F,
 ) -> Result<()>
 where
     F: FnMut(ClickHouseStartupProgress),
 {
-    let readiness = wait_for_clickhouse_with_progress(cfg, on_progress);
+    let readiness = wait_for_clickhouse_with_progress(cfg, query_runtime, on_progress);
     tokio::pin!(readiness);
     tokio::select! {
         biased;
@@ -1422,6 +1423,7 @@ pub(crate) async fn start_clickhouse_with_progress<F>(
     config_path: &LoadedConfigPath,
     cfg: &AppConfig,
     paths: &RuntimePaths,
+    query_runtime: &QueryRuntime,
     mut on_progress: F,
 ) -> Result<StartOutcome>
 where
@@ -1429,7 +1431,7 @@ where
 {
     let supervisor_log = clickhouse_supervisor_log_path(paths);
     if let Some(pid) = service_running(paths, Service::ClickHouse) {
-        wait_for_clickhouse_with_progress(cfg, &mut on_progress).await?;
+        wait_for_clickhouse_with_progress(cfg, query_runtime, &mut on_progress).await?;
         return Ok(StartOutcome {
             service: Service::ClickHouse,
             state: StartState::AlreadyRunning,
@@ -1439,16 +1441,17 @@ where
     }
 
     let url_is_local = clickhouse_url_is_local(cfg)?;
-    let client = ClickHouseClient::new(cfg.clickhouse.clone())?;
-    let probe_timeout = Duration::from_secs_f64(cfg.clickhouse.timeout_seconds.max(0.1));
+    let client = ClickHouseClient::new_with_runtime(cfg.clickhouse.clone(), query_runtime.clone())?;
     let probe_started = Instant::now();
+    let probe_timeout =
+        Duration::from_secs_f64(cfg.runtime.clickhouse_start_timeout_seconds.max(1.0));
     let probe = ping_with_progress(
         &client,
         probe_started,
         probe_started + probe_timeout,
         Duration::from_millis(cfg.runtime.healthcheck_interval_ms.max(100)),
         &mut on_progress,
-        |elapsed, timeout| ClickHouseStartupProgress::ProbingEndpoint { elapsed, timeout },
+        |elapsed, _| ClickHouseStartupProgress::ProbingEndpoint { elapsed },
     )
     .await;
     match probe {
@@ -1515,8 +1518,13 @@ where
         };
     }
 
-    if let Err(err) =
-        wait_for_supervisor_startup_with_progress(&mut supervisor, cfg, &mut on_progress).await
+    if let Err(err) = wait_for_supervisor_startup_with_progress(
+        &mut supervisor,
+        cfg,
+        query_runtime,
+        &mut on_progress,
+    )
+    .await
     {
         let cleanup =
             stop_new_supervisor(&mut supervisor, &launcher_pid_file, supervisor_pid).await;
@@ -1556,6 +1564,7 @@ pub(crate) async fn run_foreground_clickhouse(
 pub(crate) async fn run_supervised_clickhouse(
     cfg: &AppConfig,
     paths: &RuntimePaths,
+    query_runtime: &QueryRuntime,
 ) -> Result<ExitCode> {
     ensure_runtime_dirs(paths)?;
     let log = SupervisorLog::open(
@@ -1567,6 +1576,7 @@ pub(crate) async fn run_supervised_clickhouse(
         materialize_clickhouse_config(cfg, paths)?;
         supervise_clickhouse(
             cfg,
+            query_runtime,
             &server_bin,
             &paths.clickhouse_config,
             SupervisorPolicy::production(),
@@ -1943,8 +1953,12 @@ mod tests {
             .await
             .expect("bind stalled ping server");
         let addr = listener.local_addr().expect("stalled ping server addr");
+        let (request_tx, request_rx) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
-            let (_stream, _) = listener.accept().await.expect("accept stalled ping");
+            let (mut stream, _) = listener.accept().await.expect("accept stalled ping");
+            let mut request = [0_u8; 4096];
+            let request_len = stream.read(&mut request).await.expect("read stalled ping");
+            let _ = request_tx.send(String::from_utf8_lossy(&request[..request_len]).into_owned());
             sleep(Duration::from_secs(1)).await;
         });
         let mut cfg = AppConfig::default();
@@ -1960,23 +1974,32 @@ mod tests {
             started + Duration::from_millis(350),
             Duration::from_millis(50),
             &mut |event| match event {
-                ClickHouseStartupProgress::ProbingEndpoint { elapsed, .. } => {
+                ClickHouseStartupProgress::WaitingForHealth { elapsed, .. } => {
                     elapsed_updates.push(elapsed)
                 }
                 ClickHouseStartupProgress::EndpointProbeFinished => {
                     panic!("unexpected probe-finished event")
                 }
-                ClickHouseStartupProgress::WaitingForHealth { .. } => {
-                    panic!("unexpected health-wait event")
+                ClickHouseStartupProgress::ProbingEndpoint { .. } => {
+                    panic!("unexpected endpoint-probe event")
                 }
             },
-            |elapsed, timeout| ClickHouseStartupProgress::ProbingEndpoint { elapsed, timeout },
+            |elapsed, timeout| ClickHouseStartupProgress::WaitingForHealth { elapsed, timeout },
         )
         .await
         .expect_err("stalled ping must fail");
         server.abort();
+        let request = request_rx.await.expect("captured stalled ping request");
 
-        assert!(error.to_string().contains("clickhouse"));
+        assert!(request.contains("max_execution_time="), "{request}");
+        assert!(request.contains("timeout_overflow_mode=throw"), "{request}");
+        let typed = error
+            .downcast_ref::<moraine_clickhouse::ClickHouseError>()
+            .expect("deadline must remain typed");
+        assert_eq!(
+            typed.category(),
+            moraine_clickhouse::ClickHouseErrorCategory::DeadlineExceeded
+        );
         assert!(elapsed_updates
             .first()
             .is_some_and(|elapsed| *elapsed < Duration::from_millis(20)));
@@ -1985,6 +2008,48 @@ mod tests {
                 .iter()
                 .any(|elapsed| *elapsed >= Duration::from_millis(100)),
             "expected elapsed progress updates, got {elapsed_updates:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn endpoint_probe_uses_startup_deadline_not_connect_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stalled endpoint probe server");
+        let addr = listener.local_addr().expect("stalled endpoint probe addr");
+        let server = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.expect("accept endpoint probe");
+            sleep(Duration::from_secs(1)).await;
+        });
+        let mut cfg = AppConfig::default();
+        cfg.clickhouse.url = format!("http://{addr}");
+        cfg.clickhouse.timeout_seconds = 0.05;
+        let client = ClickHouseClient::new(cfg.clickhouse).expect("stalled endpoint client");
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(350);
+
+        let error = ping_with_progress(
+            &client,
+            started,
+            deadline,
+            Duration::from_millis(20),
+            &mut |_| {},
+            |elapsed, _| ClickHouseStartupProgress::ProbingEndpoint { elapsed },
+        )
+        .await
+        .expect_err("stalled endpoint probe must reach its startup deadline");
+        server.abort();
+
+        assert!(
+            started.elapsed() >= Duration::from_millis(300),
+            "connect-only timeout incorrectly bounded admitted probe execution"
+        );
+        let typed = error
+            .downcast_ref::<moraine_clickhouse::ClickHouseError>()
+            .expect("startup deadline must remain typed");
+        assert_eq!(
+            typed.category(),
+            moraine_clickhouse::ClickHouseErrorCategory::DeadlineExceeded
         );
     }
 
@@ -2214,7 +2279,10 @@ mod tests {
         let mut signals = ShutdownSignals::install().expect("shutdown signals");
         let log = test_supervisor_log(root);
         let outcome = run_generation(
-            &cfg,
+            GenerationEnvironment {
+                config: &cfg,
+                query_runtime: &QueryRuntime::new(),
+            },
             &server_bin,
             &config_path,
             1,
@@ -2470,9 +2538,14 @@ mod tests {
             .expect("spawn wrapper");
 
         let mut on_progress = |_| {};
-        let err = wait_for_supervisor_startup_with_progress(&mut wrapper, &cfg, &mut on_progress)
-            .await
-            .expect_err("wrapper exit should fail startup");
+        let err = wait_for_supervisor_startup_with_progress(
+            &mut wrapper,
+            &cfg,
+            &QueryRuntime::new(),
+            &mut on_progress,
+        )
+        .await
+        .expect_err("wrapper exit should fail startup");
 
         assert!(err.to_string().contains("exit code 23"), "{err:#}");
         let _ = fs::remove_dir_all(root);
@@ -2489,9 +2562,16 @@ mod tests {
         fs::write(&config_path, "<clickhouse/>").expect("fake config");
 
         let log = test_supervisor_log(&root);
-        let exit = supervise_clickhouse(&cfg, &server_bin, &config_path, test_policy(), &log)
-            .await
-            .expect("supervisor result");
+        let exit = supervise_clickhouse(
+            &cfg,
+            &QueryRuntime::new(),
+            &server_bin,
+            &config_path,
+            test_policy(),
+            &log,
+        )
+        .await
+        .expect("supervisor result");
 
         assert_eq!(exit, ExitCode::from(1));
         assert_eq!(
@@ -2531,7 +2611,10 @@ mod tests {
         let log = test_supervisor_log(&root);
 
         let outcome = run_generation(
-            &cfg,
+            GenerationEnvironment {
+                config: &cfg,
+                query_runtime: &QueryRuntime::new(),
+            },
             &server_bin,
             &config_path,
             1,
@@ -2576,9 +2659,15 @@ mod tests {
         )
         .expect("load explicit config selection");
 
-        let outcome = start_clickhouse_with_progress(&config_path, &cfg, &paths, |_| {})
-            .await
-            .expect("healthy external endpoint");
+        let outcome = start_clickhouse_with_progress(
+            &config_path,
+            &cfg,
+            &paths,
+            &QueryRuntime::new(),
+            |_| {},
+        )
+        .await
+        .expect("healthy external endpoint");
 
         assert!(matches!(outcome.state, StartState::AlreadyServing));
         assert!(outcome.pid.is_none());
@@ -2602,9 +2691,15 @@ mod tests {
         write_pid(&launcher_pid, sentinel_pid).expect("sentinel pid file");
 
         let config_path = loaded_config_path(&root.join("config.toml"));
-        let err = start_clickhouse_with_progress(&config_path, &cfg, &paths, |_| {})
-            .await
-            .expect_err("unhealthy sentinel should fail readiness");
+        let err = start_clickhouse_with_progress(
+            &config_path,
+            &cfg,
+            &paths,
+            &QueryRuntime::new(),
+            |_| {},
+        )
+        .await
+        .expect_err("unhealthy sentinel should fail readiness");
 
         assert!(
             err.to_string().contains("did not become healthy"),

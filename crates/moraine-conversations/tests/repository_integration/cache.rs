@@ -265,7 +265,9 @@ async fn analytics_stage_error_is_not_cached_and_empty_retry_succeeds() {
         .analytics_series(AnalyticsRange::TwentyFourHours)
         .await
         .expect_err("token stage failure propagates");
-    assert!(error.to_string().contains("analytics token stage failed"));
+    assert!(error
+        .to_string()
+        .contains("ClickHouse request was rejected"));
 
     let retry = repo
         .analytics_series(AnalyticsRange::TwentyFourHours)

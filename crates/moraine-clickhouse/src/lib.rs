@@ -1,47 +1,128 @@
-use anyhow::{anyhow, bail, Context, Result};
+#[cfg(test)]
+use anyhow::anyhow;
+use anyhow::{bail, Context, Result};
 use flate2::{write::GzEncoder, Compression};
 use moraine_config::{ClickHouseConfig, ClickHouseRequestCompression};
 use reqwest::{
     header::{HeaderValue, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, USER_AGENT},
-    Client, RequestBuilder, Url,
+    Client, RequestBuilder, StatusCode, Url,
 };
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::Value;
+use std::collections::{BTreeSet, HashSet};
 use std::io::Write;
+use std::sync::Arc;
+use std::time::Duration;
 
 pub mod mcp_tool_names;
+pub mod owner;
+use owner::{error_for_cause, extract_exception_code, AdminBackend, StatementTicket};
+pub use owner::{
+    ClickHouseError, ClickHouseErrorCategory, OwnerGuard, QueryCause, QueryOwner, QueryRuntime,
+    QueryWorkload, QUERY_CLEANUP_GRACE,
+};
 
 const MAX_INSERT_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
-use std::collections::{BTreeSet, HashSet};
-use std::time::Duration;
 const DEFAULT_USER_AGENT_ROLE: &str = "moraine-clickhouse";
-const MIGRATION_REQUEST_TIMEOUT: Duration = Duration::from_secs(60 * 60);
-const MIGRATION_QUERY_PARAMS: &[(&str, &str)] = &[
-    // Leave the client five minutes to observe ClickHouse's terminal response.
-    ("max_execution_time", "3300"),
-    ("timeout_overflow_mode", "throw"),
+const RESERVED_PARAMS: &[&str] = &[
+    "query_id",
+    "replace_running_query",
+    "max_execution_time",
+    "max_execution_time_leaf",
+    "timeout_overflow_mode",
+    "timeout_before_checking_execution_speed",
 ];
 
 #[derive(Clone)]
 pub struct ClickHouseClient {
     cfg: ClickHouseConfig,
-    http: Client,
+    inner: Arc<ClientInner>,
 }
 
-#[derive(Debug)]
+struct ClientInner {
+    http: Client,
+    admin: Arc<AdminBackend>,
+    runtime: QueryRuntime,
+}
+
 pub struct ClickHouseByteStream {
     response: reqwest::Response,
+    ticket: Option<StatementTicket>,
+    owner: Arc<QueryOwner>,
+    buffered: Vec<u8>,
+    reached_eof: bool,
+}
+
+impl std::fmt::Debug for ClickHouseByteStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClickHouseByteStream")
+            .field("response", &self.response)
+            .field("owner", &self.owner.logical_id())
+            .finish_non_exhaustive()
+    }
 }
 
 impl ClickHouseByteStream {
     pub async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>> {
-        let chunk = self
-            .response
-            .chunk()
-            .await
-            .context("failed to read clickhouse response chunk")?;
-        Ok(chunk.map(|bytes| bytes.to_vec()))
+        if self.reached_eof {
+            if self.buffered.is_empty() {
+                if let Some(mut ticket) = self.ticket.take() {
+                    ticket.succeed();
+                }
+                return Ok(None);
+            }
+            let tail = std::mem::take(&mut self.buffered);
+            return Ok(Some(tail));
+        }
+
+        loop {
+            let chunk = read_response_chunk(&self.owner, &mut self.response).await;
+            match chunk {
+                Ok(Some(bytes)) => self.buffered.extend_from_slice(&bytes),
+                Ok(None) => self.reached_eof = true,
+                Err(error) => {
+                    if let Some(mut ticket) = self.ticket.take() {
+                        ticket.fail(cause_for_error(&error));
+                    }
+                    return Err(error.into());
+                }
+            }
+
+            if let Some((code, start)) = find_exception_tail(&self.buffered) {
+                let detail = String::from_utf8_lossy(&self.buffered[start..]).into_owned();
+                self.buffered.truncate(start);
+                let error = classify_exception(
+                    &self.owner,
+                    code,
+                    "ClickHouse stream ended with an exception",
+                    Some(&detail),
+                );
+                if let Some(mut ticket) = self.ticket.take() {
+                    ticket.fail(cause_for_error(&error));
+                }
+                return Err(error.into());
+            }
+
+            if self.reached_eof {
+                if self.buffered.is_empty() {
+                    if let Some(mut ticket) = self.ticket.take() {
+                        ticket.succeed();
+                    }
+                    return Ok(None);
+                }
+                let tail = std::mem::take(&mut self.buffered);
+                return Ok(Some(tail));
+            }
+
+            // Retain the incomplete final line so an appended ClickHouse
+            // exception is classified before any part of that line is emitted.
+            if let Some(boundary) = self.buffered.iter().rposition(|byte| *byte == b'\n') {
+                let trailing = self.buffered.split_off(boundary + 1);
+                let complete = std::mem::replace(&mut self.buffered, trailing);
+                return Ok(Some(complete));
+            }
+        }
     }
 }
 
@@ -50,7 +131,12 @@ struct ClickHouseRequestOptions<'a> {
     async_insert: bool,
     default_format: Option<&'a str>,
     params: &'a [(&'a str, &'a str)],
-    request_timeout: Option<Duration>,
+}
+
+struct PreparedRequest {
+    builder: RequestBuilder,
+    ticket: StatementTicket,
+    owner: Arc<QueryOwner>,
 }
 
 #[derive(Deserialize)]
@@ -115,37 +201,66 @@ pub struct DoctorReport {
 
 impl ClickHouseClient {
     pub fn new(cfg: ClickHouseConfig) -> Result<Self> {
+        Self::new_with_runtime(cfg, QueryRuntime::new())
+    }
+
+    pub fn new_with_runtime(cfg: ClickHouseConfig, runtime: QueryRuntime) -> Result<Self> {
         let user_agent = format!(
             "{DEFAULT_USER_AGENT_ROLE}/{} (pid={})",
             moraine_config::BUILD_VERSION,
             std::process::id()
         );
-        Self::new_with_user_agent(cfg, user_agent)
+        Self::new_with_runtime_and_user_agent(cfg, runtime, user_agent)
     }
 
-    /// Construct a client whose every HTTP request carries the supplied
-    /// prevalidated-at-construction User-Agent.
+    /// Construct an isolated compatibility client with a custom User-Agent.
     pub fn new_with_user_agent(cfg: ClickHouseConfig, user_agent: impl AsRef<str>) -> Result<Self> {
-        let timeout = Duration::from_secs_f64(cfg.timeout_seconds.max(1.0));
+        Self::new_with_runtime_and_user_agent(cfg, QueryRuntime::new(), user_agent)
+    }
+
+    pub fn new_with_runtime_and_user_agent(
+        cfg: ClickHouseConfig,
+        runtime: QueryRuntime,
+        user_agent: impl AsRef<str>,
+    ) -> Result<Self> {
+        validate_connect_timeout(cfg.timeout_seconds)?;
+        let url = validate_base_url(&cfg.url)?;
         let user_agent = HeaderValue::try_from(user_agent.as_ref())
             .context("invalid ClickHouse HTTP User-Agent")?;
         let mut default_headers = reqwest::header::HeaderMap::with_capacity(1);
         default_headers.insert(USER_AGENT, user_agent);
         let http = Client::builder()
-            .timeout(timeout)
-            .default_headers(default_headers)
+            .connect_timeout(Duration::from_secs_f64(cfg.timeout_seconds))
+            .default_headers(default_headers.clone())
             .build()
-            .context("failed to construct reqwest client")?;
+            .context("failed to construct reqwest data client")?;
+        let admin = AdminBackend::new(
+            url,
+            cfg.username.clone(),
+            cfg.password.clone(),
+            default_headers,
+        )?;
 
-        Ok(Self { cfg, http })
+        Ok(Self {
+            cfg,
+            inner: Arc::new(ClientInner {
+                http,
+                admin,
+                runtime,
+            }),
+        })
     }
 
     pub fn config(&self) -> &ClickHouseConfig {
         &self.cfg
     }
 
+    pub fn runtime(&self) -> QueryRuntime {
+        self.inner.runtime.clone()
+    }
+
     fn base_url(&self) -> Result<Url> {
-        Url::parse(&self.cfg.url).context("invalid ClickHouse URL")
+        validate_base_url(&self.cfg.url).map_err(Into::into)
     }
 
     async fn request_builder(
@@ -153,29 +268,15 @@ impl ClickHouseClient {
         query: &str,
         body: Vec<u8>,
         options: ClickHouseRequestOptions<'_>,
-    ) -> Result<RequestBuilder> {
+    ) -> Result<PreparedRequest> {
+        // Fail closed before compression, connection establishment, or bytes.
+        let owner = QueryOwner::current().ok_or_else(|| {
+            ClickHouseError::ownership("ClickHouse egress requires an explicit QueryOwner")
+        })?;
+        owner.ensure_runtime(&self.inner.runtime)?;
+        validate_request_params(options.params)?;
         let mut url = self.base_url()?;
-        {
-            let mut qp = url.query_pairs_mut();
-            qp.append_pair("query", query);
-            if let Some(database) = options.database {
-                qp.append_pair("database", database);
-            }
-            if let Some(default_format) = options.default_format {
-                qp.append_pair("default_format", default_format);
-            }
-            if options.async_insert && self.cfg.async_insert {
-                qp.append_pair("async_insert", "1");
-                if self.cfg.wait_for_async_insert {
-                    qp.append_pair("wait_for_async_insert", "1");
-                }
-            }
-            for (key, value) in options.params {
-                qp.append_pair(key, value);
-            }
-        }
 
-        // ClickHouse HTTP treats GET as readonly, so use POST for both reads and writes.
         let (body, content_encoding) = match (self.cfg.request_compression, body.is_empty()) {
             (_, true) | (ClickHouseRequestCompression::None, false) => (body, None),
             (ClickHouseRequestCompression::Gzip, false) => {
@@ -193,44 +294,96 @@ impl ClickHouseClient {
                 (compressed, Some("gzip"))
             }
         };
+
+        // The absolute deadline is checked again after potentially expensive
+        // compression. Expired operations register no child and send zero bytes.
+        let remaining = owner.remaining()?;
+        let ticket = owner.register_statement(&self.inner.runtime, self.inner.admin.clone())?;
+        {
+            let mut qp = url.query_pairs_mut();
+            qp.append_pair("query", query);
+            qp.append_pair("query_id", ticket.query_id());
+            qp.append_pair("replace_running_query", "0");
+            if let Some(database) = options.database {
+                qp.append_pair("database", database);
+            }
+            if let Some(default_format) = options.default_format {
+                qp.append_pair("default_format", default_format);
+            }
+            if options.async_insert && self.cfg.async_insert {
+                qp.append_pair("async_insert", "1");
+                if self.cfg.wait_for_async_insert {
+                    qp.append_pair("wait_for_async_insert", "1");
+                }
+            }
+            for (key, value) in options.params {
+                qp.append_pair(key, value);
+            }
+            if let Some(remaining) = remaining {
+                qp.append_pair("max_execution_time", &format_clickhouse_deadline(remaining));
+                qp.append_pair("timeout_before_checking_execution_speed", "0");
+                qp.append_pair("timeout_overflow_mode", "throw");
+            }
+        }
+
         let payload_len = body.len();
-        let mut req = self
+        let mut builder = self
+            .inner
             .http
             .post(url)
             .header(CONTENT_TYPE, "text/plain; charset=utf-8")
-            // Some ClickHouse builds require an explicit Content-Length on POST.
             .header(CONTENT_LENGTH, payload_len)
             .body(body);
-
         if let Some(content_encoding) = content_encoding {
-            req = req.header(CONTENT_ENCODING, content_encoding);
+            builder = builder.header(CONTENT_ENCODING, content_encoding);
         }
-
-        if let Some(timeout) = options.request_timeout {
-            req = req.timeout(timeout);
+        if let Some(remaining) = remaining {
+            builder = builder.timeout(remaining);
         }
-
         if !self.cfg.username.is_empty() {
-            req = req.basic_auth(self.cfg.username.clone(), Some(self.cfg.password.clone()));
+            builder =
+                builder.basic_auth(self.cfg.username.clone(), Some(self.cfg.password.clone()));
         }
-
-        Ok(req)
+        Ok(PreparedRequest {
+            builder,
+            ticket,
+            owner,
+        })
     }
 
-    async fn send_checked_response(&self, req: RequestBuilder) -> Result<reqwest::Response> {
-        let response = req.send().await.context("clickhouse request failed")?;
+    async fn send_checked_response(
+        &self,
+        mut prepared: PreparedRequest,
+    ) -> Result<(reqwest::Response, StatementTicket, Arc<QueryOwner>)> {
+        prepared.ticket.mark_attempted();
+        let response = send_request(&prepared.owner, prepared.builder).await;
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                prepared.ticket.fail(cause_for_error(&error));
+                return Err(error.into());
+            }
+        };
         let status = response.status();
         if !status.is_success() {
-            let text = response.text().await.with_context(|| {
-                format!(
-                    "failed to read clickhouse response body (status {})",
-                    status
-                )
-            })?;
-            return Err(anyhow!("clickhouse returned {}: {}", status, text));
+            let header_code = response
+                .headers()
+                .get("x-clickhouse-exception-code")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u32>().ok());
+            let body = match read_response_text(&prepared.owner, response).await {
+                Ok(body) => body,
+                Err(error) => {
+                    prepared.ticket.fail(cause_for_error(&error));
+                    return Err(error.into());
+                }
+            };
+            let code = header_code.or_else(|| extract_exception_code(&body));
+            let error = classify_response(&prepared.owner, status, code, Some(&body));
+            prepared.ticket.fail(cause_for_error(&error));
+            return Err(error.into());
         }
-
-        Ok(response)
+        Ok((response, prepared.ticket, prepared.owner))
     }
 
     pub async fn request_text(
@@ -254,16 +407,8 @@ impl ClickHouseClient {
         default_format: Option<&str>,
         params: &[(&str, &str)],
     ) -> Result<String> {
-        self.request_text_with_options(
-            query,
-            body,
-            database,
-            async_insert,
-            default_format,
-            params,
-            None,
-        )
-        .await
+        self.request_text_with_options(query, body, database, async_insert, default_format, params)
+            .await
     }
 
     async fn request_text_with_options(
@@ -274,9 +419,8 @@ impl ClickHouseClient {
         async_insert: bool,
         default_format: Option<&str>,
         params: &[(&str, &str)],
-        request_timeout: Option<Duration>,
     ) -> Result<String> {
-        let req = self
+        let prepared = self
             .request_builder(
                 query,
                 body.unwrap_or_default(),
@@ -285,19 +429,38 @@ impl ClickHouseClient {
                     async_insert,
                     default_format,
                     params,
-                    request_timeout,
                 },
             )
             .await?;
-        let response = self.send_checked_response(req).await?;
-        let status = response.status();
-        let text = response.text().await.with_context(|| {
-            format!(
-                "failed to read clickhouse response body (status {})",
-                status
-            )
-        })?;
-
+        let (response, mut ticket, owner) = self.send_checked_response(prepared).await?;
+        let bytes = match read_response_bytes(&owner, response).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                ticket.fail(cause_for_error(&error));
+                return Err(error.into());
+            }
+        };
+        if let Some((code, start)) = find_exception_tail(&bytes) {
+            let detail = String::from_utf8_lossy(&bytes[start..]);
+            let error = classify_exception(
+                &owner,
+                code,
+                "ClickHouse response ended with an exception",
+                Some(&detail),
+            );
+            ticket.fail(cause_for_error(&error));
+            return Err(error.into());
+        }
+        let text = match String::from_utf8(bytes) {
+            Ok(text) => text,
+            Err(_) => {
+                ticket.fail(QueryCause::Backend);
+                return Err(
+                    ClickHouseError::backend("ClickHouse returned a non-UTF-8 response").into(),
+                );
+            }
+        };
+        ticket.succeed();
         Ok(text)
     }
 
@@ -307,9 +470,8 @@ impl ClickHouseClient {
         database: Option<&str>,
         default_format: Option<&str>,
         params: &[(&str, &str)],
-        request_timeout: Option<Duration>,
     ) -> Result<ClickHouseByteStream> {
-        let req = self
+        let prepared = self
             .request_builder(
                 query,
                 Vec::new(),
@@ -318,13 +480,17 @@ impl ClickHouseClient {
                     async_insert: false,
                     default_format,
                     params,
-                    request_timeout,
                 },
             )
             .await?;
-        let response = self.send_checked_response(req).await?;
-
-        Ok(ClickHouseByteStream { response })
+        let (response, ticket, owner) = self.send_checked_response(prepared).await?;
+        Ok(ClickHouseByteStream {
+            response,
+            ticket: Some(ticket),
+            owner,
+            buffered: Vec::new(),
+            reached_eof: false,
+        })
     }
 
     pub async fn ping(&self) -> Result<()> {
@@ -334,7 +500,7 @@ impl ClickHouseClient {
         if response.trim() == "1" {
             Ok(())
         } else {
-            Err(anyhow!("unexpected ping response: {}", response.trim()))
+            Err(ClickHouseError::backend("unexpected ClickHouse ping response").into())
         }
     }
 
@@ -342,13 +508,11 @@ impl ClickHouseClient {
         let rows: Vec<Value> = self
             .query_json_data("SELECT version() AS version", Some("system"))
             .await?;
-        let version = rows
-            .first()
+        rows.first()
             .and_then(|row| row.get("version"))
             .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("missing version in payload"))?;
-
-        Ok(version.to_string())
+            .map(ToString::to_string)
+            .ok_or_else(|| ClickHouseError::backend("missing version in ClickHouse payload").into())
     }
 
     pub async fn query_json_each_row<T: DeserializeOwned>(
@@ -373,7 +537,9 @@ impl ClickHouseClient {
         serde_json::Deserializer::from_str(&raw)
             .into_iter::<T>()
             .collect::<std::result::Result<Vec<_>, _>>()
-            .context("failed to parse JSONEachRow response")
+            .map_err(|_| {
+                ClickHouseError::backend("failed to parse ClickHouse JSONEachRow response").into()
+            })
     }
 
     pub async fn query_json_data<T: DeserializeOwned>(
@@ -394,9 +560,9 @@ impl ClickHouseClient {
         let raw = self
             .request_text_with_params(query, None, database, false, Some("JSON"), params)
             .await?;
-        let envelope: ClickHouseEnvelope<T> = serde_json::from_str(&raw)
-            .with_context(|| format!("invalid clickhouse JSON response: {}", raw))?;
-        Ok(envelope.data)
+        serde_json::from_str::<ClickHouseEnvelope<T>>(&raw)
+            .map(|envelope| envelope.data)
+            .map_err(|_| ClickHouseError::backend("invalid ClickHouse JSON data envelope").into())
     }
 
     pub async fn query_rows<T: DeserializeOwned>(
@@ -418,17 +584,25 @@ impl ClickHouseClient {
                 .query_json_each_row_with_params(query, database, params)
                 .await;
         }
-
-        match self
-            .query_json_data_with_params(query, database, params)
-            .await
+        let database = database.or(Some(&self.cfg.database));
+        let raw = self
+            .request_text_with_params(query, None, database, false, Some("JSON"), params)
+            .await?;
+        let value: Value = serde_json::from_str(&raw)
+            .map_err(|_| ClickHouseError::backend("invalid ClickHouse JSON response"))?;
+        if value
+            .as_object()
+            .is_some_and(|object| !object.contains_key("data"))
         {
-            Ok(rows) => Ok(rows),
-            Err(_) => {
-                self.query_json_each_row_with_params(query, database, params)
-                    .await
-            }
+            // The only compatibility replay: the first HTTP exchange and body
+            // completed normally and the JSON envelope structurally lacks data.
+            return self
+                .query_json_each_row_with_params(query, database, params)
+                .await;
         }
+        serde_json::from_value::<ClickHouseEnvelope<T>>(value)
+            .map(|envelope| envelope.data)
+            .map_err(|_| ClickHouseError::backend("invalid ClickHouse JSON data envelope").into())
     }
 
     pub async fn insert_json_rows(&self, table: &str, rows: &[Value]) -> Result<()> {
@@ -538,8 +712,7 @@ impl ClickHouseClient {
                     Some(&self.cfg.database),
                     false,
                     None,
-                    MIGRATION_QUERY_PARAMS,
-                    Some(MIGRATION_REQUEST_TIMEOUT),
+                    &[],
                 )
                 .await
                 .with_context(|| {
@@ -563,8 +736,7 @@ impl ClickHouseClient {
                 Some(&self.cfg.database),
                 false,
                 None,
-                MIGRATION_QUERY_PARAMS,
-                Some(MIGRATION_REQUEST_TIMEOUT),
+                &[],
             )
             .await
             .with_context(|| format!("failed to record migration {}", migration.name))?;
@@ -785,6 +957,202 @@ impl ClickHouseClient {
             .query_json_data(&query, Some(&self.cfg.database))
             .await?;
         Ok(rows.into_iter().map(|row| row.version).collect())
+    }
+}
+
+fn validate_connect_timeout(seconds: f64) -> Result<()> {
+    if !seconds.is_finite() || seconds <= 0.0 {
+        bail!("clickhouse.timeout_seconds must be finite and greater than zero");
+    }
+    Ok(())
+}
+
+fn is_reserved_param(key: &str) -> bool {
+    RESERVED_PARAMS
+        .iter()
+        .any(|reserved| key.eq_ignore_ascii_case(reserved))
+}
+
+fn validate_base_url(raw: &str) -> std::result::Result<Url, ClickHouseError> {
+    let url = Url::parse(raw).map_err(|_| ClickHouseError::ownership("invalid ClickHouse URL"))?;
+    if let Some((key, _)) = url.query_pairs().find(|(key, _)| is_reserved_param(key)) {
+        return Err(ClickHouseError::ownership(format!(
+            "ClickHouse URL contains reserved parameter `{key}`"
+        )));
+    }
+    Ok(url)
+}
+
+fn validate_request_params(params: &[(&str, &str)]) -> std::result::Result<(), ClickHouseError> {
+    if let Some((key, _)) = params.iter().find(|(key, _)| is_reserved_param(key)) {
+        return Err(ClickHouseError::ownership(format!(
+            "ClickHouse request contains reserved parameter `{key}`"
+        )));
+    }
+    Ok(())
+}
+
+fn format_clickhouse_deadline(remaining: Duration) -> String {
+    // Ceiling to a microsecond ensures the server-side representation never
+    // shortens the caller's absolute deadline.
+    let micros = remaining.as_nanos().saturating_add(999) / 1_000;
+    format!("{}.{:06}", micros / 1_000_000, micros % 1_000_000)
+}
+
+async fn send_request(
+    owner: &Arc<QueryOwner>,
+    builder: RequestBuilder,
+) -> std::result::Result<reqwest::Response, ClickHouseError> {
+    let token = owner.cancellation_token();
+    if let Some(deadline) = owner.deadline() {
+        tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(deadline) => {
+                owner.cancel(QueryCause::Deadline);
+                Err(ClickHouseError::deadline("ClickHouse query deadline exceeded"))
+            }
+            _ = token.cancelled() => Err(error_for_cause(owner.cause().unwrap_or(QueryCause::Abandoned), "ClickHouse query cancelled")),
+            result = builder.send() => result.map_err(|error| ClickHouseError::transport("ClickHouse request failed", error)),
+        }
+    } else {
+        tokio::select! {
+            biased;
+            _ = token.cancelled() => Err(error_for_cause(owner.cause().unwrap_or(QueryCause::Abandoned), "ClickHouse query cancelled")),
+            result = builder.send() => result.map_err(|error| ClickHouseError::transport("ClickHouse request failed", error)),
+        }
+    }
+}
+
+async fn read_response_bytes(
+    owner: &Arc<QueryOwner>,
+    response: reqwest::Response,
+) -> std::result::Result<Vec<u8>, ClickHouseError> {
+    let token = owner.cancellation_token();
+    if let Some(deadline) = owner.deadline() {
+        tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(deadline) => {
+                owner.cancel(QueryCause::Deadline);
+                Err(ClickHouseError::deadline("ClickHouse query deadline exceeded"))
+            }
+            _ = token.cancelled() => Err(error_for_cause(owner.cause().unwrap_or(QueryCause::Abandoned), "ClickHouse query cancelled")),
+            result = response.bytes() => result
+                .map(|bytes| bytes.to_vec())
+                .map_err(|error| ClickHouseError::transport("failed to read ClickHouse response body", error)),
+        }
+    } else {
+        tokio::select! {
+            biased;
+            _ = token.cancelled() => Err(error_for_cause(owner.cause().unwrap_or(QueryCause::Abandoned), "ClickHouse query cancelled")),
+            result = response.bytes() => result
+                .map(|bytes| bytes.to_vec())
+                .map_err(|error| ClickHouseError::transport("failed to read ClickHouse response body", error)),
+        }
+    }
+}
+
+async fn read_response_text(
+    owner: &Arc<QueryOwner>,
+    response: reqwest::Response,
+) -> std::result::Result<String, ClickHouseError> {
+    let bytes = read_response_bytes(owner, response).await?;
+    String::from_utf8(bytes)
+        .map_err(|_| ClickHouseError::backend("ClickHouse returned a non-UTF-8 error response"))
+}
+
+async fn read_response_chunk(
+    owner: &Arc<QueryOwner>,
+    response: &mut reqwest::Response,
+) -> std::result::Result<Option<Vec<u8>>, ClickHouseError> {
+    let token = owner.cancellation_token();
+    if let Some(deadline) = owner.deadline() {
+        tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(deadline) => {
+                owner.cancel(QueryCause::Deadline);
+                Err(ClickHouseError::deadline("ClickHouse query deadline exceeded"))
+            }
+            _ = token.cancelled() => Err(error_for_cause(owner.cause().unwrap_or(QueryCause::Abandoned), "ClickHouse query cancelled")),
+            result = response.chunk() => result
+                .map(|chunk| chunk.map(|bytes| bytes.to_vec()))
+                .map_err(|error| ClickHouseError::transport("failed to read ClickHouse response chunk", error)),
+        }
+    } else {
+        tokio::select! {
+            biased;
+            _ = token.cancelled() => Err(error_for_cause(owner.cause().unwrap_or(QueryCause::Abandoned), "ClickHouse query cancelled")),
+            result = response.chunk() => result
+                .map(|chunk| chunk.map(|bytes| bytes.to_vec()))
+                .map_err(|error| ClickHouseError::transport("failed to read ClickHouse response chunk", error)),
+        }
+    }
+}
+
+fn find_exception_tail(body: &[u8]) -> Option<(u32, usize)> {
+    let text = std::str::from_utf8(body).ok()?;
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("Code:") && trimmed.contains("DB::Exception") {
+            return extract_exception_code(trimmed)
+                .map(|code| (code, offset + line.len() - trimmed.len()));
+        }
+        offset += line.len();
+    }
+    None
+}
+
+fn classify_response(
+    owner: &Arc<QueryOwner>,
+    status: StatusCode,
+    code: Option<u32>,
+    detail: Option<&str>,
+) -> ClickHouseError {
+    let category = classify_code(owner, code);
+    ClickHouseError::response(
+        category,
+        "ClickHouse request was rejected",
+        status,
+        code,
+        detail,
+    )
+}
+
+fn classify_exception(
+    owner: &Arc<QueryOwner>,
+    code: u32,
+    context: &str,
+    detail: Option<&str>,
+) -> ClickHouseError {
+    ClickHouseError::exception(classify_code(owner, Some(code)), context, code, detail)
+}
+
+fn classify_code(owner: &Arc<QueryOwner>, code: Option<u32>) -> ClickHouseErrorCategory {
+    match code {
+        Some(159 | 160 | 209) => ClickHouseErrorCategory::DeadlineExceeded,
+        Some(158 | 202 | 241 | 307 | 396) => ClickHouseErrorCategory::ResourceExhausted,
+        Some(394) => match owner.cause() {
+            Some(QueryCause::Deadline) => ClickHouseErrorCategory::DeadlineExceeded,
+            Some(
+                QueryCause::Explicit
+                | QueryCause::Disconnect
+                | QueryCause::Shutdown
+                | QueryCause::Abandoned,
+            ) => ClickHouseErrorCategory::Cancelled,
+            _ => ClickHouseErrorCategory::Backend,
+        },
+        _ => ClickHouseErrorCategory::Backend,
+    }
+}
+
+fn cause_for_error(error: &ClickHouseError) -> QueryCause {
+    match error.category() {
+        ClickHouseErrorCategory::Cancelled => QueryCause::Explicit,
+        ClickHouseErrorCategory::DeadlineExceeded => QueryCause::Deadline,
+        ClickHouseErrorCategory::ResourceExhausted => QueryCause::ResourceExhausted,
+        ClickHouseErrorCategory::Backend | ClickHouseErrorCategory::OwnershipViolation => {
+            QueryCause::Backend
+        }
     }
 }
 
@@ -1162,6 +1530,15 @@ mod tests {
     use std::io::Read;
     use std::sync::{Arc, Mutex};
 
+    async fn owned<T>(
+        client: &ClickHouseClient,
+        future: impl std::future::Future<Output = T>,
+    ) -> T {
+        let owner = QueryOwner::new(&client.runtime(), QueryWorkload::Internal)
+            .expect("create test query owner");
+        owner.scope(future).await
+    }
+
     fn test_clickhouse_config(url: String) -> ClickHouseConfig {
         ClickHouseConfig {
             url,
@@ -1197,7 +1574,7 @@ mod tests {
                 .get("default_format")
                 .is_some_and(|fmt| fmt == "JSON")
             {
-                return (StatusCode::OK, "not-json".to_string());
+                return (StatusCode::OK, "{\"value\":7}".to_string());
             }
 
             (StatusCode::OK, "{\"value\":7}\n".to_string())
@@ -2245,14 +2622,18 @@ mod tests {
             ClickHouseClient::new_with_user_agent(test_clickhouse_config(base_url), identity)
                 .expect("new attributed client");
 
-        client
-            .request_text("SELECT 1", None, None, false, None)
-            .await
-            .expect("first attributed request");
-        client
-            .request_text("SELECT 1", None, None, false, None)
-            .await
-            .expect("second attributed request");
+        owned(
+            &client,
+            client.request_text("SELECT 1", None, None, false, None),
+        )
+        .await
+        .expect("first attributed request");
+        owned(
+            &client,
+            client.request_text("SELECT 1", None, None, false, None),
+        )
+        .await
+        .expect("second attributed request");
 
         assert_eq!(
             user_agents
@@ -2270,10 +2651,12 @@ mod tests {
         let client = ClickHouseClient::new(test_clickhouse_config(base_url))
             .expect("compatibility constructor");
 
-        client
-            .request_text("SELECT 1", None, None, false, None)
-            .await
-            .expect("request from compatibility client");
+        owned(
+            &client,
+            client.request_text("SELECT 1", None, None, false, None),
+        )
+        .await
+        .expect("request from compatibility client");
 
         let expected = format!(
             "{DEFAULT_USER_AGENT_ROLE}/{} (pid={})",
@@ -2319,17 +2702,19 @@ mod tests {
 "#
         .to_vec();
 
-        client
-            .request_text_with_params(
+        owned(
+            &client,
+            client.request_text_with_params(
                 "INSERT INTO tool_io FORMAT JSONEachRow",
                 Some(payload.clone()),
                 Some("moraine_team"),
                 true,
                 Some("JSONEachRow"),
-                &[("query_id", "gzip-test")],
-            )
-            .await
-            .expect("gzip request");
+                &[("readonly", "1")],
+            ),
+        )
+        .await
+        .expect("gzip request");
 
         let requests = requests.lock().expect("request capture mutex poisoned");
         assert_eq!(requests.len(), 1);
@@ -2379,9 +2764,11 @@ mod tests {
                 .map(String::as_str),
             Some("1")
         );
+        let query_id = request.params.get("query_id").expect("transport query id");
+        assert!(query_id.starts_with("moraine-internal-"));
         assert_eq!(
-            request.params.get("query_id").map(String::as_str),
-            Some("gzip-test")
+            request.params.get("readonly").map(String::as_str),
+            Some("1")
         );
 
         let mut decoded = Vec::new();
@@ -2401,10 +2788,12 @@ mod tests {
         let client = ClickHouseClient::new(test_clickhouse_config(base_url)).expect("new client");
         let payload = b"plain request body".to_vec();
 
-        client
-            .request_text("SELECT 1", Some(payload.clone()), None, false, None)
-            .await
-            .expect("plain request");
+        owned(
+            &client,
+            client.request_text("SELECT 1", Some(payload.clone()), None, false, None),
+        )
+        .await
+        .expect("plain request");
 
         let requests = requests.lock().expect("request capture mutex poisoned");
         assert_eq!(requests.len(), 1);
@@ -2423,10 +2812,12 @@ mod tests {
         config.request_compression = ClickHouseRequestCompression::Gzip;
         let client = ClickHouseClient::new(config).expect("new client");
 
-        client
-            .request_text("SELECT 1", None, None, false, None)
-            .await
-            .expect("empty request");
+        owned(
+            &client,
+            client.request_text("SELECT 1", None, None, false, None),
+        )
+        .await
+        .expect("empty request");
 
         let requests = requests.lock().expect("request capture mutex poisoned");
         assert_eq!(requests.len(), 1);
@@ -2451,8 +2842,7 @@ mod tests {
         let base_url = spawn_mock_server().await;
         let client = ClickHouseClient::new(test_clickhouse_config(base_url)).expect("new client");
 
-        let rows: Vec<Row> = client
-            .query_rows("SELECT 7 AS value", None)
+        let rows: Vec<Row> = owned(&client, client.query_rows("SELECT 7 AS value", None))
             .await
             .expect("fallback query_rows");
         assert_eq!(rows.len(), 1);
@@ -2466,16 +2856,18 @@ mod tests {
         let client = ClickHouseClient::new(test_clickhouse_config(base_url)).expect("new client");
         let large_value = "x".repeat((MAX_INSERT_PAYLOAD_BYTES / 2).saturating_add(1024));
 
-        client
-            .insert_json_rows(
+        owned(
+            &client,
+            client.insert_json_rows(
                 "raw_events",
                 &[
                     json!({ "payload": large_value }),
                     json!({ "payload": large_value }),
                 ],
-            )
-            .await
-            .expect("chunked insert should succeed");
+            ),
+        )
+        .await
+        .expect("chunked insert should succeed");
 
         let lengths = lengths.lock().expect("length capture mutex poisoned");
         assert_eq!(lengths.len(), 2, "rows should be split into two inserts");
@@ -2496,20 +2888,17 @@ mod tests {
         .await;
         let client = ClickHouseClient::new(test_clickhouse_config(base_url)).expect("new client");
 
-        let mut stream = client
-            .request_stream_with_params(
+        let mut stream = owned(
+            &client,
+            client.request_stream_with_params(
                 "SELECT value FROM events FORMAT JSONEachRow",
                 Some("moraine"),
                 None,
-                &[
-                    ("query_id", "qid-test"),
-                    ("readonly", "1"),
-                    ("max_execution_time", "600"),
-                ],
-                Some(Duration::from_secs(630)),
-            )
-            .await
-            .expect("stream request");
+                &[("readonly", "1")],
+            ),
+        )
+        .await
+        .expect("stream request");
 
         let mut body = Vec::new();
         while let Some(chunk) = stream.next_chunk().await.expect("chunk") {
@@ -2531,15 +2920,11 @@ mod tests {
             params[0].get("database").map(String::as_str),
             Some("moraine")
         );
-        assert_eq!(
-            params[0].get("query_id").map(String::as_str),
-            Some("qid-test")
-        );
+        assert!(params[0]
+            .get("query_id")
+            .is_some_and(|id| id.starts_with("moraine-internal-")));
         assert_eq!(params[0].get("readonly").map(String::as_str), Some("1"));
-        assert_eq!(
-            params[0].get("max_execution_time").map(String::as_str),
-            Some("600")
-        );
+        assert!(!params[0].contains_key("max_execution_time"));
 
         let content_lengths = content_lengths
             .lock()
@@ -2552,15 +2937,22 @@ mod tests {
         let base_url = spawn_mock_server().await;
         let client = ClickHouseClient::new(test_clickhouse_config(base_url)).expect("new client");
 
-        let err = client
-            .request_stream_with_params("SELECT FAIL", None, None, &[], None)
-            .await
-            .expect_err("expected HTTP failure");
+        let err = owned(
+            &client,
+            client.request_stream_with_params("SELECT FAIL", None, None, &[]),
+        )
+        .await
+        .expect_err("expected HTTP failure");
 
-        let msg = err.to_string();
-        assert!(msg.contains("clickhouse returned"));
-        assert!(msg.contains("500"));
-        assert!(msg.contains("boom"));
+        let typed = err
+            .downcast_ref::<ClickHouseError>()
+            .expect("typed ClickHouse error");
+        assert_eq!(typed.category(), ClickHouseErrorCategory::Backend);
+        assert_eq!(
+            typed.status(),
+            Some(reqwest::StatusCode::INTERNAL_SERVER_ERROR)
+        );
+        assert!(!err.to_string().contains("SELECT FAIL"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2578,10 +2970,12 @@ mod tests {
         let client = ClickHouseClient::new(test_clickhouse_config(base_url)).expect("new client");
         let mut events = Vec::new();
 
-        let executed = client
-            .run_migrations_with_progress(|event| events.push(event))
-            .await
-            .expect("current migrations");
+        let executed = owned(
+            &client,
+            client.run_migrations_with_progress(|event| events.push(event)),
+        )
+        .await
+        .expect("current migrations");
 
         assert!(executed.is_empty());
         assert_eq!(
@@ -2624,10 +3018,12 @@ mod tests {
         let client = ClickHouseClient::new(test_clickhouse_config(base_url)).expect("new client");
         let mut events = Vec::new();
 
-        let executed = client
-            .run_migrations_with_progress(|event| events.push(event))
-            .await
-            .expect("apply post-v0.7.1 migrations");
+        let executed = owned(
+            &client,
+            client.run_migrations_with_progress(|event| events.push(event)),
+        )
+        .await
+        .expect("apply post-v0.7.1 migrations");
 
         assert_eq!(executed, vec!["031", "032", "033", "034"]);
         let mut expected_events = vec![MigrationProgress::Plan {
@@ -2679,10 +3075,12 @@ mod tests {
         let client = ClickHouseClient::new(test_clickhouse_config(base_url)).expect("new client");
         let mut events = Vec::new();
 
-        let error = client
-            .run_migrations_with_progress(|event| events.push(event))
-            .await
-            .expect_err("ledger insert must fail");
+        let error = owned(
+            &client,
+            client.run_migrations_with_progress(|event| events.push(event)),
+        )
+        .await
+        .expect_err("ledger insert must fail");
 
         assert!(error.to_string().contains("failed to record migration"));
         assert_eq!(
@@ -2717,7 +3115,9 @@ mod tests {
         .await;
         let client = ClickHouseClient::new(test_clickhouse_config(base_url)).expect("new client");
 
-        let skew = client.schema_skew().await.expect("skew probe");
+        let skew = owned(&client, client.schema_skew())
+            .await
+            .expect("skew probe");
         let newest = bundled_migrations()
             .last()
             .expect("bundled migrations non-empty")
@@ -2745,7 +3145,9 @@ mod tests {
         .await;
         let client = ClickHouseClient::new(test_clickhouse_config(base_url)).expect("new client");
 
-        let skew = client.schema_skew().await.expect("skew probe");
+        let skew = owned(&client, client.schema_skew())
+            .await
+            .expect("skew probe");
         assert_eq!(skew.missing_on_server.len(), bundled_migrations().len());
         assert!(skew.unknown_on_server.is_empty());
     }
@@ -2755,15 +3157,22 @@ mod tests {
         let base_url = spawn_mock_server().await;
         let client = ClickHouseClient::new(test_clickhouse_config(base_url)).expect("new client");
 
-        let err = client
-            .request_text("SELECT FAIL", None, None, false, None)
-            .await
-            .expect_err("expected HTTP failure");
+        let err = owned(
+            &client,
+            client.request_text("SELECT FAIL", None, None, false, None),
+        )
+        .await
+        .expect_err("expected HTTP failure");
 
-        let msg = err.to_string();
-        assert!(msg.contains("clickhouse returned"));
-        assert!(msg.contains("500"));
-        assert!(msg.contains("boom"));
+        let typed = err
+            .downcast_ref::<ClickHouseError>()
+            .expect("typed ClickHouse error");
+        assert_eq!(typed.category(), ClickHouseErrorCategory::Backend);
+        assert_eq!(
+            typed.status(),
+            Some(reqwest::StatusCode::INTERNAL_SERVER_ERROR)
+        );
+        assert!(!err.to_string().contains("SELECT FAIL"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2771,12 +3180,751 @@ mod tests {
         let base_url = spawn_truncated_body_server();
         let client = ClickHouseClient::new(test_clickhouse_config(base_url)).expect("new client");
 
-        let err = client
-            .request_text("SELECT 1", None, None, false, None)
-            .await
-            .expect_err("expected response body read failure");
+        let err = owned(
+            &client,
+            client.request_text("SELECT 1", None, None, false, None),
+        )
+        .await
+        .expect_err("expected response body read failure");
 
         let msg = err.to_string();
-        assert!(msg.contains("failed to read clickhouse response body"));
+        assert!(msg.contains("failed to read ClickHouse response body"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unowned_egress_is_typed_and_sends_zero_bytes() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind raw byte counter");
+        let config = test_clickhouse_config(format!("http://{}", listener.local_addr().unwrap()));
+        let client = ClickHouseClient::new(config).expect("client");
+
+        let error = client
+            .request_text("SELECT 1", None, None, false, None)
+            .await
+            .expect_err("unowned buffered request must fail");
+        assert_eq!(
+            error
+                .downcast_ref::<ClickHouseError>()
+                .map(ClickHouseError::category),
+            Some(ClickHouseErrorCategory::OwnershipViolation)
+        );
+        let error = client
+            .request_stream_with_params("SELECT 1", None, None, &[])
+            .await
+            .expect_err("unowned stream request must fail");
+        assert_eq!(
+            error
+                .downcast_ref::<ClickHouseError>()
+                .map(ClickHouseError::category),
+            Some(ClickHouseErrorCategory::OwnershipViolation)
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                .await
+                .is_err(),
+            "missing ownership must be rejected before TCP connect or bytes"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn owner_from_another_runtime_is_rejected_before_connect() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind raw byte counter");
+        let client_runtime = QueryRuntime::new();
+        let client = ClickHouseClient::new_with_runtime(
+            test_clickhouse_config(format!("http://{}", listener.local_addr().unwrap())),
+            client_runtime.clone(),
+        )
+        .expect("client");
+        let owner_runtime = QueryRuntime::new();
+        let owner = QueryOwner::new(&owner_runtime, QueryWorkload::Internal).expect("owner");
+
+        let error = owner
+            .scope(client.request_text("SELECT 1", None, None, false, None))
+            .await
+            .expect_err("runtime mismatch must fail");
+        assert_eq!(
+            error
+                .downcast_ref::<ClickHouseError>()
+                .map(ClickHouseError::category),
+            Some(ClickHouseErrorCategory::OwnershipViolation)
+        );
+        assert!(error.to_string().contains("different query runtime"));
+        assert_eq!(client_runtime.active_owner_count(), 0);
+        assert_eq!(owner_runtime.active_owner_count(), 0);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                .await
+                .is_err(),
+            "runtime mismatch must be rejected before TCP connect or bytes"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn base_url_and_request_params_reserve_owner_identity_and_deadline_keys() {
+        for key in RESERVED_PARAMS {
+            let encoded_key = key.to_ascii_uppercase();
+            let config = test_clickhouse_config(format!(
+                "http://127.0.0.1:8123/?{}=x",
+                url::form_urlencoded::byte_serialize(encoded_key.as_bytes()).collect::<String>()
+            ));
+            let error = ClickHouseClient::new(config)
+                .err()
+                .expect("reserved URL key must fail");
+            assert!(error.to_string().contains("reserved parameter"));
+        }
+
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let base_url = spawn_request_capture_server(RequestCaptureState {
+            requests: requests.clone(),
+        })
+        .await;
+        let client = ClickHouseClient::new(test_clickhouse_config(base_url)).expect("client");
+        for key in RESERVED_PARAMS {
+            let owned_key = key.to_ascii_uppercase();
+            let owner = QueryOwner::new(&client.runtime(), QueryWorkload::Internal).unwrap();
+            let error = owner
+                .scope(client.request_text_with_params(
+                    "SELECT 1",
+                    None,
+                    None,
+                    false,
+                    None,
+                    &[(owned_key.as_str(), "1")],
+                ))
+                .await
+                .expect_err("reserved request key must fail");
+            assert_eq!(
+                error
+                    .downcast_ref::<ClickHouseError>()
+                    .map(ClickHouseError::category),
+                Some(ClickHouseErrorCategory::OwnershipViolation)
+            );
+        }
+        assert!(requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn owner_and_child_ids_are_classed_unique_and_runtime_isolated() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let base_url = spawn_request_capture_server(RequestCaptureState {
+            requests: requests.clone(),
+        })
+        .await;
+        let runtime = QueryRuntime::new();
+        let client = ClickHouseClient::new_with_runtime(
+            test_clickhouse_config(base_url.clone()),
+            runtime.clone(),
+        )
+        .unwrap();
+        let owner = QueryOwner::new(&runtime, QueryWorkload::Mcp).unwrap();
+        let logical = owner.logical_id().to_string();
+        owner
+            .scope(async {
+                let (left, right) = tokio::join!(
+                    client.request_text("SELECT 1", None, None, false, None),
+                    client.request_text("SELECT 2", None, None, false, None),
+                );
+                left.unwrap();
+                right.unwrap();
+            })
+            .await;
+        assert_eq!(runtime.active_owner_count(), 0);
+
+        {
+            let captured = requests.lock().unwrap();
+            let mut ids = captured
+                .iter()
+                .map(|request| request.params["query_id"].clone())
+                .collect::<Vec<_>>();
+            ids.sort();
+            ids.dedup();
+            assert_eq!(ids.len(), 2);
+            assert!(ids.iter().all(|id| id.starts_with(&format!("{logical}-"))));
+        }
+
+        let other_runtime = QueryRuntime::new();
+        let other = QueryOwner::new(&other_runtime, QueryWorkload::Mcp).unwrap();
+        assert_ne!(logical, other.logical_id());
+        other.scope(async {}).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn returned_stream_keeps_ticket_until_eof_and_normal_eof_never_kills() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let base_url = spawn_request_capture_server(RequestCaptureState {
+            requests: requests.clone(),
+        })
+        .await;
+        let runtime = QueryRuntime::new();
+        let client =
+            ClickHouseClient::new_with_runtime(test_clickhouse_config(base_url), runtime.clone())
+                .unwrap();
+        let owner = QueryOwner::new(&runtime, QueryWorkload::Export).unwrap();
+        let mut stream = owner
+            .scope(client.request_stream_with_params("SELECT 1", None, None, &[]))
+            .await
+            .unwrap();
+        assert_eq!(
+            runtime.active_owner_count(),
+            1,
+            "stream ticket must outlive scope"
+        );
+        while stream.next_chunk().await.unwrap().is_some() {}
+        assert_eq!(runtime.active_owner_count(), 0);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let captured = requests.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert!(!captured[0].params["query"].starts_with("KILL QUERY"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dropping_stream_uses_exact_child_kill_on_administrative_path() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let base_url = spawn_request_capture_server(RequestCaptureState {
+            requests: requests.clone(),
+        })
+        .await;
+        let runtime = QueryRuntime::new();
+        let client =
+            ClickHouseClient::new_with_runtime(test_clickhouse_config(base_url), runtime.clone())
+                .unwrap();
+        let owner = QueryOwner::new(&runtime, QueryWorkload::Export).unwrap();
+        let stream = owner
+            .scope(client.request_stream_with_params("SELECT 1", None, None, &[]))
+            .await
+            .unwrap();
+        let child_id = requests.lock().unwrap()[0].params["query_id"].clone();
+        drop(stream);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|request| request.params["query"].starts_with("KILL QUERY"))
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("exact KILL should be attempted");
+        let captured = requests.lock().unwrap();
+        let kill = captured
+            .iter()
+            .find(|request| request.params["query"].starts_with("KILL QUERY"))
+            .unwrap();
+        assert!(kill.params["query"].contains(&format!("query_id IN ('{child_id}')")));
+        assert!(!kill.params["query"].contains("LIKE"));
+        assert!(kill.params["query_id"].starts_with("moraine-administrative-"));
+        assert_eq!(kill.params["replace_running_query"], "0");
+    }
+
+    #[test]
+    fn deadline_encoding_ceil_never_shortens() {
+        assert_eq!(
+            format_clickhouse_deadline(Duration::from_nanos(1)),
+            "0.000001"
+        );
+        assert_eq!(
+            format_clickhouse_deadline(Duration::from_micros(1)),
+            "0.000001"
+        );
+        assert_eq!(
+            format_clickhouse_deadline(Duration::from_nanos(1_000_001)),
+            "0.001001"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn expired_absolute_deadline_sends_zero_bytes_and_is_typed() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = ClickHouseClient::new(test_clickhouse_config(format!(
+            "http://{}",
+            listener.local_addr().unwrap()
+        )))
+        .unwrap();
+        let owner = QueryOwner::with_deadline(
+            &client.runtime(),
+            QueryWorkload::Internal,
+            tokio::time::Instant::now(),
+        )
+        .unwrap();
+        let error = owner
+            .scope(client.request_text("SELECT 1", None, None, false, None))
+            .await
+            .expect_err("expired deadline");
+        assert_eq!(
+            error
+                .downcast_ref::<ClickHouseError>()
+                .map(ClickHouseError::category),
+            Some(ClickHouseErrorCategory::DeadlineExceeded)
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn deadline_injection_uses_one_absolute_deadline_and_connect_timeout_only() {
+        async fn delayed(Query(params): Query<HashMap<String, String>>) -> (StatusCode, String) {
+            tokio::time::sleep(Duration::from_millis(75)).await;
+            (StatusCode::OK, params["query_id"].clone())
+        }
+        let app = Router::new().route("/", post(delayed));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let mut config = test_clickhouse_config(format!("http://{addr}"));
+        config.timeout_seconds = 0.001;
+        let client = ClickHouseClient::new(config).unwrap();
+        let owner = QueryOwner::with_deadline(
+            &client.runtime(),
+            QueryWorkload::Internal,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .unwrap();
+        let result = owner
+            .scope(client.request_text("SELECT 1", None, None, false, None))
+            .await;
+        assert!(
+            result.is_ok(),
+            "tiny connect timeout must not become total timeout: {result:?}"
+        );
+    }
+
+    #[test]
+    fn exception_codes_map_to_exact_categories() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let domain = QueryRuntime::new();
+            let owner = QueryOwner::new(&domain, QueryWorkload::Internal).unwrap();
+            for code in [159, 160, 209] {
+                assert_eq!(
+                    classify_code(&owner, Some(code)),
+                    ClickHouseErrorCategory::DeadlineExceeded
+                );
+            }
+            for code in [158, 202, 241, 307, 396] {
+                assert_eq!(
+                    classify_code(&owner, Some(code)),
+                    ClickHouseErrorCategory::ResourceExhausted
+                );
+            }
+            assert_eq!(
+                classify_code(&owner, Some(394)),
+                ClickHouseErrorCategory::Backend
+            );
+            assert_eq!(
+                classify_code(&owner, Some(999)),
+                ClickHouseErrorCategory::Backend
+            );
+            owner.scope(async {}).await;
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn malformed_json_envelope_is_not_replayed() {
+        async fn malformed(
+            State(requests): State<Arc<Mutex<Vec<()>>>>,
+        ) -> (StatusCode, &'static str) {
+            requests.lock().unwrap().push(());
+            (StatusCode::OK, "not-json")
+        }
+        let counts = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new()
+            .route("/", post(malformed))
+            .with_state(counts.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let client =
+            ClickHouseClient::new(test_clickhouse_config(format!("http://{addr}"))).unwrap();
+        let result: Result<Vec<Value>> = owned(&client, client.query_rows("SELECT 1", None)).await;
+        assert!(result.is_err());
+        assert_eq!(
+            counts.lock().unwrap().len(),
+            1,
+            "unsafe fallback replayed request"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn successful_status_with_late_exception_is_typed_without_retry() {
+        async fn late_exception() -> (StatusCode, &'static str) {
+            (
+                StatusCode::OK,
+                "{\"value\":1}\nCode: 241. DB::Exception: memory limit exceeded\n",
+            )
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, Router::new().route("/", post(late_exception))).await;
+        });
+        let client =
+            ClickHouseClient::new(test_clickhouse_config(format!("http://{addr}"))).unwrap();
+        let error = owned(
+            &client,
+            client.request_text("SELECT 1", None, None, false, None),
+        )
+        .await
+        .expect_err("late exception must fail");
+        let typed = error.downcast_ref::<ClickHouseError>().unwrap();
+        assert_eq!(typed.category(), ClickHouseErrorCategory::ResourceExhausted);
+        assert_eq!(typed.exception_code(), Some(241));
+        assert_eq!(
+            typed.exception_detail(),
+            Some("Code: 241. DB::Exception: memory limit exceeded")
+        );
+        assert!(error.to_string().contains("memory limit exceeded"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn typed_code_117_retains_bounded_detail_for_oversized_row_classification() {
+        async fn oversized() -> (StatusCode, &'static str) {
+            (
+                StatusCode::BAD_REQUEST,
+                "Code: 117. DB::Exception: Size of JSON object at position 42 is extremely large. Expected not greater than 10485760 bytes.\nstack trace omitted",
+            )
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, Router::new().route("/", post(oversized))).await;
+        });
+        let client =
+            ClickHouseClient::new(test_clickhouse_config(format!("http://{addr}"))).unwrap();
+        let error = owned(
+            &client,
+            client.request_text("INSERT INTO events", None, None, false, None),
+        )
+        .await
+        .expect_err("oversized response must fail");
+        let typed = error.downcast_ref::<ClickHouseError>().unwrap();
+        assert_eq!(typed.exception_code(), Some(117));
+        assert!(typed
+            .exception_detail()
+            .unwrap()
+            .contains("extremely large"));
+        assert!(!typed.exception_detail().unwrap().contains("stack trace"));
+        assert!(is_oversized_json_each_row_insert_error(&error));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn explicit_cancel_interrupts_response_body_and_cleans_exact_child() {
+        use axum::body::Body;
+        use axum::response::Response;
+        use futures_util::{stream, StreamExt};
+        use std::convert::Infallible;
+
+        #[derive(Clone)]
+        struct StateData {
+            started: Arc<tokio::sync::Notify>,
+            requests: Arc<Mutex<Vec<HashMap<String, String>>>>,
+            process_polls: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        async fn handler(
+            State(state): State<StateData>,
+            Query(params): Query<HashMap<String, String>>,
+        ) -> Response<Body> {
+            let query = params.get("query").cloned().unwrap_or_default();
+            state.requests.lock().unwrap().push(params);
+            if query.starts_with("KILL QUERY") {
+                return Response::new(Body::from(""));
+            }
+            if query.contains("system.processes") {
+                let poll = state
+                    .process_polls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let id = query
+                    .split("IN ('")
+                    .nth(1)
+                    .and_then(|tail| tail.split("')").next())
+                    .unwrap();
+                return Response::new(Body::from(if poll == 0 {
+                    format!(r#"{{"query_id":"{id}"}}"#)
+                } else {
+                    String::new()
+                }));
+            }
+            state.started.notify_one();
+            let body =
+                stream::once(async { Ok::<Bytes, Infallible>(Bytes::from_static(b"partial")) })
+                    .chain(stream::pending());
+            Response::new(Body::from_stream(body))
+        }
+
+        let state = StateData {
+            started: Arc::new(tokio::sync::Notify::new()),
+            requests: Arc::new(Mutex::new(Vec::new())),
+            process_polls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/", post(handler))
+            .with_state(state.clone());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let runtime = QueryRuntime::new();
+        let client = ClickHouseClient::new_with_runtime(
+            test_clickhouse_config(format!("http://{addr}")),
+            runtime.clone(),
+        )
+        .unwrap();
+        let owner = QueryOwner::new(&runtime, QueryWorkload::Mcp).unwrap();
+        let request_owner = owner.clone();
+        let task = tokio::spawn(async move {
+            request_owner
+                .scope(client.request_text("SELECT 1", None, None, false, None))
+                .await
+        });
+        state.started.notified().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        owner.cancel(QueryCause::Explicit);
+        let error = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("cancel must promptly interrupt body")
+            .unwrap()
+            .expect_err("cancelled request");
+        assert_eq!(
+            error
+                .downcast_ref::<ClickHouseError>()
+                .map(ClickHouseError::category),
+            Some(ClickHouseErrorCategory::Cancelled)
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if runtime.active_owner_count() == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cleanup should become terminal");
+        let requests = state.requests.lock().unwrap();
+        let child = requests[0]["query_id"].clone();
+        assert!(requests.iter().any(|request| {
+            request["query"].starts_with("KILL QUERY")
+                && request["query"].contains(&format!("'{child}'"))
+        }));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_public_workload_uses_the_fixed_id_vocabulary() {
+        let runtime = QueryRuntime::new();
+        for workload in [
+            QueryWorkload::Mcp,
+            QueryWorkload::Monitor,
+            QueryWorkload::Internal,
+            QueryWorkload::Export,
+            QueryWorkload::Migration,
+            QueryWorkload::Background,
+            QueryWorkload::Administrative,
+        ] {
+            let owner = QueryOwner::new(&runtime, workload).unwrap();
+            let id = owner.logical_id();
+            assert!(id.starts_with(&format!("moraine-{}-", workload.as_str())));
+            let uuid = id.rsplit('-').next().unwrap();
+            assert_eq!(uuid.len(), 32);
+            assert!(uuid.bytes().all(|byte| byte.is_ascii_hexdigit()));
+            owner.scope(async {}).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn administrative_owner_cancels_through_non_recursive_internal_admin_path() {
+        #[derive(Clone)]
+        struct LateVisibilityState {
+            requests: Arc<Mutex<Vec<CapturedRequest>>>,
+            polls: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        async fn handler(
+            State(state): State<LateVisibilityState>,
+            Query(params): Query<HashMap<String, String>>,
+            headers: HeaderMap,
+            body: Bytes,
+        ) -> (StatusCode, String) {
+            let query = params.get("query").cloned().unwrap_or_default();
+            state.requests.lock().unwrap().push(CapturedRequest {
+                params,
+                headers,
+                body: body.to_vec(),
+            });
+            if query.contains("system.processes") {
+                let poll = state
+                    .polls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // First absent poll races visibility despite response headers;
+                // then the child appears, and finally disappears after KILL.
+                let id = query
+                    .split("IN ('")
+                    .nth(1)
+                    .and_then(|tail| tail.split("')").next())
+                    .unwrap();
+                return (
+                    StatusCode::OK,
+                    if poll == 1 {
+                        format!(r#"{{"query_id":"{id}"}}"#)
+                    } else {
+                        String::new()
+                    },
+                );
+            }
+            (StatusCode::OK, "ok".to_string())
+        }
+
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let state = LateVisibilityState {
+            requests: requests.clone(),
+            polls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+        let app = Router::new()
+            .route("/", post(handler))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let runtime = QueryRuntime::new();
+        let client =
+            ClickHouseClient::new_with_runtime(test_clickhouse_config(base_url), runtime.clone())
+                .unwrap();
+        let owner = QueryOwner::new(&runtime, QueryWorkload::Administrative).unwrap();
+        let mut stream = owner
+            .scope(client.request_stream_with_params("SELECT version()", Some("system"), None, &[]))
+            .await
+            .unwrap();
+        let child_id = requests.lock().unwrap()[0].params["query_id"].clone();
+        assert!(child_id.starts_with("moraine-administrative-"));
+
+        // Read one chunk but abandon before EOF so the normal Administrative
+        // statement remains armed and exercises cleanup after headers.
+        assert!(stream.next_chunk().await.unwrap().is_some());
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if runtime.active_owner_count() == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("late-visible administrative owner cleanup should terminate");
+
+        let captured = requests.lock().unwrap();
+        let kills = captured
+            .iter()
+            .filter(|request| request.params["query"].starts_with("KILL QUERY"))
+            .collect::<Vec<_>>();
+        let polls = captured
+            .iter()
+            .filter(|request| request.params["query"].contains("system.processes"))
+            .count();
+        assert_eq!(
+            polls, 3,
+            "absent, late-visible, then absent must all be observed"
+        );
+        assert_eq!(kills.len(), polls);
+        assert!(
+            kills.iter().all(|kill| {
+                kill.params["query"].contains(&format!("query_id IN ('{child_id}')"))
+                    && kill.params["query_id"].starts_with("moraine-administrative-")
+                    && kill.params["query_id"] != child_id
+            }),
+            "internal KILL must not recursively own or target itself"
+        );
+        assert!(
+            captured
+                .iter()
+                .filter(|request| {
+                    request.params["query"].starts_with("KILL QUERY")
+                        || request.params["query"].contains("system.processes")
+                })
+                .all(|request| request.headers.get("content-length").unwrap() == "0"),
+            "empty administrative POSTs must carry an explicit zero content length"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn still_visible_cleanup_is_bounded_even_when_admin_requests_succeed() {
+        #[derive(Clone)]
+        struct VisibleState {
+            kills: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        async fn handler(
+            State(state): State<VisibleState>,
+            Query(params): Query<HashMap<String, String>>,
+        ) -> (StatusCode, String) {
+            let query = params.get("query").cloned().unwrap_or_default();
+            if query.starts_with("KILL QUERY") {
+                state
+                    .kills
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return (StatusCode::OK, String::new());
+            }
+            if query.contains("system.processes") {
+                let id = query
+                    .split("IN ('")
+                    .nth(1)
+                    .and_then(|tail| tail.split("')").next())
+                    .unwrap();
+                return (StatusCode::OK, format!(r#"{{"query_id":"{id}"}}"#));
+            }
+            (StatusCode::OK, "ok".to_string())
+        }
+
+        let state = VisibleState {
+            kills: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+        let app = Router::new()
+            .route("/", post(handler))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let runtime = QueryRuntime::new();
+        let client =
+            ClickHouseClient::new_with_runtime(test_clickhouse_config(base_url), runtime.clone())
+                .unwrap();
+        let owner = QueryOwner::new(&runtime, QueryWorkload::Administrative).unwrap();
+        let mut stream = owner
+            .scope(client.request_stream_with_params("SELECT 1", None, None, &[]))
+            .await
+            .unwrap();
+        assert!(stream.next_chunk().await.unwrap().is_some());
+        let started = tokio::time::Instant::now();
+        drop(stream);
+        while runtime.active_owner_count() != 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let elapsed = tokio::time::Instant::now() - started;
+        assert!(elapsed >= QUERY_CLEANUP_GRACE);
+        assert!(elapsed <= QUERY_CLEANUP_GRACE + Duration::from_millis(20));
+        assert!(state.kills.load(std::sync::atomic::Ordering::SeqCst) > 1);
     }
 }

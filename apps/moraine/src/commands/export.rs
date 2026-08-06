@@ -1,14 +1,13 @@
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, SecondsFormat, TimeZone, Utc};
-use moraine_clickhouse::ClickHouseClient;
+use moraine_clickhouse::{ClickHouseClient, QueryCause, QueryOwner, QueryRuntime, QueryWorkload};
 use moraine_config::AppConfig;
 use serde::Serialize;
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{ErrorKind, Write};
 use std::process::ExitCode;
-use std::time::{Duration, Instant};
-use uuid::Uuid;
+use std::time::Instant;
 
 use super::schema::{
     all_non_sensitive_event_columns, default_event_columns, event_column, EventColumn,
@@ -18,34 +17,45 @@ use crate::cli::{ExportEventsArgs, ExportRowFormat};
 
 const EXPORT_KIND_EVENTS: &str = "events";
 const DEFAULT_BACKEND: &str = "default";
-const DEFAULT_MAX_EXECUTION_SECONDS: u64 = 600;
-const EXPORT_REQUEST_TIMEOUT_GRACE_SECONDS: u64 = 30;
-
-pub(crate) async fn events(cfg: &AppConfig, args: ExportEventsArgs) -> Result<ExitCode> {
+pub(crate) async fn events(
+    cfg: &AppConfig,
+    args: ExportEventsArgs,
+    query_runtime: &QueryRuntime,
+) -> Result<ExitCode> {
     let prepared = prepare_export(cfg, args)?;
-
-    let client = ClickHouseClient::new(cfg.clickhouse.clone())?;
-    ensure_schema_ready(&client).await?;
+    let client = ClickHouseClient::new_with_runtime(cfg.clickhouse.clone(), query_runtime.clone())?;
+    let owner = QueryOwner::new(query_runtime, QueryWorkload::Export)?;
+    let query_id = owner.logical_id().to_string();
+    let cancellation_owner = owner.clone();
 
     let started = Instant::now();
-    let params = prepared
-        .query_params
-        .iter()
-        .map(|(key, value)| (key.as_str(), value.as_str()))
-        .collect::<Vec<_>>();
-    let mut stream = client
-        .request_stream_with_params(
-            &prepared.query,
-            Some(&cfg.clickhouse.database),
-            None,
-            &params,
-            Some(request_timeout(cfg.clickhouse.timeout_seconds)),
-        )
-        .await?;
+    let stream_result = owner
+        .scope(async {
+            ensure_schema_ready(&client).await?;
+            let params = prepared
+                .query_params
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str()))
+                .collect::<Vec<_>>();
+            let mut stream = client
+                .request_stream_with_params(
+                    &prepared.query,
+                    Some(&cfg.clickhouse.database),
+                    None,
+                    &params,
+                )
+                .await?;
 
-    let mut stdout = std::io::stdout().lock();
-    let stream_result =
-        stream_jsonl_rows(&mut stream, &mut stdout, &prepared.columns, prepared.limit).await?;
+            let mut stdout = std::io::stdout().lock();
+            let result =
+                stream_jsonl_rows(&mut stream, &mut stdout, &prepared.columns, prepared.limit)
+                    .await?;
+            if result.broken_pipe {
+                cancellation_owner.cancel(QueryCause::Explicit);
+            }
+            Ok::<_, anyhow::Error>(result)
+        })
+        .await?;
 
     if stream_result.broken_pipe {
         return Ok(ExitCode::SUCCESS);
@@ -56,7 +66,7 @@ pub(crate) async fn events(cfg: &AppConfig, args: ExportEventsArgs) -> Result<Ex
         data_schema_version: EVENTS_SCHEMA_VERSION,
         export_kind: EXPORT_KIND_EVENTS,
         backend: DEFAULT_BACKEND,
-        query_id: &prepared.query_id,
+        query_id: &query_id,
         columns: prepared
             .columns
             .iter()
@@ -79,7 +89,6 @@ struct PreparedExport {
     columns: Vec<&'static EventColumn>,
     sensitive_columns_requested: Vec<String>,
     limit: Option<usize>,
-    query_id: String,
     query_params: Vec<(String, String)>,
     query: String,
     filters_metadata: BTreeMap<String, Value>,
@@ -122,15 +131,13 @@ fn prepare_export(cfg: &AppConfig, args: ExportEventsArgs) -> Result<PreparedExp
         bail!("moraine export events requires at least one filter unless --all is supplied");
     }
 
-    let query_id = Uuid::new_v4().to_string();
     let query = build_events_query(&cfg.clickhouse.database, &columns, &filters, args.limit)?;
-    let query_params = build_query_params(&query_id);
+    let query_params = build_query_params();
 
     Ok(PreparedExport {
         columns,
         sensitive_columns_requested,
         limit: args.limit,
-        query_id,
         query_params,
         query,
         filters_metadata: filters.metadata,
@@ -192,22 +199,8 @@ fn select_columns(raw: Option<&str>, include_sensitive: bool) -> Result<Vec<&'st
     Ok(columns)
 }
 
-fn build_query_params(query_id: &str) -> Vec<(String, String)> {
-    vec![
-        ("query_id".to_string(), query_id.to_string()),
-        ("readonly".to_string(), "1".to_string()),
-        (
-            "max_execution_time".to_string(),
-            DEFAULT_MAX_EXECUTION_SECONDS.to_string(),
-        ),
-    ]
-}
-
-fn request_timeout(config_timeout_seconds: f64) -> Duration {
-    let configured = config_timeout_seconds.max(1.0).ceil() as u64;
-    let seconds = configured
-        .max(DEFAULT_MAX_EXECUTION_SECONDS.saturating_add(EXPORT_REQUEST_TIMEOUT_GRACE_SECONDS));
-    Duration::from_secs(seconds)
+fn build_query_params() -> Vec<(String, String)> {
+    vec![("readonly".to_string(), "1".to_string())]
 }
 
 async fn ensure_schema_ready(client: &ClickHouseClient) -> Result<()> {
@@ -938,25 +931,11 @@ mod tests {
     }
 
     #[test]
-    fn query_params_use_readonly_and_internal_execution_limit() {
-        let params = build_query_params("qid");
+    fn query_params_are_readonly_without_reserved_identity_or_deadline() {
         assert_eq!(
-            params,
-            vec![
-                ("query_id".to_string(), "qid".to_string()),
-                ("readonly".to_string(), "1".to_string()),
-                (
-                    "max_execution_time".to_string(),
-                    DEFAULT_MAX_EXECUTION_SECONDS.to_string()
-                ),
-            ]
+            build_query_params(),
+            vec![("readonly".to_string(), "1".to_string())]
         );
-    }
-
-    #[test]
-    fn request_timeout_outlives_internal_execution_setting() {
-        assert_eq!(request_timeout(30.0), Duration::from_secs(630));
-        assert_eq!(request_timeout(900.0), Duration::from_secs(900));
     }
 
     #[test]

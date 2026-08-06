@@ -1,8 +1,10 @@
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use anyhow::{anyhow, Context as _, Result};
-use moraine_clickhouse::{enforce_remote_schema_policy, ClickHouseClient};
+use moraine_clickhouse::{
+    enforce_remote_schema_policy, ClickHouseClient, QueryOwner, QueryRuntime, QueryWorkload,
+};
 use moraine_config::{AppConfig, ClickHouseConfig, DEFAULT_BACKEND_NAME};
 use tokio::sync::{watch, Mutex};
 use tracing::warn;
@@ -70,16 +72,82 @@ type SharedInitialization = std::result::Result<Arc<BackendRepository>, Arc<str>
 
 struct BuildAttempt {
     result: watch::Sender<Option<SharedInitialization>>,
+    lifecycle: StdMutex<BuildAttemptLifecycle>,
+}
+
+struct BuildAttemptLifecycle {
+    accepting_waiters: bool,
+    waiter_count: usize,
+    build_abort: Option<tokio::task::AbortHandle>,
 }
 
 impl BuildAttempt {
     fn new() -> Self {
         let (result, _) = watch::channel(None);
-        Self { result }
+        Self {
+            result,
+            lifecycle: StdMutex::new(BuildAttemptLifecycle {
+                accepting_waiters: true,
+                waiter_count: 0,
+                build_abort: None,
+            }),
+        }
     }
 
+    fn try_waiter(self: &Arc<Self>) -> Option<BuildWaiter> {
+        let mut lifecycle = self.lifecycle.lock().expect("build attempt lock poisoned");
+        if !lifecycle.accepting_waiters {
+            return None;
+        }
+        lifecycle.waiter_count += 1;
+        Some(BuildWaiter {
+            attempt: self.clone(),
+        })
+    }
+
+    fn set_build_abort(&self, build_abort: tokio::task::AbortHandle) {
+        let mut lifecycle = self.lifecycle.lock().expect("build attempt lock poisoned");
+        debug_assert!(lifecycle.build_abort.is_none());
+        if lifecycle.accepting_waiters {
+            lifecycle.build_abort = Some(build_abort);
+        } else {
+            build_abort.abort();
+        }
+    }
+
+    fn release_waiter(&self) {
+        let build_abort = {
+            let mut lifecycle = self.lifecycle.lock().expect("build attempt lock poisoned");
+            debug_assert!(lifecycle.waiter_count > 0);
+            lifecycle.waiter_count -= 1;
+            if lifecycle.waiter_count == 0 {
+                lifecycle.accepting_waiters = false;
+                lifecycle.build_abort.take()
+            } else {
+                None
+            }
+        };
+        if let Some(build_abort) = build_abort {
+            build_abort.abort();
+        }
+    }
+
+    #[cfg(test)]
+    fn waiter_count(&self) -> usize {
+        self.lifecycle
+            .lock()
+            .expect("build attempt lock poisoned")
+            .waiter_count
+    }
+}
+
+struct BuildWaiter {
+    attempt: Arc<BuildAttempt>,
+}
+
+impl BuildWaiter {
     async fn wait(&self) -> Result<Arc<BackendRepository>> {
-        let mut result = self.result.subscribe();
+        let mut result = self.attempt.result.subscribe();
         loop {
             if let Some(result) = result.borrow_and_update().clone() {
                 return result.map_err(|message| anyhow!(message.to_string()));
@@ -89,6 +157,12 @@ impl BuildAttempt {
                 .await
                 .map_err(|_| anyhow!("backend repository initialization ended without a result"))?;
         }
+    }
+}
+
+impl Drop for BuildWaiter {
+    fn drop(&mut self) {
+        self.attempt.release_waiter();
     }
 }
 
@@ -102,6 +176,7 @@ struct BackendSlot {
     backend_name: Arc<str>,
     clickhouse: ClickHouseConfig,
     checked: bool,
+    query_runtime: QueryRuntime,
     state: Mutex<SlotState>,
 }
 
@@ -110,6 +185,7 @@ impl BackendSlot {
         backend_name: String,
         clickhouse: ClickHouseConfig,
         checked: bool,
+        query_runtime: QueryRuntime,
         preloaded: Option<Arc<dyn ConversationRepository>>,
     ) -> Self {
         let backend_name: Arc<str> = Arc::from(backend_name);
@@ -125,6 +201,7 @@ impl BackendSlot {
             backend_name,
             clickhouse,
             checked,
+            query_runtime,
             state: Mutex::new(state),
         }
     }
@@ -134,54 +211,68 @@ impl BackendSlot {
         repo_config: RepoConfig,
         user_agent: Arc<str>,
     ) -> Result<Arc<BackendRepository>> {
-        let attempt = {
+        let waiter = {
             let mut state = self.state.lock().await;
             match &*state {
                 SlotState::Ready(repository) => return Ok(repository.clone()),
-                SlotState::Building(attempt) => attempt.clone(),
-                SlotState::Empty => {
-                    let attempt = Arc::new(BuildAttempt::new());
-                    *state = SlotState::Building(attempt.clone());
-
-                    let slot = self.clone();
-                    let published_attempt = attempt.clone();
-                    tokio::spawn(async move {
-                        let build_slot = slot.clone();
-                        let build = tokio::spawn(async move {
-                            build_slot.build(repo_config, &user_agent).await
-                        });
-                        let result = match build.await {
-                            Ok(result) => {
-                                result.map_err(|error| Arc::<str>::from(error.to_string()))
-                            }
-                            Err(error) => Err(Arc::<str>::from(format!(
-                                "backend repository initialization task failed: {error}"
-                            ))),
-                        };
-
-                        // Retain the result even if every initiating caller was
-                        // cancelled before subscribing to this attempt.
-                        published_attempt.result.send_replace(Some(result.clone()));
-
-                        let mut state = slot.state.lock().await;
-                        let is_current_attempt = matches!(
-                            &*state,
-                            SlotState::Building(current)
-                                if Arc::ptr_eq(current, &published_attempt)
-                        );
-                        if is_current_attempt {
-                            *state = match result {
-                                Ok(repository) => SlotState::Ready(repository),
-                                Err(_) => SlotState::Empty,
-                            };
-                        }
-                    });
-                    attempt
-                }
+                SlotState::Building(attempt) => match attempt.try_waiter() {
+                    Some(waiter) => waiter,
+                    None => self.start_build(&mut state, repo_config, user_agent),
+                },
+                SlotState::Empty => self.start_build(&mut state, repo_config, user_agent),
             }
         };
 
-        attempt.wait().await
+        waiter.wait().await
+    }
+
+    fn start_build(
+        self: &Arc<Self>,
+        state: &mut SlotState,
+        repo_config: RepoConfig,
+        user_agent: Arc<str>,
+    ) -> BuildWaiter {
+        let attempt = Arc::new(BuildAttempt::new());
+        let waiter = attempt
+            .try_waiter()
+            .expect("a new build attempt accepts its initiating waiter");
+        *state = SlotState::Building(attempt.clone());
+
+        let build_slot = self.clone();
+        let build = tokio::spawn(async move { build_slot.build(repo_config, &user_agent).await });
+        attempt.set_build_abort(build.abort_handle());
+
+        let slot = self.clone();
+        let published_attempt = attempt.clone();
+        tokio::spawn(async move {
+            let result = match build.await {
+                Ok(result) => result.map_err(|error| Arc::<str>::from(error.to_string())),
+                Err(error) => Err(Arc::<str>::from(format!(
+                    "backend repository initialization task failed: {error}"
+                ))),
+            };
+
+            // Publish the slot state before waking waiters. Otherwise the last
+            // waiter could return and retire this attempt while it still
+            // appears to be building, allowing a racing caller to duplicate a
+            // successful initialization.
+            let mut state = slot.state.lock().await;
+            let is_current_attempt = matches!(
+                &*state,
+                SlotState::Building(current) if Arc::ptr_eq(current, &published_attempt)
+            );
+            if is_current_attempt {
+                *state = match &result {
+                    Ok(repository) => SlotState::Ready(repository.clone()),
+                    Err(_) => SlotState::Empty,
+                };
+            }
+            drop(state);
+
+            published_attempt.result.send_replace(Some(result));
+        });
+
+        waiter
     }
 
     async fn build(
@@ -194,6 +285,7 @@ impl BackendSlot {
                 &self.backend_name,
                 self.clickhouse.clone(),
                 repo_config,
+                self.query_runtime.clone(),
                 user_agent,
             )
             .await?
@@ -201,6 +293,7 @@ impl BackendSlot {
             build_clickhouse_repository_with_user_agent(
                 self.clickhouse.clone(),
                 repo_config,
+                self.query_runtime.clone(),
                 user_agent,
             )?
         };
@@ -218,12 +311,14 @@ impl BackendSlot {
 /// One slot is predeclared for every normalized backend. The default slot is
 /// constructed without a remote schema handshake because Moraine owns and
 /// migrates it. Every named slot is checked exactly once per successful
-/// initialization. Concurrent callers share an in-flight result; failures are
-/// returned to those callers but are not cached, so a later call retries.
+/// initialization. Concurrent callers share an in-flight result while at least
+/// one caller is still waiting. An abandoned attempt is cancelled once its last
+/// waiter disappears. Failures are not cached, so a later call retries.
 pub struct BackendRepositoryRouter {
     config: Arc<AppConfig>,
     repo_config: RepoConfig,
     user_agent: Arc<str>,
+    query_runtime: QueryRuntime,
     slots: BTreeMap<String, Arc<BackendSlot>>,
 }
 
@@ -231,9 +326,16 @@ impl BackendRepositoryRouter {
     pub fn new(
         config: Arc<AppConfig>,
         repo_config: RepoConfig,
+        query_runtime: QueryRuntime,
         user_agent: impl Into<Arc<str>>,
     ) -> Result<Self> {
-        Self::new_inner(config, repo_config, user_agent.into(), BTreeMap::new())
+        Self::new_inner(
+            config,
+            repo_config,
+            user_agent.into(),
+            query_runtime,
+            BTreeMap::new(),
+        )
     }
 
     /// Construct a router with already-built repositories for consumer tests.
@@ -241,12 +343,14 @@ impl BackendRepositoryRouter {
     #[doc(hidden)]
     pub fn from_preloaded_for_testing(
         config: Arc<AppConfig>,
+        query_runtime: QueryRuntime,
         repositories: impl IntoIterator<Item = (String, Arc<dyn ConversationRepository>)>,
     ) -> Result<Self> {
         Self::new_inner(
             config,
             RepoConfig::default(),
             Arc::from("moraine-conversations-test"),
+            query_runtime,
             repositories.into_iter().collect(),
         )
     }
@@ -255,6 +359,7 @@ impl BackendRepositoryRouter {
         config: Arc<AppConfig>,
         repo_config: RepoConfig,
         user_agent: Arc<str>,
+        query_runtime: QueryRuntime,
         mut preloaded: BTreeMap<String, Arc<dyn ConversationRepository>>,
     ) -> Result<Self> {
         if !config.backends.contains_key(DEFAULT_BACKEND_NAME) {
@@ -273,6 +378,7 @@ impl BackendRepositoryRouter {
                     backend_name.clone(),
                     clickhouse.clone(),
                     backend_name != DEFAULT_BACKEND_NAME,
+                    query_runtime.clone(),
                     repository,
                 )),
             );
@@ -287,8 +393,13 @@ impl BackendRepositoryRouter {
             config,
             repo_config,
             user_agent,
+            query_runtime,
             slots,
         })
+    }
+
+    pub fn query_runtime(&self) -> QueryRuntime {
+        self.query_runtime.clone()
     }
 
     pub async fn default_repository(&self) -> Result<Arc<BackendRepository>> {
@@ -378,14 +489,19 @@ async fn build_checked_clickhouse_repository_with_user_agent(
     backend_name: &str,
     clickhouse: ClickHouseConfig,
     config: RepoConfig,
+    query_runtime: QueryRuntime,
     user_agent: impl AsRef<str>,
 ) -> Result<Arc<dyn ConversationRepository>> {
     let allow_newer_server = clickhouse.allow_newer_server;
-    let client =
-        ClickHouseClient::new_with_user_agent(clickhouse, user_agent).with_context(|| {
-            format!("backend '{backend_name}': failed to construct ClickHouse client")
-        })?;
-    let skew = client.schema_skew().await.with_context(|| {
+    let client = ClickHouseClient::new_with_runtime_and_user_agent(
+        clickhouse,
+        query_runtime.clone(),
+        user_agent,
+    )
+    .with_context(|| format!("backend '{backend_name}': failed to construct ClickHouse client"))?;
+    let owner = QueryOwner::new(&query_runtime, QueryWorkload::Internal)
+        .with_context(|| format!("backend '{backend_name}': failed to own schema handshake"))?;
+    let skew = owner.scope(client.schema_skew()).await.with_context(|| {
         format!("backend '{backend_name}': schema handshake failed (is the server reachable?)")
     })?;
     enforce_remote_schema_policy(backend_name, &skew, allow_newer_server)?;
@@ -420,6 +536,7 @@ mod tests {
     struct CapturedRequest {
         method: Method,
         query: String,
+        query_id: Option<String>,
         user_agent: Option<String>,
     }
 
@@ -433,6 +550,7 @@ mod tests {
         versions: Vec<String>,
         fail_first: AtomicBool,
         requests: AtomicUsize,
+        cleanup_polls: AtomicUsize,
         captured: StdMutex<Vec<CapturedRequest>>,
         first_request_block: Option<FirstRequestBlock>,
     }
@@ -458,6 +576,7 @@ mod tests {
                 .push(CapturedRequest {
                     method,
                     query: query.clone(),
+                    query_id: params.get("query_id").cloned(),
                     user_agent: headers
                         .get("user-agent")
                         .and_then(|value| value.to_str().ok())
@@ -477,6 +596,21 @@ mod tests {
                 );
             }
 
+            if query.starts_with("KILL QUERY") {
+                return (StatusCode::OK, String::new());
+            }
+            if query.contains("FROM system.processes") {
+                let body = if state.cleanup_polls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    query
+                        .split('\'')
+                        .nth(1)
+                        .map(|query_id| json!({"query_id": query_id}).to_string())
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                return (StatusCode::OK, body);
+            }
             if query.contains("FROM system.tables") {
                 return (
                     StatusCode::OK,
@@ -503,6 +637,7 @@ mod tests {
             versions,
             fail_first: AtomicBool::new(fail_first),
             requests: AtomicUsize::new(0),
+            cleanup_polls: AtomicUsize::new(0),
             captured: StdMutex::new(Vec::new()),
             first_request_block,
         });
@@ -524,6 +659,19 @@ mod tests {
             .into_iter()
             .map(|migration| migration.version.to_string())
             .collect()
+    }
+
+    fn data_request_count(state: &SchemaServerState) -> usize {
+        state
+            .captured
+            .lock()
+            .expect("captured request lock")
+            .iter()
+            .filter(|request| {
+                !request.query.starts_with("KILL QUERY")
+                    && !request.query.contains("FROM system.processes")
+            })
+            .count()
     }
 
     fn clickhouse_config(url: String, allow_newer_server: bool) -> ClickHouseConfig {
@@ -557,6 +705,7 @@ mod tests {
             Arc::new(InMemoryConversationRepository::new(RepoConfig::default()));
         BackendRepositoryRouter::from_preloaded_for_testing(
             config,
+            QueryRuntime::new(),
             [
                 (DEFAULT_BACKEND_NAME.to_string(), default),
                 ("team-ch".to_string(), named),
@@ -572,6 +721,7 @@ mod tests {
             "team-ch",
             clickhouse_config(url, false),
             RepoConfig::default(),
+            QueryRuntime::new(),
             "moraine-backend/test",
         )
         .await
@@ -592,6 +742,19 @@ mod tests {
         assert!(captured
             .iter()
             .all(|request| { request.user_agent.as_deref() == Some("moraine-backend/test") }));
+        let query_ids = captured
+            .iter()
+            .map(|request| request.query_id.as_deref().expect("owned schema query"))
+            .collect::<Vec<_>>();
+        let logical_id = query_ids[0]
+            .rsplit_once('-')
+            .expect("schema child sequence")
+            .0;
+        assert!(logical_id.starts_with("moraine-internal-"));
+        assert!(query_ids
+            .iter()
+            .all(|query_id| query_id.starts_with(logical_id)));
+        assert_ne!(query_ids[0], query_ids[1]);
     }
 
     #[tokio::test]
@@ -603,6 +766,7 @@ mod tests {
             "team-ch",
             clickhouse_config(url, true),
             RepoConfig::default(),
+            QueryRuntime::new(),
             "moraine-backend/test",
         )
         .await
@@ -624,6 +788,7 @@ mod tests {
             "team-ch",
             clickhouse_config(url, false),
             RepoConfig::default(),
+            QueryRuntime::new(),
             "moraine-backend/test",
         )
         .await
@@ -644,6 +809,7 @@ mod tests {
             "team-ch",
             clickhouse_config(url, true),
             RepoConfig::default(),
+            QueryRuntime::new(),
             "moraine-backend/test",
         )
         .await
@@ -657,6 +823,7 @@ mod tests {
             "team-ch",
             clickhouse_config(url, false),
             RepoConfig::default(),
+            QueryRuntime::new(),
             "moraine-backend/test",
         )
         .await
@@ -679,6 +846,7 @@ mod tests {
         let router = BackendRepositoryRouter::new(
             Arc::new(config),
             RepoConfig::default(),
+            QueryRuntime::new(),
             "moraine-backend/test",
         )
         .expect("router");
@@ -696,6 +864,12 @@ mod tests {
             ClickHouseConfig::default().database
         );
         assert!(Arc::ptr_eq(first.repository(), second.repository()));
+        let runtime = router.query_runtime();
+        let owner =
+            QueryOwner::new(&runtime, QueryWorkload::Internal).expect("router runtime owner");
+        assert_eq!(runtime.active_owner_count(), 1);
+        owner.scope(async {}).await;
+        assert_eq!(runtime.active_owner_count(), 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -716,6 +890,7 @@ mod tests {
             BackendRepositoryRouter::new(
                 routed_config(url, false),
                 RepoConfig::default(),
+                QueryRuntime::new(),
                 "moraine-backend/test",
             )
             .expect("router"),
@@ -750,7 +925,7 @@ mod tests {
             assert!(message.contains("schema handshake failed"));
             assert!(!message.contains("temporary schema probe failure"));
         }
-        assert_eq!(state.requests.load(Ordering::SeqCst), 1);
+        assert_eq!(data_request_count(&state), 1);
 
         let recovered = router
             .repository_for_project_dir(Some("/work/team/project"))
@@ -761,11 +936,148 @@ mod tests {
             .await
             .expect("successful slot is cached");
         assert!(Arc::ptr_eq(&recovered, &cached));
-        assert_eq!(state.requests.load(Ordering::SeqCst), 3);
+        assert_eq!(data_request_count(&state), 3);
+    }
+
+    async fn wait_for_owner_count(runtime: &QueryRuntime, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while runtime.active_owner_count() != expected {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("query owner count did not converge");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn named_slot_cancels_initialization_when_its_only_waiter_is_dropped() {
+        let reached = Arc::new(Barrier::new(2));
+        let release = Arc::new(Notify::new());
+        let (url, _state) = spawn_schema_server(
+            true,
+            bundled_versions(),
+            false,
+            Some(FirstRequestBlock {
+                reached: reached.clone(),
+                release: release.clone(),
+            }),
+        )
+        .await;
+        let query_runtime = QueryRuntime::new();
+        let router = Arc::new(
+            BackendRepositoryRouter::new(
+                routed_config(url, false),
+                RepoConfig::default(),
+                query_runtime.clone(),
+                "moraine-backend/test",
+            )
+            .expect("router"),
+        );
+
+        let caller = {
+            let router = router.clone();
+            tokio::spawn(async move {
+                router
+                    .repository_for_project_dir(Some("/work/team/project"))
+                    .await
+            })
+        };
+        reached.wait().await;
+        assert_eq!(query_runtime.active_owner_count(), 1);
+
+        caller.abort();
+        match caller.await {
+            Err(error) => assert!(error.is_cancelled()),
+            Ok(_) => panic!("caller must be aborted"),
+        }
+        wait_for_owner_count(&query_runtime, 0).await;
+
+        // Let the test server retire a handler if its HTTP stack retained the
+        // disconnected request. The abandoned build itself is already gone.
+        release.notify_waiters();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn named_slot_keeps_shared_initialization_for_a_remaining_waiter() {
+        let reached = Arc::new(Barrier::new(2));
+        let release = Arc::new(Notify::new());
+        let (url, state) = spawn_schema_server(
+            true,
+            bundled_versions(),
+            false,
+            Some(FirstRequestBlock {
+                reached: reached.clone(),
+                release: release.clone(),
+            }),
+        )
+        .await;
+        let query_runtime = QueryRuntime::new();
+        let router = Arc::new(
+            BackendRepositoryRouter::new(
+                routed_config(url, false),
+                RepoConfig::default(),
+                query_runtime.clone(),
+                "moraine-backend/test",
+            )
+            .expect("router"),
+        );
+
+        let first = {
+            let router = router.clone();
+            tokio::spawn(async move {
+                router
+                    .repository_for_project_dir(Some("/work/team/project"))
+                    .await
+            })
+        };
+        reached.wait().await;
+        let second = {
+            let router = router.clone();
+            tokio::spawn(async move {
+                router
+                    .repository_for_project_dir(Some("/work/team/project"))
+                    .await
+            })
+        };
+
+        let slot = router.slots.get("team-ch").expect("named slot").clone();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let waiter_count = {
+                    let state = slot.state.lock().await;
+                    match &*state {
+                        SlotState::Building(attempt) => attempt.waiter_count(),
+                        _ => 0,
+                    }
+                };
+                if waiter_count == 2 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("second waiter must join shared initialization");
+
+        first.abort();
+        match first.await {
+            Err(error) => assert!(error.is_cancelled()),
+            Ok(_) => panic!("first caller must be aborted"),
+        }
+        assert_eq!(query_runtime.active_owner_count(), 1);
+
+        release.notify_one();
+        let repository = second
+            .await
+            .expect("second caller task")
+            .expect("remaining waiter keeps initialization alive");
+        assert_eq!(repository.backend_name(), "team-ch");
+        wait_for_owner_count(&query_runtime, 0).await;
+        assert_eq!(data_request_count(&state), 2);
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn panicked_build_attempt_releases_waiters_and_retries() {
+    async fn failed_build_attempt_releases_waiters_and_retries() {
         let mut config = (*routed_config("http://127.0.0.1:1".to_string(), false)).clone();
         config
             .backends
@@ -775,6 +1087,7 @@ mod tests {
         let router = BackendRepositoryRouter::new(
             Arc::new(config),
             RepoConfig::default(),
+            QueryRuntime::new(),
             "moraine-backend/test",
         )
         .expect("router");
@@ -785,12 +1098,14 @@ mod tests {
                 router.repository_for_project_dir(Some("/work/team/project")),
             )
             .await
-            .expect("panicked build attempt must publish instead of hanging");
+            .expect("failed build attempt must publish instead of hanging");
             let error = match result {
                 Ok(_) => panic!("invalid timeout must fail construction"),
                 Err(error) => error,
             };
-            assert!(error.to_string().contains("initialization task failed"));
+            assert!(error
+                .to_string()
+                .contains("failed to construct ClickHouse client"));
         }
     }
 
@@ -805,6 +1120,7 @@ mod tests {
             Arc::new(InMemoryConversationRepository::new(RepoConfig::default()));
         let router = BackendRepositoryRouter::from_preloaded_for_testing(
             config,
+            QueryRuntime::new(),
             [(DEFAULT_BACKEND_NAME.to_string(), default)],
         )
         .expect("default-only router");
@@ -938,6 +1254,7 @@ mod tests {
         let router = BackendRepositoryRouter::new(
             routed_config(url, false),
             RepoConfig::default(),
+            QueryRuntime::new(),
             "moraine-backend/test",
         )
         .expect("router");

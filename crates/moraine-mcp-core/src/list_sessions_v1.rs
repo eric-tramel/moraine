@@ -5,7 +5,7 @@ use super::{
 use crate::contract::{
     format_rfc3339_utc_millis, CanonicalListSessionsArgs, ContractError, ListSessionsArgs,
     ListSessionsMode, ListSessionsSort, McpSessionId, Performance, ToolEnvelope, ToolErrorCode,
-    ToolErrorEnvelope, LIST_SESSIONS_DEADLINE_MS, LIST_SESSIONS_TOOL,
+    ToolErrorEnvelope, LIST_SESSIONS_TOOL,
 };
 use anyhow::{Context, Result};
 use moraine_conversations::{
@@ -13,7 +13,6 @@ use moraine_conversations::{
     McpSessionListFilter, McpSessionListItem, Page, PageRequest,
 };
 use serde_json::{json, Value};
-use tokio::time::{timeout, Duration};
 use tracing::warn;
 
 impl AppState {
@@ -41,29 +40,12 @@ impl AppState {
             cursor: args.cursor.clone(),
         };
 
-        let page_result = timeout(
-            Duration::from_millis(LIST_SESSIONS_DEADLINE_MS),
-            self.repo.list_mcp_sessions(repo_filter, repo_page),
-        )
-        .await;
-
-        let page = match page_result {
-            Ok(Ok(page)) => page,
-            Ok(Err(error)) => {
+        let page = match self.repo.list_mcp_sessions(repo_filter, repo_page).await {
+            Ok(page) => page,
+            Err(error) => {
                 return encode_list_sessions_error(
                     canonical_request,
                     repo_error_to_contract_error(error),
-                    perf.finish(),
-                );
-            }
-            Err(_) => {
-                return encode_list_sessions_error(
-                    canonical_request,
-                    ContractError::new(
-                        ToolErrorCode::DeadlineExceeded,
-                        "list_sessions exceeded its response deadline",
-                    )
-                    .with_details(json!({ "deadline_ms": LIST_SESSIONS_DEADLINE_MS })),
                     perf.finish(),
                 );
             }

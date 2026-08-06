@@ -184,7 +184,10 @@ invalid_request
 invalid_id
 not_found
 unsupported_event_type
+cancelled
 deadline_exceeded
+resource_exhausted
+backend_failure
 internal_error
 ```
 
@@ -197,7 +200,16 @@ Error behavior:
 - Missing IDs must return `not_found`.
 - Malformed IDs must return `invalid_id`.
 - Unknown event type filters must return `unsupported_event_type`.
-- Runtime failures must return `internal_error` with a concise message.
+- Abandoned or explicitly cancelled admitted work must return `cancelled` when a
+  response is still valid; a cancellation notification itself produces no
+  response.
+- An explicitly supplied caller deadline returns `deadline_exceeded`. Current
+  MCP requests do not supply one, and Moraine does not add a default deadline.
+- A full admission queue or a ClickHouse resource limit returns
+  `resource_exhausted`.
+- ClickHouse transport, HTTP, and database failures return `backend_failure`.
+- Moraine implementation failures return `internal_error` with a concise
+  message.
 - While the search read model is publishing an active-ingest update,
   `search_sessions` returns `internal_error` with
   `error.details.reason = "read_model_refresh"`, `retryable = true`, and a
@@ -1948,11 +1960,13 @@ classify individual responses as meeting an SLA: query cost varies with the
 amount of stored session data, request scope, event payload size, hardware, and
 concurrent work.
 
-The `list_sessions` and `file_attention` implementations retain bounded
-execution deadlines for resource safety. A deadline failure returns the
-`deadline_exceeded` error code; these safety limits are not latency guarantees.
-`open(event)` always returns full event content, so its elapsed time can scale
-with the serialized payload size.
+Moraine does not apply a fixed elapsed execution deadline to
+`list_sessions`, `file_attention`, or any other admitted MCP tool call. Work can
+end through completion, explicit cancellation, full transport disconnect,
+service shutdown, or an absolute deadline supplied by a future/internal caller.
+A clean request-side EOF is a half-close and does not abandon already admitted
+work. `open(event)` always returns full event content, so its elapsed time can
+scale with the serialized payload size.
 
 ## Success Criteria
 

@@ -12,17 +12,23 @@ use axum::{
 use moraine_config::AppConfig;
 use moraine_conversations::{
     AnalyticsRange, BackendRepository, BackendRepositoryRouter, IngestHeartbeat,
-    IngestHeartbeatRead, RepoError, SessionAnalytics, SessionAnalyticsQuery, SessionLookback,
-    SessionStep, SessionTurn, StoreConnectionMetrics, StoreHealth, StoreProbe, TablePreviewQuery,
-    TableSummaries,
+    IngestHeartbeatRead, QueryCause, QueryOwner, QueryWorkload, RepoError, SessionAnalytics,
+    SessionAnalyticsQuery, SessionLookback, SessionStep, SessionTurn, StoreConnectionMetrics,
+    StoreHealth, StoreProbe, TablePreviewQuery, TableSummaries, QUERY_CLEANUP_GRACE,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::future::Future;
+use std::collections::HashMap;
+use std::future::{Future, IntoFuture};
 use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::path::{Path as FsPath, PathBuf};
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex, Weak,
+};
+#[cfg(test)]
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::fs;
 use tracing::warn;
@@ -30,6 +36,110 @@ use tracing::warn;
 struct AppState {
     backend_router: Arc<BackendRepositoryRouter>,
     static_dir: PathBuf,
+    active_monitor_owners: Arc<ActiveMonitorOwners>,
+}
+
+#[derive(Default)]
+struct ActiveMonitorOwners {
+    owners: Mutex<HashMap<String, Arc<QueryOwner>>>,
+    shutting_down: AtomicBool,
+}
+
+impl ActiveMonitorOwners {
+    fn register(self: &Arc<Self>, owner: Arc<QueryOwner>) -> ActiveMonitorOwner {
+        let logical_id = owner.logical_id().to_string();
+        self.owners
+            .lock()
+            .expect("active monitor owner mutex poisoned")
+            .insert(logical_id.clone(), owner.clone());
+        if self.shutting_down.load(Ordering::Acquire) {
+            owner.cancel(QueryCause::Shutdown);
+        }
+        ActiveMonitorOwner {
+            registry: Arc::downgrade(self),
+            logical_id,
+        }
+    }
+
+    fn remove(&self, logical_id: &str) {
+        self.owners
+            .lock()
+            .expect("active monitor owner mutex poisoned")
+            .remove(logical_id);
+    }
+
+    fn cancel_all(&self, cause: QueryCause) {
+        if cause == QueryCause::Shutdown {
+            self.shutting_down.store(true, Ordering::Release);
+        }
+        let owners = self
+            .owners
+            .lock()
+            .expect("active monitor owner mutex poisoned")
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for owner in owners {
+            owner.cancel(cause);
+        }
+    }
+}
+
+struct ActiveMonitorOwner {
+    registry: Weak<ActiveMonitorOwners>,
+    logical_id: String,
+}
+
+impl Drop for ActiveMonitorOwner {
+    fn drop(&mut self) {
+        if let Some(registry) = self.registry.upgrade() {
+            registry.remove(&self.logical_id);
+        }
+    }
+}
+
+/// Ensures a service future dropped by Hyper while still pending records the
+/// TCP connection loss before dropping the owner scope (whose generic fallback
+/// cause is abandonment). A normally completed request disarms the guard.
+struct DisconnectAwareRequest<F: Future> {
+    inner: std::pin::Pin<Box<F>>,
+    owner: Arc<QueryOwner>,
+    ready: bool,
+}
+
+impl<F: Future> DisconnectAwareRequest<F> {
+    fn new(owner: Arc<QueryOwner>, inner: F) -> Self {
+        Self {
+            inner: Box::pin(inner),
+            owner,
+            ready: false,
+        }
+    }
+}
+
+impl<F: Future> Future for DisconnectAwareRequest<F> {
+    type Output = F::Output;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        match self.inner.as_mut().poll(cx) {
+            std::task::Poll::Pending => std::task::Poll::Pending,
+            std::task::Poll::Ready(output) => {
+                self.ready = true;
+                std::task::Poll::Ready(output)
+            }
+        }
+    }
+}
+
+impl<F: Future> Drop for DisconnectAwareRequest<F> {
+    fn drop(&mut self) {
+        if !self.ready {
+            self.owner.cancel(QueryCause::Disconnect);
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -74,7 +184,12 @@ where
     S: Future<Output = ()> + Send + 'static,
 {
     let static_dir_display = static_dir.display().to_string();
-    let app = router_with_backend_router(backend_router, static_dir)?;
+    let active_monitor_owners = Arc::new(ActiveMonitorOwners::default());
+    let app = router_with_backend_router_and_owners(
+        backend_router,
+        static_dir,
+        active_monitor_owners.clone(),
+    )?;
     let bind = format!("{host}:{port}")
         .parse::<SocketAddr>()
         .map_err(|err| anyhow!("invalid bind address: {err}"))?;
@@ -89,7 +204,15 @@ where
         }
     })?;
 
-    serve_on_listener(listener, app, bind, static_dir_display, shutdown).await
+    serve_on_listener(
+        listener,
+        app,
+        bind,
+        static_dir_display,
+        active_monitor_owners,
+        shutdown,
+    )
+    .await
 }
 
 /// Run the monitor HTTP server on an already-bound listener.
@@ -106,12 +229,25 @@ where
     S: Future<Output = ()> + Send + 'static,
 {
     let static_dir_display = static_dir.display().to_string();
-    let app = router_with_backend_router(backend_router, static_dir)?;
+    let active_monitor_owners = Arc::new(ActiveMonitorOwners::default());
+    let app = router_with_backend_router_and_owners(
+        backend_router,
+        static_dir,
+        active_monitor_owners.clone(),
+    )?;
     let bind = listener
         .local_addr()
         .map_err(|error| anyhow!("failed to read monitor listener address: {error}"))?;
 
-    serve_on_listener(listener, app, bind, static_dir_display, shutdown).await
+    serve_on_listener(
+        listener,
+        app,
+        bind,
+        static_dir_display,
+        active_monitor_owners,
+        shutdown,
+    )
+    .await
 }
 
 async fn serve_on_listener<S>(
@@ -119,6 +255,7 @@ async fn serve_on_listener<S>(
     app: Router,
     bind: SocketAddr,
     static_dir_display: String,
+    active_monitor_owners: Arc<ActiveMonitorOwners>,
     shutdown: S,
 ) -> Result<()>
 where
@@ -127,21 +264,55 @@ where
     println!("moraine-monitor running at http://{bind}");
     println!("serving UI from {static_dir_display}");
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown)
-        .await?;
+    let (shutdown_started_tx, shutdown_started_rx) = tokio::sync::oneshot::channel();
+    let shutdown_signal = async move {
+        shutdown.await;
+        active_monitor_owners.cancel_all(QueryCause::Shutdown);
+        let _ = shutdown_started_tx.send(());
+    };
+    let server = axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal)
+        .into_future();
+    tokio::pin!(server);
+
+    tokio::select! {
+        result = &mut server => result?,
+        started = shutdown_started_rx => {
+            if started.is_ok() {
+                tokio::time::timeout(QUERY_CLEANUP_GRACE, &mut server)
+                    .await
+                    .map_err(|_| anyhow!("monitor server shutdown exceeded five-second query cleanup grace"))??;
+            } else {
+                server.await?;
+            }
+        }
+    }
     Ok(())
 }
 
 /// Build the complete monitor router around the daemon-owned backend router.
+#[cfg(test)]
 fn router_with_backend_router(
     backend_router: Arc<BackendRepositoryRouter>,
     static_dir: PathBuf,
+) -> Result<Router> {
+    router_with_backend_router_and_owners(
+        backend_router,
+        static_dir,
+        Arc::new(ActiveMonitorOwners::default()),
+    )
+}
+
+fn router_with_backend_router_and_owners(
+    backend_router: Arc<BackendRepositoryRouter>,
+    static_dir: PathBuf,
+    active_monitor_owners: Arc<ActiveMonitorOwners>,
 ) -> Result<Router> {
     validate_static_dir(&static_dir)?;
     let state = Arc::new(AppState {
         backend_router,
         static_dir,
+        active_monitor_owners,
     });
     Ok(monitor_router(state))
 }
@@ -155,16 +326,50 @@ fn monitor_router(state: Arc<AppState>) -> Router {
     // endpoint. It intentionally remains outside project selection middleware.
     let versioned_routes = data_routes
         .clone()
-        .route("/capabilities", get(api_capabilities));
+        .route("/capabilities", get(api_capabilities))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            own_monitor_operation,
+        ));
+    let compatibility_routes = data_routes.route_layer(middleware::from_fn_with_state(
+        state.clone(),
+        own_monitor_operation,
+    ));
 
     Router::new()
         .nest("/api/v1", versioned_routes)
         // One-release compatibility surface. These are direct aliases so
         // status codes, query handling, response payloads, and backend
         // selection remain identical.
-        .nest("/api", data_routes)
+        .nest("/api", compatibility_routes)
         .fallback(get(static_fallback))
         .with_state(state)
+}
+
+async fn own_monitor_operation(
+    State(state): State<Arc<AppState>>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let owner = match QueryOwner::new(
+        &state.backend_router.query_runtime(),
+        QueryWorkload::Monitor,
+    ) {
+        Ok(owner) => owner,
+        Err(error) => {
+            warn!(error = %error, "failed to create monitor query owner");
+            return json_response(
+                json!({
+                    "ok": false,
+                    "code": "internal_error",
+                    "error": "monitor query ownership unavailable",
+                }),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            );
+        }
+    };
+    let _active_owner = state.active_monitor_owners.register(owner.clone());
+    DisconnectAwareRequest::new(owner.clone(), owner.scope(next.run(request))).await
 }
 
 fn dashboard_routes() -> Router<Arc<AppState>> {
@@ -220,7 +425,7 @@ async fn select_backend_repository(
         }
         Err(error) => {
             return json_response(
-                json!({"ok": false, "error": error}),
+                json!({"ok": false, "code": "invalid_request", "error": error}),
                 StatusCode::BAD_REQUEST,
             );
         }
@@ -233,6 +438,7 @@ async fn select_backend_repository(
             return json_response(
                 json!({
                     "ok": false,
+                    "code": "backend_failure",
                     "error": "selected backend is unavailable or schema-incompatible"
                 }),
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -332,6 +538,41 @@ fn json_response<T: Serialize>(payload: T, status: StatusCode) -> Response {
     *response.status_mut() = status;
     response
 }
+
+fn repo_error_http(error: &RepoError) -> (StatusCode, &'static str) {
+    match error {
+        RepoError::InvalidArgument(_) | RepoError::InvalidCursor(_) => {
+            (StatusCode::BAD_REQUEST, "invalid_request")
+        }
+        RepoError::Cancelled(_) => (
+            StatusCode::from_u16(499).expect("499 is a valid extension status"),
+            "cancelled",
+        ),
+        RepoError::DeadlineExceeded(_) => (StatusCode::GATEWAY_TIMEOUT, "deadline_exceeded"),
+        RepoError::ResourceExhausted(_) => (StatusCode::TOO_MANY_REQUESTS, "resource_exhausted"),
+        RepoError::Backend(_) => (StatusCode::SERVICE_UNAVAILABLE, "backend_failure"),
+        RepoError::Internal(_) | RepoError::ReadModelChanged => {
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal_error")
+        }
+    }
+}
+
+fn repo_error_response(error: RepoError, message: String) -> Response {
+    let (status, code) = repo_error_http(&error);
+    json_response(
+        json!({
+            "ok": false,
+            "code": code,
+            "error": message,
+        }),
+        status,
+    )
+}
+
+fn default_repo_error_response(error: RepoError) -> Response {
+    let message = error.to_string();
+    repo_error_response(error, message)
+}
 /// Daemon-wide capabilities intentionally report the owned default backend's
 /// schema level. Project routing selects externally managed data stores, not a
 /// different daemon protocol or feature set, so this endpoint ignores
@@ -370,19 +611,11 @@ async fn api_health(Extension(backend): Extension<Arc<BackendRepository>>) -> Re
     );
     let health = match health {
         Ok(health) => health,
-        Err(error) => {
-            let message = error.to_string();
-            return json_response(
-                json!({
-                    "ok": false,
-                    "url": backend.clickhouse_url(),
-                    "database": backend.clickhouse_database(),
-                    "error": message,
-                    "connections": {"total": Value::Null, "error": message},
-                }),
-                StatusCode::SERVICE_UNAVAILABLE,
-            );
-        }
+        Err(error) => return health_repo_error_response(&backend, error),
+    };
+    let heartbeat = match heartbeat {
+        Ok(heartbeat) => heartbeat,
+        Err(error) => return health_repo_error_response(&backend, error),
     };
     let connections = connection_payload(&health.connections);
 
@@ -398,7 +631,7 @@ async fn api_health(Extension(backend): Extension<Arc<BackendRepository>>) -> Re
             return health_failure_response(&backend, message, connections);
         }
     };
-    let heartbeat = heartbeat.map(monitor_heartbeat_status).unwrap_or_default();
+    let heartbeat = monitor_heartbeat_status(heartbeat);
 
     json_response(
         json!({
@@ -414,6 +647,22 @@ async fn api_health(Extension(backend): Extension<Arc<BackendRepository>>) -> Re
     )
 }
 
+fn health_repo_error_response(backend: &BackendRepository, error: RepoError) -> Response {
+    let message = error.to_string();
+    let (status, code) = repo_error_http(&error);
+    json_response(
+        json!({
+            "ok": false,
+            "code": code,
+            "url": backend.clickhouse_url(),
+            "database": backend.clickhouse_database(),
+            "error": message,
+            "connections": {"total": Value::Null, "error": message},
+        }),
+        status,
+    )
+}
+
 fn health_failure_response(
     backend: &BackendRepository,
     message: &str,
@@ -422,6 +671,7 @@ fn health_failure_response(
     json_response(
         json!({
             "ok": false,
+            "code": "backend_failure",
             "url": backend.clickhouse_url(),
             "database": backend.clickhouse_database(),
             "error": message,
@@ -435,11 +685,10 @@ async fn api_status(
     Query(query): Query<StatusQuery>,
     Extension(backend): Extension<Arc<BackendRepository>>,
 ) -> Response {
-    let health = backend
-        .repository()
-        .read_store_health()
-        .await
-        .unwrap_or_else(|error| unavailable_store_health(error.to_string()));
+    let health = match backend.repository().read_store_health().await {
+        Ok(health) => health,
+        Err(error) => return default_repo_error_response(error),
+    };
     let database_exists = probe_bool(&health.database_exists).unwrap_or(false);
 
     let history_limit = query.history.unwrap_or(0).min(120) as u16;
@@ -450,19 +699,14 @@ async fn api_status(
         );
         let tables = match tables {
             Ok(tables) => monitor_table_summaries(tables),
-            Err(error) => {
-                return json_response(
-                    json!({"ok": false, "error": error.to_string()}),
-                    StatusCode::SERVICE_UNAVAILABLE,
-                );
-            }
+            Err(error) => return default_repo_error_response(error),
         };
-        let status = status.map(|read| read.derive(unix_now_ms()));
-        let heartbeat = status
-            .as_ref()
-            .map(|status| monitor_heartbeat_status(status.heartbeat.clone()))
-            .unwrap_or_default();
-        (tables, heartbeat, status.ok())
+        let status = match status {
+            Ok(read) => read.derive(unix_now_ms()),
+            Err(error) => return default_repo_error_response(error),
+        };
+        let heartbeat = monitor_heartbeat_status(status.heartbeat.clone());
+        (tables, heartbeat, Some(status))
     } else {
         (Vec::new(), MonitorHeartbeatStatus::default(), None)
     };
@@ -485,21 +729,6 @@ async fn api_status(
         }),
         StatusCode::OK,
     )
-}
-
-fn unavailable_store_health(message: String) -> StoreHealth {
-    StoreHealth {
-        ping: StoreProbe::Failed {
-            message: message.clone(),
-        },
-        version: StoreProbe::Failed {
-            message: message.clone(),
-        },
-        database_exists: StoreProbe::Failed {
-            message: message.clone(),
-        },
-        connections: StoreProbe::Failed { message },
-    }
 }
 
 fn probe_bool(probe: &StoreProbe<bool>) -> Option<bool> {
@@ -560,10 +789,7 @@ async fn api_tables(Extension(backend): Extension<Arc<BackendRepository>>) -> Re
             json!({"ok": true, "tables": monitor_table_summaries(tables)}),
             StatusCode::OK,
         ),
-        Err(error) => json_response(
-            json!({"ok": false, "error": error.to_string()}),
-            StatusCode::SERVICE_UNAVAILABLE,
-        ),
+        Err(error) => default_repo_error_response(error),
     }
 }
 
@@ -588,10 +814,8 @@ async fn api_web_searches(
     let rows = match backend.repository().list_web_searches(limit).await {
         Ok(rows) => rows,
         Err(error) => {
-            return json_response(
-                json!({"ok": false, "error": format!("web search query failed: {error}")}),
-                StatusCode::SERVICE_UNAVAILABLE,
-            );
+            let message = format!("web search query failed: {error}");
+            return repo_error_response(error, message);
         }
     };
 
@@ -625,10 +849,8 @@ async fn api_analytics(
     let snapshot = match backend.repository().analytics_series(range).await {
         Ok(snapshot) => snapshot,
         Err(error) => {
-            return json_response(
-                json!({"ok": false, "error": format!("analytics query failed: {error}")}),
-                StatusCode::SERVICE_UNAVAILABLE,
-            );
+            let message = format!("analytics query failed: {error}");
+            return repo_error_response(error, message);
         }
     };
 
@@ -676,10 +898,8 @@ async fn api_sessions(
     let sessions = match backend.repository().list_session_analytics(query).await {
         Ok(sessions) => sessions,
         Err(error) => {
-            return json_response(
-                json!({"ok": false, "error": format!("sessions query failed: {error}")}),
-                StatusCode::SERVICE_UNAVAILABLE,
-            );
+            let message = format!("sessions query failed: {error}");
+            return repo_error_response(error, message);
         }
     };
     let now_ms = unix_now_ms();
@@ -1044,17 +1264,13 @@ async fn api_table_rows(
                 StatusCode::OK,
             )
         }
-        Err(RepoError::InvalidArgument(_)) => json_response(
-            json!({"ok": false, "error": "invalid table name"}),
-            StatusCode::BAD_REQUEST,
-        ),
-        Err(error) => json_response(
-            json!({
-                "ok": false,
-                "error": format!("unable to read table {table}: {error}"),
-            }),
-            StatusCode::SERVICE_UNAVAILABLE,
-        ),
+        Err(error @ (RepoError::InvalidArgument(_) | RepoError::InvalidCursor(_))) => {
+            repo_error_response(error, "invalid table name".to_string())
+        }
+        Err(error) => {
+            let message = format!("unable to read table {table}: {error}");
+            repo_error_response(error, message)
+        }
     }
 }
 
@@ -1134,8 +1350,8 @@ mod tests {
         AnalyticsConcurrencyPoint, AnalyticsSnapshot, AnalyticsTokenPoint, AnalyticsTurnPoint,
         AnalyticsWindow, ConversationMode, ConversationRepository, ConversationSummary,
         InMemoryConversationRepository, InMemoryConversationResponses, IngestHeartbeat,
-        IngestStatusRead, RepoConfig, SessionStep, StoreDiagnostics, TableColumn, TablePreview,
-        TableSummary, ToolResult, TurnSummary, WebSearchEvent,
+        IngestStatusRead, QueryRuntime, RepoConfig, SessionStep, StoreDiagnostics, TableColumn,
+        TablePreview, TableSummary, ToolResult, TurnSummary, WebSearchEvent,
     };
     use std::collections::BTreeMap;
     use std::fs;
@@ -1160,8 +1376,10 @@ mod tests {
             responses,
         ));
         let injected: Arc<dyn ConversationRepository> = repository.clone();
+        let query_runtime = QueryRuntime::new();
         let router = BackendRepositoryRouter::from_preloaded_for_testing(
             Arc::new(AppConfig::default()),
+            query_runtime,
             [(DEFAULT_BACKEND_NAME.to_string(), injected)],
         )
         .expect("preloaded default router");
@@ -1180,9 +1398,11 @@ mod tests {
             responses,
         ));
         let injected: Arc<dyn ConversationRepository> = repository.clone();
+        let query_runtime = QueryRuntime::new();
         let backend_router = Arc::new(
             BackendRepositoryRouter::from_preloaded_for_testing(
                 Arc::new(AppConfig::default()),
+                query_runtime,
                 [(DEFAULT_BACKEND_NAME.to_string(), injected)],
             )
             .expect("preloaded default router"),
@@ -1191,6 +1411,7 @@ mod tests {
             Arc::new(AppState {
                 backend_router,
                 static_dir: PathBuf::new(),
+                active_monitor_owners: Arc::new(ActiveMonitorOwners::default()),
             }),
             repository,
         )
@@ -1233,9 +1454,11 @@ mod tests {
     ) -> Arc<BackendRepositoryRouter> {
         let default_repository: Arc<dyn ConversationRepository> = default_repository;
         let named_repository: Arc<dyn ConversationRepository> = named_repository;
+        let query_runtime = QueryRuntime::new();
         Arc::new(
             BackendRepositoryRouter::from_preloaded_for_testing(
                 Arc::new(config),
+                query_runtime,
                 [
                     (DEFAULT_BACKEND_NAME.to_string(), default_repository),
                     ("team-ch".to_string(), named_repository),
@@ -1938,9 +2161,11 @@ mod tests {
             responses,
         ));
         let injected: Arc<dyn ConversationRepository> = repository.clone();
+        let query_runtime = QueryRuntime::new();
         let backend_router = Arc::new(
             BackendRepositoryRouter::from_preloaded_for_testing(
                 Arc::new(AppConfig::default()),
+                query_runtime,
                 [(DEFAULT_BACKEND_NAME.to_string(), injected)],
             )
             .expect("preloaded default router"),
@@ -2294,6 +2519,7 @@ mod tests {
             BackendRepositoryRouter::new(
                 Arc::new(config),
                 RepoConfig::default(),
+                QueryRuntime::new(),
                 "moraine-monitor-core/test",
             )
             .expect("lazy backend router"),
@@ -2417,6 +2643,191 @@ mod tests {
             .await
             .expect("listener address should be reusable after startup failure");
         drop(rebound);
+    }
+
+    #[tokio::test]
+    async fn one_monitor_owner_spans_concurrent_route_fanout() {
+        async fn fanout() -> Json<Value> {
+            let (first, second) = tokio::join!(
+                async {
+                    QueryOwner::current()
+                        .expect("first fanout branch owner")
+                        .logical_id()
+                        .to_string()
+                },
+                async {
+                    tokio::task::yield_now().await;
+                    QueryOwner::current()
+                        .expect("second fanout branch owner")
+                        .logical_id()
+                        .to_string()
+                }
+            );
+            Json(json!({"first": first, "second": second}))
+        }
+
+        let (state, _) = fake_state(InMemoryConversationResponses::default());
+        let runtime = state.backend_router.query_runtime();
+        let app = Router::new()
+            .route("/fanout", get(fanout))
+            .route_layer(middleware::from_fn_with_state(state, own_monitor_operation));
+
+        let (status, payload) = router_json(&app, "/fanout").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(payload["first"], payload["second"]);
+        assert!(payload["first"]
+            .as_str()
+            .expect("logical owner id")
+            .starts_with("moraine-monitor-"));
+        assert_eq!(runtime.active_owner_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn repo_error_categories_have_distinct_monitor_statuses_and_codes() {
+        let cases = [
+            (
+                RepoError::invalid_argument("bad input"),
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+            ),
+            (
+                RepoError::invalid_cursor("bad cursor"),
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+            ),
+            (
+                RepoError::cancelled("caller left"),
+                StatusCode::from_u16(499).expect("499 status"),
+                "cancelled",
+            ),
+            (
+                RepoError::deadline_exceeded("too late"),
+                StatusCode::GATEWAY_TIMEOUT,
+                "deadline_exceeded",
+            ),
+            (
+                RepoError::resource_exhausted("busy"),
+                StatusCode::TOO_MANY_REQUESTS,
+                "resource_exhausted",
+            ),
+            (
+                RepoError::backend("offline"),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "backend_failure",
+            ),
+            (
+                RepoError::internal("broken invariant"),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+            ),
+            (
+                RepoError::ReadModelChanged,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+            ),
+        ];
+
+        for (error, expected_status, expected_code) in cases {
+            let (backend, _) = fake_backend(InMemoryConversationResponses {
+                list_table_summaries: Some(Err(error)),
+                ..Default::default()
+            })
+            .await;
+            let response = api_tables(Extension(backend)).await;
+            assert_eq!(response.status(), expected_status);
+            let payload = response_json(response).await;
+            assert_eq!(payload["ok"], json!(false));
+            assert_eq!(payload["code"], json!(expected_code));
+            assert!(payload["error"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty()));
+        }
+    }
+
+    #[tokio::test]
+    async fn tcp_peer_disconnect_cancels_the_exact_in_flight_monitor_owner() {
+        use tokio::io::AsyncWriteExt;
+
+        type OwnerSender = Arc<Mutex<Option<tokio::sync::oneshot::Sender<Arc<QueryOwner>>>>>;
+
+        async fn blocked(Extension(sender): Extension<OwnerSender>) -> Response {
+            let owner = QueryOwner::current().expect("blocked handler owner");
+            if let Some(sender) = sender.lock().expect("owner sender mutex").take() {
+                let _ = sender.send(owner);
+            }
+            std::future::pending::<Response>().await
+        }
+
+        let (state, _) = fake_state(InMemoryConversationResponses::default());
+        let owners = state.active_monitor_owners.clone();
+        let unrelated = QueryOwner::new(
+            &state.backend_router.query_runtime(),
+            QueryWorkload::Monitor,
+        )
+        .expect("unrelated owner");
+        let (owner_tx, owner_rx) = tokio::sync::oneshot::channel();
+        let owner_tx: OwnerSender = Arc::new(Mutex::new(Some(owner_tx)));
+        let app = Router::new()
+            .route("/blocked", get(blocked))
+            .route_layer(middleware::from_fn_with_state(state, own_monitor_operation))
+            .layer(Extension(owner_tx));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind disconnect listener");
+        let address = listener.local_addr().expect("disconnect listener address");
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let mut stream = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("connect blocked monitor route");
+        stream
+            .write_all(b"GET /blocked HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .expect("write blocked request");
+        let owner = tokio::time::timeout(Duration::from_secs(2), owner_rx)
+            .await
+            .expect("blocked route did not start")
+            .expect("blocked route owner sender dropped");
+        assert_ne!(owner.logical_id(), unrelated.logical_id());
+
+        drop(stream);
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            owner.cancellation_token().cancelled(),
+        )
+        .await
+        .expect("peer disconnect did not cancel monitor owner");
+        assert_eq!(owner.cause(), Some(QueryCause::Disconnect));
+        assert_eq!(unrelated.cause(), None);
+        assert!(owners
+            .owners
+            .lock()
+            .expect("active monitor owner mutex")
+            .is_empty());
+
+        unrelated.scope(async {}).await;
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn monitor_shutdown_registry_cancels_only_active_monitor_requests() {
+        let (state, _) = fake_state(InMemoryConversationResponses::default());
+        let runtime = state.backend_router.query_runtime();
+        let active = QueryOwner::new(&runtime, QueryWorkload::Monitor).expect("active owner");
+        let unrelated = QueryOwner::new(&runtime, QueryWorkload::Mcp).expect("unrelated owner");
+        let registration = state.active_monitor_owners.register(active.clone());
+
+        state.active_monitor_owners.cancel_all(QueryCause::Shutdown);
+        assert_eq!(active.cause(), Some(QueryCause::Shutdown));
+        assert_eq!(unrelated.cause(), None);
+
+        let racing = QueryOwner::new(&runtime, QueryWorkload::Monitor).expect("racing owner");
+        let racing_registration = state.active_monitor_owners.register(racing.clone());
+        assert_eq!(racing.cause(), Some(QueryCause::Shutdown));
+
+        drop((registration, racing_registration));
+        unrelated.scope(async {}).await;
     }
 
     #[test]

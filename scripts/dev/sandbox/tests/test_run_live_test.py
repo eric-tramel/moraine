@@ -15,6 +15,7 @@ import unittest
 
 SCRIPT = Path(__file__).resolve().parents[1] / "run-live-test"
 SANDBOX_SCRIPT = SCRIPT.parent / "moraine-sandbox"
+LIVE_CLICKHOUSE_SOURCE = SCRIPT.parents[3] / "crates/moraine-conversations/tests/live_clickhouse.rs"
 
 
 FAKE_SANDBOX = r"""#!/usr/bin/env bash
@@ -443,6 +444,27 @@ class RunLiveTestTests(unittest.TestCase):
     def test_parity_mode_runs_only_exact_ignored_function(self) -> None:
         self.assert_exact_invocation(
             "analytics-parity", "live_monitor_repository_semantic_parity"
+        )
+
+    def test_query_ownership_mode_runs_only_exact_ignored_function(self) -> None:
+        self.assert_exact_invocation(
+            "query-ownership", "live_query_ownership_and_cancellation"
+        )
+
+    def test_live_target_has_five_ignored_functions(self) -> None:
+        source = LIVE_CLICKHOUSE_SOURCE.read_text(encoding="utf-8")
+        ignored_functions = re.findall(
+            r'#\[ignore\s*=\s*"[^"]+"\]\s*async fn ([a-zA-Z0-9_]+)', source
+        )
+        self.assertEqual(
+            [
+                "live_query_ownership_and_cancellation",
+                "live_schema_semantics_and_teardown",
+                "live_schema_032_replay_stable_upgrade_stays_within_memory_budget",
+                "live_mcp_open_boundedness_benchmark",
+                "live_monitor_repository_semantic_parity",
+            ],
+            ignored_functions,
         )
 
     def test_missing_and_unknown_modes_fail_before_boot(self) -> None:

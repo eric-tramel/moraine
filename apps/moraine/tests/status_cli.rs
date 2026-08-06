@@ -139,7 +139,7 @@ fn spawn_http_responses(
 fn spawn_http_endpoint() -> (u16, thread::JoinHandle<Vec<String>>) {
     spawn_http_responses(vec![
         ("503 Service Unavailable", String::new()),
-        ("503 Service Unavailable", String::new()),
+        ("404 Not Found", String::new()),
     ])
 }
 

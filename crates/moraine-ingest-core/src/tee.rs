@@ -19,7 +19,9 @@ use crate::redaction::{RedactionAudit, SecretRedactor};
 use crate::sink::{spawn_sink_task, SinkAuthorConfig, SinkRole};
 use crate::watch::enumerate_tracked_files;
 use crate::{Metrics, SinkMessage, WorkItem};
-use moraine_clickhouse::{enforce_remote_schema_policy, ClickHouseClient};
+use moraine_clickhouse::{
+    enforce_remote_schema_policy, ClickHouseClient, QueryOwner, QueryRuntime, QueryWorkload,
+};
 use moraine_config::{AppConfig, ClickHouseConfig, IngestSource, DEFAULT_BACKEND_NAME};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -494,6 +496,7 @@ impl RedactionContext {
 #[derive(Clone)]
 struct TeeRouterContext {
     config: Arc<AppConfig>,
+    query_runtime: QueryRuntime,
     sources: Arc<Vec<IngestSource>>,
     resolver: SharedRouteResolver,
     registry: StatusRegistry,
@@ -505,8 +508,10 @@ struct TeeRouterContext {
 /// backends via `try_send` (never awaited — a slow remote cannot stall the
 /// default path). Backend sinks filter their intake themselves, so the
 /// router only decides *whether* a batch is relevant to a backend.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_tee_router(
     config: Arc<AppConfig>,
+    query_runtime: QueryRuntime,
     sources: Vec<IngestSource>,
     mut rx: mpsc::Receiver<SinkMessage>,
     default_tx: mpsc::Sender<SinkMessage>,
@@ -517,6 +522,7 @@ pub(crate) fn spawn_tee_router(
     tokio::spawn(async move {
         let context = TeeRouterContext {
             config,
+            query_runtime,
             sources: Arc::new(sources),
             resolver,
             registry,
@@ -758,12 +764,13 @@ fn forward_to_backend(handle: &BackendHandle, batch: &RowBatch) {
 /// replay passes re-armed on every recovery.
 fn build_named_backend_clickhouse_client(
     mut backend_cfg: ClickHouseConfig,
+    query_runtime: QueryRuntime,
 ) -> anyhow::Result<ClickHouseClient> {
     // A replay barrier may only acknowledge after every earlier row is
     // inserted. Preserve async batching, but never allow a named mirror
     // backend to acknowledge an async insert before ClickHouse flushes it.
     backend_cfg.wait_for_async_insert = true;
-    ClickHouseClient::new(backend_cfg)
+    ClickHouseClient::new_with_runtime(backend_cfg, query_runtime)
 }
 
 fn spawn_backend_supervisor(
@@ -776,17 +783,24 @@ fn spawn_backend_supervisor(
     tokio::spawn(async move {
         let name = cell.name().to_string();
         let allow_newer_server = backend_cfg.allow_newer_server;
-        let client = match build_named_backend_clickhouse_client(backend_cfg) {
-            Ok(client) => client,
-            Err(exc) => {
-                cell.mark_unreachable();
-                error!(backend = %name, "failed to construct clickhouse client: {exc}");
-                return;
-            }
-        };
+        let client =
+            match build_named_backend_clickhouse_client(backend_cfg, context.query_runtime.clone())
+            {
+                Ok(client) => client,
+                Err(exc) => {
+                    cell.mark_unreachable();
+                    error!(backend = %name, "failed to construct clickhouse client: {exc}");
+                    return;
+                }
+            };
 
         loop {
-            match client.schema_skew().await {
+            let handshake = match QueryOwner::new(&context.query_runtime, QueryWorkload::Background)
+            {
+                Ok(owner) => owner.scope(client.schema_skew()).await,
+                Err(error) => Err(error.into()),
+            };
+            match handshake {
                 Ok(skew) => {
                     match enforce_remote_schema_policy(&name, &skew, allow_newer_server) {
                         Ok(()) => break,
@@ -1102,6 +1116,7 @@ mod tests {
             })));
         let context = TeeRouterContext {
             config,
+            query_runtime: QueryRuntime::new(),
             sources: Arc::new(vec![IngestSource {
                 name: "claude".to_string(),
                 harness: "claude-code".to_string(),
@@ -1646,6 +1661,7 @@ mod tests {
     ) -> TeeRouterContext {
         TeeRouterContext {
             config,
+            query_runtime: QueryRuntime::new(),
             sources: Arc::new(Vec::new()),
             resolver,
             registry: Arc::new(Mutex::new(BTreeMap::new())),
@@ -1762,29 +1778,37 @@ mod tests {
         let mut config = backend_cfg_for(format!("http://{addr}"));
         config.async_insert = true;
         config.wait_for_async_insert = false;
-        let named_client = build_named_backend_clickhouse_client(config.clone())
-            .expect("construct named backend client");
-        let default_client =
-            crate::build_ingest_clickhouse_client(config).expect("construct default ingest client");
+        let query_runtime = QueryRuntime::new();
+        let named_client =
+            build_named_backend_clickhouse_client(config.clone(), query_runtime.clone())
+                .expect("construct named backend client");
+        let default_client = crate::build_ingest_clickhouse_client(config, query_runtime.clone())
+            .expect("construct default ingest client");
 
-        named_client
-            .request_text(
+        let named_owner = QueryOwner::new(&named_client.runtime(), QueryWorkload::Background)
+            .expect("construct named request owner");
+        assert_eq!(query_runtime.active_owner_count(), 1);
+        named_owner
+            .scope(named_client.request_text(
                 "INSERT INTO named_probe FORMAT JSONEachRow",
                 Some(b"{}\n".to_vec()),
                 None,
                 true,
                 Some("JSONEachRow"),
-            )
+            ))
             .await
             .expect("named backend request");
-        default_client
-            .request_text(
+        let default_owner = QueryOwner::new(&default_client.runtime(), QueryWorkload::Background)
+            .expect("construct default request owner");
+        assert_eq!(query_runtime.active_owner_count(), 1);
+        default_owner
+            .scope(default_client.request_text(
                 "INSERT INTO default_probe FORMAT JSONEachRow",
                 Some(b"{}\n".to_vec()),
                 None,
                 true,
                 Some("JSONEachRow"),
-            )
+            ))
             .await
             .expect("default backend request");
 

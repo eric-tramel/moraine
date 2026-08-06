@@ -8,9 +8,7 @@ mod repo;
 mod session_label;
 
 pub use backend_router::{BackendRepository, BackendRepositoryRouter};
-pub use clickhouse_repo::{
-    with_repository_query_deadline, with_repository_query_id, ClickHouseConversationRepository,
-};
+pub use clickhouse_repo::ClickHouseConversationRepository;
 pub use domain::{
     is_user_facing_content_event, Conversation, ConversationDetailOptions, ConversationListFilter,
     ConversationListSort, ConversationMode, ConversationSearchHit, ConversationSearchQuery,
@@ -38,6 +36,9 @@ pub use error::{RepoError, RepoResult};
 pub use in_memory_repo::{
     InMemoryConversationCalls, InMemoryConversationRepository, InMemoryConversationResponses,
 };
+pub use moraine_clickhouse::{
+    QueryCause, QueryOwner, QueryRuntime, QueryWorkload, QUERY_CLEANUP_GRACE,
+};
 pub use repo::ConversationRepository;
 
 /// Build the production ClickHouse repository behind its backend-neutral read
@@ -47,13 +48,14 @@ pub use repo::ConversationRepository;
 pub fn build_clickhouse_repository(
     clickhouse: moraine_config::ClickHouseConfig,
     config: RepoConfig,
+    query_runtime: QueryRuntime,
 ) -> anyhow::Result<std::sync::Arc<dyn ConversationRepository>> {
     let user_agent = format!(
         "moraine-conversations/{} (pid={})",
         moraine_config::BUILD_VERSION,
         std::process::id()
     );
-    build_clickhouse_repository_with_user_agent(clickhouse, config, user_agent)
+    build_clickhouse_repository_with_user_agent(clickhouse, config, query_runtime, user_agent)
 }
 
 /// Build the production ClickHouse repository with an HTTP User-Agent chosen
@@ -61,9 +63,14 @@ pub fn build_clickhouse_repository(
 pub fn build_clickhouse_repository_with_user_agent(
     clickhouse: moraine_config::ClickHouseConfig,
     config: RepoConfig,
+    query_runtime: QueryRuntime,
     user_agent: impl AsRef<str>,
 ) -> anyhow::Result<std::sync::Arc<dyn ConversationRepository>> {
-    let client = moraine_clickhouse::ClickHouseClient::new_with_user_agent(clickhouse, user_agent)?;
+    let client = moraine_clickhouse::ClickHouseClient::new_with_runtime_and_user_agent(
+        clickhouse,
+        query_runtime,
+        user_agent,
+    )?;
     Ok(std::sync::Arc::new(ClickHouseConversationRepository::new(
         client, config,
     )))
@@ -72,20 +79,29 @@ pub fn build_clickhouse_repository_with_user_agent(
 #[cfg(test)]
 mod construction_tests {
     use super::{
-        build_clickhouse_repository, build_clickhouse_repository_with_user_agent, RepoConfig,
+        build_clickhouse_repository, build_clickhouse_repository_with_user_agent, QueryRuntime,
+        RepoConfig,
     };
 
-    #[test]
-    fn clickhouse_factory_returns_configured_trait_object() {
+    #[tokio::test]
+    async fn clickhouse_factory_returns_configured_trait_object() {
         let config = RepoConfig {
             max_results: 73,
             ..RepoConfig::default()
         };
-        let repository =
-            build_clickhouse_repository(moraine_config::ClickHouseConfig::default(), config)
-                .expect("valid ClickHouse configuration");
+        let runtime = QueryRuntime::new();
+        let repository = build_clickhouse_repository(
+            moraine_config::ClickHouseConfig::default(),
+            config,
+            runtime.clone(),
+        )
+        .expect("valid ClickHouse configuration");
 
         assert_eq!(repository.config().max_results, 73);
+        let owner = super::QueryOwner::new(&runtime, super::QueryWorkload::Internal)
+            .expect("factory runtime owner");
+        assert_eq!(runtime.active_owner_count(), 1);
+        owner.scope(async {}).await;
     }
 
     #[test]
@@ -97,6 +113,7 @@ mod construction_tests {
         let repository = build_clickhouse_repository_with_user_agent(
             moraine_config::ClickHouseConfig::default(),
             config,
+            QueryRuntime::new(),
             "moraine-backend/0.6.4 (pid=4242)",
         )
         .expect("valid attributed ClickHouse configuration");

@@ -1,7 +1,5 @@
 use anyhow::{anyhow, bail, Context, Result};
-use moraine_config::AppConfig;
 use serde_json::{json, Value};
-use std::time::Duration;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const PRIVATE_ROUTE_MAX_LINE_BYTES: usize = 64 * 1024;
@@ -10,43 +8,6 @@ const PRIVATE_ROUTE_METHOD: &str = "moraine/private/route";
 const PRIVATE_ROUTE_VERSION: u64 = 1;
 const PRIVATE_ROUTE_ERROR_CODE: i64 = -32000;
 const PRIVATE_ROUTE_INCOMPATIBLE_CODE: i64 = -32001;
-
-/// Maximum time a proxy waits for the daemon's private route response.
-///
-/// A named-backend schema probe performs at most two sequential ClickHouse
-/// requests. The extra second covers routing and control-message overhead.
-/// ClickHouse applies a one-second floor to every configured request timeout;
-/// this calculation intentionally applies the same floor.
-pub fn private_route_deadline(cfg: &AppConfig) -> Result<Duration> {
-    let mut max_timeout_seconds = 1.0_f64;
-
-    for (backend_name, backend) in cfg.backends.iter() {
-        let seconds = backend.timeout_seconds;
-        if !seconds.is_finite() {
-            bail!(
-                "backend '{backend_name}' timeout_seconds must be finite to derive the private route deadline"
-            );
-        }
-        max_timeout_seconds = max_timeout_seconds.max(seconds.max(1.0));
-    }
-
-    // Preserve the AppConfig invariant defensively for programmatic configs
-    // whose `backends` map may have been cleared or desynchronized.
-    let default_seconds = cfg.clickhouse.timeout_seconds;
-    if !default_seconds.is_finite() {
-        bail!(
-            "default backend timeout_seconds must be finite to derive the private route deadline"
-        );
-    }
-    max_timeout_seconds = max_timeout_seconds.max(default_seconds.max(1.0));
-
-    let deadline_seconds = max_timeout_seconds.mul_add(2.0, 1.0);
-    if !deadline_seconds.is_finite() {
-        bail!("private route deadline is out of range");
-    }
-    Duration::try_from_secs_f64(deadline_seconds)
-        .map_err(|_| anyhow!("private route deadline is out of range"))
-}
 
 /// Opaque socket halves retained after the daemon acknowledges a private route.
 ///
@@ -90,15 +51,15 @@ pub enum PrivateRouteNegotiation {
 
 /// Negotiate a cwd-selected repository with a connected central daemon.
 ///
-/// The request and response are bounded to 64 KiB and the complete exchange is
-/// limited by `deadline`. Every pre-ACK transport/protocol failure is returned
-/// as [`PrivateRouteNegotiation::Incompatible`]; only an exact structured route
-/// error becomes [`PrivateRouteNegotiation::Rejected`].
+/// The request and response are bounded to 64 KiB. Every pre-ACK
+/// transport/protocol failure is returned as
+/// [`PrivateRouteNegotiation::Incompatible`]; only an exact structured route
+/// error becomes [`PrivateRouteNegotiation::Rejected`]. The connected caller
+/// may wait without an elapsed deadline while backend schema queries complete.
 #[cfg(unix)]
 pub async fn negotiate_private_route(
     stream: tokio::net::UnixStream,
     cwd: &str,
-    deadline: Duration,
 ) -> PrivateRouteNegotiation {
     use tokio::io::BufReader;
 
@@ -145,19 +106,11 @@ pub async fn negotiate_private_route(
             .ok_or_else(|| anyhow!("daemon closed before the private route response"))
     };
 
-    let response = match tokio::time::timeout(deadline, exchange).await {
-        Ok(Ok(response)) => response,
-        Ok(Err(error)) => {
+    let response = match exchange.await {
+        Ok(response) => response,
+        Err(error) => {
             return PrivateRouteNegotiation::Incompatible {
                 reason: error.to_string(),
-            };
-        }
-        Err(_) => {
-            return PrivateRouteNegotiation::Incompatible {
-                reason: format!(
-                    "private route negotiation timed out after {:.3}s",
-                    deadline.as_secs_f64()
-                ),
             };
         }
     };
@@ -445,59 +398,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-
-    #[test]
-    fn deadline_uses_effective_max_backend_timeout() {
-        let mut cfg = AppConfig::default();
-        assert_eq!(
-            private_route_deadline(&cfg).expect("default deadline"),
-            Duration::from_secs(61)
-        );
-
-        cfg.backends.insert(
-            "slow".to_string(),
-            moraine_config::ClickHouseConfig {
-                timeout_seconds: 45.0,
-                ..Default::default()
-            },
-        );
-        assert_eq!(
-            private_route_deadline(&cfg).expect("slow deadline"),
-            Duration::from_secs(91)
-        );
-
-        cfg.clickhouse.timeout_seconds = 0.2;
-        for backend in cfg.backends.values_mut() {
-            backend.timeout_seconds = 0.2;
-        }
-        assert_eq!(
-            private_route_deadline(&cfg).expect("floored deadline"),
-            Duration::from_secs(3)
-        );
-    }
-
-    #[test]
-    fn deadline_rejects_non_finite_and_out_of_range_values() {
-        let mut cfg = AppConfig::default();
-        cfg.backends
-            .get_mut("default")
-            .expect("default backend")
-            .timeout_seconds = f64::INFINITY;
-        assert!(private_route_deadline(&cfg)
-            .expect_err("infinite timeout must fail")
-            .to_string()
-            .contains("must be finite"));
-
-        cfg.backends
-            .get_mut("default")
-            .expect("default backend")
-            .timeout_seconds = f64::MAX;
-        assert!(private_route_deadline(&cfg)
-            .expect_err("overflowing timeout must fail")
-            .to_string()
-            .contains("out of range"));
-    }
 
     #[tokio::test]
     async fn bounded_line_accepts_limit_and_rejects_one_byte_over() {
@@ -641,7 +543,7 @@ mod tests {
                 .expect("write private response");
             write_half.write_all(b"\n").await.expect("write newline");
         });
-        negotiate_private_route(client, "/work/team", Duration::from_secs(1)).await
+        negotiate_private_route(client, "/work/team").await
     }
 
     #[cfg(unix)]
@@ -723,7 +625,7 @@ mod tests {
                 .expect("write ACK");
         });
 
-        let outcome = negotiate_private_route(client, "/work/team", Duration::from_secs(1)).await;
+        let outcome = negotiate_private_route(client, "/work/team").await;
         assert!(matches!(outcome, PrivateRouteNegotiation::Accepted(_)));
         assert_eq!(
             request_rx.await.expect("captured request"),
@@ -757,13 +659,13 @@ mod tests {
                 .expect("write delayed ACK");
         });
 
-        let outcome = negotiate_private_route(client, "/work/team", Duration::from_secs(1)).await;
+        let outcome = negotiate_private_route(client, "/work/team").await;
         assert!(matches!(outcome, PrivateRouteNegotiation::Accepted(_)));
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn eof_malformed_response_and_deadline_are_incompatible() {
+    async fn eof_and_malformed_response_are_incompatible() {
         let (eof_client, eof_server) = tokio::net::UnixStream::pair().expect("EOF socket pair");
         tokio::spawn(async move {
             let (read_half, _write_half) = eof_server.into_split();
@@ -774,7 +676,7 @@ mod tests {
                 .await
                 .expect("read EOF request");
         });
-        let eof = negotiate_private_route(eof_client, "/work/team", Duration::from_secs(1)).await;
+        let eof = negotiate_private_route(eof_client, "/work/team").await;
         assert!(matches!(eof, PrivateRouteNegotiation::Incompatible { .. }));
 
         let (malformed_client, malformed_server) =
@@ -792,33 +694,11 @@ mod tests {
                 .await
                 .expect("write malformed response");
         });
-        let malformed =
-            negotiate_private_route(malformed_client, "/work/team", Duration::from_secs(1)).await;
+        let malformed = negotiate_private_route(malformed_client, "/work/team").await;
         assert!(matches!(
             malformed,
             PrivateRouteNegotiation::Incompatible { .. }
         ));
-
-        let (timeout_client, timeout_server) =
-            tokio::net::UnixStream::pair().expect("timeout socket pair");
-        tokio::spawn(async move {
-            let (read_half, _write_half) = timeout_server.into_split();
-            let mut reader = BufReader::new(read_half);
-            let mut request = String::new();
-            reader
-                .read_line(&mut request)
-                .await
-                .expect("read timeout request");
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        });
-        let timed_out =
-            negotiate_private_route(timeout_client, "/work/team", Duration::from_millis(10)).await;
-        match timed_out {
-            PrivateRouteNegotiation::Incompatible { reason } => {
-                assert!(reason.contains("timed out"), "unexpected reason: {reason}");
-            }
-            _ => panic!("private response deadline must be incompatible"),
-        }
     }
 
     #[cfg(unix)]
@@ -841,7 +721,7 @@ mod tests {
                 .expect("write ack and data");
         });
 
-        let accepted = negotiate_private_route(client, "/work/team", Duration::from_secs(1)).await;
+        let accepted = negotiate_private_route(client, "/work/team").await;
         let PrivateRouteNegotiation::Accepted(connection) = accepted else {
             panic!("valid ACK must be accepted");
         };
@@ -870,7 +750,7 @@ mod tests {
             write_half.write_all(b"\n").await.expect("write newline");
         });
 
-        let outcome = negotiate_private_route(client, "/work/team", Duration::from_secs(1)).await;
+        let outcome = negotiate_private_route(client, "/work/team").await;
         match outcome {
             PrivateRouteNegotiation::Incompatible { reason } => {
                 assert!(reason.contains("exceeds"), "unexpected reason: {reason}");

@@ -11,22 +11,20 @@
 //! it never reinvents inspection.
 
 use super::{
-    backend_query_id, cancel_query_with_deadline, handled_tool_error_result, internal_id_error,
-    repo_error_to_contract_error, request_performance, tool_success_result, AppState,
-    QueryCancellationGuard,
+    handled_tool_error_result, internal_id_error, repo_error_to_contract_error,
+    request_performance, tool_success_result, AppState,
 };
 use crate::contract::{
     format_rfc3339_utc_millis, CanonicalFileAttentionArgs, ContractError, FileAttentionArgs,
     FileAttentionGranularity, FileAttentionScope, McpEventId, McpSessionId, McpTurnId, Performance,
-    ToolEnvelope, ToolErrorCode, ToolErrorEnvelope, FILE_ATTENTION_DEADLINE_MS,
-    FILE_ATTENTION_MIN_TAIL_SEGMENTS, FILE_ATTENTION_TOOL,
+    ToolEnvelope, ToolErrorCode, ToolErrorEnvelope, FILE_ATTENTION_MIN_TAIL_SEGMENTS,
+    FILE_ATTENTION_TOOL,
 };
 use anyhow::{Context, Result};
 use moraine_conversations::{FileAttentionQuery, FileAttentionTouch};
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use tokio::time::{timeout, Duration};
 use tracing::warn;
 
 /// Hard cap on matched rows pulled from ClickHouse for one query. The summary,
@@ -99,9 +97,7 @@ impl AppState {
             );
         }
 
-        let query_id = backend_query_id("file-attention");
         let repo_query = FileAttentionQuery {
-            cancellation_token: query_id.clone(),
             rel: tail.rel.clone(),
             normalized_project_id: tail.project_id.clone(),
             normalized_project_roots: tail
@@ -118,39 +114,14 @@ impl AppState {
             source_name: args.source.clone(),
             mutations_only: args.mutations_only,
             max_rows: FILE_ATTENTION_SCAN_CAP,
-            execution_budget_secs: FILE_ATTENTION_DEADLINE_MS.div_ceil(1_000),
         };
 
-        let mut cancellation = QueryCancellationGuard::new(query_id.clone());
-        let repo_result = timeout(
-            Duration::from_millis(FILE_ATTENTION_DEADLINE_MS),
-            self.repo.file_attention(repo_query),
-        )
-        .await;
-
-        let touches = match repo_result {
-            Ok(Ok(touches)) => {
-                cancellation.disarm();
-                touches
-            }
-            Ok(Err(error)) => {
-                cancellation.disarm();
+        let touches = match self.repo.file_attention(repo_query).await {
+            Ok(touches) => touches,
+            Err(error) => {
                 return encode_error(
                     canonical_request,
                     repo_error_to_contract_error(error),
-                    perf.finish(),
-                );
-            }
-            Err(_) => {
-                cancel_query_with_deadline(self, &query_id).await;
-                cancellation.disarm();
-                return encode_error(
-                    canonical_request,
-                    ContractError::new(
-                        ToolErrorCode::DeadlineExceeded,
-                        "file_attention exceeded its response deadline",
-                    )
-                    .with_details(json!({ "deadline_ms": FILE_ATTENTION_DEADLINE_MS })),
                     perf.finish(),
                 );
             }

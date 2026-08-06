@@ -107,9 +107,10 @@ at most 120 oldest-to-newest narrow checkpoint points for the selected ingestor
 run; it does not repeat host data, source paths, errors, or backend sink payloads.
 
 The table path parameter must match the strict ASCII identifier pattern
-`[A-Za-z_][A-Za-z0-9_]*`. A rejected identifier returns HTTP `400`. A
-syntactically valid name that cannot be read from the configured database is a
-backend read failure, not a `404` resource response.
+`[A-Za-z_][A-Za-z0-9_]*`. A rejected identifier returns HTTP `400` with
+`code: "invalid_request"`. A syntactically valid name that cannot be read from
+the configured database is a backend read failure, not a `404` resource
+response.
 
 ## Successful Empty and Nullable Values
 
@@ -132,9 +133,11 @@ rows. They do not use `null` to mean an empty collection.
 - When no ingest heartbeat is available, `ingestor.present` and
   `ingestor.alive` are `false`, while `ingestor.latest` and
   `ingestor.age_seconds` are `null`.
-- `ingest_status` is `null` when the status repository read fails. When present,
-  its independent `health`, `coverage`, `freshness`, and `readiness` conditions
-  use `true`, `false`, or `unknown` states with stable reason codes.
+- `ingest_status` is `null` when no database/status is available in an otherwise
+  successful diagnostic response. A typed repository read failure is instead a
+  non-2xx response as described below. When present, its independent `health`,
+  `coverage`, `freshness`, and `readiness` conditions use `true`, `false`, or
+  `unknown` states with stable reason codes.
 - `ingest_status.heartbeat.latest.progress` is absent on pre-034 heartbeat rows.
   A present progress snapshot freezes the startup file/byte denominator for one
   ingestor instance and advances only after checkpoint rows are durably
@@ -159,25 +162,29 @@ API handlers use JSON errors with at least this envelope:
 ```json
 {
   "ok": false,
+  "code": "backend_failure",
   "error": "human-readable message"
 }
 ```
 
-An endpoint can add diagnostic fields to that minimum envelope. For example, a
-health failure also reports its configured database information and connection
-diagnostics. Error message text is for operators and can include backend
-details; clients should branch on the HTTP status and `ok`, not match arbitrary
-message text.
+An endpoint can add diagnostic fields to that minimum envelope. `code` is a
+stable machine-readable category; error message text is narrative operator
+context and can include backend details. For example, a health failure also
+reports its configured database information and connection diagnostics. Clients
+should branch on the HTTP status and `code`, not match arbitrary message text.
 
 | Status | Meaning |
 | --- | --- |
 | `200 OK` | The request completed. Inspect diagnostic fields such as `clickhouse.healthy`; `200` does not mean every component is healthy. |
-| `400 Bad Request` | The query could not be deserialized, or a table identifier was rejected. A rejected table identifier uses `{"ok":false,"error":"invalid table name"}`. Framework-generated malformed-query responses are not guaranteed to use the application JSON envelope. |
+| `400 Bad Request` | Request/repository validation failed (`invalid_request`), including a rejected table identifier. Framework-generated malformed-query responses are not guaranteed to use the application JSON envelope. |
 | `403 Forbidden` | Static-file path traversal or a path that resolves outside the configured static root. The JSON error is `{"ok":false,"error":"forbidden"}`. |
 | `404 Not Found` | No requested static file exists. The JSON error is `{"ok":false,"error":"not found"}`. |
 | `405 Method Not Allowed` | The path exists but does not support the requested HTTP method. A JSON error envelope is not guaranteed. |
-| `500 Internal Server Error` | The static root cannot be resolved or a selected static file cannot be read. |
-| `503 Service Unavailable` | A required repository or ClickHouse read failed. Handler-generated responses use the JSON error envelope. |
+| `429 Too Many Requests` | ClickHouse or admission resources are exhausted (`resource_exhausted`). |
+| `499 Client Closed Request` | Admitted repository work was cancelled (`cancelled`) while an HTTP response was still possible. A fully disconnected client cannot receive this response. |
+| `500 Internal Server Error` | A Moraine invariant/implementation failed (`internal_error`), or the static root/file cannot be resolved/read. |
+| `503 Service Unavailable` | A required repository, ClickHouse, or transport operation failed (`backend_failure`). |
+| `504 Gateway Timeout` | An explicitly supplied absolute caller deadline expired (`deadline_exceeded`). Current Monitor requests do not supply one, and Moraine adds no default query deadline. |
 
 `/api/v1/health` returns `503` when the required store-health read, ping, or
 version probe fails. Most collection read failures also return `503`.

@@ -1,6 +1,6 @@
 use super::{
-    backend_query_id, handled_tool_error_result, internal_id_error, repo_error_to_contract_error,
-    request_performance, tool_success_result, AppState, QueryCancellationGuard,
+    handled_tool_error_result, internal_id_error, repo_error_to_contract_error,
+    request_performance, tool_success_result, AppState,
 };
 use crate::contract::{
     format_rfc3339_utc_millis, CanonicalSearchSessionsArgs, ContractError, McpEventId, McpId,
@@ -29,10 +29,8 @@ impl AppState {
         };
 
         let canonical_request = canonical_request_json(&args)?;
-        let query_id = backend_query_id("search-sessions");
         let repo_query = SearchMcpEventsQuery {
             query: args.query.clone(),
-            cancellation_token: Some(query_id.clone()),
             n_hits: Some(args.n_hits),
             session_id: scoped_session_id(&args).map(ToOwned::to_owned),
             turn_seq: scoped_turn_seq(&args),
@@ -49,14 +47,9 @@ impl AppState {
             min_should_match: None,
         };
 
-        let mut cancellation = QueryCancellationGuard::new(query_id);
         let search_result = match self.repo.search_mcp_events(repo_query).await {
-            Ok(result) => {
-                cancellation.disarm();
-                result
-            }
+            Ok(result) => result,
             Err(error) => {
-                cancellation.disarm();
                 return encode_search_sessions_error(
                     canonical_request,
                     repo_error_to_contract_error(error),

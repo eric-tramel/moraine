@@ -122,6 +122,4 @@ pub trait ConversationRepository: Send + Sync {
         &self,
         query: FileAttentionQuery,
     ) -> RepoResult<Vec<FileAttentionTouch>>;
-
-    async fn cancel_query(&self, query_id: &str) -> RepoResult<()>;
 }

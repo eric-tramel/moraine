@@ -1,7 +1,9 @@
 use crate::cli::ServeMode;
 use anyhow::{anyhow, bail, Context, Result};
 use moraine_config::AppConfig;
-use moraine_conversations::{BackendRepositoryRouter, RepoConfig};
+use moraine_conversations::{
+    BackendRepositoryRouter, QueryRuntime, RepoConfig, QUERY_CLEANUP_GRACE,
+};
 #[cfg(unix)]
 use moraine_mcp_core::PrivateRouteNegotiation;
 use moraine_mcp_core::SessionOriginScope;
@@ -123,6 +125,7 @@ fn repository_config(cfg: &AppConfig, session_scope: Option<SessionOriginScope>)
 fn backend_router(
     cfg: Arc<AppConfig>,
     session_scope: Option<SessionOriginScope>,
+    query_runtime: QueryRuntime,
     role: &str,
 ) -> Result<Arc<BackendRepositoryRouter>> {
     let user_agent = format!(
@@ -133,6 +136,7 @@ fn backend_router(
     Ok(Arc::new(BackendRepositoryRouter::new(
         cfg.clone(),
         repository_config(&cfg, session_scope),
+        query_runtime,
         user_agent,
     )?))
 }
@@ -165,8 +169,7 @@ async fn run_stdio_entry(cfg: AppConfig, session_scope: Option<SessionOriginScop
         let connect_deadline = std::time::Duration::from_millis(cfg.mcp.central_connect_timeout_ms);
         match tokio::time::timeout(connect_deadline, UnixStream::connect(&socket_path)).await {
             Ok(Ok(stream)) => {
-                let route_deadline = moraine_mcp_core::private_route_deadline(&cfg)?;
-                match moraine_mcp_core::negotiate_private_route(stream, &cwd, route_deadline).await {
+                match moraine_mcp_core::negotiate_private_route(stream, &cwd).await {
                     PrivateRouteNegotiation::Accepted(connection) => {
                         debug!(
                             "proxying stdio to central MCP server at {}",
@@ -199,15 +202,31 @@ async fn run_stdio_entry(cfg: AppConfig, session_scope: Option<SessionOriginScop
     }
 
     let cfg = Arc::new(cfg);
-    let router = backend_router(cfg.clone(), session_scope, "moraine-mcp")?;
-    let backend = router
-        .repository_for_project_dir(Some(&cwd))
+    let query_runtime = QueryRuntime::new();
+    let result = async {
+        let router = backend_router(
+            cfg.clone(),
+            session_scope,
+            query_runtime.clone(),
+            "moraine-mcp",
+        )?;
+        let backend = router
+            .repository_for_project_dir(Some(&cwd))
+            .await
+            .context("failed to construct embedded conversation repository")?;
+        let repository = backend.repository().clone();
+        drop(backend);
+        drop(router);
+        moraine_mcp_core::run_stdio_with_repository(
+            Arc::unwrap_or_clone(cfg),
+            repository,
+            query_runtime.clone(),
+        )
         .await
-        .context("failed to construct embedded conversation repository")?;
-    let repository = backend.repository().clone();
-    drop(backend);
-    drop(router);
-    moraine_mcp_core::run_stdio_with_repository(Arc::unwrap_or_clone(cfg), repository).await
+    }
+    .await;
+    query_runtime.close_and_drain().await;
+    result
 }
 
 async fn run_backend(
@@ -223,12 +242,24 @@ async fn run_backend(
     // receive clones of this exact router Arc; each selected backend therefore
     // shares one checked client, repository, and cache set across MCP and HTTP.
     let cfg = Arc::new(cfg);
-    let router = backend_router(cfg.clone(), None, "moraine-backend")
-        .context("failed to build backend repository router")?;
-    router
+    let query_runtime = QueryRuntime::new();
+    let router = match backend_router(cfg.clone(), None, query_runtime.clone(), "moraine-backend")
+        .context("failed to build backend repository router")
+    {
+        Ok(router) => router,
+        Err(error) => {
+            query_runtime.close_and_drain().await;
+            return Err(error);
+        }
+    };
+    if let Err(error) = router
         .default_repository()
         .await
-        .context("failed to build default backend conversation repository")?;
+        .context("failed to build default backend conversation repository")
+    {
+        query_runtime.close_and_drain().await;
+        return Err(error);
+    }
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut services = JoinSet::new();
@@ -274,12 +305,31 @@ async fn run_backend(
         )),
     };
 
-    let mut shutdown_failure = None;
-    while let Some(service) = services.join_next().await {
-        if let Err(error) = service_exit_result(service, true) {
-            shutdown_failure.get_or_insert(error);
+    // Query cleanup and owner-bearing service tasks share one five-second
+    // shutdown wall. QueryRuntime owns the sole cleanup drain; services only
+    // cancel/join their request tasks and are aborted if they outlive it.
+    let shutdown_deadline = tokio::time::Instant::now() + QUERY_CLEANUP_GRACE;
+    let service_drain = async {
+        let mut shutdown_failure = None;
+        while let Some(service) = services.join_next().await {
+            if let Err(error) = service_exit_result(service, true) {
+                shutdown_failure.get_or_insert(error);
+            }
         }
-    }
+        shutdown_failure
+    };
+    let (_, service_result) = tokio::join!(
+        query_runtime.close_and_drain(),
+        tokio::time::timeout_at(shutdown_deadline, service_drain),
+    );
+    let shutdown_failure = match service_result {
+        Ok(failure) => failure,
+        Err(_) => {
+            services.abort_all();
+            while services.join_next().await.is_some() {}
+            None
+        }
+    };
 
     primary?;
     if let Some(error) = shutdown_failure {
