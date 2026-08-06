@@ -28,7 +28,7 @@ use crate::tee::{
 };
 use crate::watch::{enumerate_tracked_files, spawn_watcher_threads};
 use anyhow::{Context, Result};
-use moraine_clickhouse::ClickHouseClient;
+use moraine_clickhouse::{ClickHouseClient, QueryOwner, QueryRuntime, QueryWorkload};
 use moraine_config::{
     AppConfig, ClickHouseConfig, IngestSource, SourceFormat, DEFAULT_BACKEND_NAME,
 };
@@ -141,16 +141,27 @@ pub(crate) enum SinkMessage {
     FlushBarrier(tokio::sync::oneshot::Sender<()>),
 }
 
-fn build_ingest_clickhouse_client(config: ClickHouseConfig) -> Result<ClickHouseClient> {
+fn build_ingest_clickhouse_client(
+    config: ClickHouseConfig,
+    runtime: QueryRuntime,
+) -> Result<ClickHouseClient> {
     let user_agent = format!(
         "moraine-ingest/{} (pid={})",
         moraine_config::BUILD_VERSION,
         std::process::id()
     );
-    ClickHouseClient::new_with_user_agent(config, user_agent)
+    ClickHouseClient::new_with_runtime_and_user_agent(config, runtime, user_agent)
 }
 
-pub async fn run_ingestor(config: AppConfig) -> Result<()> {
+async fn probe_clickhouse(clickhouse: &ClickHouseClient) -> Result<()> {
+    let owner = QueryOwner::new(&clickhouse.runtime(), QueryWorkload::Background)?;
+    owner
+        .scope(clickhouse.ping())
+        .await
+        .context("clickhouse ping failed")
+}
+
+pub async fn run_ingestor(config: AppConfig, query_runtime: QueryRuntime) -> Result<()> {
     let enabled_sources: Vec<IngestSource> = config
         .ingest
         .sources
@@ -165,8 +176,9 @@ pub async fn run_ingestor(config: AppConfig) -> Result<()> {
         ));
     }
 
-    let clickhouse = build_ingest_clickhouse_client(config.clickhouse.clone())?;
-    clickhouse.ping().await.context("clickhouse ping failed")?;
+    let clickhouse =
+        build_ingest_clickhouse_client(config.clickhouse.clone(), query_runtime.clone())?;
+    probe_clickhouse(&clickhouse).await?;
 
     let checkpoint_cursor_columns = checkpoint_cursor_columns_available(&clickhouse)
         .await
@@ -310,6 +322,7 @@ pub async fn run_ingestor(config: AppConfig) -> Result<()> {
 
     let router_handle = spawn_tee_router(
         shared_config,
+        query_runtime,
         enabled_sources.clone(),
         sink_rx,
         default_sink_tx,
@@ -540,7 +553,8 @@ async fn table_column_available(
         table.replace('\'', "\\'"),
         column.replace('\'', "\\'")
     );
-    let rows: Vec<CountRow> = clickhouse.query_rows(&query, None).await?;
+    let owner = QueryOwner::new(&clickhouse.runtime(), QueryWorkload::Background)?;
+    let rows: Vec<CountRow> = owner.scope(clickhouse.query_rows(&query, None)).await?;
     Ok(rows
         .first()
         .map(|row| row.column_count > 0)
@@ -594,7 +608,8 @@ async fn load_checkpoints(
     host: Option<&str>,
 ) -> Result<HashMap<String, model::Checkpoint>> {
     let query = checkpoints_query(&clickhouse.config().database, cursor_columns, host);
-    let rows: Vec<CheckpointRow> = clickhouse.query_rows(&query, None).await?;
+    let owner = QueryOwner::new(&clickhouse.runtime(), QueryWorkload::Background)?;
+    let rows: Vec<CheckpointRow> = owner.scope(clickhouse.query_rows(&query, None)).await?;
     let mut map = HashMap::<String, model::Checkpoint>::new();
 
     for row in rows {
@@ -621,13 +636,24 @@ async fn load_checkpoints(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_ingest_clickhouse_client, checkpoints_query};
-    use axum::{extract::State, http::HeaderMap, routing::post, Router};
+    use super::{build_ingest_clickhouse_client, checkpoints_query, probe_clickhouse};
+    use axum::{
+        extract::{Query, State},
+        http::HeaderMap,
+        routing::post,
+        Router,
+    };
+    use moraine_clickhouse::QueryRuntime;
+    use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
+
+    type RequestCapture = (Arc<Mutex<Vec<String>>>, Arc<Mutex<Vec<String>>>);
+
     #[tokio::test]
     async fn ingest_clickhouse_requests_carry_process_identity() {
         async fn handler(
-            State(user_agents): State<Arc<Mutex<Vec<String>>>>,
+            State((user_agents, query_ids)): State<RequestCapture>,
+            Query(params): Query<HashMap<String, String>>,
             headers: HeaderMap,
         ) -> &'static str {
             let user_agent = headers
@@ -640,13 +666,23 @@ mod tests {
                 .lock()
                 .expect("user-agent capture mutex poisoned")
                 .push(user_agent);
+            query_ids
+                .lock()
+                .expect("query-id capture mutex poisoned")
+                .push(
+                    params
+                        .get("query_id")
+                        .expect("ingest request must carry a query id")
+                        .clone(),
+                );
             "1"
         }
 
         let user_agents = Arc::new(Mutex::new(Vec::new()));
+        let query_ids = Arc::new(Mutex::new(Vec::new()));
         let app = Router::new()
             .route("/", post(handler))
-            .with_state(user_agents.clone());
+            .with_state((user_agents.clone(), query_ids.clone()));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind user-agent capture listener");
@@ -655,12 +691,18 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
 
-        let clickhouse = build_ingest_clickhouse_client(moraine_config::ClickHouseConfig {
-            url: format!("http://{address}"),
-            ..moraine_config::ClickHouseConfig::default()
-        })
+        let query_runtime = QueryRuntime::new();
+        let clickhouse = build_ingest_clickhouse_client(
+            moraine_config::ClickHouseConfig {
+                url: format!("http://{address}"),
+                ..moraine_config::ClickHouseConfig::default()
+            },
+            query_runtime,
+        )
         .expect("construct ingest ClickHouse client");
-        clickhouse.ping().await.expect("ingest ClickHouse ping");
+        probe_clickhouse(&clickhouse)
+            .await
+            .expect("ingest ClickHouse ping");
 
         assert_eq!(
             user_agents
@@ -673,6 +715,9 @@ mod tests {
                 std::process::id()
             )]
         );
+        let query_ids = query_ids.lock().expect("query-id capture mutex poisoned");
+        assert_eq!(query_ids.len(), 1);
+        assert!(query_ids[0].starts_with("moraine-background-"));
     }
 
     #[test]
