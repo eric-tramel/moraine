@@ -1256,7 +1256,6 @@ name = "moraine-ingest"
 version = "0.7.2"
 dependencies = [
  "anyhow",
- "moraine-clickhouse",
  "moraine-config",
  "moraine-ingest-core",
  "tokio",

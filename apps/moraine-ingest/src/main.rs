@@ -1,7 +1,7 @@
 mod cli;
 
 use anyhow::{Context, Result};
-use moraine_clickhouse::QueryRuntime;
+use moraine_ingest_core::QueryRuntime;
 use std::future::Future;
 use tracing_subscriber::EnvFilter;
 
@@ -36,7 +36,7 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::run_and_drain;
-    use moraine_clickhouse::{QueryCause, QueryOwner, QueryRuntime, QueryWorkload};
+    use moraine_ingest_core::{QueryCause, QueryOwner, QueryRuntime, QueryWorkload};
 
     #[tokio::test]
     async fn runtime_root_drains_after_ingestor_error() {
