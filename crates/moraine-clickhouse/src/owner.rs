@@ -1,5 +1,5 @@
 use reqwest::{Client, StatusCode, Url};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
@@ -273,6 +273,8 @@ struct ChildRecord {
     headers_received: bool,
 }
 
+type CleanupBackendBatch = (Arc<AdminBackend>, Vec<(String, bool)>);
+
 impl QueryOwner {
     pub fn new(
         runtime: &QueryRuntime,
@@ -294,11 +296,6 @@ impl QueryOwner {
         workload: QueryWorkload,
         deadline: Option<Instant>,
     ) -> Result<Arc<Self>, ClickHouseError> {
-        if workload == QueryWorkload::Administrative {
-            return Err(ClickHouseError::ownership(
-                "administrative workload is reserved for internal cleanup",
-            ));
-        }
         if runtime.inner.closing.load(Ordering::Acquire) {
             return Err(ClickHouseError::ownership("query runtime is closing"));
         }
@@ -856,7 +853,9 @@ async fn supervisor_loop(
 
 async fn cleanup_owner(owner: Arc<OwnerState>) {
     let wall = Instant::now() + QUERY_CLEANUP_GRACE;
-    let mut warning: Option<String> = None;
+    let mut last_admin_error: Option<String> = None;
+    let mut observed_visible = HashSet::<String>::new();
+    let mut bounded_failure = false;
     loop {
         let records = {
             owner
@@ -871,63 +870,101 @@ async fn cleanup_owner(owner: Arc<OwnerState>) {
         if records.is_empty() {
             break;
         }
-
-        let mut by_backend: HashMap<Uuid, (Arc<AdminBackend>, Vec<String>, bool)> = HashMap::new();
-        for (id, child) in records {
-            let entry = by_backend
-                .entry(child.backend.key)
-                .or_insert_with(|| (child.backend.clone(), Vec::new(), false));
-            entry.1.push(id);
-            entry.2 |= child.attempted && !child.headers_received;
+        if Instant::now() >= wall {
+            bounded_failure = true;
+            break;
         }
 
-        let mut still_visible = false;
-        let mut stabilize_absent = false;
-        for (_key, (backend, ids, needs_stabilization)) in by_backend {
-            let quoted = ids
+        let mut by_backend: HashMap<Uuid, CleanupBackendBatch> = HashMap::new();
+        for (id, child) in records {
+            by_backend
+                .entry(child.backend.key)
+                .or_insert_with(|| (child.backend.clone(), Vec::new()))
+                .1
+                .push((id, child.attempted));
+        }
+
+        let mut unresolved = false;
+        for (_key, (backend, children)) in by_backend {
+            let quoted = children
                 .iter()
-                .map(|id| format!("'{}'", id))
+                .map(|(id, _)| format!("'{id}'"))
                 .collect::<Vec<_>>()
                 .join(",");
             let kill = format!("KILL QUERY WHERE query_id IN ({quoted}) ASYNC");
             if let Err(error) = backend.execute(&kill, wall).await {
-                warning = Some(error.to_string());
-                still_visible = true;
+                last_admin_error = Some(error.to_string());
+                unresolved = true;
                 continue;
             }
             let poll = format!(
                 "SELECT query_id FROM system.processes WHERE query_id IN ({quoted}) FORMAT JSONEachRow"
             );
             match backend.execute(&poll, wall).await {
-                Ok(body) => {
-                    let visible = ids.iter().any(|id| body.contains(id));
-                    still_visible |= visible;
-                    stabilize_absent |= !visible && needs_stabilization;
-                }
+                Ok(body) => match parse_process_query_ids(&body) {
+                    Ok(visible_ids) => {
+                        for (id, attempted) in children {
+                            if visible_ids.contains(&id) {
+                                observed_visible.insert(id);
+                                unresolved = true;
+                            } else if attempted && !observed_visible.contains(&id) {
+                                // An absent first poll is not terminal. HTTP headers
+                                // can precede process visibility, so every attempted
+                                // unfinished child is retried through the shared
+                                // visibility wall until it is observed and then gone.
+                                unresolved = true;
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        last_admin_error = Some(error.to_string());
+                        unresolved = true;
+                    }
+                },
                 Err(error) => {
-                    warning = Some(error.to_string());
-                    still_visible = true;
+                    last_admin_error = Some(error.to_string());
+                    unresolved = true;
                 }
             }
         }
 
-        if !still_visible && !stabilize_absent {
+        if !unresolved {
             break;
         }
         if Instant::now() >= wall {
+            bounded_failure = true;
             break;
         }
         tokio::time::sleep_until((Instant::now() + CLEANUP_RETRY).min(wall)).await;
     }
-    if let Some(warning) = warning {
+    if bounded_failure {
         tracing::warn!(
             owner_id = %owner.logical_id,
             grace_ms = QUERY_CLEANUP_GRACE.as_millis(),
-            error = %warning,
+            error = last_admin_error.as_deref().unwrap_or("active child did not reach a terminal visibility state"),
             "ClickHouse query cleanup did not complete within the bounded grace"
         );
     }
     owner.finish_terminal();
+}
+
+fn parse_process_query_ids(body: &str) -> Result<HashSet<String>, ClickHouseError> {
+    let mut ids = HashSet::new();
+    for line in body.lines().filter(|line| !line.trim().is_empty()) {
+        let value: serde_json::Value = serde_json::from_str(line).map_err(|_| {
+            ClickHouseError::backend("ClickHouse cleanup process poll returned malformed JSON")
+        })?;
+        let id = value
+            .get("query_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                ClickHouseError::backend(
+                    "ClickHouse cleanup process poll omitted the query_id field",
+                )
+            })?;
+        ids.insert(id.to_string());
+    }
+    Ok(ids)
 }
 
 pub(crate) fn extract_exception_code(body: &str) -> Option<u32> {

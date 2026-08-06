@@ -3556,6 +3556,7 @@ mod tests {
         struct StateData {
             started: Arc<tokio::sync::Notify>,
             requests: Arc<Mutex<Vec<HashMap<String, String>>>>,
+            process_polls: Arc<std::sync::atomic::AtomicUsize>,
         }
         async fn handler(
             State(state): State<StateData>,
@@ -3563,8 +3564,23 @@ mod tests {
         ) -> Response<Body> {
             let query = params.get("query").cloned().unwrap_or_default();
             state.requests.lock().unwrap().push(params);
-            if query.starts_with("KILL QUERY") || query.contains("system.processes") {
+            if query.starts_with("KILL QUERY") {
                 return Response::new(Body::from(""));
+            }
+            if query.contains("system.processes") {
+                let poll = state
+                    .process_polls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let id = query
+                    .split("IN ('")
+                    .nth(1)
+                    .and_then(|tail| tail.split("')").next())
+                    .unwrap();
+                return Response::new(Body::from(if poll == 0 {
+                    format!(r#"{{"query_id":"{id}"}}"#)
+                } else {
+                    String::new()
+                }));
             }
             state.started.notify_one();
             let body =
@@ -3576,6 +3592,7 @@ mod tests {
         let state = StateData {
             started: Arc::new(tokio::sync::Notify::new()),
             requests: Arc::new(Mutex::new(Vec::new())),
+            process_polls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -3641,6 +3658,7 @@ mod tests {
             QueryWorkload::Export,
             QueryWorkload::Migration,
             QueryWorkload::Background,
+            QueryWorkload::Administrative,
         ] {
             let owner = QueryOwner::new(&runtime, workload).unwrap();
             let id = owner.logical_id();
@@ -3650,6 +3668,179 @@ mod tests {
             assert!(uuid.bytes().all(|byte| byte.is_ascii_hexdigit()));
             owner.scope(async {}).await;
         }
-        assert!(QueryOwner::new(&runtime, QueryWorkload::Administrative).is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn administrative_owner_cancels_through_non_recursive_internal_admin_path() {
+        #[derive(Clone)]
+        struct LateVisibilityState {
+            requests: Arc<Mutex<Vec<CapturedRequest>>>,
+            polls: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        async fn handler(
+            State(state): State<LateVisibilityState>,
+            Query(params): Query<HashMap<String, String>>,
+            headers: HeaderMap,
+            body: Bytes,
+        ) -> (StatusCode, String) {
+            let query = params.get("query").cloned().unwrap_or_default();
+            state.requests.lock().unwrap().push(CapturedRequest {
+                params,
+                headers,
+                body: body.to_vec(),
+            });
+            if query.contains("system.processes") {
+                let poll = state
+                    .polls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // First absent poll races visibility despite response headers;
+                // then the child appears, and finally disappears after KILL.
+                let id = query
+                    .split("IN ('")
+                    .nth(1)
+                    .and_then(|tail| tail.split("')").next())
+                    .unwrap();
+                return (
+                    StatusCode::OK,
+                    if poll == 1 {
+                        format!(r#"{{"query_id":"{id}"}}"#)
+                    } else {
+                        String::new()
+                    },
+                );
+            }
+            (StatusCode::OK, "ok".to_string())
+        }
+
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let state = LateVisibilityState {
+            requests: requests.clone(),
+            polls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+        let app = Router::new()
+            .route("/", post(handler))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let runtime = QueryRuntime::new();
+        let client =
+            ClickHouseClient::new_with_runtime(test_clickhouse_config(base_url), runtime.clone())
+                .unwrap();
+        let owner = QueryOwner::new(&runtime, QueryWorkload::Administrative).unwrap();
+        let mut stream = owner
+            .scope(client.request_stream_with_params(
+                "SELECT version()",
+                Some("system"),
+                None,
+                &[],
+                None,
+            ))
+            .await
+            .unwrap();
+        let child_id = requests.lock().unwrap()[0].params["query_id"].clone();
+        assert!(child_id.starts_with("moraine-administrative-"));
+
+        // Read one chunk but abandon before EOF so the normal Administrative
+        // statement remains armed and exercises cleanup after headers.
+        assert!(stream.next_chunk().await.unwrap().is_some());
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if runtime.active_owner_count() == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("late-visible administrative owner cleanup should terminate");
+
+        let captured = requests.lock().unwrap();
+        let kills = captured
+            .iter()
+            .filter(|request| request.params["query"].starts_with("KILL QUERY"))
+            .collect::<Vec<_>>();
+        let polls = captured
+            .iter()
+            .filter(|request| request.params["query"].contains("system.processes"))
+            .count();
+        assert_eq!(
+            polls, 3,
+            "absent, late-visible, then absent must all be observed"
+        );
+        assert_eq!(kills.len(), polls);
+        assert!(
+            kills.iter().all(|kill| {
+                kill.params["query"].contains(&format!("query_id IN ('{child_id}')"))
+                    && kill.params["query_id"].starts_with("moraine-administrative-")
+                    && kill.params["query_id"] != child_id
+            }),
+            "internal KILL must not recursively own or target itself"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn still_visible_cleanup_is_bounded_even_when_admin_requests_succeed() {
+        #[derive(Clone)]
+        struct VisibleState {
+            kills: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        async fn handler(
+            State(state): State<VisibleState>,
+            Query(params): Query<HashMap<String, String>>,
+        ) -> (StatusCode, String) {
+            let query = params.get("query").cloned().unwrap_or_default();
+            if query.starts_with("KILL QUERY") {
+                state
+                    .kills
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return (StatusCode::OK, String::new());
+            }
+            if query.contains("system.processes") {
+                let id = query
+                    .split("IN ('")
+                    .nth(1)
+                    .and_then(|tail| tail.split("')").next())
+                    .unwrap();
+                return (StatusCode::OK, format!(r#"{{"query_id":"{id}"}}"#));
+            }
+            (StatusCode::OK, "ok".to_string())
+        }
+
+        let state = VisibleState {
+            kills: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+        let app = Router::new()
+            .route("/", post(handler))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let runtime = QueryRuntime::new();
+        let client =
+            ClickHouseClient::new_with_runtime(test_clickhouse_config(base_url), runtime.clone())
+                .unwrap();
+        let owner = QueryOwner::new(&runtime, QueryWorkload::Administrative).unwrap();
+        let mut stream = owner
+            .scope(client.request_stream_with_params("SELECT 1", None, None, &[], None))
+            .await
+            .unwrap();
+        assert!(stream.next_chunk().await.unwrap().is_some());
+        let started = tokio::time::Instant::now();
+        drop(stream);
+        while runtime.active_owner_count() != 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let elapsed = tokio::time::Instant::now() - started;
+        assert!(elapsed >= QUERY_CLEANUP_GRACE);
+        assert!(elapsed <= QUERY_CLEANUP_GRACE + Duration::from_millis(20));
+        assert!(state.kills.load(std::sync::atomic::Ordering::SeqCst) > 1);
     }
 }
