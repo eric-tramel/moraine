@@ -99,9 +99,16 @@ Completion metadata is one JSON object written to stderr:
 {"schema_version":"moraine.analytics.export_metadata.v1","data_schema_version":"moraine.analytics.events.v1","export_kind":"events","backend":"default","query_id":"...","columns":["session_id","event_uid"],"filters":{"harness":["codex"]},"limit":1000,"row_count":1000,"truncated":true,"elapsed_ms":1234,"sensitive_columns_requested":[]}
 ```
 
+`query_id` is the logical export owner ID, with the form
+`moraine-export-<uuid>`. ClickHouse statements for the preflight and stream use
+unique child IDs derived from that value; the field is not a server child query
+ID and does not contain filter or query text.
+
 Stream, preflight, and query failures exit nonzero and do not emit completion
-metadata. If stdout is closed by a downstream consumer, such as `head`, Moraine
-stops streaming, suppresses completion metadata, and exits successfully.
+metadata. Exports have no Moraine-supplied elapsed execution deadline. If stdout
+is closed by a downstream consumer, such as `head`, Moraine cancels every active
+export child, suppresses completion metadata, and exits successfully after
+bounded best-effort cleanup.
 
 ## Limits And Schema Checks
 

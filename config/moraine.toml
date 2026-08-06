@@ -3,6 +3,8 @@ url = "http://127.0.0.1:8123"
 database = "moraine"
 username = "default"
 password = ""
+# Connection-establishment timeout only. Admitted queries have no Moraine
+# execution deadline unless an internal caller supplies an absolute deadline.
 timeout_seconds = 30.0
 request_compression = "none"
 async_insert = true

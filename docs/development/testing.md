@@ -139,14 +139,16 @@ coverage for the standalone binding or legacy trees.
 
 ## Live ClickHouse suites
 
-Only these three ignored tests are supported. Never use a blanket `--ignored` command.
+Only these five ignored tests are supported. Never use a blanket `--ignored` command.
 The wrapper is the contributor entry point where listed; the raw commands document exact routing
 and intentionally fail unless `MORAINE_ALLOW_DESTRUCTIVE_TESTS=1` and the endpoint is
 the wrapper-owned sandbox.
 
 | Owner / full function | Exact wrapper and raw Cargo command | Prerequisites, timeout, resources, cleanup | Tier and semantics |
 | --- | --- | --- | --- |
-| `moraine-conversations/live_clickhouse::live_schema_semantics_and_teardown` | `scripts/dev/sandbox/run-live-test analytics-schema`; raw: `cargo test -p moraine-conversations --test live_clickhouse --locked live_schema_semantics_and_teardown -- --exact --ignored --nocapture` | Bash, Docker/Compose, sandbox toolchain. Default wrapper timeout 1,800s (`MORAINE_LIVE_TEST_TIMEOUT_SECONDS` accepts a positive integer). Wrapper owns a fresh `sb-xxxxxx` sandbox and Rust generates an uncaller-controlled `moraine_test_<uuid>` database. Empty, `moraine`, or non-prefix names are refused before SQL. | T3 manual/scheduled. Direct missing/unsafe prerequisites fail. Success and every catchable failure with successful cleanup leave no owned sandbox/database. |
+| `moraine-conversations/live_clickhouse::live_query_ownership_and_cancellation` | `scripts/dev/sandbox/run-live-test query-ownership`; raw: `cargo test -p moraine-conversations --test live_clickhouse --locked live_query_ownership_and_cancellation -- --exact --ignored --nocapture` | Bash, Docker/Compose, sandbox toolchain. Default wrapper timeout 1,800s (`MORAINE_LIVE_TEST_TIMEOUT_SECONDS` accepts a positive integer). Wrapper owns a fresh `sb-xxxxxx` sandbox and Rust generates an uncaller-controlled `moraine_test_<uuid>` database. The ~40s test includes a connected low-resource query lasting more than 30s, exact-ID cancellation, query-log settings, isolation, and absolute-deadline assertions. | T3 manual/scheduled acceptance gate. Direct missing/unsafe prerequisites fail. Success and every catchable failure with successful cleanup leave no owned sandbox/database. |
+| `moraine-conversations/live_clickhouse::live_schema_semantics_and_teardown` | `scripts/dev/sandbox/run-live-test analytics-schema`; raw: `cargo test -p moraine-conversations --test live_clickhouse --locked live_schema_semantics_and_teardown -- --exact --ignored --nocapture` | Same wrapper-owned sandbox/database safety contract. Empty, `moraine`, or non-prefix names are refused before SQL. | T3 manual/scheduled. Direct missing/unsafe prerequisites fail. Success and every catchable failure with successful cleanup leave no owned sandbox/database. |
+| `moraine-conversations/live_clickhouse::live_schema_032_replay_stable_upgrade_stays_within_memory_budget` | Raw: `cargo test -p moraine-conversations --test live_clickhouse --locked live_schema_032_replay_stable_upgrade_stays_within_memory_budget -- --exact --ignored --nocapture` inside a caller-owned sandbox | Same owned database guard and cleanup; requires about 2 GB free for the replay/memory fixture. | T3 manual migration regression gate. |
 | `moraine-conversations/live_clickhouse::live_monitor_repository_semantic_parity` | `scripts/dev/sandbox/run-live-test analytics-parity`; raw: `cargo test -p moraine-conversations --test live_clickhouse --locked live_monitor_repository_semantic_parity -- --exact --ignored --nocapture` | Same owned sandbox; both arms use the same generated database/dataset. Cardinality, digest, or oracle mismatch fails independently of timing. | T3 unless the same semantics are already proven in T1. Timing is not the pass condition. |
 | `moraine-conversations/live_clickhouse::live_mcp_open_boundedness_benchmark` | Raw: `cargo test -p moraine-conversations --test live_clickhouse --locked live_mcp_open_boundedness_benchmark -- --exact --ignored --nocapture` inside a caller-owned sandbox | Same owned database guard and cleanup. Opens separate realistic targets spanning 100 turns, 500 full-payload events, and a 1,000-event compact turn; then seeds 100,000 unrelated sessions and 1,000,000 substantial unrelated events into both canonical `events` and the bounded MCP read model. Compares exact session/turn/event semantics before and after growth, exercises sequential/concurrent/recovery opens, and records labeled `system.query_log` latency, throughput, errors, rows, bytes, and memory. Fails on SLA misses, errors, semantic drift, or corpus-linear row/byte/memory growth. Requires about 2 GB free. | T3 manual regression benchmark. Timing and bounded-cost assertions are pass conditions. |
 
@@ -167,8 +169,8 @@ Before/after resource census for isolation changes records sandbox/container/vol
 listener, and `moraine_test_` database ownership; the wrapper's diagnostic log is the
 retained failure artifact.
 
-Isolation validation for the final implementation ran the 21-case wrapper unittest
-suite once; its concurrency case launched exactly two wrapper processes simultaneously
+The focused wrapper unittest suite contains 23 cases; its concurrency case launches
+exactly two wrapper processes simultaneously
 and verified two sandbox/token/database identities. Each raw Cargo route selects one
 exact ignored function (one selected libtest case; no global thread-count override).
 One final real `analytics-schema` invocation and one final real `analytics-parity`

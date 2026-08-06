@@ -126,11 +126,23 @@ projects to additional servers, see
 | `database` | `moraine` | Database containing Moraine tables. |
 | `username` | `default` | ClickHouse user for ingest, monitor, MCP, and migrations. |
 | `password` | empty | ClickHouse password. |
-| `timeout_seconds` | `30.0` | Per-request ClickHouse HTTP timeout. |
+| `timeout_seconds` | `30.0` | Finite, positive ClickHouse connection-establishment timeout. It does not limit admitted query execution. |
 | `request_compression` | `none` | Compression for non-empty HTTP request bodies. Supported values are `none` and `gzip`. |
 | `async_insert` | `true` | Enables ClickHouse async insert mode on writes. |
 | `wait_for_async_insert` | `true` | Waits for async insert completion before advancing checkpoints, so write failures are visible. Named mirror ingestion always enforces this setting even if configured as `false`; other clients retain the configured value. |
 | `allow_newer_server` | `false` | Allows a non-default backend whose migration ledger is ahead of this Moraine build. The default backend is migrated by Moraine itself, so this is only useful on `[backends.<name>]`. |
+
+Moraine does not impose a default elapsed execution deadline after a query is
+admitted. Work continues until it completes, its caller cancels or disconnects,
+the owning service shuts down, or an internal caller supplies an absolute
+deadline. Every statement is tagged with a collision-safe
+`moraine-<workload>-<uuid>-<child>` query ID. Abandoned logical work cancels all
+of its active child statements through a separate administrative path; cleanup
+is best effort and bounded to five seconds. The `url` query string and
+per-request parameters may not override Moraine's reserved ownership/deadline
+settings (`query_id`, `replace_running_query`, `max_execution_time`,
+`max_execution_time_leaf`, `timeout_overflow_mode`, or
+`timeout_before_checking_execution_speed`).
 
 ### Environment-backed ClickHouse values
 
@@ -333,6 +345,12 @@ startup in exactly one project, check that project's route and the team
 backend's health/schema first. As with ingest routes, a repo `.moraine.toml`
 naming an unconfigured backend logs a warning and keeps the default
 behavior.
+
+The Unix socket connection attempt remains bounded by
+`central_connect_timeout_ms`. After a socket connects, private-route
+negotiation has no elapsed ACK deadline because the server may need to complete
+an owned backend schema handshake before replying. It continues while the
+caller remains connected; a full disconnect abandons and cancels that work.
 
 ## Secret Redaction
 
@@ -810,11 +828,12 @@ first-search latency.
 The shared central server applies one parallel-request budget across every MCP
 socket connection and queues at most 16 valid retrievals in FIFO order when that
 budget is busy. Queued and running retrievals have no fixed admission deadline;
-they continue until completion, client cancellation, disconnect, or service
-shutdown. A full queue is rejected immediately with a structured retryable tool
-error. An embedded fallback is a separate process, so its default or configured
-execution budget is process-local. Validation and control requests continue to
-run while retrievals wait.
+they continue until completion, client cancellation, full disconnect, or service
+shutdown. A clean request-side EOF is only a half-close: already admitted work
+finishes and its response is still written. A full queue is rejected immediately
+with a structured `resource_exhausted` tool error. An embedded fallback is a
+separate process, so its execution budget is process-local. Validation and
+control requests continue to run while retrievals wait.
 
 ### Shared central MCP server
 
