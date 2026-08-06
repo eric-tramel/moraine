@@ -107,13 +107,29 @@ impl ClickHouseConversationRepository {
   toUInt64(s.tool_results) AS tool_results,
   ifNull(m.mode, 'chat') AS mode,
   ifNull(meta.session_slug, '') AS session_slug,
-  ifNull(meta.session_summary, '') AS session_summary
+  ifNull(meta.session_summary, '') AS session_summary,
+  ifNull(meta.explicit_title, '') AS explicit_title
 FROM {session_summary} AS s
 LEFT JOIN ({mode_subquery}) AS m ON m.session_id = s.session_id
 LEFT JOIN (
   SELECT
     session_id,
     ifNull(argMax(nullIf(JSONExtractString(payload_json, 'slug'), ''), tuple(event_ts, event_uid)), '') AS session_slug,
+    ifNull(
+      argMaxIf(
+        coalesce(
+          nullIf(trimBoth(JSONExtractString(payload_json, 'title')), ''),
+          nullIf(trimBoth(JSONExtractString(payload_json, 'name')), '')
+        ),
+        tuple(event_ts, event_uid),
+        event_kind = 'session_meta'
+          AND (
+            notEmpty(trimBoth(JSONExtractString(payload_json, 'title')))
+            OR notEmpty(trimBoth(JSONExtractString(payload_json, 'name')))
+          )
+      ),
+      ''
+    ) AS explicit_title,
     ifNull(
       argMax(
         coalesce(
@@ -197,7 +213,13 @@ FORMAT JSONEachRow"
   ifNull(e.source_name, '') AS source_name,
   ifNull(e.trace_id, '') AS trace_id
 FROM {trace} AS t
-LEFT JOIN {canonical_events} AS e ON e.event_uid = t.event_uid
+LEFT JOIN {canonical_events} AS e
+  ON e.session_id = t.session_id
+  AND e.source_file = t.source_file
+  AND e.source_generation = t.source_generation
+  AND e.source_offset = t.source_offset
+  AND e.source_line_no = t.source_line_no
+  AND e.event_uid = t.event_uid
 WHERE t.session_id IN {session_ids_sql}
 ORDER BY t.session_id ASC, t.event_order ASC
 FORMAT JSONEachRow"
@@ -485,12 +507,7 @@ fn assemble_sessions(
             let harness = first_nonempty(&events, |event| &event.harness);
             let source_name = first_nonempty(&events, |event| &event.source_name);
             let trace_id = first_nonempty(&events, |event| &event.trace_id);
-            let first_user_text = events
-                .iter()
-                .find(|event| event.event_class == "message" && event.actor_role == "user")
-                .map(preferred_event_text)
-                .map(|text| truncate_chars(&text, 400))
-                .unwrap_or_default();
+            let first_user_text = first_display_user_text(&events, &harness);
             let mut models = events
                 .iter()
                 .filter_map(|event| normalized_session_model(&event.model))
@@ -515,6 +532,19 @@ fn assemble_sessions(
                 })
                 .collect();
 
+            let display_label = crate::session_label::build_session_display_label(
+                crate::session_label::SessionDisplayLabelInput {
+                    explicit_title: non_blank(&row.explicit_title),
+                    user_message_preview: non_blank(&first_user_text),
+                    wire_title: None,
+                    summary: non_blank(&row.session_summary),
+                    slug: non_blank(&row.session_slug),
+                    harness: non_blank(&harness),
+                    mode: row.mode.as_str(),
+                    updated_at: &row.last_event_time,
+                    total_turns: row.total_turns,
+                },
+            );
             SessionAnalytics {
                 summary: ClickHouseConversationRepository::map_conversation_row(row),
                 harness,
@@ -522,10 +552,43 @@ fn assemble_sessions(
                 models,
                 trace_id,
                 first_user_text,
+                display_label,
                 turns,
             }
         })
         .collect()
+}
+
+fn first_display_user_text(events: &[SessionAnalyticsEventRow], harness: &str) -> String {
+    events
+        .iter()
+        .find(|event| {
+            if harness == "codex" {
+                crate::session_label::is_genuine_codex_user_message(
+                    &event.harness,
+                    &event.actor_role,
+                    &event.event_class,
+                    &event.payload_type,
+                )
+            } else {
+                event.harness == harness
+                    && event.event_class == "message"
+                    && event.actor_role == "user"
+            }
+        })
+        .map(|event| {
+            if harness == "codex" {
+                event.text_preview.trim().to_string()
+            } else {
+                preferred_event_text(event)
+            }
+        })
+        .map(|text| truncate_chars(&text, 400))
+        .unwrap_or_default()
+}
+
+fn non_blank(value: &str) -> Option<&str> {
+    (!value.trim().is_empty()).then_some(value)
 }
 
 fn assemble_turn(row: TurnSummaryRow, mut events: Vec<SessionAnalyticsEventRow>) -> SessionTurn {
@@ -762,6 +825,61 @@ mod tests {
             tool_results: 1,
             reasoning_items: 0,
         }
+    }
+
+    #[test]
+    fn codex_title_prompt_uses_typed_user_message_not_injected_user_role() {
+        let mut injected = event(1, "message", "");
+        injected.actor_role = "user".to_string();
+        injected.payload_type = "message".to_string();
+        injected.harness = "codex".to_string();
+        injected.text_content = "<recommended_plugins>injected</recommended_plugins>".to_string();
+
+        let mut genuine = event(2, "event_msg", "");
+        genuine.actor_role = "user".to_string();
+        genuine.payload_type = "user_message".to_string();
+        genuine.harness = "codex".to_string();
+        genuine.text_preview = "Resolve issue #617".to_string();
+        genuine.text_content = "different full text".to_string();
+
+        assert_eq!(
+            first_display_user_text(&[injected, genuine], "codex"),
+            "Resolve issue #617"
+        );
+    }
+
+    #[test]
+    fn codex_title_prompt_rejects_matching_shape_from_other_harness() {
+        let mut other = event(1, "event_msg", "");
+        other.actor_role = "user".to_string();
+        other.payload_type = "user_message".to_string();
+        other.harness = "prime-agent".to_string();
+        other.text_preview = "Wrong harness request".to_string();
+
+        let mut genuine = event(2, "event_msg", "");
+        genuine.actor_role = "user".to_string();
+        genuine.payload_type = "user_message".to_string();
+        genuine.harness = "codex".to_string();
+        genuine.text_preview = "Genuine Codex request".to_string();
+
+        assert_eq!(
+            first_display_user_text(&[other, genuine], "codex"),
+            "Genuine Codex request"
+        );
+    }
+
+    #[test]
+    fn non_codex_title_prompt_preserves_first_user_message_behavior() {
+        let mut first = event(1, "message", "");
+        first.actor_role = "user".to_string();
+        first.payload_type = "text".to_string();
+        first.harness = "claude-code".to_string();
+        first.text_content = "Claude request".to_string();
+
+        assert_eq!(
+            first_display_user_text(&[first], "claude-code"),
+            "Claude request"
+        );
     }
 
     #[test]

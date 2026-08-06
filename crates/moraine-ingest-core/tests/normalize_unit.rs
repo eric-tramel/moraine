@@ -56,6 +56,65 @@ fn codex_tool_call_normalization() {
 }
 
 #[test]
+fn codex_injected_user_role_message_is_distinct_from_genuine_user_event() {
+    let injected = json!({
+        "timestamp": "2026-02-15T03:50:42.000Z",
+        "type": "response_item",
+        "payload": {
+            "type": "message",
+            "role": "user",
+            "content": [{
+                "type": "input_text",
+                "text": "<recommended_plugins>ignore this for titles</recommended_plugins>"
+            }]
+        }
+    });
+    let genuine = json!({
+        "timestamp": "2026-02-15T03:50:43.000Z",
+        "type": "event_msg",
+        "payload": {
+            "type": "user_message",
+            "message": "Resolve issue #617"
+        }
+    });
+    let normalize = |record: &Value, line_no| {
+        normalize_record(
+            record,
+            "codex",
+            "codex",
+            "/tmp/session.jsonl",
+            1,
+            1,
+            line_no,
+            128,
+            "",
+            "",
+            "",
+        )
+        .expect("Codex message should normalize")
+        .event_rows
+        .into_iter()
+        .next()
+        .expect("one canonical event")
+    };
+
+    let injected = normalize(&injected, 1);
+    assert_eq!(injected["actor_kind"], json!("user"));
+    assert_eq!(injected["event_kind"], json!("message"));
+    assert_eq!(injected["payload_type"], json!("message"));
+    assert!(injected["text_content"]
+        .as_str()
+        .expect("injected text")
+        .contains("recommended_plugins"));
+
+    let genuine = normalize(&genuine, 2);
+    assert_eq!(genuine["actor_kind"], json!("user"));
+    assert_eq!(genuine["event_kind"], json!("event_msg"));
+    assert_eq!(genuine["payload_type"], json!("user_message"));
+    assert_eq!(genuine["text_content"], json!("Resolve issue #617"));
+}
+
+#[test]
 fn codex_turn_context_promotes_model_and_turn_id() {
     let record = json!({
         "timestamp": "2026-02-15T03:50:42.191Z",

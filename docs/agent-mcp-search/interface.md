@@ -233,10 +233,12 @@ Output data includes compact session records:
 }
 ```
 
-`list_sessions` intentionally does not return transcript text. Open a listed
-session if you need to inspect its turns. For untitled sessions,
-`display_label` falls back to already exposed metadata such as harness, mode,
-update time, and turn count.
+`list_sessions` intentionally does not return raw transcript text, event snippets,
+or payloads. Open a listed session if you need to inspect its turns. The bounded
+`display_label` prefers an explicit title/name, then the first genuine Codex
+`event_msg/user_message` preview (trimmed first line, at most 120 Unicode scalar
+values plus an ellipsis), followed by existing title/summary/slug metadata and a
+privacy-safe harness/mode/time/turn-count descriptor.
 
 ## `file_attention`
 

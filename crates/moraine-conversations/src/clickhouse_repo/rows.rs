@@ -18,6 +18,8 @@ pub(super) struct ConversationSummaryRow {
     pub(super) session_slug: String,
     #[serde(default)]
     pub(super) session_summary: String,
+    #[serde(default)]
+    pub(super) explicit_title: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -63,6 +65,10 @@ pub(super) struct McpSessionListRow {
     pub(super) session_slug: String,
     #[serde(default)]
     pub(super) session_summary: String,
+    #[serde(default)]
+    pub(super) explicit_title: String,
+    #[serde(default)]
+    pub(super) codex_user_message_preview: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -422,6 +428,25 @@ impl ClickHouseConversationRepository {
     }
 
     pub(super) fn map_mcp_session_list_row(row: McpSessionListRow) -> McpSessionListItem {
+        let mode = Self::parse_mode(&row.mode);
+        let title = non_empty_string(row.title);
+        let source = non_empty_string(row.source);
+        let harness = non_empty_string(row.harness);
+        let session_slug = non_empty_string(row.session_slug);
+        let session_summary = non_empty_string(row.session_summary);
+        let display_label = crate::session_label::build_session_display_label(
+            crate::session_label::SessionDisplayLabelInput {
+                explicit_title: non_empty_string(row.explicit_title).as_deref(),
+                user_message_preview: non_empty_string(row.codex_user_message_preview).as_deref(),
+                wire_title: title.as_deref(),
+                summary: session_summary.as_deref(),
+                slug: session_slug.as_deref(),
+                harness: harness.as_deref(),
+                mode: mode.as_str(),
+                updated_at: &row.last_event_time,
+                total_turns: row.total_turns,
+            },
+        );
         McpSessionListItem {
             session_id: row.session_id,
             first_event_time: row.first_event_time,
@@ -430,13 +455,14 @@ impl ClickHouseConversationRepository {
             last_event_unix_ms: row.last_event_unix_ms,
             total_turns: row.total_turns,
             total_events: row.total_events,
-            mode: Self::parse_mode(&row.mode),
+            mode,
             completed: row.completed != 0,
-            title: non_empty_string(row.title),
-            source: non_empty_string(row.source),
-            harness: non_empty_string(row.harness),
-            session_slug: non_empty_string(row.session_slug),
-            session_summary: non_empty_string(row.session_summary),
+            title,
+            source,
+            harness,
+            session_slug,
+            session_summary,
+            display_label,
         }
     }
 

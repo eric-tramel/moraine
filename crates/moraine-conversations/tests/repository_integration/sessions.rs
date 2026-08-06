@@ -189,6 +189,7 @@ async fn list_mcp_sessions_uses_overlap_filter_and_cursor_pagination() {
     assert_eq!(first.items.len(), 2);
     assert_eq!(first.items[0].session_id, "sess_c");
     assert_eq!(first.items[0].title.as_deref(), Some("Session C title"));
+    assert_eq!(first.items[0].display_label, "Session C title");
     assert_eq!(first.items[0].source.as_deref(), Some("codex"));
     assert_eq!(first.items[0].harness.as_deref(), Some("codex"));
     let public_items = serde_json::to_string(&first.items).expect("serialize public list items");
@@ -197,6 +198,7 @@ async fn list_mcp_sessions_uses_overlap_filter_and_cursor_pagination() {
     assert!(!public_items.contains("acme-secret-merger"));
     assert!(first.items[0].completed);
     assert_eq!(first.items[1].session_id, "sess_b");
+    assert_eq!(first.items[1].display_label, "Genuine B request");
     assert!(first.next_cursor.is_some());
 
     let second = repo
@@ -239,6 +241,17 @@ async fn list_mcp_sessions_uses_overlap_filter_and_cursor_pagination() {
     assert!(list_query.contains("nullIf(r.omp_dispatch_title, '')"));
     assert!(list_query.contains("ifNull(r.latest_session_meta_title, '')"));
     assert!(list_query.contains("ifNull(r.latest_session_meta_summary, '')"));
+    assert!(list_query.contains("substringUTF8(e.text_preview, 1, 320)"));
+    assert!(list_query.contains("nullIf(trimBoth(JSONExtractString(payload_json, 'title')), '')"));
+    assert!(list_query.contains("nullIf(trimBoth(JSONExtractString(payload_json, 'name')), '')"));
+    assert!(list_query.contains("e.harness = 'codex'"));
+    assert!(list_query.contains("e.actor_kind = 'user'"));
+    assert!(list_query.contains("e.event_kind = 'event_msg'"));
+    assert!(list_query.contains("e.payload_type = 'user_message'"));
+    assert!(list_query.contains("source_generation"));
+    assert!(list_query.contains("source_offset"));
+    assert!(list_query.contains("source_line_no"));
+    assert!(!list_query.contains("text_content"));
     assert!(list_query.contains("ORDER BY w.last_event_unix_ms DESC, w.session_id DESC"));
     assert!(list_query.contains("payload_type IN ('task_complete', 'turn_aborted')"));
     // Blank session_id rows are filtered at the source so they never consume a

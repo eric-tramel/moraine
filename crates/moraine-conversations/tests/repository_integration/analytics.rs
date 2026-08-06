@@ -8,6 +8,8 @@ async fn session_analytics_assembles_canonical_views_and_public_steps() {
                 "FROM `moraine`.`v_session_summary` AS s",
                 "FROM (SELECT * FROM `moraine`.`events` FINAL) AS meta_events",
                 "WHERE meta_events.event_kind = 'session_meta'",
+                "nullIf(trimBoth(JSONExtractString(payload_json, 'title')), '')",
+                "nullIf(trimBoth(JSONExtractString(payload_json, 'name')), '')",
                 "WHERE notEmpty(trimBoth(s.session_id))",
                 "ORDER BY s.last_event_time DESC, s.session_id DESC",
                 "LIMIT 1",
@@ -36,7 +38,13 @@ async fn session_analytics_assembles_canonical_views_and_public_steps() {
             &[
                 "FROM `moraine`.`v_conversation_trace` AS t",
                 "toInt64(toUnixTimestamp64Milli(t.event_time)) AS event_unix_ms",
-                "LEFT JOIN (SELECT * FROM `moraine`.`events` FINAL) AS e ON e.event_uid = t.event_uid",
+                "LEFT JOIN (SELECT * FROM `moraine`.`events` FINAL) AS e",
+                "ON e.session_id = t.session_id",
+                "AND e.source_file = t.source_file",
+                "AND e.source_generation = t.source_generation",
+                "AND e.source_offset = t.source_offset",
+                "AND e.source_line_no = t.source_line_no",
+                "AND e.event_uid = t.event_uid",
                 "WHERE t.session_id IN ['analytics-session']",
                 "ORDER BY t.session_id ASC, t.event_order ASC",
                 "FORMAT JSONEachRow",
@@ -72,6 +80,7 @@ async fn session_analytics_assembles_canonical_views_and_public_steps() {
     assert_eq!(session.source_name, "codex-jsonl");
     assert_eq!(session.trace_id, "trace-454");
     assert_eq!(session.first_user_text, "first user fallback");
+    assert_eq!(session.display_label, "first user fallback");
     assert_eq!(session.models, vec!["gpt-x", "other"]);
     assert_eq!(
         session
@@ -91,7 +100,7 @@ async fn session_analytics_assembles_canonical_views_and_public_steps() {
     assert_eq!(first_turn.steps.len(), 4);
     assert!(matches!(
         &first_turn.steps[0],
-        SessionStep::User { text, .. } if text == "first user fallback"
+        SessionStep::User { text, .. } if text.contains("recommended_plugins")
     ));
     match &first_turn.steps[1] {
         SessionStep::Assistant {
