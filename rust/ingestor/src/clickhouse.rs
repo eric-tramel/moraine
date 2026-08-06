@@ -1,7 +1,9 @@
 use crate::config::ClickHouseConfig;
 use crate::model::Checkpoint;
 use anyhow::Result;
-use moraine_clickhouse::ClickHouseClient as SharedClickHouseClient;
+use moraine_clickhouse::{
+    ClickHouseClient as SharedClickHouseClient, QueryOwner, QueryWorkload,
+};
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -18,11 +20,13 @@ impl ClickHouseClient {
     }
 
     pub async fn ping(&self) -> Result<()> {
-        self.inner.ping().await
+        let owner = QueryOwner::new(&self.inner.runtime(), QueryWorkload::Internal)?;
+        owner.scope(self.inner.ping()).await
     }
 
     pub async fn insert_json_rows(&self, table: &str, rows: &[Value]) -> Result<()> {
-        self.inner.insert_json_rows(table, rows).await
+        let owner = QueryOwner::new(&self.inner.runtime(), QueryWorkload::Background)?;
+        owner.scope(self.inner.insert_json_rows(table, rows)).await
     }
 
     pub async fn load_checkpoints(&self) -> Result<HashMap<String, Checkpoint>> {
@@ -31,9 +35,9 @@ impl ClickHouseClient {
             self.inner.config().database
         );
 
-        let raw = self
-            .inner
-            .request_text(&query, None, None, false, None)
+        let owner = QueryOwner::new(&self.inner.runtime(), QueryWorkload::Background)?;
+        let raw = owner
+            .scope(self.inner.request_text(&query, None, None, false, None))
             .await?;
 
         let mut map = HashMap::<String, Checkpoint>::new();

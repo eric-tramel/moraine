@@ -11,7 +11,7 @@ crate-type = ["cdylib"]
 [dependencies]
 pyo3 = { version = "0.22", features = ["abi3-py39"] }
 serde_json = "1.0"
-tokio = { version = "1.40", features = ["rt-multi-thread"] }
+tokio = { version = "1.40", features = ["rt-multi-thread", "time"] }
 moraine-config = { path = "../../../crates/moraine-config" }
 moraine-clickhouse = { path = "../../../crates/moraine-clickhouse" }
 moraine-conversations = { path = "../../../crates/moraine-conversations" }

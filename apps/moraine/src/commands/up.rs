@@ -1,6 +1,8 @@
 use anyhow::Result;
 use dialoguer::console::Style;
-use moraine_clickhouse::{ClickHouseClient, MigrationProgress};
+use moraine_clickhouse::{
+    ClickHouseClient, MigrationProgress, QueryOwner, QueryRuntime, QueryWorkload,
+};
 use moraine_config::{AppConfig, LoadedConfigPath};
 use std::future::Future;
 use std::io::Write;
@@ -398,13 +400,22 @@ pub(super) async fn handle_args(
     config_path: &LoadedConfigPath,
     cfg: &AppConfig,
     args: &UpArgs,
+    query_runtime: &QueryRuntime,
 ) -> Result<ExitCode> {
     let paths = runtime_paths(cfg);
     let services_to_start = selected_up_services(args);
     let mut progress = StartupProgress::from_output(output);
     progress.startup_plan(&services_to_start);
 
-    match start_selected_services(config_path, cfg, &paths, services_to_start, &mut progress).await
+    match start_selected_services(
+        config_path,
+        cfg,
+        &paths,
+        services_to_start,
+        &mut progress,
+        query_runtime,
+    )
+    .await
     {
         Ok(snapshot) => {
             progress.finish_success();
@@ -424,6 +435,7 @@ async fn start_selected_services<W: Write>(
     paths: &RuntimePaths,
     services_to_start: Vec<Service>,
     progress: &mut StartupProgress<W>,
+    query_runtime: &QueryRuntime,
 ) -> Result<UpSnapshot> {
     progress.phase(
         "Preflight",
@@ -434,14 +446,18 @@ async fn start_selected_services<W: Write>(
     progress.success_step("Preflight complete", None);
 
     progress.phase("ClickHouse", "inspecting endpoint and managed runtime");
-    let clickhouse = start_clickhouse_with_progress(config_path, cfg, paths, |event| {
-        progress.clickhouse_wait(event);
-    })
-    .await?;
+    let clickhouse =
+        start_clickhouse_with_progress(config_path, cfg, paths, query_runtime, |event| {
+            progress.clickhouse_wait(event);
+        })
+        .await?;
     progress.clickhouse_outcome(&clickhouse);
 
-    let schema_skew = ClickHouseClient::new(cfg.clickhouse.clone())?
-        .schema_skew()
+    let migration_client =
+        ClickHouseClient::new_with_runtime(cfg.clickhouse.clone(), query_runtime.clone())?;
+    let migration_owner = QueryOwner::new(query_runtime, QueryWorkload::Migration)?;
+    let schema_skew = migration_owner
+        .scope(migration_client.schema_skew())
         .await?;
     let migration_gate = if writer_barrier_required(&schema_skew.missing_on_server) {
         let gate = lock_storage_migration(paths)?;
@@ -460,7 +476,7 @@ async fn start_selected_services<W: Write>(
     };
 
     progress.database_start();
-    let migrations = drive_database_progress(cfg, progress).await?;
+    let migrations = drive_database_progress(cfg, progress, query_runtime).await?;
     drop(migration_gate);
 
     progress.phase("Services", "starting selected Moraine processes");
@@ -475,10 +491,11 @@ async fn start_selected_services<W: Write>(
         "Verification",
         "collecting final runtime and database status",
     );
-    let repository = conversation_repository(cfg)?;
+    let repository = conversation_repository(cfg, query_runtime)?;
+    let status_owner = QueryOwner::new(query_runtime, QueryWorkload::Administrative)?;
     let status_started = Instant::now();
     let status = drive_status_progress(
-        cmd_status(paths, cfg, &repository),
+        status_owner.scope(cmd_status(paths, cfg, &repository)),
         status_started,
         progress,
     )
@@ -506,9 +523,10 @@ where
 async fn drive_database_progress<W: Write>(
     cfg: &AppConfig,
     progress: &mut StartupProgress<W>,
+    query_runtime: &QueryRuntime,
 ) -> Result<MigrationOutcome> {
     let (sender, receiver) = mpsc::channel();
-    let migration = migrate_database_for_up(cfg, move |event| {
+    let migration = migrate_database_for_up(cfg, query_runtime, move |event| {
         let _ = sender.send(event);
     });
     tokio::pin!(migration);

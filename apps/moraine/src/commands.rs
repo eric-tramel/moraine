@@ -7,7 +7,9 @@ mod status;
 mod up;
 
 use anyhow::{bail, Context, Result};
-use moraine_clickhouse::{ClickHouseClient, DoctorReport, MigrationProgress};
+use moraine_clickhouse::{
+    ClickHouseClient, DoctorReport, MigrationProgress, QueryOwner, QueryRuntime, QueryWorkload,
+};
 use moraine_config::AppConfig;
 use moraine_conversations::{ClickHouseConversationRepository, RepoConfig};
 use std::path::{Path, PathBuf};
@@ -37,11 +39,15 @@ pub(super) const WRITER_BARRIER_MIGRATIONS: [&str; 2] = ["031", "033"];
 pub(super) const WRITER_BARRIER_SERVICES: [Service; 3] =
     [Service::Backend, Service::Ingest, Service::Mcp];
 
-pub(crate) async fn dispatch(cli: Cli, output: CliOutput) -> Result<ExitCode> {
+pub(crate) async fn dispatch(
+    cli: Cli,
+    output: CliOutput,
+    query_runtime: &QueryRuntime,
+) -> Result<ExitCode> {
     match cli.command {
         CliCommand::Up(args) => {
             let (config_path, cfg) = load_cfg(cli.config.clone())?;
-            up::handle_args(&output, &config_path, &cfg, &args).await
+            up::handle_args(&output, &config_path, &cfg, &args, query_runtime).await
         }
         CliCommand::Down => {
             let (_, cfg) = load_cfg(cli.config.clone())?;
@@ -50,8 +56,11 @@ pub(crate) async fn dispatch(cli: Cli, output: CliOutput) -> Result<ExitCode> {
         CliCommand::Status => {
             let (_, cfg) = load_cfg(cli.config.clone())?;
             let paths = runtime_paths(&cfg);
-            let repository = conversation_repository(&cfg)?;
-            let snapshot = status::cmd_status(&paths, &cfg, &repository).await?;
+            let repository = conversation_repository(&cfg, query_runtime)?;
+            let owner = QueryOwner::new(query_runtime, QueryWorkload::Administrative)?;
+            let snapshot = owner
+                .scope(status::cmd_status(&paths, &cfg, &repository))
+                .await?;
             crate::render::render_status(&output, &snapshot)?;
             Ok(ExitCode::SUCCESS)
         }
@@ -70,7 +79,7 @@ pub(crate) async fn dispatch(cli: Cli, output: CliOutput) -> Result<ExitCode> {
             }
             let (_, cfg) = load_cfg(cli.config.clone())?;
             match args.command {
-                ExportCommand::Events(events) => export::events(&cfg, events).await,
+                ExportCommand::Events(events) => export::events(&cfg, events, query_runtime).await,
             }
         }
         CliCommand::Schema(args) => match args.command {
@@ -83,12 +92,12 @@ pub(crate) async fn dispatch(cli: Cli, output: CliOutput) -> Result<ExitCode> {
             let (_, cfg) = load_cfg(cli.config.clone())?;
             match args.command {
                 DbCommand::Migrate => {
-                    let outcome = cmd_db_migrate(&cfg, &runtime_paths(&cfg)).await?;
+                    let outcome = cmd_db_migrate(&cfg, &runtime_paths(&cfg), query_runtime).await?;
                     render_db_migrate(&output, &outcome)?;
                     Ok(ExitCode::SUCCESS)
                 }
                 DbCommand::Doctor => {
-                    let report = cmd_db_doctor(&cfg).await?;
+                    let report = cmd_db_doctor(&cfg, query_runtime).await?;
                     render_db_doctor(&output, &report)?;
                     if doctor_is_healthy(&report) {
                         Ok(ExitCode::SUCCESS)
@@ -133,7 +142,9 @@ pub(crate) async fn dispatch(cli: Cli, output: CliOutput) -> Result<ExitCode> {
                     render_clickhouse_status(&output, &snapshot)?;
                     Ok(ExitCode::SUCCESS)
                 }
-                ClickhouseCommand::Supervise => run_supervised_clickhouse(&cfg, &paths).await,
+                ClickhouseCommand::Supervise => {
+                    run_supervised_clickhouse(&cfg, &paths, query_runtime).await
+                }
                 ClickhouseCommand::Uninstall => {
                     let removed = cmd_clickhouse_uninstall(&paths)?;
                     if output.is_json() {
@@ -240,8 +251,11 @@ fn run_registered_foreground_child(
     Ok(ExitCode::from(status.code().unwrap_or(1) as u8))
 }
 
-fn conversation_repository(cfg: &AppConfig) -> Result<ClickHouseConversationRepository> {
-    let ch = ClickHouseClient::new(cfg.clickhouse.clone())?;
+fn conversation_repository(
+    cfg: &AppConfig,
+    query_runtime: &QueryRuntime,
+) -> Result<ClickHouseConversationRepository> {
+    let ch = ClickHouseClient::new_with_runtime(cfg.clickhouse.clone(), query_runtime.clone())?;
     Ok(ClickHouseConversationRepository::new(
         ch,
         RepoConfig::default(),
@@ -288,46 +302,60 @@ where
 
 async fn migrate_database_with_progress<F>(
     cfg: &AppConfig,
+    query_runtime: &QueryRuntime,
     mut on_progress: F,
 ) -> Result<MigrationOutcome>
 where
     F: FnMut(MigrationProgress),
 {
-    let ch = ClickHouseClient::new(cfg.clickhouse.clone())?;
-    let applied = ch
-        .run_migrations_with_progress(|event| {
+    let ch = ClickHouseClient::new_with_runtime(cfg.clickhouse.clone(), query_runtime.clone())?;
+    let owner = QueryOwner::new(query_runtime, QueryWorkload::Migration)?;
+    let applied = owner
+        .scope(ch.run_migrations_with_progress(|event| {
             on_progress(event);
-        })
+        }))
         .await?;
     Ok(MigrationOutcome { applied })
 }
 
 pub(super) async fn migrate_database_for_up<F>(
     cfg: &AppConfig,
+    query_runtime: &QueryRuntime,
     on_progress: F,
 ) -> Result<MigrationOutcome>
 where
     F: FnMut(MigrationProgress),
 {
-    migrate_database_with_progress(cfg, on_progress).await
+    migrate_database_with_progress(cfg, query_runtime, on_progress).await
 }
 
-async fn cmd_db_migrate(cfg: &AppConfig, paths: &RuntimePaths) -> Result<MigrationOutcome> {
-    let ch = ClickHouseClient::new(cfg.clickhouse.clone())?;
-    let schema_skew = ch.schema_skew().await?;
-    let _migration_gate = writer_barrier_required(&schema_skew.missing_on_server)
-        .then(|| lock_storage_migration(paths))
-        .transpose()?;
-    ensure_standalone_migration_quiescent_with(&schema_skew.missing_on_server, |service| {
-        service_running_read_only(paths, service)
-    })?;
-    let applied = ch.run_migrations().await?;
-    Ok(MigrationOutcome { applied })
+async fn cmd_db_migrate(
+    cfg: &AppConfig,
+    paths: &RuntimePaths,
+    query_runtime: &QueryRuntime,
+) -> Result<MigrationOutcome> {
+    let ch = ClickHouseClient::new_with_runtime(cfg.clickhouse.clone(), query_runtime.clone())?;
+    let owner = QueryOwner::new(query_runtime, QueryWorkload::Migration)?;
+    owner
+        .scope(async {
+            let schema_skew = ch.schema_skew().await?;
+            let _migration_gate = writer_barrier_required(&schema_skew.missing_on_server)
+                .then(|| lock_storage_migration(paths))
+                .transpose()?;
+            ensure_standalone_migration_quiescent_with(
+                &schema_skew.missing_on_server,
+                |service| service_running_read_only(paths, service),
+            )?;
+            let applied = ch.run_migrations().await?;
+            Ok(MigrationOutcome { applied })
+        })
+        .await
 }
 
-async fn cmd_db_doctor(cfg: &AppConfig) -> Result<DoctorReport> {
-    let ch = ClickHouseClient::new(cfg.clickhouse.clone())?;
-    ch.doctor_report().await
+async fn cmd_db_doctor(cfg: &AppConfig, query_runtime: &QueryRuntime) -> Result<DoctorReport> {
+    let ch = ClickHouseClient::new_with_runtime(cfg.clickhouse.clone(), query_runtime.clone())?;
+    let owner = QueryOwner::new(query_runtime, QueryWorkload::Administrative)?;
+    owner.scope(ch.doctor_report()).await
 }
 
 fn parse_config_flag(args: &[String]) -> Result<(Option<PathBuf>, Vec<String>)> {
@@ -533,7 +561,7 @@ mod tests {
             })),
         };
 
-        let err = dispatch(cli, plain_output())
+        let err = dispatch(cli, plain_output(), &QueryRuntime::new())
             .await
             .expect_err("export must reject explicit output");
         assert!(err.to_string().contains("use --format"));
@@ -550,7 +578,7 @@ mod tests {
             }),
         };
 
-        let code = dispatch(cli, plain_output())
+        let code = dispatch(cli, plain_output(), &QueryRuntime::new())
             .await
             .expect("schema command should not load config");
         assert_eq!(code, ExitCode::SUCCESS);

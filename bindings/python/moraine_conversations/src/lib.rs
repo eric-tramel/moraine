@@ -1,16 +1,20 @@
-use moraine_clickhouse::ClickHouseClient;
+use moraine_clickhouse::{
+    ClickHouseClient, QueryOwner, QueryRuntime, QueryWorkload, QUERY_CLEANUP_GRACE,
+};
 use moraine_config::ClickHouseConfig;
 use moraine_conversations::{
     ClickHouseConversationRepository, ConversationDetailOptions, ConversationListFilter,
     ConversationListSort, ConversationMode, ConversationRepository, ConversationSearchQuery,
-    PageRequest, RepoConfig, SearchEventsQuery, SearchStrategyHint,
+    PageRequest, RepoConfig, RepoResult, SearchEventsQuery, SearchStrategyHint,
 };
+use std::future::Future;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 
 #[pyclass]
 struct ConversationClient {
     repo: ClickHouseConversationRepository,
+    query_runtime: QueryRuntime,
     rt: tokio::runtime::Runtime,
 }
 
@@ -33,17 +37,25 @@ impl ConversationClient {
         timeout_seconds: f64,
         max_results: u16,
     ) -> PyResult<Self> {
-        let clickhouse = ClickHouseClient::new(ClickHouseConfig {
-            url,
-            database,
-            username,
-            password,
-            timeout_seconds,
-            request_compression: Default::default(),
-            async_insert: true,
-            wait_for_async_insert: true,
-            allow_newer_server: false,
-        })
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(py_runtime_err)?;
+        let query_runtime = QueryRuntime::new();
+        let clickhouse = ClickHouseClient::new_with_runtime(
+            ClickHouseConfig {
+                url,
+                database,
+                username,
+                password,
+                timeout_seconds,
+                request_compression: Default::default(),
+                async_insert: true,
+                wait_for_async_insert: true,
+                allow_newer_server: false,
+            },
+            query_runtime.clone(),
+        )
         .map_err(py_runtime_err)?;
 
         let repo = ClickHouseConversationRepository::new(
@@ -54,12 +66,11 @@ impl ConversationClient {
             },
         );
 
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .map_err(py_runtime_err)?;
-
-        Ok(Self { repo, rt })
+        Ok(Self {
+            repo,
+            query_runtime,
+            rt,
+        })
     }
 
     #[pyo3(signature = (from_unix_ms=None, to_unix_ms=None, mode=None, limit=50, cursor=None))]
@@ -72,31 +83,25 @@ impl ConversationClient {
         cursor: Option<String>,
     ) -> PyResult<String> {
         let parsed_mode = parse_mode(mode)?;
-        let page = self
-            .rt
-            .block_on(self.repo.list_conversations(
-                ConversationListFilter {
-                    from_unix_ms,
-                    to_unix_ms,
-                    mode: parsed_mode,
-                    sort: ConversationListSort::Desc,
-                },
-                PageRequest { limit, cursor },
-            ))
-            .map_err(py_runtime_err)?;
+        let page = self.run_owned(self.repo.list_conversations(
+            ConversationListFilter {
+                from_unix_ms,
+                to_unix_ms,
+                mode: parsed_mode,
+                sort: ConversationListSort::Desc,
+            },
+            PageRequest { limit, cursor },
+        ))?;
 
         serde_json::to_string(&page).map_err(py_runtime_err)
     }
 
     #[pyo3(signature = (session_id, include_turns=false))]
     fn get_conversation_json(&self, session_id: String, include_turns: bool) -> PyResult<String> {
-        let conversation = self
-            .rt
-            .block_on(
-                self.repo
-                    .get_conversation(&session_id, ConversationDetailOptions { include_turns }),
-            )
-            .map_err(py_runtime_err)?;
+        let conversation = self.run_owned(
+            self.repo
+                .get_conversation(&session_id, ConversationDetailOptions { include_turns }),
+        )?;
 
         serde_json::to_string(&conversation).map_err(py_runtime_err)
     }
@@ -125,9 +130,8 @@ impl ConversationClient {
         exclude_codex_mcp: Option<bool>,
     ) -> PyResult<String> {
         let parsed_mode = parse_mode(mode)?;
-        let results = self
-            .rt
-            .block_on(self.repo.search_conversations(ConversationSearchQuery {
+        let results = self.run_owned(self.repo.search_conversations(
+            ConversationSearchQuery {
                 query,
                 limit,
                 min_score,
@@ -137,8 +141,8 @@ impl ConversationClient {
                 mode: parsed_mode,
                 include_tool_events,
                 exclude_codex_mcp,
-            }))
-            .map_err(py_runtime_err)?;
+            },
+        ))?;
 
         serde_json::to_string(&results).map_err(py_runtime_err)
     }
@@ -169,25 +173,49 @@ impl ConversationClient {
         search_strategy: Option<&str>,
     ) -> PyResult<String> {
         let parsed_strategy_hint = parse_strategy_hint(search_strategy)?;
-        let results = self
-            .rt
-            .block_on(self.repo.search_events(SearchEventsQuery {
-                query,
-                source,
-                limit,
-                session_id,
-                session_ids: None,
-                min_score,
-                min_should_match,
-                include_tool_events,
-                event_kinds: None,
-                exclude_codex_mcp,
-                bypass_cache: disable_cache,
-                strategy_hint: parsed_strategy_hint,
-            }))
-            .map_err(py_runtime_err)?;
+        let results = self.run_owned(self.repo.search_events(SearchEventsQuery {
+            query,
+            source,
+            limit,
+            session_id,
+            session_ids: None,
+            min_score,
+            min_should_match,
+            include_tool_events,
+            event_kinds: None,
+            exclude_codex_mcp,
+            bypass_cache: disable_cache,
+            strategy_hint: parsed_strategy_hint,
+        }))?;
 
         serde_json::to_string(&results).map_err(py_runtime_err)
+    }
+}
+
+impl ConversationClient {
+    fn run_owned<T, F>(&self, future: F) -> PyResult<T>
+    where
+        F: Future<Output = RepoResult<T>>,
+    {
+        let result = self.rt.block_on(async {
+            let owner = QueryOwner::new(&self.query_runtime, QueryWorkload::Internal)
+                .map_err(|error| error.to_string())?;
+            owner
+                .scope(async { future.await.map_err(|error| error.to_string()) })
+                .await
+        });
+
+        if result.is_err() {
+            self.rt.block_on(drain_pending_cleanup(&self.query_runtime));
+        }
+        result.map_err(py_runtime_err)
+    }
+}
+
+async fn drain_pending_cleanup(query_runtime: &QueryRuntime) {
+    let deadline = tokio::time::Instant::now() + QUERY_CLEANUP_GRACE;
+    while query_runtime.active_owner_count() > 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 }
 
