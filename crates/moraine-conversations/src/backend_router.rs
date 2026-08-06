@@ -35,7 +35,6 @@ pub struct BackendRepository {
     repository: Arc<dyn ConversationRepository>,
     clickhouse_url: Arc<str>,
     clickhouse_database: Arc<str>,
-    query_runtime: QueryRuntime,
 }
 
 impl BackendRepository {
@@ -43,14 +42,12 @@ impl BackendRepository {
         backend_name: Arc<str>,
         repository: Arc<dyn ConversationRepository>,
         clickhouse: &ClickHouseConfig,
-        query_runtime: QueryRuntime,
     ) -> Self {
         Self {
             backend_name,
             repository,
             clickhouse_url: clickhouse_display_url(&clickhouse.url),
             clickhouse_database: Arc::from(clickhouse.database.as_str()),
-            query_runtime,
         }
     }
 
@@ -68,10 +65,6 @@ impl BackendRepository {
 
     pub fn clickhouse_database(&self) -> &str {
         &self.clickhouse_database
-    }
-
-    pub fn query_runtime(&self) -> QueryRuntime {
-        self.query_runtime.clone()
     }
 }
 
@@ -129,7 +122,6 @@ impl BackendSlot {
                 backend_name.clone(),
                 repository,
                 &clickhouse,
-                query_runtime.clone(),
             ))),
             None => SlotState::Empty,
         };
@@ -224,7 +216,6 @@ impl BackendSlot {
             self.backend_name.clone(),
             repository,
             &self.clickhouse,
-            self.query_runtime.clone(),
         )))
     }
 }
@@ -769,11 +760,12 @@ mod tests {
             ClickHouseConfig::default().database
         );
         assert!(Arc::ptr_eq(first.repository(), second.repository()));
-        let owner = QueryOwner::new(&router.query_runtime(), QueryWorkload::Internal)
-            .expect("router runtime owner");
-        assert_eq!(first.query_runtime().active_owner_count(), 1);
+        let runtime = router.query_runtime();
+        let owner =
+            QueryOwner::new(&runtime, QueryWorkload::Internal).expect("router runtime owner");
+        assert_eq!(runtime.active_owner_count(), 1);
         owner.scope(async {}).await;
-        assert_eq!(router.query_runtime().active_owner_count(), 0);
+        assert_eq!(runtime.active_owner_count(), 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
