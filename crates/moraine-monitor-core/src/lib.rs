@@ -14,7 +14,7 @@ use moraine_conversations::{
     AnalyticsRange, BackendRepository, BackendRepositoryRouter, IngestHeartbeat,
     IngestHeartbeatRead, QueryCause, QueryOwner, QueryWorkload, RepoError, SessionAnalytics,
     SessionAnalyticsQuery, SessionLookback, SessionStep, SessionTurn, StoreConnectionMetrics,
-    StoreHealth, StoreProbe, TablePreviewQuery, TableSummaries,
+    StoreHealth, StoreProbe, TablePreviewQuery, TableSummaries, QUERY_CLEANUP_GRACE,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -27,7 +27,9 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex, Weak,
 };
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+#[cfg(test)]
+use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::fs;
 use tracing::warn;
 
@@ -139,8 +141,6 @@ impl<F: Future> Drop for DisconnectAwareRequest<F> {
         }
     }
 }
-
-const MONITOR_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 #[derive(Deserialize)]
 struct LimitQuery {
@@ -279,7 +279,7 @@ where
         result = &mut server => result?,
         started = shutdown_started_rx => {
             if started.is_ok() {
-                tokio::time::timeout(MONITOR_SHUTDOWN_GRACE, &mut server)
+                tokio::time::timeout(QUERY_CLEANUP_GRACE, &mut server)
                     .await
                     .map_err(|_| anyhow!("monitor server shutdown exceeded five-second query cleanup grace"))??;
             } else {

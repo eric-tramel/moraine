@@ -35,7 +35,9 @@ pub use error::{RepoError, RepoResult};
 pub use in_memory_repo::{
     InMemoryConversationCalls, InMemoryConversationRepository, InMemoryConversationResponses,
 };
-pub use moraine_clickhouse::{QueryCause, QueryOwner, QueryRuntime, QueryWorkload};
+pub use moraine_clickhouse::{
+    QueryCause, QueryOwner, QueryRuntime, QueryWorkload, QUERY_CLEANUP_GRACE,
+};
 pub use repo::ConversationRepository;
 
 /// Build the production ClickHouse repository behind its backend-neutral read

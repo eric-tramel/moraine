@@ -1624,8 +1624,9 @@ struct SocketState {
 /// never installs signal handlers or terminates the process. Each accepted
 /// connection negotiates and pins one repository handle, while connections to
 /// the same backend share both its repository and its MCP prewarm gate. When
-/// shutdown resolves, accepting stops, connection and request cancellation is
-/// drained within a fixed bound, and the public socket path is unlinked.
+/// shutdown resolves, accepting stops, active connection owners are cancelled,
+/// and the public socket path is unlinked. The composition root supplies the
+/// shared bounded drain and aborts this service if owner cleanup outlives it.
 #[cfg(unix)]
 pub async fn run_socket_with_router<S>(
     cfg: Arc<AppConfig>,

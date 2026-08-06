@@ -1,7 +1,9 @@
 use crate::cli::ServeMode;
 use anyhow::{anyhow, bail, Context, Result};
 use moraine_config::AppConfig;
-use moraine_conversations::{BackendRepositoryRouter, QueryRuntime, RepoConfig};
+use moraine_conversations::{
+    BackendRepositoryRouter, QueryRuntime, RepoConfig, QUERY_CLEANUP_GRACE,
+};
 #[cfg(unix)]
 use moraine_mcp_core::PrivateRouteNegotiation;
 use moraine_mcp_core::SessionOriginScope;
@@ -306,7 +308,7 @@ async fn run_backend(
     // Query cleanup and owner-bearing service tasks share one five-second
     // shutdown wall. QueryRuntime owns the sole cleanup drain; services only
     // cancel/join their request tasks and are aborted if they outlive it.
-    let shutdown_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let shutdown_deadline = tokio::time::Instant::now() + QUERY_CLEANUP_GRACE;
     let service_drain = async {
         let mut shutdown_failure = None;
         while let Some(service) = services.join_next().await {

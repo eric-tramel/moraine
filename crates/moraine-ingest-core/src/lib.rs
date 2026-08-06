@@ -28,8 +28,8 @@ use crate::tee::{
 };
 use crate::watch::{enumerate_tracked_files, spawn_watcher_threads};
 use anyhow::{Context, Result};
-pub use moraine_clickhouse::{QueryCause, QueryOwner, QueryRuntime, QueryWorkload};
 use moraine_clickhouse::ClickHouseClient;
+pub use moraine_clickhouse::{QueryCause, QueryOwner, QueryRuntime, QueryWorkload};
 use moraine_config::{
     AppConfig, ClickHouseConfig, IngestSource, SourceFormat, DEFAULT_BACKEND_NAME,
 };

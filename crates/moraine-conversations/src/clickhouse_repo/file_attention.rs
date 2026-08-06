@@ -146,9 +146,9 @@ WHERE (session_id, event_uid) IN (
                 Err(RepoError::Backend(message)) if is_file_attention_schema_skew(&message) => {
                     warn!(
                         error = %message,
-                        "file_attention durable project-root mapping unavailable; using registered roots for this request"
+                        "file_attention durable project-root mapping unavailable; keeping request closed"
                     );
-                    false
+                    return Err(RepoError::backend(message));
                 }
                 Err(error) => return Err(error),
             }
