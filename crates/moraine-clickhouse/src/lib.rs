@@ -273,6 +273,7 @@ impl ClickHouseClient {
         let owner = QueryOwner::current().ok_or_else(|| {
             ClickHouseError::ownership("ClickHouse egress requires an explicit QueryOwner")
         })?;
+        owner.ensure_runtime(&self.inner.runtime)?;
         validate_request_params(options.params)?;
         let mut url = self.base_url()?;
 
@@ -297,7 +298,7 @@ impl ClickHouseClient {
         // The absolute deadline is checked again after potentially expensive
         // compression. Expired operations register no child and send zero bytes.
         let remaining = owner.remaining()?;
-        let ticket = owner.register_statement(self.inner.admin.clone())?;
+        let ticket = owner.register_statement(&self.inner.runtime, self.inner.admin.clone())?;
         {
             let mut qp = url.query_pairs_mut();
             qp.append_pair("query", query);
@@ -363,7 +364,6 @@ impl ClickHouseClient {
                 return Err(error.into());
             }
         };
-        prepared.ticket.mark_headers_received();
         let status = response.status();
         if !status.is_success() {
             let header_code = response
@@ -464,22 +464,13 @@ impl ClickHouseClient {
         Ok(text)
     }
 
-    /// The compatibility timeout argument must be `None`: operation deadlines
-    /// are absolute and belong to `QueryOwner::with_deadline`.
     pub async fn request_stream_with_params(
         &self,
         query: &str,
         database: Option<&str>,
         default_format: Option<&str>,
         params: &[(&str, &str)],
-        request_timeout: Option<Duration>,
     ) -> Result<ClickHouseByteStream> {
-        if request_timeout.is_some() {
-            return Err(ClickHouseError::ownership(
-                "elapsed request timeout is reserved; use QueryOwner::with_deadline",
-            )
-            .into());
-        }
         let prepared = self
             .request_builder(
                 query,
@@ -2904,7 +2895,6 @@ mod tests {
                 Some("moraine"),
                 None,
                 &[("readonly", "1")],
-                None,
             ),
         )
         .await
@@ -2949,7 +2939,7 @@ mod tests {
 
         let err = owned(
             &client,
-            client.request_stream_with_params("SELECT FAIL", None, None, &[], None),
+            client.request_stream_with_params("SELECT FAIL", None, None, &[]),
         )
         .await
         .expect_err("expected HTTP failure");
@@ -3220,7 +3210,7 @@ mod tests {
             Some(ClickHouseErrorCategory::OwnershipViolation)
         );
         let error = client
-            .request_stream_with_params("SELECT 1", None, None, &[], None)
+            .request_stream_with_params("SELECT 1", None, None, &[])
             .await
             .expect_err("unowned stream request must fail");
         assert_eq!(
@@ -3234,6 +3224,41 @@ mod tests {
                 .await
                 .is_err(),
             "missing ownership must be rejected before TCP connect or bytes"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn owner_from_another_runtime_is_rejected_before_connect() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind raw byte counter");
+        let client_runtime = QueryRuntime::new();
+        let client = ClickHouseClient::new_with_runtime(
+            test_clickhouse_config(format!("http://{}", listener.local_addr().unwrap())),
+            client_runtime.clone(),
+        )
+        .expect("client");
+        let owner_runtime = QueryRuntime::new();
+        let owner = QueryOwner::new(&owner_runtime, QueryWorkload::Internal).expect("owner");
+
+        let error = owner
+            .scope(client.request_text("SELECT 1", None, None, false, None))
+            .await
+            .expect_err("runtime mismatch must fail");
+        assert_eq!(
+            error
+                .downcast_ref::<ClickHouseError>()
+                .map(ClickHouseError::category),
+            Some(ClickHouseErrorCategory::OwnershipViolation)
+        );
+        assert!(error.to_string().contains("different query runtime"));
+        assert_eq!(client_runtime.active_owner_count(), 0);
+        assert_eq!(owner_runtime.active_owner_count(), 0);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                .await
+                .is_err(),
+            "runtime mismatch must be rejected before TCP connect or bytes"
         );
     }
 
@@ -3339,7 +3364,7 @@ mod tests {
                 .unwrap();
         let owner = QueryOwner::new(&runtime, QueryWorkload::Export).unwrap();
         let mut stream = owner
-            .scope(client.request_stream_with_params("SELECT 1", None, None, &[], None))
+            .scope(client.request_stream_with_params("SELECT 1", None, None, &[]))
             .await
             .unwrap();
         assert_eq!(
@@ -3368,7 +3393,7 @@ mod tests {
                 .unwrap();
         let owner = QueryOwner::new(&runtime, QueryWorkload::Export).unwrap();
         let stream = owner
-            .scope(client.request_stream_with_params("SELECT 1", None, None, &[], None))
+            .scope(client.request_stream_with_params("SELECT 1", None, None, &[]))
             .await
             .unwrap();
         let child_id = requests.lock().unwrap()[0].params["query_id"].clone();
@@ -3787,13 +3812,7 @@ mod tests {
                 .unwrap();
         let owner = QueryOwner::new(&runtime, QueryWorkload::Administrative).unwrap();
         let mut stream = owner
-            .scope(client.request_stream_with_params(
-                "SELECT version()",
-                Some("system"),
-                None,
-                &[],
-                None,
-            ))
+            .scope(client.request_stream_with_params("SELECT version()", Some("system"), None, &[]))
             .await
             .unwrap();
         let child_id = requests.lock().unwrap()[0].params["query_id"].clone();
@@ -3894,7 +3913,7 @@ mod tests {
                 .unwrap();
         let owner = QueryOwner::new(&runtime, QueryWorkload::Administrative).unwrap();
         let mut stream = owner
-            .scope(client.request_stream_with_params("SELECT 1", None, None, &[], None))
+            .scope(client.request_stream_with_params("SELECT 1", None, None, &[]))
             .await
             .unwrap();
         assert!(stream.next_chunk().await.unwrap().is_some());

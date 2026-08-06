@@ -9,7 +9,7 @@ use std::sync::{
 };
 use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::sync::{mpsc, Notify, Semaphore};
+use tokio::sync::{mpsc, watch, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -79,14 +79,18 @@ pub struct QueryRuntime {
 }
 
 struct QueryRuntimeInner {
-    active: Mutex<HashMap<Uuid, Arc<OwnerState>>>,
+    state: Mutex<QueryRuntimeState>,
     tx: mpsc::UnboundedSender<SupervisorMessage>,
     receiver: Mutex<Option<mpsc::UnboundedReceiver<SupervisorMessage>>>,
     supervisor: Mutex<Option<JoinHandle<()>>>,
-    closing: AtomicBool,
-    changed: Notify,
+    changed: watch::Sender<u64>,
     close_started: Mutex<Option<Instant>>,
     close_lock: tokio::sync::Mutex<()>,
+}
+
+struct QueryRuntimeState {
+    active: HashMap<Uuid, Arc<OwnerState>>,
+    closing: bool,
 }
 
 enum SupervisorMessage {
@@ -104,14 +108,17 @@ impl Default for QueryRuntime {
 impl QueryRuntime {
     pub fn new() -> Self {
         let (tx, receiver) = mpsc::unbounded_channel();
+        let (changed, _) = watch::channel(0);
         Self {
             inner: Arc::new(QueryRuntimeInner {
-                active: Mutex::new(HashMap::new()),
+                state: Mutex::new(QueryRuntimeState {
+                    active: HashMap::new(),
+                    closing: false,
+                }),
                 tx,
                 receiver: Mutex::new(Some(receiver)),
                 supervisor: Mutex::new(None),
-                closing: AtomicBool::new(false),
-                changed: Notify::new(),
+                changed,
                 close_started: Mutex::new(None),
                 close_lock: tokio::sync::Mutex::new(()),
             }),
@@ -143,11 +150,24 @@ impl QueryRuntime {
     }
 
     pub fn is_closing(&self) -> bool {
-        self.inner.closing.load(Ordering::Acquire)
+        self.inner
+            .state
+            .lock()
+            .expect("query runtime state poisoned")
+            .closing
     }
 
     pub fn active_owner_count(&self) -> usize {
-        self.inner.active.lock().expect("owner map poisoned").len()
+        self.inner
+            .state
+            .lock()
+            .expect("query runtime state poisoned")
+            .active
+            .len()
+    }
+
+    fn same_domain(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
     }
 
     /// Reject new owners, cancel every active owner, and bound all query cleanup
@@ -163,27 +183,36 @@ impl QueryRuntime {
             *value.get_or_insert_with(Instant::now)
         };
         let deadline = started + QUERY_CLEANUP_GRACE;
-        self.inner.closing.store(true, Ordering::Release);
         let _ = self.ensure_supervisor();
 
-        let owners: Vec<_> = self
-            .inner
-            .active
-            .lock()
-            .expect("owner map poisoned")
-            .values()
-            .cloned()
-            .collect();
+        // Closing admission and the active-owner snapshot share one lock. An
+        // owner is therefore either present in this snapshot or observes the
+        // closed state and is rejected.
+        let owners: Vec<_> = {
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .expect("query runtime state poisoned");
+            state.closing = true;
+            state.active.values().cloned().collect()
+        };
         for owner in owners {
             owner.cancel(QueryCause::Shutdown);
         }
 
+        // Subscribe before checking the durable active map. A removal between
+        // the check and changed().await advances the watch version and cannot
+        // be missed.
+        let mut changed = self.inner.changed.subscribe();
         loop {
             if self.active_owner_count() == 0 {
                 break;
             }
-            let notified = self.inner.changed.notified();
-            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+            if tokio::time::timeout_at(deadline, changed.changed())
+                .await
+                .is_err()
+            {
                 break;
             }
         }
@@ -209,9 +238,10 @@ impl QueryRuntime {
         // was unavailable. Do not retain operations past the composition root.
         let remaining: Vec<_> = self
             .inner
-            .active
+            .state
             .lock()
-            .expect("owner map poisoned")
+            .expect("query runtime state poisoned")
+            .active
             .values()
             .cloned()
             .collect();
@@ -223,8 +253,18 @@ impl QueryRuntime {
 
 impl QueryRuntimeInner {
     fn remove(&self, id: Uuid) {
-        self.active.lock().expect("owner map poisoned").remove(&id);
-        self.changed.notify_waiters();
+        let removed = self
+            .state
+            .lock()
+            .expect("query runtime state poisoned")
+            .active
+            .remove(&id)
+            .is_some();
+        if removed {
+            self.changed.send_modify(|version| {
+                *version = version.wrapping_add(1);
+            });
+        }
     }
 }
 
@@ -257,7 +297,7 @@ struct OwnerState {
     next_child: AtomicU64,
     data: Mutex<OwnerData>,
     cleanup_queued: AtomicBool,
-    terminal: Notify,
+    terminal: CancellationToken,
 }
 
 struct OwnerData {
@@ -270,7 +310,6 @@ struct OwnerData {
 struct ChildRecord {
     backend: Arc<AdminBackend>,
     attempted: bool,
-    headers_received: bool,
 }
 
 type CleanupBackendBatch = (Arc<AdminBackend>, Vec<(String, bool)>);
@@ -296,9 +335,6 @@ impl QueryOwner {
         workload: QueryWorkload,
         deadline: Option<Instant>,
     ) -> Result<Arc<Self>, ClickHouseError> {
-        if runtime.inner.closing.load(Ordering::Acquire) {
-            return Err(ClickHouseError::ownership("query runtime is closing"));
-        }
         runtime.ensure_supervisor()?;
         let id = Uuid::new_v4();
         let state = Arc::new(OwnerState {
@@ -316,14 +352,22 @@ impl QueryOwner {
                 children: HashMap::new(),
             }),
             cleanup_queued: AtomicBool::new(false),
-            terminal: Notify::new(),
+            terminal: CancellationToken::new(),
         });
-        runtime
-            .inner
-            .active
-            .lock()
-            .expect("owner map poisoned")
-            .insert(id, state.clone());
+        {
+            let mut runtime_state = runtime
+                .inner
+                .state
+                .lock()
+                .expect("query runtime state poisoned");
+            if runtime_state.closing {
+                return Err(ClickHouseError::ownership("query runtime is closing"));
+            }
+            runtime_state.active.insert(id, state.clone());
+        }
+        runtime.inner.changed.send_modify(|version| {
+            *version = version.wrapping_add(1);
+        });
         if deadline.is_some() {
             let _ = runtime
                 .inner
@@ -393,10 +437,22 @@ impl QueryOwner {
         Ok(Some(deadline - now))
     }
 
+    pub(crate) fn ensure_runtime(&self, runtime: &QueryRuntime) -> Result<(), ClickHouseError> {
+        if self.runtime.same_domain(runtime) {
+            Ok(())
+        } else {
+            Err(ClickHouseError::ownership(
+                "query owner belongs to a different query runtime",
+            ))
+        }
+    }
+
     pub(crate) fn register_statement(
         &self,
+        runtime: &QueryRuntime,
         backend: Arc<AdminBackend>,
     ) -> Result<StatementTicket, ClickHouseError> {
+        self.ensure_runtime(runtime)?;
         let sequence = self
             .state
             .next_child
@@ -422,7 +478,6 @@ impl QueryOwner {
             ChildRecord {
                 backend,
                 attempted: false,
-                headers_received: false,
             },
         );
         Ok(StatementTicket {
@@ -490,19 +545,6 @@ impl StatementTicket {
         }
     }
 
-    pub(crate) fn mark_headers_received(&self) {
-        if let Some(child) = self
-            .owner
-            .data
-            .lock()
-            .expect("owner state poisoned")
-            .children
-            .get_mut(&self.child_id)
-        {
-            child.headers_received = true;
-        }
-    }
-
     pub(crate) fn succeed(&mut self) {
         if self.armed {
             self.armed = false;
@@ -542,7 +584,7 @@ impl OwnerState {
         };
         if remove {
             self.remove_from_runtime();
-            self.terminal.notify_waiters();
+            self.terminal.cancel();
         }
     }
 
@@ -562,7 +604,7 @@ impl OwnerState {
         };
         if remove {
             self.remove_from_runtime();
-            self.terminal.notify_waiters();
+            self.terminal.cancel();
         }
     }
 
@@ -595,7 +637,7 @@ impl OwnerState {
             data.lifecycle = OwnerLifecycle::Terminal;
         }
         self.remove_from_runtime();
-        self.terminal.notify_waiters();
+        self.terminal.cancel();
     }
 
     fn remove_from_runtime(&self) {
@@ -864,7 +906,7 @@ async fn supervisor_loop(
                         let Some(deadline) = owner.deadline else { return; };
                         tokio::select! {
                             _ = tokio::time::sleep_until(deadline) => owner.cancel(QueryCause::Deadline),
-                            _ = owner.terminal.notified() => {}
+                            _ = owner.terminal.cancelled() => {}
                         }
                     });
                 }
@@ -884,7 +926,9 @@ async fn supervisor_loop(
     }
     while jobs.join_next().await.is_some() {}
     if let Some(runtime) = runtime.upgrade() {
-        runtime.changed.notify_waiters();
+        runtime
+            .changed
+            .send_modify(|version| *version = version.wrapping_add(1));
     }
 }
 
@@ -1016,5 +1060,101 @@ pub(crate) fn extract_exception_code(body: &str) -> Option<u32> {
         None
     } else {
         digits.parse().ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn admission_racing_with_close_is_rejected_or_shutdown_owned() {
+        let executor = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let handle = executor.handle().clone();
+        let runtime = QueryRuntime::new();
+
+        // Hold the common state lock until both admission and close are
+        // waiting on it. Whichever transition wins after release must produce
+        // one of the two valid outcomes.
+        let state = runtime.inner.state.lock().expect("query runtime state");
+        let admission_runtime = runtime.clone();
+        let admission_handle = handle.clone();
+        let admission = std::thread::spawn(move || {
+            let _entered = admission_handle.enter();
+            QueryOwner::new(&admission_runtime, QueryWorkload::Internal)
+        });
+
+        let wait_started = std::time::Instant::now();
+        while runtime
+            .inner
+            .supervisor
+            .lock()
+            .expect("supervisor state")
+            .is_none()
+        {
+            assert!(
+                wait_started.elapsed() < Duration::from_secs(1),
+                "admission did not reach the runtime state lock"
+            );
+            std::thread::yield_now();
+        }
+
+        let close_runtime = runtime.clone();
+        let close = handle.spawn(async move {
+            close_runtime.close_and_drain().await;
+        });
+        let wait_started = std::time::Instant::now();
+        while runtime
+            .inner
+            .close_started
+            .lock()
+            .expect("close state")
+            .is_none()
+        {
+            assert!(
+                wait_started.elapsed() < Duration::from_secs(1),
+                "close did not reach the runtime state lock"
+            );
+            std::thread::yield_now();
+        }
+
+        drop(state);
+        let admitted = admission.join().expect("admission thread");
+        executor.block_on(close).expect("close task");
+
+        match admitted {
+            Ok(owner) => assert_eq!(owner.cause(), Some(QueryCause::Shutdown)),
+            Err(error) => assert_eq!(
+                error.category(),
+                ClickHouseErrorCategory::OwnershipViolation
+            ),
+        }
+        assert!(runtime.is_closing());
+        assert_eq!(runtime.active_owner_count(), 0);
+        assert!(QueryOwner::new(&runtime, QueryWorkload::Internal).is_err());
+    }
+
+    #[tokio::test]
+    async fn completed_deadline_owner_does_not_hold_drain_until_deadline() {
+        let runtime = QueryRuntime::new();
+        let owner = QueryOwner::with_deadline(
+            &runtime,
+            QueryWorkload::Internal,
+            Instant::now() + Duration::from_secs(60),
+        )
+        .expect("deadline owner");
+
+        // On the current-thread runtime, completion occurs before the
+        // supervisor can begin its deadline job. Terminal state must therefore
+        // be durable rather than an edge-triggered notification.
+        owner.scope(async {}).await;
+        assert_eq!(runtime.active_owner_count(), 0);
+        tokio::time::timeout(Duration::from_millis(250), runtime.close_and_drain())
+            .await
+            .expect("completed deadline owner must not hold shutdown open");
     }
 }

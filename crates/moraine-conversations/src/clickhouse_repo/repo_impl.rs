@@ -11,10 +11,6 @@ impl ConversationRepository for ClickHouseConversationRepository {
         ClickHouseConversationRepository::config(self)
     }
 
-    fn query_runtime(&self) -> Option<QueryRuntime> {
-        Some(ClickHouseConversationRepository::query_runtime(self))
-    }
-
     async fn prewarm_mcp_search_state(&self) -> RepoResult<()> {
         ClickHouseConversationRepository::prewarm_mcp_search_state(self).await
     }

@@ -43,7 +43,6 @@ pub(crate) async fn events(
                     Some(&cfg.clickhouse.database),
                     None,
                     &params,
-                    None,
                 )
                 .await?;
 

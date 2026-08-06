@@ -1096,8 +1096,7 @@ impl AppState {
 
     #[cfg(test)]
     fn embedded(cfg: AppConfig, repo: Arc<dyn ConversationRepository>) -> Arc<AppState> {
-        let query_runtime = repo.query_runtime().unwrap_or_default();
-        Self::embedded_with_runtime(cfg, repo, query_runtime)
+        Self::embedded_with_runtime(cfg, repo, QueryRuntime::new())
     }
 
     fn embedded_with_runtime(

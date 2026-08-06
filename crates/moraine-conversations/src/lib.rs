@@ -99,13 +99,7 @@ mod construction_tests {
         assert_eq!(repository.config().max_results, 73);
         let owner = super::QueryOwner::new(&runtime, super::QueryWorkload::Internal)
             .expect("factory runtime owner");
-        assert_eq!(
-            repository
-                .query_runtime()
-                .expect("real repository runtime")
-                .active_owner_count(),
-            1
-        );
+        assert_eq!(runtime.active_owner_count(), 1);
         owner.scope(async {}).await;
     }
 

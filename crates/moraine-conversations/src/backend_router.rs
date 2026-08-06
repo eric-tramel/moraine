@@ -772,14 +772,6 @@ mod tests {
         let owner = QueryOwner::new(&router.query_runtime(), QueryWorkload::Internal)
             .expect("router runtime owner");
         assert_eq!(first.query_runtime().active_owner_count(), 1);
-        assert_eq!(
-            first
-                .repository()
-                .query_runtime()
-                .expect("real repository runtime")
-                .active_owner_count(),
-            1
-        );
         owner.scope(async {}).await;
         assert_eq!(router.query_runtime().active_owner_count(), 0);
     }

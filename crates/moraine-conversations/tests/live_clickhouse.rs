@@ -587,11 +587,12 @@ FROM numbers({total_events})"#
 
 async fn run_open_suite(
     repository: &ClickHouseConversationRepository,
+    runtime: &QueryRuntime,
     _phase: &str,
     concurrent: bool,
 ) -> Result<OpenSuite> {
-    let owner = QueryOwner::new(&repository.query_runtime(), QueryWorkload::Mcp)
-        .context("failed to own bounded-open suite")?;
+    let owner =
+        QueryOwner::new(runtime, QueryWorkload::Mcp).context("failed to own bounded-open suite")?;
     let owner_id = owner.logical_id().to_string();
     owner
         .scope(async {
@@ -2464,8 +2465,8 @@ async fn live_mcp_open_boundedness_benchmark() -> Result<()> {
 
         // Warm code paths before either measured phase; all measured IDs remain
         // distinct and uncached at the MCP repository boundary.
-        let _ = run_open_suite(&repository, "warm", false).await?;
-        let before = run_open_suite(&repository, "before", false).await?;
+        let _ = run_open_suite(&repository, &query_runtime, "warm", false).await?;
+        let before = run_open_suite(&repository, &query_runtime, "before", false).await?;
 
         let database_name = database.as_str();
         for offset in (0..UNRELATED_EVENTS).step_by(CANONICAL_BATCH_SIZE as usize) {
@@ -2502,9 +2503,9 @@ async fn live_mcp_open_boundedness_benchmark() -> Result<()> {
                 .context("failed to seed one-million-event canonical corpus")?;
         }
 
-        let after = run_open_suite(&repository, "after", false).await?;
-        let concurrent = run_open_suite(&repository, "concurrent", true).await?;
-        let recovery = run_open_suite(&repository, "recovery", false).await?;
+        let after = run_open_suite(&repository, &query_runtime, "after", false).await?;
+        let concurrent = run_open_suite(&repository, &query_runtime, "concurrent", true).await?;
+        let recovery = run_open_suite(&repository, &query_runtime, "recovery", false).await?;
         assert_eq!(after.semantic, before.semantic);
         assert_eq!(concurrent.semantic, before.semantic);
         assert_eq!(recovery.semantic, before.semantic);
@@ -2720,6 +2721,7 @@ async fn monitor_semantics<T: MonitorResponse>(
 
 async fn start_owned_monitor(
     repository: ClickHouseConversationRepository,
+    query_runtime: QueryRuntime,
 ) -> Result<(
     Url,
     oneshot::Sender<()>,
@@ -2734,7 +2736,6 @@ async fn start_owned_monitor(
     let base = Url::parse(&format!("http://127.0.0.1:{port}/api/v1/"))?;
     let health_url = base.join("health")?;
     let client = Client::builder().timeout(Duration::from_secs(5)).build()?;
-    let query_runtime = repository.query_runtime();
     let injected: Arc<dyn ConversationRepository> = Arc::new(repository);
     let router = Arc::new(BackendRepositoryRouter::from_preloaded_for_testing(
         Arc::new(AppConfig::default()),
@@ -2809,7 +2810,7 @@ async fn live_monitor_repository_semantic_parity() -> Result<()> {
                 );
                 let client = Client::builder().timeout(Duration::from_secs(30)).build()?;
                 let (base, shutdown, server, static_dir) =
-                    start_owned_monitor(monitor_repository).await?;
+                    start_owned_monitor(monitor_repository, query_runtime.clone()).await?;
 
                 let parity = async {
             let monitor_analytics = monitor_semantics::<MonitorAnalyticsResponse>(

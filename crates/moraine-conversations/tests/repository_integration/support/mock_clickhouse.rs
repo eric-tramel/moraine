@@ -7,7 +7,7 @@ use axum::{
     routing::get,
     Router,
 };
-use moraine_clickhouse::ClickHouseClient;
+use moraine_clickhouse::{ClickHouseClient, QueryRuntime};
 use moraine_config::ClickHouseConfig;
 use moraine_conversations::{ClickHouseConversationRepository, RepoConfig, SessionOriginScope};
 use serde_json::json;
@@ -2160,8 +2160,10 @@ pub(crate) async fn build_repo_with_options(
     options: MockOptions,
 ) -> (OwnedRepository, Arc<MockState>) {
     let (base_url, state) = spawn_mock_server(options).await;
+    let runtime = QueryRuntime::new();
     let client =
-        ClickHouseClient::new(test_clickhouse_config(base_url)).expect("valid clickhouse client");
+        ClickHouseClient::new_with_runtime(test_clickhouse_config(base_url), runtime.clone())
+            .expect("valid clickhouse client");
 
     let repo = ClickHouseConversationRepository::new(
         client,
@@ -2171,7 +2173,7 @@ pub(crate) async fn build_repo_with_options(
         },
     );
 
-    (OwnedRepository::new(repo), state)
+    (OwnedRepository::new(repo, runtime), state)
 }
 
 pub(crate) async fn build_scripted_repo(
@@ -2193,8 +2195,10 @@ pub(crate) async fn build_repo() -> (OwnedRepository, Arc<MockState>) {
 /// Repository with a `--project-only` session origin scope configured.
 pub(crate) async fn build_scoped_repo(roots: &[&str]) -> (OwnedRepository, Arc<MockState>) {
     let (base_url, state) = spawn_mock_server(MockOptions::default()).await;
+    let runtime = QueryRuntime::new();
     let client =
-        ClickHouseClient::new(test_clickhouse_config(base_url)).expect("valid clickhouse client");
+        ClickHouseClient::new_with_runtime(test_clickhouse_config(base_url), runtime.clone())
+            .expect("valid clickhouse client");
 
     let repo = ClickHouseConversationRepository::new(
         client,
@@ -2205,5 +2209,5 @@ pub(crate) async fn build_scoped_repo(roots: &[&str]) -> (OwnedRepository, Arc<M
         },
     );
 
-    (OwnedRepository::new(repo), state)
+    (OwnedRepository::new(repo, runtime), state)
 }

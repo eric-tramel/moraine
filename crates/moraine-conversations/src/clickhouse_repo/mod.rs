@@ -6,8 +6,7 @@ use ahash::AHashMap as HashMap;
 use anyhow::Result as AnyResult;
 use async_trait::async_trait;
 use moraine_clickhouse::{
-    ClickHouseClient, ClickHouseError, ClickHouseErrorCategory, QueryOwner, QueryRuntime,
-    QueryWorkload,
+    ClickHouseClient, ClickHouseError, ClickHouseErrorCategory, QueryOwner, QueryWorkload,
 };
 use regex::Regex;
 use serde::{de::DeserializeOwned, Deserialize};
@@ -108,10 +107,6 @@ impl ClickHouseConversationRepository {
             sql_identifier(&self.ch.config().database),
             sql_identifier(table)
         )
-    }
-
-    pub fn query_runtime(&self) -> QueryRuntime {
-        self.ch.runtime()
     }
 
     pub(super) async fn query_rows<T: DeserializeOwned>(

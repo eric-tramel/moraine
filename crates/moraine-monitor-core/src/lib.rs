@@ -1393,7 +1393,7 @@ mod tests {
             responses,
         ));
         let injected: Arc<dyn ConversationRepository> = repository.clone();
-        let query_runtime = injected.query_runtime().unwrap_or_default();
+        let query_runtime = QueryRuntime::new();
         let router = BackendRepositoryRouter::from_preloaded_for_testing(
             Arc::new(AppConfig::default()),
             query_runtime,
@@ -1415,7 +1415,7 @@ mod tests {
             responses,
         ));
         let injected: Arc<dyn ConversationRepository> = repository.clone();
-        let query_runtime = injected.query_runtime().unwrap_or_default();
+        let query_runtime = QueryRuntime::new();
         let backend_router = Arc::new(
             BackendRepositoryRouter::from_preloaded_for_testing(
                 Arc::new(AppConfig::default()),
@@ -1471,10 +1471,7 @@ mod tests {
     ) -> Arc<BackendRepositoryRouter> {
         let default_repository: Arc<dyn ConversationRepository> = default_repository;
         let named_repository: Arc<dyn ConversationRepository> = named_repository;
-        let query_runtime = default_repository
-            .query_runtime()
-            .or_else(|| named_repository.query_runtime())
-            .unwrap_or_default();
+        let query_runtime = QueryRuntime::new();
         Arc::new(
             BackendRepositoryRouter::from_preloaded_for_testing(
                 Arc::new(config),
@@ -2166,7 +2163,7 @@ mod tests {
             responses,
         ));
         let injected: Arc<dyn ConversationRepository> = repository.clone();
-        let query_runtime = injected.query_runtime().unwrap_or_default();
+        let query_runtime = QueryRuntime::new();
         let backend_router = Arc::new(
             BackendRepositoryRouter::from_preloaded_for_testing(
                 Arc::new(AppConfig::default()),

@@ -9,15 +9,16 @@ use moraine_conversations::*;
 #[derive(Clone)]
 pub(crate) struct OwnedRepository {
     inner: ClickHouseConversationRepository,
+    runtime: QueryRuntime,
 }
 
 impl OwnedRepository {
-    pub(crate) fn new(inner: ClickHouseConversationRepository) -> Self {
-        Self { inner }
+    pub(crate) fn new(inner: ClickHouseConversationRepository, runtime: QueryRuntime) -> Self {
+        Self { inner, runtime }
     }
 
     pub(crate) fn runtime(&self) -> QueryRuntime {
-        self.inner.query_runtime()
+        self.runtime.clone()
     }
 
     pub(crate) fn unowned(&self) -> &ClickHouseConversationRepository {
@@ -35,9 +36,6 @@ impl OwnedRepository {
 impl ConversationRepository for OwnedRepository {
     fn config(&self) -> &RepoConfig {
         self.inner.config()
-    }
-    fn query_runtime(&self) -> Option<QueryRuntime> {
-        Some(self.runtime())
     }
 
     async fn prewarm_mcp_search_state(&self) -> RepoResult<()> {
