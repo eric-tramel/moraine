@@ -3836,6 +3836,16 @@ mod tests {
             }),
             "internal KILL must not recursively own or target itself"
         );
+        assert!(
+            captured
+                .iter()
+                .filter(|request| {
+                    request.params["query"].starts_with("KILL QUERY")
+                        || request.params["query"].contains("system.processes")
+                })
+                .all(|request| request.headers.get("content-length").unwrap() == "0"),
+            "empty administrative POSTs must carry an explicit zero content length"
+        );
     }
 
     #[tokio::test(start_paused = true)]

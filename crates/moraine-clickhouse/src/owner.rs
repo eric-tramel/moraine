@@ -812,7 +812,12 @@ impl AdminBackend {
             pairs.append_pair("query_id", &query_id);
             pairs.append_pair("replace_running_query", "0");
         }
-        let mut request = self.client.post(url).timeout(timeout).body(Vec::new());
+        let mut request = self
+            .client
+            .post(url)
+            .timeout(timeout)
+            .header(reqwest::header::CONTENT_LENGTH, 0)
+            .body(Vec::new());
         if !self.username.is_empty() {
             request = request.basic_auth(&self.username, Some(&self.password));
         }
