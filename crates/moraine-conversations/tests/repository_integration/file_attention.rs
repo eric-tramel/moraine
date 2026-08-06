@@ -1,14 +1,17 @@
 use super::*;
 
 #[tokio::test(flavor = "multi_thread")]
-async fn file_attention_clamps_its_query_budget_to_the_request_deadline() {
+async fn file_attention_uses_the_owner_absolute_deadline() {
     let (repo, state) = build_repo().await;
 
-    with_repository_query_deadline(
-        "test-file-attention-deadline".to_string(),
+    let owner = QueryOwner::with_deadline(
+        &repo.runtime(),
+        QueryWorkload::Mcp,
         tokio::time::Instant::now() + Duration::from_secs(2),
-        repo.file_attention(FileAttentionQuery {
-            cancellation_token: "test-file-attention-deadline".to_string(),
+    )
+    .expect("deadline owner");
+    owner
+        .scope(repo.unowned().file_attention(FileAttentionQuery {
             rel: "crates/foo.rs".to_string(),
             normalized_project_id: Some("project-a".to_string()),
             normalized_project_roots: vec!["/worktree-a".to_string()],
@@ -21,11 +24,9 @@ async fn file_attention_clamps_its_query_budget_to_the_request_deadline() {
             tool: None,
             mutations_only: false,
             max_rows: 10,
-            execution_budget_secs: 4,
-        }),
-    )
-    .await
-    .expect("deadline-scoped file attention succeeds");
+        }))
+        .await
+        .expect("deadline-scoped file attention succeeds");
 
     let request_params = state.request_params.lock().expect("request params lock");
     let deadline_params = request_params
@@ -48,7 +49,6 @@ async fn file_attention_merges_normalized_exact_lookup_with_suffix_fallback() {
 
     let touches = repo
         .file_attention(FileAttentionQuery {
-            cancellation_token: "test-file-attention-normalized".to_string(),
             rel: "crates/foo.rs".to_string(),
             normalized_project_id: Some("project-a".to_string()),
             normalized_project_roots: vec!["/worktree-a".to_string()],
@@ -61,7 +61,6 @@ async fn file_attention_merges_normalized_exact_lookup_with_suffix_fallback() {
             tool: None,
             mutations_only: false,
             max_rows: 10,
-            execution_budget_secs: 3,
         })
         .await
         .expect("file_attention query succeeds");
@@ -162,11 +161,24 @@ async fn file_attention_merges_normalized_exact_lookup_with_suffix_fallback() {
         .filter_map(Clone::clone)
         .collect::<Vec<_>>();
     assert_eq!(
-        query_ids,
-        [
-            "test-file-attention-normalized-exact",
-            "test-file-attention-normalized-indexed-suffix",
-        ]
+        query_ids.len(),
+        3,
+        "exact, mapping insert, and suffix are owned"
+    );
+    let logical_prefix = query_ids[0]
+        .rsplit_once('-')
+        .expect("child query sequence")
+        .0;
+    assert!(logical_prefix.starts_with("moraine-internal-"));
+    assert!(query_ids
+        .iter()
+        .all(|query_id| query_id.starts_with(logical_prefix)));
+    assert_eq!(
+        query_ids
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        query_ids.len()
     );
 }
 
@@ -216,7 +228,6 @@ async fn file_attention_project_scope_recovers_durable_only_deleted_root() {
 
     let touches = repo
         .file_attention(FileAttentionQuery {
-            cancellation_token: "test-file-attention-pre-digest".to_string(),
             rel: "crates/foo.rs".to_string(),
             normalized_project_id: Some("git:new-project-id".to_string()),
             normalized_project_roots: vec!["/worktree-a".to_string()],
@@ -229,7 +240,6 @@ async fn file_attention_project_scope_recovers_durable_only_deleted_root() {
             tool: None,
             mutations_only: false,
             max_rows: 10,
-            execution_budget_secs: 3,
         })
         .await
         .expect("durably mapped deleted root remains visible during migration");
@@ -266,7 +276,6 @@ async fn file_attention_project_scope_excludes_unmapped_pruned_legacy_root() {
 
     let touches = repo
         .file_attention(FileAttentionQuery {
-            cancellation_token: "test-file-attention-unmapped-pruned".to_string(),
             rel: "crates/foo.rs".to_string(),
             normalized_project_id: Some("git:new-project-id".to_string()),
             normalized_project_roots: vec!["/worktree-a".to_string()],
@@ -279,7 +288,6 @@ async fn file_attention_project_scope_excludes_unmapped_pruned_legacy_root() {
             tool: None,
             mutations_only: false,
             max_rows: 10,
-            execution_budget_secs: 3,
         })
         .await
         .expect("unmappable pruned history must fail closed");
@@ -292,7 +300,6 @@ async fn file_attention_all_scope_is_the_only_unscoped_widening_path() {
     let (repo, state) = build_repo().await;
 
     repo.file_attention(FileAttentionQuery {
-        cancellation_token: "test-file-attention-all".to_string(),
         rel: "crates/foo.rs".to_string(),
         normalized_project_id: Some("project-a".to_string()),
         normalized_project_roots: vec!["/worktree-a".to_string()],
@@ -305,7 +312,6 @@ async fn file_attention_all_scope_is_the_only_unscoped_widening_path() {
         tool: None,
         mutations_only: false,
         max_rows: 10,
-        execution_budget_secs: 3,
     })
     .await
     .expect("all-scope file_attention query succeeds");
@@ -333,7 +339,6 @@ async fn file_attention_all_scope_keeps_the_configured_server_floor_only() {
     let (repo, state) = build_scoped_repo(&["/work/project"]).await;
 
     repo.file_attention(FileAttentionQuery {
-        cancellation_token: "test-file-attention-scoped-all".to_string(),
         rel: "crates/foo.rs".to_string(),
         normalized_project_id: Some("project-a".to_string()),
         normalized_project_roots: vec!["/worktree-a".to_string()],
@@ -346,7 +351,6 @@ async fn file_attention_all_scope_keeps_the_configured_server_floor_only() {
         tool: None,
         mutations_only: false,
         max_rows: 10,
-        execution_budget_secs: 3,
     })
     .await
     .expect("all-scope query on scoped repository succeeds");
@@ -365,24 +369,15 @@ async fn file_attention_all_scope_keeps_the_configured_server_floor_only() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn file_attention_all_scope_preserves_legacy_suffix_fallback_on_schema_skew() {
-    let responses = vec![
-        ScriptedResponse::failure(
-            &["repo_rel_path = 'crates/foo.rs'"],
-            "Unknown identifier project_id",
-        ),
-        ScriptedResponse::rows(&["JSONExtractString(input_json, 'path')"], json!([])).forbidding(
-            &[
-                ", project_id, repo_rel_path, worktree_root",
-                "any(project_id) AS project_id",
-            ],
-        ),
-    ];
+async fn file_attention_all_scope_does_not_replay_after_backend_schema_error() {
+    let responses = vec![ScriptedResponse::failure(
+        &["repo_rel_path = 'crates/foo.rs'"],
+        "Code: 47. DB::Exception: Unknown identifier project_id",
+    )];
     let (repo, state) = build_scripted_repo(responses).await;
 
-    let touches = repo
+    let error = repo
         .file_attention(FileAttentionQuery {
-            cancellation_token: "test-file-attention-schema-skew-all".to_string(),
             rel: "crates/foo.rs".to_string(),
             normalized_project_id: Some("project-a".to_string()),
             normalized_project_roots: vec!["/worktree-a".to_string()],
@@ -395,26 +390,24 @@ async fn file_attention_all_scope_preserves_legacy_suffix_fallback_on_schema_ske
             tool: None,
             mutations_only: false,
             max_rows: 10,
-            execution_budget_secs: 3,
         })
         .await
-        .expect("legacy all-scope fallback succeeds");
+        .expect_err("backend schema failure is not replayed");
 
-    assert!(touches.is_empty());
-    assert_eq!(state.queries.lock().expect("queries lock").len(), 2);
+    assert!(matches!(error, RepoError::Backend(_)));
+    assert_script_consumed(&state, 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn file_attention_project_scope_stays_closed_on_schema_skew() {
     let responses = vec![ScriptedResponse::failure(
         &["repo_rel_path = 'crates/foo.rs'"],
-        "Unknown identifier project_id",
+        "Code: 47. DB::Exception: Unknown identifier project_id",
     )];
     let (repo, state) = build_scripted_repo(responses).await;
 
     let touches = repo
         .file_attention(FileAttentionQuery {
-            cancellation_token: "test-file-attention-schema-skew-project".to_string(),
             rel: "crates/foo.rs".to_string(),
             normalized_project_id: Some("project-a".to_string()),
             normalized_project_roots: vec!["/worktree-a".to_string()],
@@ -427,7 +420,6 @@ async fn file_attention_project_scope_stays_closed_on_schema_skew() {
             tool: None,
             mutations_only: false,
             max_rows: 10,
-            execution_budget_secs: 3,
         })
         .await
         .expect("project-scoped schema-skew query stays closed");
@@ -441,7 +433,6 @@ async fn file_attention_project_scope_without_identity_stays_closed() {
     let (repo, state) = build_repo().await;
 
     repo.file_attention(FileAttentionQuery {
-        cancellation_token: "test-file-attention-unknown-project".to_string(),
         rel: "crates/foo.rs".to_string(),
         normalized_project_id: None,
         normalized_project_roots: Vec::new(),
@@ -454,7 +445,6 @@ async fn file_attention_project_scope_without_identity_stays_closed() {
         tool: None,
         mutations_only: false,
         max_rows: 10,
-        execution_budget_secs: 3,
     })
     .await
     .expect("closed project-scope file_attention query succeeds");
@@ -463,21 +453,4 @@ async fn file_attention_project_scope_without_identity_stays_closed() {
         state.queries.lock().expect("queries lock").is_empty(),
         "an unknown request project must stay closed without issuing a backend query"
     );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn cancel_query_kills_base_and_fanout_child_query_ids() {
-    let (repo, state) = build_repo().await;
-
-    repo.cancel_query("mcp-request-123")
-        .await
-        .expect("cancel query family");
-
-    let queries = state.queries.lock().expect("queries lock");
-    let kill = queries
-        .iter()
-        .find(|query| query.starts_with("KILL QUERY"))
-        .expect("kill query captured");
-    assert!(kill.contains("query_id = 'mcp-request-123'"));
-    assert!(kill.contains("startsWith(query_id, 'mcp-request-123-')"));
 }

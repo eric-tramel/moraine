@@ -8,6 +8,12 @@ pub enum RepoError {
     InvalidArgument(String),
     #[error("invalid cursor: {0}")]
     InvalidCursor(String),
+    #[error("query cancelled: {0}")]
+    Cancelled(String),
+    #[error("query deadline exceeded: {0}")]
+    DeadlineExceeded(String),
+    #[error("query resources exhausted: {0}")]
+    ResourceExhausted(String),
     #[error("backend error: {0}")]
     Backend(String),
     #[error("internal error: {0}")]
@@ -23,6 +29,18 @@ impl RepoError {
 
     pub fn invalid_cursor(message: impl Into<String>) -> Self {
         Self::InvalidCursor(message.into())
+    }
+
+    pub fn cancelled(message: impl Into<String>) -> Self {
+        Self::Cancelled(message.into())
+    }
+
+    pub fn deadline_exceeded(message: impl Into<String>) -> Self {
+        Self::DeadlineExceeded(message.into())
+    }
+
+    pub fn resource_exhausted(message: impl Into<String>) -> Self {
+        Self::ResourceExhausted(message.into())
     }
 
     pub fn backend(message: impl Into<String>) -> Self {

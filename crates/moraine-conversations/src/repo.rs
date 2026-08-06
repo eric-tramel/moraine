@@ -15,10 +15,17 @@ use crate::domain::{
     TurnSummary,
 };
 use crate::error::RepoResult;
+use crate::QueryRuntime;
 
 #[async_trait]
 pub trait ConversationRepository: Send + Sync {
     fn config(&self) -> &RepoConfig;
+
+    /// Return the query runtime for repositories backed by ClickHouse.
+    /// Backend-neutral test repositories do not own a query runtime.
+    fn query_runtime(&self) -> Option<QueryRuntime> {
+        None
+    }
 
     async fn prewarm_mcp_search_state(&self) -> RepoResult<()>;
     async fn list_session_analytics(
@@ -122,6 +129,4 @@ pub trait ConversationRepository: Send + Sync {
         &self,
         query: FileAttentionQuery,
     ) -> RepoResult<Vec<FileAttentionTouch>>;
-
-    async fn cancel_query(&self, query_id: &str) -> RepoResult<()>;
 }

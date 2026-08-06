@@ -211,7 +211,9 @@ async fn session_analytics_propagates_each_wire_stage_error() {
             .await
             .expect_err("wire stage error propagates");
         assert!(
-            error.to_string().contains("session stage"),
+            error
+                .to_string()
+                .contains("ClickHouse request was rejected"),
             "stage {stage} error: {error}"
         );
         assert_script_consumed(&state, stage + 1);

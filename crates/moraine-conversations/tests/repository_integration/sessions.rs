@@ -1118,9 +1118,13 @@ async fn web_feed_propagates_backend_and_json_each_row_decode_errors() {
             .await
             .expect_err("web feed failure propagates");
         if index == 0 {
-            assert!(error.to_string().contains("web feed backend failed"));
+            assert!(error
+                .to_string()
+                .contains("ClickHouse request was rejected"));
         } else {
-            assert!(error.to_string().contains("failed to parse JSONEachRow"));
+            assert!(error
+                .to_string()
+                .contains("failed to parse ClickHouse JSONEachRow"));
         }
         assert_script_consumed(&state, 1);
     }

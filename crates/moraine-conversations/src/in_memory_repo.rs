@@ -44,7 +44,6 @@ pub struct InMemoryConversationResponses {
     pub search_session_metadata: Option<RepoResult<SessionMetadataSearchResults>>,
     pub file_attention: Option<RepoResult<Vec<FileAttentionTouch>>>,
     pub prewarm_mcp_search_state: Option<RepoResult<()>>,
-    pub cancel_query: Option<RepoResult<()>>,
     pub list_session_analytics: Option<RepoResult<Vec<SessionAnalytics>>>,
     pub analytics_series: Option<RepoResult<AnalyticsSnapshot>>,
     pub list_web_searches: Option<RepoResult<Vec<WebSearchEvent>>>,
@@ -76,7 +75,6 @@ pub struct InMemoryConversationCalls {
     pub search_session_metadata: Vec<SessionMetadataSearchQuery>,
     pub file_attention: Vec<FileAttentionQuery>,
     pub prewarm_mcp_search_state: usize,
-    pub cancel_query: Vec<String>,
     pub list_session_analytics: Vec<SessionAnalyticsQuery>,
     pub analytics_series: Vec<AnalyticsRange>,
     pub list_web_searches: Vec<u16>,
@@ -142,10 +140,7 @@ impl InMemoryConversationRepository {
     fn empty_search_mcp_events(&self, query: &SearchMcpEventsQuery) -> SearchMcpEventsResult {
         let requested_n_hits = query.n_hits.unwrap_or(self.config.max_results).max(1);
         SearchMcpEventsResult {
-            query_id: query
-                .cancellation_token
-                .clone()
-                .unwrap_or_else(|| "in-memory".to_string()),
+            query_id: "in-memory".to_string(),
             query: query.query.clone(),
             terms: Vec::new(),
             event_types: query
@@ -499,11 +494,6 @@ impl ConversationRepository for InMemoryConversationRepository {
     ) -> RepoResult<Vec<FileAttentionTouch>> {
         self.record(|calls| calls.file_attention.push(query));
         response_or!(self, file_attention, Vec::new())
-    }
-
-    async fn cancel_query(&self, query_id: &str) -> RepoResult<()> {
-        self.record(|calls| calls.cancel_query.push(query_id.to_string()));
-        response_or!(self, cancel_query, ())
     }
 }
 

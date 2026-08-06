@@ -2,7 +2,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context as _, Result};
-use moraine_clickhouse::{enforce_remote_schema_policy, ClickHouseClient};
+use moraine_clickhouse::{
+    enforce_remote_schema_policy, ClickHouseClient, QueryOwner, QueryRuntime, QueryWorkload,
+};
 use moraine_config::{AppConfig, ClickHouseConfig, DEFAULT_BACKEND_NAME};
 use tokio::sync::{watch, Mutex};
 use tracing::warn;
@@ -33,6 +35,7 @@ pub struct BackendRepository {
     repository: Arc<dyn ConversationRepository>,
     clickhouse_url: Arc<str>,
     clickhouse_database: Arc<str>,
+    query_runtime: QueryRuntime,
 }
 
 impl BackendRepository {
@@ -40,12 +43,14 @@ impl BackendRepository {
         backend_name: Arc<str>,
         repository: Arc<dyn ConversationRepository>,
         clickhouse: &ClickHouseConfig,
+        query_runtime: QueryRuntime,
     ) -> Self {
         Self {
             backend_name,
             repository,
             clickhouse_url: clickhouse_display_url(&clickhouse.url),
             clickhouse_database: Arc::from(clickhouse.database.as_str()),
+            query_runtime,
         }
     }
 
@@ -63,6 +68,10 @@ impl BackendRepository {
 
     pub fn clickhouse_database(&self) -> &str {
         &self.clickhouse_database
+    }
+
+    pub fn query_runtime(&self) -> QueryRuntime {
+        self.query_runtime.clone()
     }
 }
 
@@ -102,6 +111,7 @@ struct BackendSlot {
     backend_name: Arc<str>,
     clickhouse: ClickHouseConfig,
     checked: bool,
+    query_runtime: QueryRuntime,
     state: Mutex<SlotState>,
 }
 
@@ -110,6 +120,7 @@ impl BackendSlot {
         backend_name: String,
         clickhouse: ClickHouseConfig,
         checked: bool,
+        query_runtime: QueryRuntime,
         preloaded: Option<Arc<dyn ConversationRepository>>,
     ) -> Self {
         let backend_name: Arc<str> = Arc::from(backend_name);
@@ -118,6 +129,7 @@ impl BackendSlot {
                 backend_name.clone(),
                 repository,
                 &clickhouse,
+                query_runtime.clone(),
             ))),
             None => SlotState::Empty,
         };
@@ -125,6 +137,7 @@ impl BackendSlot {
             backend_name,
             clickhouse,
             checked,
+            query_runtime,
             state: Mutex::new(state),
         }
     }
@@ -194,6 +207,7 @@ impl BackendSlot {
                 &self.backend_name,
                 self.clickhouse.clone(),
                 repo_config,
+                self.query_runtime.clone(),
                 user_agent,
             )
             .await?
@@ -201,6 +215,7 @@ impl BackendSlot {
             build_clickhouse_repository_with_user_agent(
                 self.clickhouse.clone(),
                 repo_config,
+                self.query_runtime.clone(),
                 user_agent,
             )?
         };
@@ -209,6 +224,7 @@ impl BackendSlot {
             self.backend_name.clone(),
             repository,
             &self.clickhouse,
+            self.query_runtime.clone(),
         )))
     }
 }
@@ -224,6 +240,7 @@ pub struct BackendRepositoryRouter {
     config: Arc<AppConfig>,
     repo_config: RepoConfig,
     user_agent: Arc<str>,
+    query_runtime: QueryRuntime,
     slots: BTreeMap<String, Arc<BackendSlot>>,
 }
 
@@ -231,9 +248,16 @@ impl BackendRepositoryRouter {
     pub fn new(
         config: Arc<AppConfig>,
         repo_config: RepoConfig,
+        query_runtime: QueryRuntime,
         user_agent: impl Into<Arc<str>>,
     ) -> Result<Self> {
-        Self::new_inner(config, repo_config, user_agent.into(), BTreeMap::new())
+        Self::new_inner(
+            config,
+            repo_config,
+            user_agent.into(),
+            query_runtime,
+            BTreeMap::new(),
+        )
     }
 
     /// Construct a router with already-built repositories for consumer tests.
@@ -241,12 +265,14 @@ impl BackendRepositoryRouter {
     #[doc(hidden)]
     pub fn from_preloaded_for_testing(
         config: Arc<AppConfig>,
+        query_runtime: QueryRuntime,
         repositories: impl IntoIterator<Item = (String, Arc<dyn ConversationRepository>)>,
     ) -> Result<Self> {
         Self::new_inner(
             config,
             RepoConfig::default(),
             Arc::from("moraine-conversations-test"),
+            query_runtime,
             repositories.into_iter().collect(),
         )
     }
@@ -255,6 +281,7 @@ impl BackendRepositoryRouter {
         config: Arc<AppConfig>,
         repo_config: RepoConfig,
         user_agent: Arc<str>,
+        query_runtime: QueryRuntime,
         mut preloaded: BTreeMap<String, Arc<dyn ConversationRepository>>,
     ) -> Result<Self> {
         if !config.backends.contains_key(DEFAULT_BACKEND_NAME) {
@@ -273,6 +300,7 @@ impl BackendRepositoryRouter {
                     backend_name.clone(),
                     clickhouse.clone(),
                     backend_name != DEFAULT_BACKEND_NAME,
+                    query_runtime.clone(),
                     repository,
                 )),
             );
@@ -287,8 +315,13 @@ impl BackendRepositoryRouter {
             config,
             repo_config,
             user_agent,
+            query_runtime,
             slots,
         })
+    }
+
+    pub fn query_runtime(&self) -> QueryRuntime {
+        self.query_runtime.clone()
     }
 
     pub async fn default_repository(&self) -> Result<Arc<BackendRepository>> {
@@ -378,14 +411,19 @@ async fn build_checked_clickhouse_repository_with_user_agent(
     backend_name: &str,
     clickhouse: ClickHouseConfig,
     config: RepoConfig,
+    query_runtime: QueryRuntime,
     user_agent: impl AsRef<str>,
 ) -> Result<Arc<dyn ConversationRepository>> {
     let allow_newer_server = clickhouse.allow_newer_server;
-    let client =
-        ClickHouseClient::new_with_user_agent(clickhouse, user_agent).with_context(|| {
-            format!("backend '{backend_name}': failed to construct ClickHouse client")
-        })?;
-    let skew = client.schema_skew().await.with_context(|| {
+    let client = ClickHouseClient::new_with_runtime_and_user_agent(
+        clickhouse,
+        query_runtime.clone(),
+        user_agent,
+    )
+    .with_context(|| format!("backend '{backend_name}': failed to construct ClickHouse client"))?;
+    let owner = QueryOwner::new(&query_runtime, QueryWorkload::Internal)
+        .with_context(|| format!("backend '{backend_name}': failed to own schema handshake"))?;
+    let skew = owner.scope(client.schema_skew()).await.with_context(|| {
         format!("backend '{backend_name}': schema handshake failed (is the server reachable?)")
     })?;
     enforce_remote_schema_policy(backend_name, &skew, allow_newer_server)?;
@@ -420,6 +458,7 @@ mod tests {
     struct CapturedRequest {
         method: Method,
         query: String,
+        query_id: Option<String>,
         user_agent: Option<String>,
     }
 
@@ -458,6 +497,7 @@ mod tests {
                 .push(CapturedRequest {
                     method,
                     query: query.clone(),
+                    query_id: params.get("query_id").cloned(),
                     user_agent: headers
                         .get("user-agent")
                         .and_then(|value| value.to_str().ok())
@@ -526,6 +566,19 @@ mod tests {
             .collect()
     }
 
+    fn data_request_count(state: &SchemaServerState) -> usize {
+        state
+            .captured
+            .lock()
+            .expect("captured request lock")
+            .iter()
+            .filter(|request| {
+                !request.query.starts_with("KILL QUERY")
+                    && !request.query.contains("FROM system.processes")
+            })
+            .count()
+    }
+
     fn clickhouse_config(url: String, allow_newer_server: bool) -> ClickHouseConfig {
         ClickHouseConfig {
             url,
@@ -557,6 +610,7 @@ mod tests {
             Arc::new(InMemoryConversationRepository::new(RepoConfig::default()));
         BackendRepositoryRouter::from_preloaded_for_testing(
             config,
+            QueryRuntime::new(),
             [
                 (DEFAULT_BACKEND_NAME.to_string(), default),
                 ("team-ch".to_string(), named),
@@ -572,6 +626,7 @@ mod tests {
             "team-ch",
             clickhouse_config(url, false),
             RepoConfig::default(),
+            QueryRuntime::new(),
             "moraine-backend/test",
         )
         .await
@@ -592,6 +647,19 @@ mod tests {
         assert!(captured
             .iter()
             .all(|request| { request.user_agent.as_deref() == Some("moraine-backend/test") }));
+        let query_ids = captured
+            .iter()
+            .map(|request| request.query_id.as_deref().expect("owned schema query"))
+            .collect::<Vec<_>>();
+        let logical_id = query_ids[0]
+            .rsplit_once('-')
+            .expect("schema child sequence")
+            .0;
+        assert!(logical_id.starts_with("moraine-internal-"));
+        assert!(query_ids
+            .iter()
+            .all(|query_id| query_id.starts_with(logical_id)));
+        assert_ne!(query_ids[0], query_ids[1]);
     }
 
     #[tokio::test]
@@ -603,6 +671,7 @@ mod tests {
             "team-ch",
             clickhouse_config(url, true),
             RepoConfig::default(),
+            QueryRuntime::new(),
             "moraine-backend/test",
         )
         .await
@@ -624,6 +693,7 @@ mod tests {
             "team-ch",
             clickhouse_config(url, false),
             RepoConfig::default(),
+            QueryRuntime::new(),
             "moraine-backend/test",
         )
         .await
@@ -644,6 +714,7 @@ mod tests {
             "team-ch",
             clickhouse_config(url, true),
             RepoConfig::default(),
+            QueryRuntime::new(),
             "moraine-backend/test",
         )
         .await
@@ -657,6 +728,7 @@ mod tests {
             "team-ch",
             clickhouse_config(url, false),
             RepoConfig::default(),
+            QueryRuntime::new(),
             "moraine-backend/test",
         )
         .await
@@ -679,6 +751,7 @@ mod tests {
         let router = BackendRepositoryRouter::new(
             Arc::new(config),
             RepoConfig::default(),
+            QueryRuntime::new(),
             "moraine-backend/test",
         )
         .expect("router");
@@ -696,6 +769,19 @@ mod tests {
             ClickHouseConfig::default().database
         );
         assert!(Arc::ptr_eq(first.repository(), second.repository()));
+        let owner = QueryOwner::new(&router.query_runtime(), QueryWorkload::Internal)
+            .expect("router runtime owner");
+        assert_eq!(first.query_runtime().active_owner_count(), 1);
+        assert_eq!(
+            first
+                .repository()
+                .query_runtime()
+                .expect("real repository runtime")
+                .active_owner_count(),
+            1
+        );
+        owner.scope(async {}).await;
+        assert_eq!(router.query_runtime().active_owner_count(), 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -716,6 +802,7 @@ mod tests {
             BackendRepositoryRouter::new(
                 routed_config(url, false),
                 RepoConfig::default(),
+                QueryRuntime::new(),
                 "moraine-backend/test",
             )
             .expect("router"),
@@ -750,7 +837,7 @@ mod tests {
             assert!(message.contains("schema handshake failed"));
             assert!(!message.contains("temporary schema probe failure"));
         }
-        assert_eq!(state.requests.load(Ordering::SeqCst), 1);
+        assert_eq!(data_request_count(&state), 1);
 
         let recovered = router
             .repository_for_project_dir(Some("/work/team/project"))
@@ -761,11 +848,11 @@ mod tests {
             .await
             .expect("successful slot is cached");
         assert!(Arc::ptr_eq(&recovered, &cached));
-        assert_eq!(state.requests.load(Ordering::SeqCst), 3);
+        assert_eq!(data_request_count(&state), 3);
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn panicked_build_attempt_releases_waiters_and_retries() {
+    async fn failed_build_attempt_releases_waiters_and_retries() {
         let mut config = (*routed_config("http://127.0.0.1:1".to_string(), false)).clone();
         config
             .backends
@@ -775,6 +862,7 @@ mod tests {
         let router = BackendRepositoryRouter::new(
             Arc::new(config),
             RepoConfig::default(),
+            QueryRuntime::new(),
             "moraine-backend/test",
         )
         .expect("router");
@@ -785,12 +873,14 @@ mod tests {
                 router.repository_for_project_dir(Some("/work/team/project")),
             )
             .await
-            .expect("panicked build attempt must publish instead of hanging");
+            .expect("failed build attempt must publish instead of hanging");
             let error = match result {
                 Ok(_) => panic!("invalid timeout must fail construction"),
                 Err(error) => error,
             };
-            assert!(error.to_string().contains("initialization task failed"));
+            assert!(error
+                .to_string()
+                .contains("failed to construct ClickHouse client"));
         }
     }
 
@@ -805,6 +895,7 @@ mod tests {
             Arc::new(InMemoryConversationRepository::new(RepoConfig::default()));
         let router = BackendRepositoryRouter::from_preloaded_for_testing(
             config,
+            QueryRuntime::new(),
             [(DEFAULT_BACKEND_NAME.to_string(), default)],
         )
         .expect("default-only router");
@@ -938,6 +1029,7 @@ mod tests {
         let router = BackendRepositoryRouter::new(
             routed_config(url, false),
             RepoConfig::default(),
+            QueryRuntime::new(),
             "moraine-backend/test",
         )
         .expect("router");

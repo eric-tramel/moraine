@@ -15,6 +15,7 @@ use tokio::sync::Notify;
 
 use super::canonical_open_fixtures::{hydrated_rows, navigation_rows};
 use super::responses::{json_each_row, trace_event_row, turn_summary_row};
+use super::OwnedRepository;
 
 #[derive(Clone)]
 pub(crate) struct ScriptedBarrier {
@@ -127,6 +128,12 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
         }
 
         let query = params.get("query").cloned().unwrap_or_default();
+        if query.starts_with("KILL QUERY") {
+            return (StatusCode::OK, String::new());
+        }
+        if query.contains("FROM system.processes") {
+            return (StatusCode::OK, json_each_row(json!([])));
+        }
         state
             .queries
             .lock()
@@ -2144,14 +2151,14 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
 
 pub(crate) async fn build_repo_with_max_results(
     max_results: u16,
-) -> (ClickHouseConversationRepository, Arc<MockState>) {
+) -> (OwnedRepository, Arc<MockState>) {
     build_repo_with_options(max_results, MockOptions::default()).await
 }
 
 pub(crate) async fn build_repo_with_options(
     max_results: u16,
     options: MockOptions,
-) -> (ClickHouseConversationRepository, Arc<MockState>) {
+) -> (OwnedRepository, Arc<MockState>) {
     let (base_url, state) = spawn_mock_server(options).await;
     let client =
         ClickHouseClient::new(test_clickhouse_config(base_url)).expect("valid clickhouse client");
@@ -2164,12 +2171,12 @@ pub(crate) async fn build_repo_with_options(
         },
     );
 
-    (repo, state)
+    (OwnedRepository::new(repo), state)
 }
 
 pub(crate) async fn build_scripted_repo(
     scripted_responses: Vec<ScriptedResponse>,
-) -> (ClickHouseConversationRepository, Arc<MockState>) {
+) -> (OwnedRepository, Arc<MockState>) {
     build_repo_with_options(
         100,
         MockOptions {
@@ -2179,14 +2186,12 @@ pub(crate) async fn build_scripted_repo(
     )
     .await
 }
-pub(crate) async fn build_repo() -> (ClickHouseConversationRepository, Arc<MockState>) {
+pub(crate) async fn build_repo() -> (OwnedRepository, Arc<MockState>) {
     build_repo_with_max_results(100).await
 }
 
 /// Repository with a `--project-only` session origin scope configured.
-pub(crate) async fn build_scoped_repo(
-    roots: &[&str],
-) -> (ClickHouseConversationRepository, Arc<MockState>) {
+pub(crate) async fn build_scoped_repo(roots: &[&str]) -> (OwnedRepository, Arc<MockState>) {
     let (base_url, state) = spawn_mock_server(MockOptions::default()).await;
     let client =
         ClickHouseClient::new(test_clickhouse_config(base_url)).expect("valid clickhouse client");
@@ -2200,5 +2205,5 @@ pub(crate) async fn build_scoped_repo(
         },
     );
 
-    (repo, state)
+    (OwnedRepository::new(repo), state)
 }

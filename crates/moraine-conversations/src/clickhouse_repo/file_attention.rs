@@ -127,9 +127,12 @@ WHERE (session_id, event_uid) IN (
                 true
             }
             Err(RepoError::Backend(message)) if is_file_attention_schema_skew(&message) => {
+                if !query.apply_project_scope {
+                    return Err(RepoError::backend(message));
+                }
                 warn!(
                     error = %message,
-                    "file_attention normalized lookup unavailable; using Tier-0 suffix scan where its scope can be proven"
+                    "file_attention normalized lookup unavailable; keeping project-scoped request closed"
                 );
                 false
             }
@@ -244,13 +247,7 @@ WHERE (session_id, event_uid) IN (
         };
 
         let limit_plus = query.max_rows.saturating_add(1);
-        let max_execution_time = query.execution_budget_secs.max(1).to_string();
-        let exact_query_id = format!("{}-exact", query.cancellation_token);
-        let params = [
-            ("query_id", exact_query_id.as_str()),
-            ("max_execution_time", max_execution_time.as_str()),
-            ("join_use_nulls", "1"),
-        ];
+        let params = [("join_use_nulls", "1")];
 
         let normalized_root_condition = single_path_sql("ti.worktree_root");
 
@@ -588,21 +585,7 @@ WHERE (session_id, event_uid) IN (SELECT session_id, event_uid FROM matched))"
         };
 
         let limit_plus = query.max_rows.saturating_add(1);
-        let max_execution_time = query.execution_budget_secs.max(1).to_string();
-        let suffix_query_id = format!(
-            "{}-{}",
-            query.cancellation_token,
-            if use_candidate_index {
-                "indexed-suffix"
-            } else {
-                "suffix"
-            }
-        );
-        let params = [
-            ("query_id", suffix_query_id.as_str()),
-            ("max_execution_time", max_execution_time.as_str()),
-            ("join_use_nulls", "1"),
-        ];
+        let params = [("join_use_nulls", "1")];
 
         let normalized_tool_columns = if normalized_schema_available {
             ", project_id, repo_rel_path, worktree_root, event_project_id, event_worktree_root"
@@ -649,21 +632,6 @@ WHERE (session_id, event_uid) IN (SELECT session_id, event_uid FROM matched))"
 
         self.map_backend(self.query_rows_with_params(&sql, None, &params).await)
     }
-
-    pub async fn cancel_query(&self, query_id: &str) -> RepoResult<()> {
-        let query_id = query_id.trim();
-        if query_id.is_empty() {
-            return Ok(());
-        }
-        let child_prefix = format!("{query_id}-");
-        let sql = format!(
-            "KILL QUERY WHERE query_id = {} OR startsWith(query_id, {}) SYNC",
-            sql_quote(query_id),
-            sql_quote(&child_prefix)
-        );
-        self.map_backend(self.ch.request_text(&sql, None, None, false, None).await)
-            .map(|_| ())
-    }
 }
 
 fn single_path_sql(expression: &str) -> String {
@@ -674,7 +642,8 @@ fn single_path_sql(expression: &str) -> String {
 
 fn is_file_attention_schema_skew(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
-    lower.contains("project_id")
+    lower.contains("clickhouse code 47")
+        || lower.contains("project_id")
         || lower.contains("repo_rel_path")
         || lower.contains("worktree_root")
         || lower.contains("file_attention_project_roots")

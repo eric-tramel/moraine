@@ -89,7 +89,7 @@ async fn table_summaries_return_metadata_when_parts_probe_fails() {
     assert!(summaries
         .row_counts_error
         .as_deref()
-        .is_some_and(|message| message.contains("active parts probe failed")));
+        .is_some_and(|message| message.contains("ClickHouse request was rejected")));
     assert_script_consumed(&state, 2);
 }
 #[tokio::test(flavor = "multi_thread")]
@@ -180,7 +180,9 @@ async fn preview_propagates_schema_and_row_stage_errors() {
         })
         .await
         .expect_err("schema failure propagates");
-    assert!(schema_error.to_string().contains("preview schema failed"));
+    assert!(schema_error
+        .to_string()
+        .contains("ClickHouse request was rejected"));
     assert_script_consumed(&schema_state, 1);
 
     let (row_repo, row_state) = build_scripted_repo(vec![
@@ -205,6 +207,8 @@ async fn preview_propagates_schema_and_row_stage_errors() {
         })
         .await
         .expect_err("row failure propagates");
-    assert!(row_error.to_string().contains("preview row read failed"));
+    assert!(row_error
+        .to_string()
+        .contains("ClickHouse request was rejected"));
     assert_script_consumed(&row_state, 2);
 }

@@ -543,14 +543,14 @@ async fn search_mcp_events_supports_global_search_with_enriched_hits() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn search_mcp_events_attaches_cancellation_token_to_clickhouse_reads() {
+async fn search_mcp_events_preserves_domain_query_id_separate_from_owner_id() {
     let (repo, state) = build_repo().await;
-    let cancellation_token = "mcp-search-cancel-test";
+    let owner = QueryOwner::new(&repo.runtime(), QueryWorkload::Mcp).expect("MCP query owner");
+    let owner_id = owner.logical_id().to_string();
 
-    let result = repo
-        .search_mcp_events(SearchMcpEventsQuery {
+    let result = owner
+        .scope(repo.unowned().search_mcp_events(SearchMcpEventsQuery {
             query: "hello world".to_string(),
-            cancellation_token: Some(cancellation_token.to_string()),
             n_hits: Some(2),
             event_types: Some(vec![
                 McpEventType::UserInput,
@@ -559,21 +559,21 @@ async fn search_mcp_events_attaches_cancellation_token_to_clickhouse_reads() {
             min_score: Some(0.0),
             min_should_match: Some(1),
             ..SearchMcpEventsQuery::default()
-        })
+        }))
         .await
-        .expect("cancellable mcp event search");
+        .expect("owned MCP event search");
 
-    assert_eq!(result.query_id, cancellation_token);
+    assert_ne!(result.query_id, owner_id);
+    assert!(Uuid::parse_str(&result.query_id).is_ok());
     let query_ids = state.query_ids.lock().expect("query id lock").clone();
-    assert!(!query_ids.is_empty());
-    let child_prefix = format!("{cancellation_token}-");
     let observed = query_ids
         .iter()
         .map(|query_id| query_id.as_deref().expect("query id"))
         .collect::<Vec<_>>();
+    assert!(!observed.is_empty());
     assert!(observed
         .iter()
-        .all(|query_id| query_id.starts_with(&child_prefix)));
+        .all(|query_id| query_id.starts_with(&format!("{owner_id}-"))));
     assert_eq!(
         observed
             .iter()
@@ -585,37 +585,32 @@ async fn search_mcp_events_attaches_cancellation_token_to_clickhouse_reads() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn repository_query_context_attaches_id_without_query_model_token() {
+async fn one_owner_covers_all_repository_statements_with_unique_children() {
     let (repo, state) = build_repo().await;
-    let query_id = "mcp-request-context-test";
+    let owner = QueryOwner::new(&repo.runtime(), QueryWorkload::Monitor).expect("monitor owner");
+    let owner_id = owner.logical_id().to_string();
 
-    with_repository_query_id(
-        query_id.to_string(),
-        repo.search_mcp_events(SearchMcpEventsQuery {
+    owner
+        .scope(repo.unowned().search_mcp_events(SearchMcpEventsQuery {
             query: "hello world".to_string(),
             n_hits: Some(2),
-            event_types: Some(vec![
-                McpEventType::UserInput,
-                McpEventType::AssistantResponse,
-            ]),
+            event_types: Some(vec![McpEventType::AssistantResponse]),
             min_score: Some(0.0),
             min_should_match: Some(1),
             ..SearchMcpEventsQuery::default()
-        }),
-    )
-    .await
-    .expect("query scoped by request context");
+        }))
+        .await
+        .expect("owned multi-statement search");
 
     let query_ids = state.query_ids.lock().expect("query id lock").clone();
-    assert!(!query_ids.is_empty());
-    let child_prefix = format!("{query_id}-");
     let observed = query_ids
         .iter()
-        .map(|observed| observed.as_deref().expect("query id"))
+        .map(|value| value.as_deref().expect("owned query id"))
         .collect::<Vec<_>>();
+    assert!(observed.len() >= 2);
     assert!(observed
         .iter()
-        .all(|observed| observed.starts_with(&child_prefix)));
+        .all(|value| value.starts_with(&format!("{owner_id}-"))));
     assert_eq!(
         observed
             .iter()
@@ -631,21 +626,19 @@ async fn repository_query_context_passes_remaining_deadline_to_every_read() {
     let (repo, state) = build_repo().await;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
 
-    with_repository_query_deadline(
-        "mcp-deadline-context-test".to_string(),
-        deadline,
-        repo.search_mcp_events(SearchMcpEventsQuery {
+    let owner = QueryOwner::with_deadline(&repo.runtime(), QueryWorkload::Mcp, deadline)
+        .expect("deadline owner");
+    owner
+        .scope(repo.unowned().search_mcp_events(SearchMcpEventsQuery {
             query: "hello world".to_string(),
-            cancellation_token: Some("nested-search-query".to_string()),
             n_hits: Some(2),
             event_types: Some(vec![McpEventType::AssistantResponse]),
             min_score: Some(0.0),
             min_should_match: Some(1),
             ..SearchMcpEventsQuery::default()
-        }),
-    )
-    .await
-    .expect("deadline-scoped search");
+        }))
+        .await
+        .expect("deadline-scoped search");
 
     let request_params = state.request_params.lock().expect("request params lock");
     assert_eq!(request_params.len(), 2);
@@ -742,7 +735,6 @@ async fn search_mcp_events_supports_turn_scoped_search() {
     let result = repo
         .search_mcp_events(SearchMcpEventsQuery {
             query: "cargo failure".to_string(),
-            cancellation_token: None,
             n_hits: Some(5),
             session_id: Some("sess_c".to_string()),
             turn_seq: Some(2),

@@ -2,9 +2,9 @@ use anyhow::{anyhow, bail, Context, Result};
 use moraine_clickhouse::ClickHouseClient;
 use moraine_config::{AppConfig, ClickHouseConfig, DEFAULT_BACKEND_NAME};
 use moraine_conversations::{
-    with_repository_query_id, AnalyticsRange, BackendRepositoryRouter,
-    ClickHouseConversationRepository, ConversationListSort, ConversationRepository,
-    McpSessionListFilter, PageRequest, RepoConfig, SearchEventsQuery, SearchStrategyHint,
+    AnalyticsRange, BackendRepositoryRouter, ClickHouseConversationRepository,
+    ConversationListSort, ConversationRepository, McpSessionListFilter, PageRequest, QueryOwner,
+    QueryRuntime, QueryWorkload, RepoConfig, SearchEventsQuery, SearchStrategyHint,
     SessionAnalyticsQuery, SessionLookback, TurnListFilter,
 };
 use reqwest::{Client, Url};
@@ -273,8 +273,9 @@ fn finish_with_cleanup(outcome: Result<()>, cleanup: Result<()>) -> Result<()> {
 fn live_client(
     prerequisites: &LivePrerequisites,
     database: &OwnedDatabaseName,
+    query_runtime: QueryRuntime,
 ) -> Result<ClickHouseClient> {
-    ClickHouseClient::new(prerequisites.clickhouse_config(database))
+    ClickHouseClient::new_with_runtime(prerequisites.clickhouse_config(database), query_runtime)
         .context("failed to construct owned live ClickHouse client")
 }
 
@@ -506,6 +507,7 @@ async fn assert_omp_session_metadata(repository: &ClickHouseConversationReposito
 
 #[derive(Debug)]
 struct OpenSuite {
+    owner_id: String,
     semantic: Value,
     event_ms: u64,
     turn_ms: u64,
@@ -585,107 +587,116 @@ FROM numbers({total_events})"#
 
 async fn run_open_suite(
     repository: &ClickHouseConversationRepository,
-    phase: &str,
+    _phase: &str,
     concurrent: bool,
 ) -> Result<OpenSuite> {
-    let wall_started = Instant::now();
-    let (session, session_ms, turn, turn_ms, event, event_ms) = if concurrent {
-        let session = async {
-            let started = Instant::now();
-            let value = with_repository_query_id(
-                format!("issue532-{phase}-session"),
-                repository.get_mcp_session("issue532-target-session"),
-            )
-            .await
-            .context("bounded session open failed")?
-            .context("bounded session target missing")?;
-            Ok::<_, anyhow::Error>((value, started.elapsed().as_millis() as u64))
-        };
-        let turn = async {
-            let started = Instant::now();
-            let value = with_repository_query_id(
-                format!("issue532-{phase}-turn"),
-                repository.get_mcp_turn("issue532-target-turn", 1),
-            )
-            .await
-            .context("bounded turn open failed")?
-            .context("bounded turn target missing")?;
-            Ok::<_, anyhow::Error>((value, started.elapsed().as_millis() as u64))
-        };
-        let event = async {
-            let started = Instant::now();
-            let value = with_repository_query_id(
-                format!("issue532-{phase}-event"),
-                repository.get_mcp_event("issue532-target-event-0250"),
-            )
-            .await
-            .context("bounded event open failed")?
-            .context("bounded event target missing")?;
-            Ok::<_, anyhow::Error>((value, started.elapsed().as_millis() as u64))
-        };
-        let (session, turn, event) = tokio::join!(session, turn, event);
-        let (session, session_ms) = session?;
-        let (turn, turn_ms) = turn?;
-        let (event, event_ms) = event?;
-        (session, session_ms, turn, turn_ms, event, event_ms)
-    } else {
-        let started = Instant::now();
-        let session = with_repository_query_id(
-            format!("issue532-{phase}-session"),
-            repository.get_mcp_session("issue532-target-session"),
-        )
-        .await
-        .context("bounded session open failed")?
-        .context("bounded session target missing")?;
-        let session_ms = started.elapsed().as_millis() as u64;
+    let owner = QueryOwner::new(&repository.query_runtime(), QueryWorkload::Mcp)
+        .context("failed to own bounded-open suite")?;
+    let owner_id = owner.logical_id().to_string();
+    owner
+        .scope(async {
+            let wall_started = Instant::now();
+            let (session, session_ms, turn, turn_ms, event, event_ms) = if concurrent {
+                let session = async {
+                    let started = Instant::now();
+                    let value = repository
+                        .get_mcp_session("issue532-target-session")
+                        .await
+                        .context("bounded session open failed")?
+                        .context("bounded session target missing")?;
+                    Ok::<_, anyhow::Error>((value, started.elapsed().as_millis() as u64))
+                };
+                let turn = async {
+                    let started = Instant::now();
+                    let value = repository
+                        .get_mcp_turn("issue532-target-turn", 1)
+                        .await
+                        .context("bounded turn open failed")?
+                        .context("bounded turn target missing")?;
+                    Ok::<_, anyhow::Error>((value, started.elapsed().as_millis() as u64))
+                };
+                let event = async {
+                    let started = Instant::now();
+                    let value = repository
+                        .get_mcp_event("issue532-target-event-0250")
+                        .await
+                        .context("bounded event open failed")?
+                        .context("bounded event target missing")?;
+                    Ok::<_, anyhow::Error>((value, started.elapsed().as_millis() as u64))
+                };
+                let (session, turn, event) = tokio::join!(session, turn, event);
+                let (session, session_ms) = session?;
+                let (turn, turn_ms) = turn?;
+                let (event, event_ms) = event?;
+                (session, session_ms, turn, turn_ms, event, event_ms)
+            } else {
+                let started = Instant::now();
+                let session = repository
+                    .get_mcp_session("issue532-target-session")
+                    .await
+                    .context("bounded session open failed")?
+                    .context("bounded session target missing")?;
+                let session_ms = started.elapsed().as_millis() as u64;
 
-        let started = Instant::now();
-        let turn = with_repository_query_id(
-            format!("issue532-{phase}-turn"),
-            repository.get_mcp_turn("issue532-target-turn", 1),
-        )
-        .await
-        .context("bounded turn open failed")?
-        .context("bounded turn target missing")?;
-        let turn_ms = started.elapsed().as_millis() as u64;
+                let started = Instant::now();
+                let turn = repository
+                    .get_mcp_turn("issue532-target-turn", 1)
+                    .await
+                    .context("bounded turn open failed")?
+                    .context("bounded turn target missing")?;
+                let turn_ms = started.elapsed().as_millis() as u64;
 
-        let started = Instant::now();
-        let event = with_repository_query_id(
-            format!("issue532-{phase}-event"),
-            repository.get_mcp_event("issue532-target-event-0250"),
-        )
-        .await
-        .context("bounded event open failed")?
-        .context("bounded event target missing")?;
-        let event_ms = started.elapsed().as_millis() as u64;
-        (session, session_ms, turn, turn_ms, event, event_ms)
-    };
+                let started = Instant::now();
+                let event = repository
+                    .get_mcp_event("issue532-target-event-0250")
+                    .await
+                    .context("bounded event open failed")?
+                    .context("bounded event target missing")?;
+                let event_ms = started.elapsed().as_millis() as u64;
+                (session, session_ms, turn, turn_ms, event, event_ms)
+            };
 
-    Ok(OpenSuite {
-        semantic: json!({
-            "session": session,
-            "turn": turn,
-            "event": event,
-        }),
-        event_ms,
-        turn_ms,
-        session_ms,
-        wall_ms: wall_started.elapsed().as_millis() as u64,
-    })
+            Ok(OpenSuite {
+                owner_id,
+                semantic: json!({
+                    "session": session,
+                    "turn": turn,
+                    "event": event,
+                }),
+                event_ms,
+                turn_ms,
+                session_ms,
+                wall_ms: wall_started.elapsed().as_millis() as u64,
+            })
+        })
+        .await
 }
 
 async fn read_open_cost_metrics(
     clickhouse: &ClickHouseClient,
     database: &str,
+    phase_owners: &[(&str, &str)],
 ) -> Result<HashMap<String, OpenCostMetrics>> {
     clickhouse
         .request_text("SYSTEM FLUSH LOGS", None, None, false, None)
         .await
         .context("failed to flush query log")?;
-    let rows: Vec<OpenCostMetrics> = clickhouse
-        .query_rows(
-            "SELECT
-  extract(query_id, '^issue532-([^-]+)-') AS phase,
+    let phase_expression = format!(
+        "multiIf({}, 'unknown')",
+        phase_owners
+            .iter()
+            .map(|(phase, owner)| format!("startsWith(query_id, '{}'), '{}'", owner, phase))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let owner_predicate = phase_owners
+        .iter()
+        .map(|(_, owner)| format!("startsWith(query_id, '{owner}')"))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    let query = format!(
+        "SELECT
+  {phase_expression} AS phase,
   toUInt64(count()) AS query_count,
   toUInt64(sum(read_rows)) AS read_rows,
   toUInt64(sum(read_bytes)) AS read_bytes,
@@ -693,12 +704,13 @@ async fn read_open_cost_metrics(
   toUInt64(sum(query_duration_ms)) AS duration_ms
 FROM system.query_log
 WHERE type = 'QueryFinish'
-  AND startsWith(query_id, 'issue532-')
+  AND ({owner_predicate})
   AND current_database = currentDatabase()
 GROUP BY phase
-FORMAT JSONEachRow",
-            Some(database),
-        )
+FORMAT JSONEachRow"
+    );
+    let rows: Vec<OpenCostMetrics> = clickhouse
+        .query_rows(&query, Some(database))
         .await
         .context("failed to aggregate MCP open query-log cost")?;
     Ok(rows
@@ -1107,9 +1119,14 @@ FORMAT JSONEachRow"#
 #[tokio::test]
 #[ignore = "requires wrapper-owned live ClickHouse and destructive opt-in"]
 async fn live_schema_semantics_and_teardown() -> Result<()> {
+    let query_runtime = QueryRuntime::new();
+    let query_owner = QueryOwner::new(&query_runtime, QueryWorkload::Internal)
+        .context("failed to create live-test query owner")?;
+    query_owner.scope(async {
+
     let prerequisites = LivePrerequisites::load()?;
     let database = prepare_owned_database_identity(&prerequisites.sandbox_id)?;
-    let clickhouse = live_client(&prerequisites, &database)?;
+    let clickhouse = live_client(&prerequisites, &database, query_runtime.clone())?;
     assert_owned_database_census_empty(&clickhouse, "before mutation").await?;
     let outcome = async {
         assert_live_schema_032_replay_stable_upgrade(&clickhouse, &database).await?;
@@ -1499,6 +1516,8 @@ VALUES
     let cleanup = cleanup_database(&clickhouse, &database).await;
     let census = assert_owned_database_census_empty(&clickhouse, "after cleanup").await;
     finish_with_cleanup(outcome, finish_with_cleanup(cleanup, census))
+
+    }).await
 }
 
 async fn assert_live_schema_032_replay_stable_upgrade(
@@ -1762,12 +1781,17 @@ FORMAT JSONEachRow"#
 #[tokio::test]
 #[ignore = "requires wrapper-owned live ClickHouse, destructive opt-in, and ~2 GB free"]
 async fn live_schema_032_replay_stable_upgrade_stays_within_memory_budget() -> Result<()> {
+    let query_runtime = QueryRuntime::new();
+    let query_owner = QueryOwner::new(&query_runtime, QueryWorkload::Internal)
+        .context("failed to create live-test query owner")?;
+    query_owner.scope(async {
+
     const EVENT_ROWS: u64 = 200_000;
     const PAYLOAD_BYTES: usize = 2_048;
 
     let prerequisites = LivePrerequisites::load()?;
     let database = prepare_owned_database_identity(&prerequisites.sandbox_id)?;
-    let clickhouse = live_client(&prerequisites, &database)?;
+    let clickhouse = live_client(&prerequisites, &database, query_runtime.clone())?;
     assert_owned_database_census_empty(&clickhouse, "before memory-bounded upgrade").await?;
 
     let outcome = async {
@@ -1876,11 +1900,18 @@ FORMAT JSONEachRow"#
     let census =
         assert_owned_database_census_empty(&clickhouse, "after memory-bounded upgrade").await;
     finish_with_cleanup(outcome, finish_with_cleanup(cleanup, census))
+
+    }).await
 }
 
 #[tokio::test]
 #[ignore = "requires wrapper-owned live ClickHouse, destructive opt-in, and ~2 GB free"]
 async fn live_mcp_open_boundedness_benchmark() -> Result<()> {
+    let query_runtime = QueryRuntime::new();
+    let query_owner = QueryOwner::new(&query_runtime, QueryWorkload::Internal)
+        .context("failed to create live-test query owner")?;
+    query_owner.scope(async {
+
     const UNRELATED_EVENTS: u64 = 1_000_000;
     const UNRELATED_SESSIONS: u64 = 100_000;
     const CANONICAL_BATCH_SIZE: u64 = 10_000;
@@ -1890,7 +1921,7 @@ async fn live_mcp_open_boundedness_benchmark() -> Result<()> {
 
     let prerequisites = LivePrerequisites::load()?;
     let database = prepare_owned_database_identity(&prerequisites.sandbox_id)?;
-    let clickhouse = live_client(&prerequisites, &database)?;
+    let clickhouse = live_client(&prerequisites, &database, query_runtime.clone())?;
     assert_owned_database_census_empty(&clickhouse, "before bounded-open benchmark").await?;
 
     let outcome = async {
@@ -1975,7 +2006,17 @@ async fn live_mcp_open_boundedness_benchmark() -> Result<()> {
             "post-concurrency recovery missed an open SLA: {recovery:?}"
         );
 
-        let metrics = read_open_cost_metrics(&clickhouse, database_name).await?;
+        let metrics = read_open_cost_metrics(
+            &clickhouse,
+            database_name,
+            &[
+                ("before", before.owner_id.as_str()),
+                ("after", after.owner_id.as_str()),
+                ("concurrent", concurrent.owner_id.as_str()),
+                ("recovery", recovery.owner_id.as_str()),
+            ],
+        )
+        .await?;
         let before_cost = metrics
             .get("before")
             .context("before-corpus query-log metrics missing")?;
@@ -2075,6 +2116,8 @@ async fn live_mcp_open_boundedness_benchmark() -> Result<()> {
     let census =
         assert_owned_database_census_empty(&clickhouse, "after bounded-open benchmark").await;
     finish_with_cleanup(outcome, finish_with_cleanup(cleanup, census))
+
+    }).await
 }
 
 fn direct_analytics_semantics(
@@ -2163,9 +2206,11 @@ async fn start_owned_monitor(
     let base = Url::parse(&format!("http://127.0.0.1:{port}/api/v1/"))?;
     let health_url = base.join("health")?;
     let client = Client::builder().timeout(Duration::from_secs(5)).build()?;
+    let query_runtime = repository.query_runtime();
     let injected: Arc<dyn ConversationRepository> = Arc::new(repository);
     let router = Arc::new(BackendRepositoryRouter::from_preloaded_for_testing(
         Arc::new(AppConfig::default()),
+        query_runtime,
         [(DEFAULT_BACKEND_NAME.to_string(), injected)],
     )?);
 
@@ -2209,26 +2254,36 @@ async fn start_owned_monitor(
 #[tokio::test]
 #[ignore = "requires wrapper-owned live ClickHouse and destructive opt-in"]
 async fn live_monitor_repository_semantic_parity() -> Result<()> {
-    let prerequisites = LivePrerequisites::load()?;
-    let database = prepare_owned_database_identity(&prerequisites.sandbox_id)?;
-    let clickhouse = live_client(&prerequisites, &database)?;
-    assert_owned_database_census_empty(&clickhouse, "before mutation").await?;
+    let query_runtime = QueryRuntime::new();
+    let query_owner = QueryOwner::new(&query_runtime, QueryWorkload::Internal)
+        .context("failed to create live-test query owner")?;
+    query_owner
+        .scope(async {
+            let prerequisites = LivePrerequisites::load()?;
+            let database = prepare_owned_database_identity(&prerequisites.sandbox_id)?;
+            let clickhouse = live_client(&prerequisites, &database, query_runtime.clone())?;
+            assert_owned_database_census_empty(&clickhouse, "before mutation").await?;
 
-    let outcome = async {
-        clickhouse
-            .run_migrations()
-            .await
-            .context("failed to migrate parity database")?;
-        install_schema_fixture(&clickhouse, &database).await?;
+            let outcome = async {
+                clickhouse
+                    .run_migrations()
+                    .await
+                    .context("failed to migrate parity database")?;
+                install_schema_fixture(&clickhouse, &database).await?;
 
-        let monitor_repository =
-            ClickHouseConversationRepository::new(clickhouse.clone(), RepoConfig::default());
-        let direct_repository =
-            ClickHouseConversationRepository::new(clickhouse.clone(), RepoConfig::default());
-        let client = Client::builder().timeout(Duration::from_secs(30)).build()?;
-        let (base, shutdown, server, static_dir) = start_owned_monitor(monitor_repository).await?;
+                let monitor_repository = ClickHouseConversationRepository::new(
+                    clickhouse.clone(),
+                    RepoConfig::default(),
+                );
+                let direct_repository = ClickHouseConversationRepository::new(
+                    clickhouse.clone(),
+                    RepoConfig::default(),
+                );
+                let client = Client::builder().timeout(Duration::from_secs(30)).build()?;
+                let (base, shutdown, server, static_dir) =
+                    start_owned_monitor(monitor_repository).await?;
 
-        let parity = async {
+                let parity = async {
             let monitor_analytics = monitor_semantics::<MonitorAnalyticsResponse>(
                 &client,
                 &base.join("analytics?range=24h")?,
@@ -2267,21 +2322,23 @@ async fn live_monitor_repository_semantic_parity() -> Result<()> {
         }
         .await;
 
-        let _ = shutdown.send(());
-        let server_result = match server.await {
-            Ok(result) => result,
-            Err(error) => Err(anyhow!("owned monitor task failed to join: {error}")),
-        };
-        let static_cleanup = fs::remove_dir_all(&static_dir)
-            .context("failed to remove owned monitor static directory");
-        let monitor_cleanup = finish_with_cleanup(server_result, static_cleanup);
-        finish_with_cleanup(parity, monitor_cleanup)
-    }
-    .await;
+                let _ = shutdown.send(());
+                let server_result = match server.await {
+                    Ok(result) => result,
+                    Err(error) => Err(anyhow!("owned monitor task failed to join: {error}")),
+                };
+                let static_cleanup = fs::remove_dir_all(&static_dir)
+                    .context("failed to remove owned monitor static directory");
+                let monitor_cleanup = finish_with_cleanup(server_result, static_cleanup);
+                finish_with_cleanup(parity, monitor_cleanup)
+            }
+            .await;
 
-    let cleanup = cleanup_database(&clickhouse, &database).await;
-    let census = assert_owned_database_census_empty(&clickhouse, "after cleanup").await;
-    finish_with_cleanup(outcome, finish_with_cleanup(cleanup, census))
+            let cleanup = cleanup_database(&clickhouse, &database).await;
+            let census = assert_owned_database_census_empty(&clickhouse, "after cleanup").await;
+            finish_with_cleanup(outcome, finish_with_cleanup(cleanup, census))
+        })
+        .await
 }
 
 #[cfg(test)]

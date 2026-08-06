@@ -2283,14 +2283,29 @@ FORMAT JSONEachRow",
         let ch = self.ch.clone();
         if self.cfg.async_log_writes {
             tokio::spawn(async move {
-                if let Err(err) = ch.insert_json_rows("search_query_log", &[query_row]).await {
-                    warn!("failed to write search_query_log: {}", err);
-                }
-                if !hit_rows.is_empty() {
-                    if let Err(err) = ch.insert_json_rows("search_hit_log", &hit_rows).await {
-                        warn!("failed to write search_hit_log: {}", err);
+                let runtime = ch.runtime();
+                let owner = match QueryOwner::new(&runtime, QueryWorkload::Background) {
+                    Ok(owner) => owner,
+                    Err(err) => {
+                        warn!("failed to own detached search telemetry: {}", err);
+                        return;
                     }
-                }
+                };
+                owner
+                    .scope(async move {
+                        if let Err(err) =
+                            ch.insert_json_rows("search_query_log", &[query_row]).await
+                        {
+                            warn!("failed to write search_query_log: {}", err);
+                        }
+                        if !hit_rows.is_empty() {
+                            if let Err(err) = ch.insert_json_rows("search_hit_log", &hit_rows).await
+                            {
+                                warn!("failed to write search_hit_log: {}", err);
+                            }
+                        }
+                    })
+                    .await;
             });
         } else {
             if let Err(err) = self
@@ -2529,10 +2544,7 @@ FORMAT JSONEachRow",
             }
         }
 
-        let query_id = query
-            .cancellation_token
-            .clone()
-            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        let query_id = Uuid::new_v4().to_string();
         let started = Instant::now();
 
         let terms_with_qf = tokenize_query(query_text, self.cfg.bm25_max_query_terms);

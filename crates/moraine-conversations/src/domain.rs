@@ -69,9 +69,6 @@ pub struct McpSessionListFilter {
 /// whose input path ends with `rel`, scoped and filtered per the request.
 #[derive(Debug, Clone)]
 pub struct FileAttentionQuery {
-    /// Opaque cancellation token assigned by the caller so timed-out requests
-    /// can cancel in-flight backend work.
-    pub cancellation_token: String,
     /// Project-relative tail to suffix-match against captured file paths. The tail
     /// is what unifies the same logical file across worktree roots.
     pub rel: String,
@@ -108,8 +105,6 @@ pub struct FileAttentionQuery {
     /// per-session rollups are computed over this scanned set; the caller flags
     /// the result truncated when the cap is hit.
     pub max_rows: usize,
-    /// Execution budget available to the backend for this scan.
-    pub execution_budget_secs: u64,
 }
 
 /// One captured tool call that touched the queried file. Deserialized from a
@@ -733,8 +728,6 @@ pub struct SearchEventsResult {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SearchMcpEventsQuery {
     pub query: String,
-    #[serde(skip)]
-    pub cancellation_token: Option<String>,
     #[serde(default)]
     pub n_hits: Option<u16>,
     #[serde(default)]
