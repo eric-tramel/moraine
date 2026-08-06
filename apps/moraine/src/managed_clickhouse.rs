@@ -540,7 +540,6 @@ fn prompt_install_clickhouse(version: &str) -> Result<bool> {
 pub(crate) enum ClickHouseStartupProgress {
     ProbingEndpoint {
         elapsed: Duration,
-        timeout: Duration,
     },
     EndpointProbeFinished,
     WaitingForHealth {
@@ -566,34 +565,48 @@ where
         started.elapsed().min(progress_timeout),
         progress_timeout,
     ));
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    if remaining.is_zero() {
-        bail!(
-            "clickhouse health probe timed out after {:.1}s",
-            progress_timeout.as_secs_f64()
-        );
-    }
-    let owner = QueryOwner::new(&client.runtime(), QueryWorkload::Internal)?;
-    let ping = timeout(remaining, owner.scope(client.ping()));
+    let owner = QueryOwner::with_deadline(&client.runtime(), QueryWorkload::Internal, deadline)?;
+    let ping = owner.scope(client.ping());
     tokio::pin!(ping);
     let mut ticker = interval_at(Instant::now() + refresh_interval, refresh_interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
         tokio::select! {
-            result = &mut ping => {
-                return match result {
-                    Ok(result) => result,
-                    Err(_) => bail!(
-                        "clickhouse health probe timed out after {:.1}s",
-                        progress_timeout.as_secs_f64()
-                    ),
-                };
-            }
+            result = &mut ping => return result,
             _ = ticker.tick() => {
                 on_progress(event(
                     started.elapsed().min(progress_timeout),
                     progress_timeout,
                 ));
+            }
+        }
+    }
+}
+
+async fn ping_without_deadline_with_progress<F>(
+    client: &ClickHouseClient,
+    started: Instant,
+    refresh_interval: Duration,
+    on_progress: &mut F,
+) -> Result<()>
+where
+    F: FnMut(ClickHouseStartupProgress),
+{
+    on_progress(ClickHouseStartupProgress::ProbingEndpoint {
+        elapsed: started.elapsed(),
+    });
+    let owner = QueryOwner::new(&client.runtime(), QueryWorkload::Internal)?;
+    let ping = owner.scope(client.ping());
+    tokio::pin!(ping);
+    let mut ticker = interval_at(Instant::now() + refresh_interval, refresh_interval);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            result = &mut ping => return result,
+            _ = ticker.tick() => {
+                on_progress(ClickHouseStartupProgress::ProbingEndpoint {
+                    elapsed: started.elapsed(),
+                });
             }
         }
     }
@@ -1458,15 +1471,12 @@ where
 
     let url_is_local = clickhouse_url_is_local(cfg)?;
     let client = ClickHouseClient::new_with_runtime(cfg.clickhouse.clone(), query_runtime.clone())?;
-    let probe_timeout = Duration::from_secs_f64(cfg.clickhouse.timeout_seconds.max(0.1));
     let probe_started = Instant::now();
-    let probe = ping_with_progress(
+    let probe = ping_without_deadline_with_progress(
         &client,
         probe_started,
-        probe_started + probe_timeout,
         Duration::from_millis(cfg.runtime.healthcheck_interval_ms.max(100)),
         &mut on_progress,
-        |elapsed, timeout| ClickHouseStartupProgress::ProbingEndpoint { elapsed, timeout },
     )
     .await;
     match probe {
@@ -1968,8 +1978,12 @@ mod tests {
             .await
             .expect("bind stalled ping server");
         let addr = listener.local_addr().expect("stalled ping server addr");
+        let (request_tx, request_rx) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
-            let (_stream, _) = listener.accept().await.expect("accept stalled ping");
+            let (mut stream, _) = listener.accept().await.expect("accept stalled ping");
+            let mut request = [0_u8; 4096];
+            let request_len = stream.read(&mut request).await.expect("read stalled ping");
+            let _ = request_tx.send(String::from_utf8_lossy(&request[..request_len]).into_owned());
             sleep(Duration::from_secs(1)).await;
         });
         let mut cfg = AppConfig::default();
@@ -1985,23 +1999,32 @@ mod tests {
             started + Duration::from_millis(350),
             Duration::from_millis(50),
             &mut |event| match event {
-                ClickHouseStartupProgress::ProbingEndpoint { elapsed, .. } => {
+                ClickHouseStartupProgress::WaitingForHealth { elapsed, .. } => {
                     elapsed_updates.push(elapsed)
                 }
                 ClickHouseStartupProgress::EndpointProbeFinished => {
                     panic!("unexpected probe-finished event")
                 }
-                ClickHouseStartupProgress::WaitingForHealth { .. } => {
-                    panic!("unexpected health-wait event")
+                ClickHouseStartupProgress::ProbingEndpoint { .. } => {
+                    panic!("unexpected endpoint-probe event")
                 }
             },
-            |elapsed, timeout| ClickHouseStartupProgress::ProbingEndpoint { elapsed, timeout },
+            |elapsed, timeout| ClickHouseStartupProgress::WaitingForHealth { elapsed, timeout },
         )
         .await
         .expect_err("stalled ping must fail");
         server.abort();
+        let request = request_rx.await.expect("captured stalled ping request");
 
-        assert!(error.to_string().contains("clickhouse"));
+        assert!(request.contains("max_execution_time="), "{request}");
+        assert!(request.contains("timeout_overflow_mode=throw"), "{request}");
+        let typed = error
+            .downcast_ref::<moraine_clickhouse::ClickHouseError>()
+            .expect("deadline must remain typed");
+        assert_eq!(
+            typed.category(),
+            moraine_clickhouse::ClickHouseErrorCategory::DeadlineExceeded
+        );
         assert!(elapsed_updates
             .first()
             .is_some_and(|elapsed| *elapsed < Duration::from_millis(20)));
@@ -2011,6 +2034,36 @@ mod tests {
                 .any(|elapsed| *elapsed >= Duration::from_millis(100)),
             "expected elapsed progress updates, got {elapsed_updates:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn endpoint_probe_does_not_reuse_connect_timeout_as_query_deadline() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stalled endpoint probe server");
+        let addr = listener.local_addr().expect("stalled endpoint probe addr");
+        let server = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.expect("accept endpoint probe");
+            sleep(Duration::from_secs(1)).await;
+        });
+        let mut cfg = AppConfig::default();
+        cfg.clickhouse.url = format!("http://{addr}");
+        cfg.clickhouse.timeout_seconds = 0.05;
+        let client = ClickHouseClient::new(cfg.clickhouse).expect("stalled endpoint client");
+        let started = Instant::now();
+
+        let mut progress = |_| {};
+        let probe = ping_without_deadline_with_progress(
+            &client,
+            started,
+            Duration::from_millis(20),
+            &mut progress,
+        );
+        assert!(
+            timeout(Duration::from_millis(150), probe).await.is_err(),
+            "connect-only timeout incorrectly bounded admitted probe execution"
+        );
+        server.abort();
     }
 
     #[tokio::test]

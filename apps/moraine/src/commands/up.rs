@@ -121,11 +121,10 @@ impl<W: Write> StartupProgress<W> {
 
     fn clickhouse_wait(&mut self, event: ClickHouseStartupProgress) {
         match event {
-            ClickHouseStartupProgress::ProbingEndpoint { elapsed, timeout } => {
+            ClickHouseStartupProgress::ProbingEndpoint { elapsed } => {
                 self.tree.active(&format!(
-                    "Probing configured ClickHouse endpoint · {:.1}s / {:.1}s",
-                    elapsed.as_secs_f64(),
-                    timeout.as_secs_f64()
+                    "Probing configured ClickHouse endpoint · {:.1}s",
+                    elapsed.as_secs_f64()
                 ));
             }
             ClickHouseStartupProgress::EndpointProbeFinished => self.tree.clear_active(),
