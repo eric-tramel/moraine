@@ -240,6 +240,7 @@ enum ProbePaths {
     Cursor,
     Nac,
     Pi,
+    Omp,
 }
 
 impl ProbePaths {
@@ -259,6 +260,7 @@ impl ProbePaths {
             ],
             ProbePaths::Nac => vec![home.join(".config").join("nac")],
             ProbePaths::Pi => vec![home.join(".pi").join("agent")],
+            ProbePaths::Omp => vec![home.join(".omp").join("agent")],
         }
     }
 }
@@ -404,25 +406,24 @@ const CURSOR_INGEST: [DefaultIngestSource; 2] = [
     },
 ];
 
-const PI_INGEST: [DefaultIngestSource; 2] = [
-    DefaultIngestSource {
-        name: "pi",
-        harness: "pi-coding-agent",
-        glob: "~/.pi/agent/sessions/**/*.jsonl",
-        watch_root: "~/.pi/agent/sessions",
-        format: Some("jsonl"),
-    },
-    DefaultIngestSource {
-        name: "omp",
-        harness: "pi-coding-agent",
-        glob: "~/.omp/agent/sessions/**/*.jsonl",
-        watch_root: "~/.omp/agent/sessions",
-        format: Some("jsonl"),
-    },
-];
+const PI_INGEST: [DefaultIngestSource; 1] = [DefaultIngestSource {
+    name: "pi",
+    harness: "pi-coding-agent",
+    glob: "~/.pi/agent/sessions/**/*.jsonl",
+    watch_root: "~/.pi/agent/sessions",
+    format: Some("jsonl"),
+}];
+
+const OMP_INGEST: [DefaultIngestSource; 1] = [DefaultIngestSource {
+    name: "omp",
+    harness: "pi-coding-agent",
+    glob: "~/.omp/agent/sessions/**/*.jsonl",
+    watch_root: "~/.omp/agent/sessions",
+    format: Some("jsonl"),
+}];
 
 const NAC_INGEST: [DefaultIngestSource; 0] = [];
-const SPECS: [HarnessSpec; 10] = [
+const SPECS: [HarnessSpec; 11] = [
     HarnessSpec {
         target: SetupMcpTarget::ClaudeCode,
         label: "Claude Code",
@@ -502,6 +503,14 @@ const SPECS: [HarnessSpec; 10] = [
         programs: &["pi"],
         probe_paths: ProbePaths::Pi,
         ingest_sources: &PI_INGEST,
+    },
+    HarnessSpec {
+        target: SetupMcpTarget::Omp,
+        label: "OMP",
+        setup_kind: "MCP config",
+        programs: &["omp"],
+        probe_paths: ProbePaths::Omp,
+        ingest_sources: &OMP_INGEST,
     },
 ];
 
@@ -877,6 +886,12 @@ pub(super) fn mcp_plan(
             }
             plan
         }
+        SetupMcpTarget::Omp => McpPlan::write_config(
+            target,
+            home.as_ref()
+                .map(|home| McpConfigWrite::omp(home, config_target)),
+            omp_snippet(config_target),
+        ),
     })
 }
 
@@ -978,6 +993,15 @@ impl McpConfigWrite {
         }
     }
 
+    pub(super) fn omp(home: &Path, config_target: &ConfigTarget) -> Self {
+        Self {
+            path: home.join(".omp").join("agent").join("mcp.json"),
+            kind: McpConfigKind::Omp,
+            command: mcp_run_args(config_target),
+            nac_write: None,
+        }
+    }
+
     pub(super) fn opencode(home: &Path, config_target: &ConfigTarget) -> Self {
         Self {
             path: home.join(".config").join("opencode").join("opencode.json"),
@@ -1038,7 +1062,7 @@ impl McpConfigWrite {
                 let servers = object_entry_mut(root, "mcpServers")?;
                 servers.insert("moraine".to_string(), self.server_value());
             }
-            McpConfigKind::Pi => {
+            McpConfigKind::Pi | McpConfigKind::Omp => {
                 let servers = object_entry_mut(root, "mcpServers")?;
                 servers.insert("moraine".to_string(), self.server_value());
             }
@@ -1060,7 +1084,7 @@ impl McpConfigWrite {
                 "command": "moraine",
                 "args": self.command.clone(),
             }),
-            McpConfigKind::Pi => serde_json::json!({
+            McpConfigKind::Pi | McpConfigKind::Omp => serde_json::json!({
                 "transport": "stdio",
                 "command": "moraine",
                 "args": self.command.clone(),
@@ -1087,6 +1111,7 @@ impl McpConfigWrite {
 enum McpConfigKind {
     Cursor,
     Pi,
+    Omp,
     OpenCode,
     Nac,
 }
@@ -1096,6 +1121,7 @@ impl McpConfigKind {
         match self {
             McpConfigKind::Cursor => "Cursor",
             McpConfigKind::Pi => "Pi",
+            McpConfigKind::Omp => "OMP",
             McpConfigKind::OpenCode => "OpenCode",
             McpConfigKind::Nac => "NAC",
         }
@@ -1103,7 +1129,7 @@ impl McpConfigKind {
 
     fn format(self) -> McpConfigFormat {
         match self {
-            McpConfigKind::Cursor | McpConfigKind::Pi => McpConfigFormat::Json,
+            McpConfigKind::Cursor | McpConfigKind::Pi | McpConfigKind::Omp => McpConfigFormat::Json,
             McpConfigKind::OpenCode => McpConfigFormat::Jsonc,
             McpConfigKind::Nac => McpConfigFormat::Toml,
         }
@@ -1326,6 +1352,12 @@ fn pi_snippet(config_target: &ConfigTarget) -> String {
     )
 }
 
+fn omp_snippet(config_target: &ConfigTarget) -> String {
+    snippet(
+        "Add this server to ~/.omp/agent/mcp.json; OMP loads this file natively",
+        Value::Object(McpConfigWrite::omp(Path::new("~"), config_target).snippet_root()),
+    )
+}
 fn snippet(intro: &str, value: Value) -> String {
     format!(
         "{intro}:\n{}",
@@ -1358,6 +1390,36 @@ mod tests {
         assert!(ProbePaths::Cursor
             .paths(home)
             .contains(&home.join(".config").join("Cursor")));
+    }
+
+    #[test]
+    fn pi_and_omp_have_independent_detection_and_ingest_ownership() {
+        let home = Path::new("/home/example");
+        assert_eq!(
+            ProbePaths::Pi.paths(home),
+            vec![home.join(".pi").join("agent")]
+        );
+        assert_eq!(
+            ProbePaths::Omp.paths(home),
+            vec![home.join(".omp").join("agent")]
+        );
+
+        let paths = SetupPathContext::with_home(Some(home.to_path_buf()));
+        let pi = default_ingest_sources(SetupMcpTarget::PiCodingAgent, &paths, true)
+            .expect("resolve Pi sources");
+        let omp =
+            default_ingest_sources(SetupMcpTarget::Omp, &paths, true).expect("resolve OMP sources");
+        assert_eq!(pi.len(), 1);
+        assert_eq!(pi[0].name, "pi");
+        assert_eq!(omp.len(), 1);
+        assert_eq!(omp[0].name, "omp");
+        assert_eq!(omp[0].harness, "pi-coding-agent");
+        assert_eq!(omp[0].format.as_deref(), Some("jsonl"));
+        assert_eq!(
+            spec(SetupMcpTarget::PiCodingAgent).program_candidates(),
+            &["pi"]
+        );
+        assert_eq!(spec(SetupMcpTarget::Omp).program_candidates(), &["omp"]);
     }
 
     #[test]

@@ -233,6 +233,7 @@ pub(crate) enum SetupMcpTarget {
     OpenCode,
     Cursor,
     PiCodingAgent,
+    Omp,
 }
 
 #[derive(Debug, Args)]
@@ -378,6 +379,8 @@ mod tests {
             "--mcp-target",
             "pi-coding-agent",
             "--mcp-target",
+            "omp",
+            "--mcp-target",
             "claude-code",
             "--mcp-target",
             "hermes",
@@ -399,6 +402,7 @@ mod tests {
                         SetupMcpTarget::OpenCode,
                         SetupMcpTarget::Cursor,
                         SetupMcpTarget::PiCodingAgent,
+                        SetupMcpTarget::Omp,
                         SetupMcpTarget::ClaudeCode,
                         SetupMcpTarget::Hermes,
                         SetupMcpTarget::QwenCode,
