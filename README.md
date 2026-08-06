@@ -75,13 +75,15 @@ For release bundles, upgrades, project-scoped setup, and other harnesses, see th
 Use `moraine setup` to install or update the Moraine plugins for Claude Code,
 Codex, and Hermes; install Kiro CLI's global steering and MCP registration; or
 register Moraine MCP for supported harnesses such as Qwen Code, NAC, OpenCode,
-Cursor, Kimi CLI, and Pi Coding Agent. The integrations use the `moraine` CLI on
-your `PATH` and the running local stack. For Kiro CLI, Moraine also resolves the
-default `kiro` ingest source from `KIRO_HOME`.
+Cursor, Kimi CLI, Pi Coding Agent, OMP, and Prime Agent. The integrations use
+the installed Moraine bundle and the running local stack. For Kiro CLI and Prime
+Agent, Moraine also resolves ingest paths from `KIRO_HOME` and
+`PRIME_AGENT_CODING_AGENT_DIR`, respectively.
 
 Start a new agent session after installing an integration. The Claude Code,
-Codex, and Hermes plugins provide named Moraine skills. Kiro CLI receives
-equivalent search and realtime guidance from its managed global steering file.
+Codex, and Hermes plugins provide named Moraine skills. Prime Agent receives a
+managed Python-backed `moraine` skill, while Kiro CLI receives equivalent search
+and realtime guidance from its managed global steering file.
 Moraine MCP tools are exposed with each harness's MCP naming scheme. Then ask:
 
 ```text

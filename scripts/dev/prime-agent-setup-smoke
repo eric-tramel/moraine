@@ -1,0 +1,190 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/dev/prime-agent-setup-smoke [--binary-dir DIR] [--live]
+
+Validate Prime Agent setup in an isolated HOME and agent root. DIR must contain
+sibling moraine and moraine-mcp executables (default: target/debug). The optional
+--live step additionally requires moraine-ingest, Prime Agent v0.7.0, Docker,
+configured model credentials, and network access for a cold managed Python
+kernel. It boots an owned sandbox ClickHouse, ingests committed root/child
+fixtures, and runs a fresh model turn through list/status/search/open. No live
+~/.prime/agent files or Moraine database are read or written.
+EOF
+}
+
+repo=$(cd "$(dirname "$0")/../.." && pwd)
+host_docker_config=${DOCKER_CONFIG:-$HOME/.docker}
+binary_dir="$repo/target/debug"
+prime_agent_cmd=$(command -v prime-agent || true)
+sandbox_id=""
+live=0
+while (($#)); do
+  case "$1" in
+    --binary-dir) binary_dir=${2:?missing directory}; shift 2 ;;
+    --live) live=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+binary_dir=$(cd "$binary_dir" && pwd)
+for name in moraine moraine-mcp; do
+  test -x "$binary_dir/$name" || {
+    echo "missing executable $binary_dir/$name; run cargo build -p moraine -p moraine-mcp --locked" >&2
+    exit 1
+  }
+done
+
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/moraine-prime-setup.XXXXXX")
+cleanup() {
+  if ((live)) && test -n "$prime_agent_cmd"; then
+    HOME="$tmp/home" PRIME_AGENT_CODING_AGENT_DIR="$tmp/prime-agent" \
+      "$prime_agent_cmd" shutdown >/dev/null 2>&1 || true
+  fi
+  if test -n "$sandbox_id"; then
+    "$repo/scripts/dev/sandbox/moraine-sandbox" down "$sandbox_id" >/dev/null 2>&1 || true
+  fi
+  rm -rf "$tmp"
+}
+trap cleanup EXIT INT TERM
+mkdir -p "$tmp/home" "$tmp/bin"
+cp "$binary_dir/moraine" "$binary_dir/moraine-mcp" "$tmp/bin/"
+config="$tmp/moraine.toml"
+agent="$tmp/prime-agent"
+export HOME="$tmp/home"
+export DOCKER_CONFIG="$host_docker_config"
+export PRIME_AGENT_CODING_AGENT_DIR="$agent"
+
+"$tmp/bin/moraine" --config "$config" setup --yes --mcp-target prime-agent
+# Reconcile setup-owned ingest sources without exposing any real harness homes.
+PATH="$tmp/bin:/usr/bin:/bin" "$tmp/bin/moraine" --config "$config" setup --yes >/dev/null
+root_id=12345678-1234-4234-8234-123456789abc
+child_id=abcdefab-cdef-4abc-8def-abcdefabcdef
+mkdir -p "$agent/sessions" "$agent/session-artifacts/$root_id/sub-ce0de280"
+cp "$repo/fixtures/prime-agent/session.jsonl" "$agent/sessions/$root_id.jsonl"
+cp "$repo/fixtures/prime-agent/child.jsonl" \
+  "$agent/session-artifacts/$root_id/sub-ce0de280/$child_id.jsonl"
+
+python3 - "$agent" "$config" "$tmp/bin/moraine-mcp" <<'PY'
+import hashlib, json, pathlib, sys
+agent, config, mcp = map(pathlib.Path, sys.argv[1:])
+settings = json.loads((agent / "settings.json").read_text())
+server = settings["mcpServers"]["moraine"]
+assert server["type"] == "stdio"
+assert pathlib.Path(server["command"]).resolve() == mcp.resolve()
+assert server["args"][0] == "--config"
+assert pathlib.Path(server["args"][1]).resolve() == config.resolve()
+assert server["args"][2:] == ["--serve", "stdio"]
+assert server["enabled"] is True
+assert set(server) == {"type", "command", "args", "enabled"}
+import tomllib
+config_data = tomllib.loads(config.read_text())
+sources = {source["name"]: source for source in config_data["ingest"]["sources"]}
+root_source = sources["prime-agent"]
+child_source = sources["prime-agent-subagents"]
+assert pathlib.Path(root_source["glob"].removesuffix("/*.jsonl")).resolve() == (agent / "sessions").resolve()
+assert pathlib.Path(root_source["watch_root"]).resolve() == (agent / "sessions").resolve()
+assert pathlib.Path(child_source["glob"].removesuffix("/**/sub-*/*.jsonl")).resolve() == (agent / "session-artifacts").resolve()
+assert pathlib.Path(child_source["watch_root"]).resolve() == (agent / "session-artifacts").resolve()
+skill = agent / "skills" / "moraine"
+for rel in ("SKILL.md", "pyproject.toml", "src/moraine/__init__.py", ".moraine-setup.json"):
+    assert (skill / rel).is_file(), rel
+for path in (agent / "settings.json", skill / ".moraine-setup.json"):
+    print(hashlib.sha256(path.read_bytes()).hexdigest(), path)
+PY
+
+before=$(find "$agent" -type f -print0 | sort -z | xargs -0 shasum -a 256)
+"$tmp/bin/moraine" --config "$config" setup --yes --mcp-target prime-agent >/dev/null
+after=$(find "$agent" -type f -print0 | sort -z | xargs -0 shasum -a 256)
+test "$before" = "$after" || { echo "repeat setup changed managed files" >&2; exit 1; }
+dry_before=$(find "$agent" -type f -print0 | sort -z | xargs -0 shasum -a 256)
+"$tmp/bin/moraine" --config "$config" setup --yes --dry-run --mcp-target prime-agent >/dev/null
+dry_after=$(find "$agent" -type f -print0 | sort -z | xargs -0 shasum -a 256)
+test "$dry_before" = "$dry_after" || { echo "dry-run changed managed files" >&2; exit 1; }
+kernel_python="$tmp/custom python/bin/python"
+kernel_report=$(PRIME_AGENT_KERNEL_PYTHON="$kernel_python"   "$tmp/bin/moraine" --config "$config" setup --yes --dry-run --mcp-target prime-agent)
+grep -Fq -- "--python '$kernel_python'" <<<"$kernel_report"
+grep -Fq "&& '$kernel_python' -c 'import mcp, moraine'" <<<"$kernel_report"
+test ! -e "$kernel_python" || { echo "custom kernel path was unexpectedly mutated" >&2; exit 1; }
+python3 -m unittest "$repo/plugins/prime-agent-moraine/tests/test_moraine.py"
+
+if ((live)); then
+  test -n "$prime_agent_cmd" || { echo "prime-agent is required for --live" >&2; exit 1; }
+  test -x "$binary_dir/moraine-ingest" || {
+    echo "--live requires $binary_dir/moraine-ingest; include -p moraine-ingest in the build" >&2
+    exit 1
+  }
+  version=$("$prime_agent_cmd" --version 2>&1)
+  [[ "$version" == *"0.7.0"* ]] || {
+    echo "--live requires verified Prime Agent v0.7.0, found: $version" >&2
+    exit 1
+  }
+
+  sandbox_id=$("$repo/scripts/dev/sandbox/moraine-sandbox" up --quiet)
+  sandbox_json=$("$repo/scripts/dev/sandbox/moraine-sandbox" status --json "$sandbox_id")
+  clickhouse_port=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["ports"]["clickhouse_http"])' <<<"$sandbox_json")
+  python3 - "$config" "$clickhouse_port" <<'PY'
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+text = path.read_text()
+old = 'url = "http://127.0.0.1:8123"'
+assert text.count(old) == 1
+path.write_text(text.replace(old, f'url = "http://127.0.0.1:{sys.argv[2]}"'))
+PY
+  python3 - "$binary_dir/moraine-ingest" "$config" <<'PY'
+import subprocess, sys, time
+process = subprocess.Popen(
+    [sys.argv[1], "--config", sys.argv[2]],
+    stdout=subprocess.PIPE,
+    stderr=subprocess.STDOUT,
+    text=True,
+)
+try:
+    time.sleep(8)
+finally:
+    process.terminate()
+    try:
+        output, _ = process.communicate(timeout=10)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        output, _ = process.communicate()
+if "ERROR" in output.upper():
+    print(output, file=sys.stderr)
+    raise SystemExit("isolated fixture ingestion reported an error")
+PY
+  python3 - "$clickhouse_port" <<'PY'
+import sys, urllib.parse, urllib.request
+port = sys.argv[1]
+query = "SELECT source_name, count() FROM moraine.raw_events WHERE source_name IN ('prime-agent','prime-agent-subagents') GROUP BY source_name ORDER BY source_name FORMAT TabSeparated"
+url = f"http://127.0.0.1:{port}/?" + urllib.parse.urlencode({"query": query})
+rows = urllib.request.urlopen(url, timeout=10).read().decode().strip().splitlines()
+counts = {name: int(count) for name, count in (row.split("\t") for row in rows)}
+assert counts.get("prime-agent", 0) > 0, counts
+assert counts.get("prime-agent-subagents", 0) > 0, counts
+PY
+  prompt='Use the moraine Python skill. Call list_tools and get_ingest_status; verify prime-agent and prime-agent-subagents are present. Search sessions for the exact phrase Visible agent handoff and open the first result. Reply with PRIME_MORAINE_SMOKE_PASS only after all four calls succeed and the opened result comes from the seeded fixture.'
+  output=$(python3 - "$prime_agent_cmd" "$prompt" <<'PY'
+import subprocess, sys
+try:
+    result = subprocess.run(
+        [sys.argv[1], "-p", "--no-session", "--mode", "text", sys.argv[2]],
+        check=True, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        timeout=180,
+    )
+except subprocess.TimeoutExpired as exc:
+    print(exc.stdout or "", end="")
+    raise SystemExit("live Prime Agent turn timed out")
+print(result.stdout, end="")
+PY
+  )
+  grep -q 'PRIME_MORAINE_SMOKE_PASS' <<<"$output" || {
+    echo "live Prime Agent turn did not report success" >&2
+    exit 1
+  }
+fi
+
+echo "Prime Agent setup smoke: PASS"

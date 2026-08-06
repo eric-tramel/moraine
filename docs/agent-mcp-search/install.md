@@ -604,6 +604,45 @@ path:
 $EDITOR ~/.omp/agent/mcp.json
 ```
 
+## Prime Agent
+
+Prime Agent v0.7.0 is the verified compatibility contract. Stop Prime Agent,
+then install its Python-backed Moraine skill and stdio registration:
+
+```bash
+moraine setup --mcp-target prime-agent --yes
+```
+
+Setup manages `settings.json` and `skills/moraine` under
+`$PRIME_AGENT_CODING_AGENT_DIR`, or `~/.prime/agent` when the variable is unset.
+The override must be absolute (a leading `~` is expanded). The same directory
+drives both setup-owned ingest sources: root sessions under `sessions` and RLM
+children under `session-artifacts`. Unrelated settings and skills are preserved;
+a customized `mcpServers.moraine` or modified managed skill is reported as a
+conflict instead of overwritten. Setup stores validated absolute paths to the
+installed sibling `moraine-mcp` binary and Moraine config.
+
+Start a fresh Prime Agent session after setup. The first managed Python kernel
+may need network access to install `mcp>=1,<2` and `hatchling`. If
+`PRIME_AGENT_KERNEL_PYTHON` selects a custom interpreter, setup installs files
+but does not mutate that interpreter; activate the skill with the exact path
+reported by setup, then verify `import mcp, moraine` in that interpreter.
+
+The managed `moraine` module exposes MCP tools dynamically for session search,
+opening results, ingest status, and realtime agent inspection. Like every
+user-scoped integration, it can search host-wide Moraine history visible to your
+user, so enable it only in a trusted harness environment.
+
+Preview without writing:
+
+```bash
+moraine setup --mcp-target prime-agent --dry-run
+```
+
+If setup reports a partial prior installation, keep Prime Agent stopped and rerun
+setup. Move an intentionally customized `skills/moraine` or
+`mcpServers.moraine` aside before asking setup to take ownership.
+
 ## Generic MCP Clients
 
 Most MCP clients that support local stdio servers can use this shape:
