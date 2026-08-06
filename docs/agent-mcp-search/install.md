@@ -578,6 +578,32 @@ With the extension's default prefix, Pi exposes Moraine tools as
 `mcp_moraine_list_sessions`, and `mcp_moraine_file_attention`. Use `/mcp` inside
 Pi to inspect server status.
 
+## OMP (Oh My Pi)
+
+OMP has native MCP support and keeps its own agent state.
+`moraine setup --mcp-target omp` creates or updates
+`~/.omp/agent/mcp.json`; no MCP extension is required. Existing servers and
+unrelated settings in that file are preserved. OMP setup is independent from
+Pi: it detects `omp` or `~/.omp/agent`, owns only the `omp` ingest source, and
+does not read or write `~/.pi/agent/mcp.json`.
+
+Do not install `pi-mcp-extension` for this integration. That Pi extension reads
+Pi's global MCP config rather than OMP's, while current OMP releases load
+`~/.omp/agent/mcp.json` directly.
+
+To preview the OMP config change without writing files, run:
+
+```bash
+moraine setup --mcp-target omp --dry-run
+```
+
+For manual setup, use the same JSON shape shown above at OMP's global config
+path:
+
+```bash
+$EDITOR ~/.omp/agent/mcp.json
+```
+
 ## Generic MCP Clients
 
 Most MCP clients that support local stdio servers can use this shape:
