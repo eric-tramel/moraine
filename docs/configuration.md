@@ -129,7 +129,7 @@ projects to additional servers, see
 | `timeout_seconds` | `30.0` | Per-request ClickHouse HTTP timeout. |
 | `request_compression` | `none` | Compression for non-empty HTTP request bodies. Supported values are `none` and `gzip`. |
 | `async_insert` | `true` | Enables ClickHouse async insert mode on writes. |
-| `wait_for_async_insert` | `true` | Waits for async insert completion before advancing checkpoints, so write failures are visible. |
+| `wait_for_async_insert` | `true` | Waits for async insert completion before advancing checkpoints, so write failures are visible. Named mirror ingestion always enforces this setting even if configured as `false`; other clients retain the configured value. |
 | `allow_newer_server` | `false` | Allows a non-default backend whose migration ledger is ahead of this Moraine build. The default backend is migrated by Moraine itself, so this is only useful on `[backends.<name>]`. |
 
 ### Environment-backed ClickHouse values
@@ -277,7 +277,7 @@ window effectively empty (the working directory rides the records
 themselves, or is recovered from the session header), so in practice it
 only affects traces that carry no working directory at all.
 
-Per-backend mirror status — `connecting`, `ok`, `lagging`, `unreachable`,
+Per-backend mirror status — `connecting`, `catching_up`, `ok`, `lagging`, `unreachable`,
 `disabled_skew`, or `disabled_missing_identity_author` — is written to ingest
 heartbeats as a `backend_sinks` map and surfaced through the monitor's
 `/api/v1/health`. This uses a column added by migration 017; until
@@ -285,6 +285,14 @@ heartbeats as a `backend_sinks` map and surfaced through the monitor's
 field rather than failing heartbeats. `disabled_missing_identity_author` means
 `[identity].author` is empty; set it and restart ingest before mirroring to
 team backends.
+
+`catching_up` means the remote sink is reachable and retained source files are
+replaying. New live rows may drain during this phase, but their checkpoints are
+withheld until replay establishes contiguous coverage. Moraine switches to `ok`
+only after an ordered durability barrier confirms earlier replay batches were
+durably handled — inserted or recorded by the existing explicit oversized-row
+quarantine — with their checkpoints committed, and no routed batch was dropped
+across the promotion boundary.
 
 ### Schema version handshake
 

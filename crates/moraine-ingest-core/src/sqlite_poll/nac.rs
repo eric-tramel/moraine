@@ -1978,7 +1978,9 @@ mod tests {
         )
         .await
         .expect("scan with local project excluded");
-        let SinkMessage::Batch(first_batch) = sink_rx.recv().await.expect("first NAC batch");
+        let SinkMessage::Batch(first_batch) = sink_rx.recv().await.expect("first NAC batch") else {
+            panic!("NAC processor emitted a sink control message")
+        };
         assert_eq!(first_batch.raw_rows.len(), 6);
         let checkpoint = first_batch.checkpoint.expect("first checkpoint");
         checkpoints
@@ -1997,7 +1999,10 @@ mod tests {
         )
         .await
         .expect("replay after exclusion changes");
-        let SinkMessage::Batch(replayed_batch) = sink_rx.recv().await.expect("replayed NAC batch");
+        let SinkMessage::Batch(replayed_batch) = sink_rx.recv().await.expect("replayed NAC batch")
+        else {
+            panic!("NAC processor emitted a sink control message")
+        };
         assert_eq!(
             replayed_batch.raw_rows.len(),
             19,
@@ -2061,7 +2066,10 @@ mod tests {
         )
         .await
         .expect("initial valid scan");
-        let SinkMessage::Batch(initial_batch) = sink_rx.recv().await.expect("initial NAC batch");
+        let SinkMessage::Batch(initial_batch) = sink_rx.recv().await.expect("initial NAC batch")
+        else {
+            panic!("NAC processor emitted a sink control message")
+        };
         let checkpoint = initial_batch.checkpoint.expect("initial checkpoint");
         let committed_inode = checkpoint.source_inode;
         let committed_generation = checkpoint.source_generation;
@@ -2077,7 +2085,10 @@ mod tests {
         process_nac_sqlite_db(&config, &work, checkpoints, &poll_state, sink_tx, &metrics)
             .await
             .expect("failed replacement is reported as a batch");
-        let SinkMessage::Batch(failed_batch) = sink_rx.recv().await.expect("failed NAC batch");
+        let SinkMessage::Batch(failed_batch) = sink_rx.recv().await.expect("failed NAC batch")
+        else {
+            panic!("NAC processor emitted a sink control message")
+        };
         assert_eq!(failed_batch.error_rows.len(), 1);
         assert_eq!(
             failed_batch.error_rows[0]["source_generation"],
@@ -2141,7 +2152,10 @@ mod tests {
         )
         .await
         .expect("oversized scan reports an ingest error");
-        let SinkMessage::Batch(batch) = sink_rx.recv().await.expect("oversized failure batch");
+        let SinkMessage::Batch(batch) = sink_rx.recv().await.expect("oversized failure batch")
+        else {
+            panic!("NAC processor emitted a sink control message")
+        };
         assert!(batch.raw_rows.is_empty());
         assert!(batch.event_rows.is_empty());
         assert!(batch.tool_rows.is_empty());

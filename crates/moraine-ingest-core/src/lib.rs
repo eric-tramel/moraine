@@ -123,8 +123,22 @@ impl Metrics {
 }
 
 #[derive(Debug)]
+// Keep the hot-path RowBatch inline; boxing every ingest batch to optimize the
+// rare backend-only barrier would add an allocation to the default path.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum SinkMessage {
     Batch(RowBatch),
+    /// Live traffic admitted to a named backend. The admission epoch lets the
+    /// sink withhold a checkpoint if an earlier queued batch invalidates the
+    /// backend after this message was accepted.
+    BackendBatch {
+        batch: RowBatch,
+        epoch: u64,
+        persist_checkpoint: bool,
+    },
+    /// Ordered durability fence used by backend replay. The sink acknowledges
+    /// only after every earlier batch (including its checkpoint) is durable.
+    FlushBarrier(tokio::sync::oneshot::Sender<()>),
 }
 
 fn build_ingest_clickhouse_client(config: ClickHouseConfig) -> Result<ClickHouseClient> {
