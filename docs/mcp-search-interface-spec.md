@@ -285,14 +285,15 @@ search_sessions({
   trimming; blank values return `invalid_request`.
 - Each is an exact, case-sensitive filter. Supported `harness` values are
   `codex`, `claude-code`, `cursor`, `hermes`, `kiro-cli`, `kimi-cli`, `nac`,
-  `opencode`, `pi-coding-agent`, and `qwen-code`.
+  `opencode`, `pi-coding-agent`, `prime-agent`, and `qwen-code`.
 - `source` matches a configured ingest source name. Standard source names
   include `claude`, macOS-only `claude-cowork`, `codex`, `cursor`,
   `cursor-sqlite`, `hermes`, `kimi-cli`, `kiro`, setup-managed `nac`, `omp`,
-  `opencode`, `pi`, and `qwen-code`; each server's MCP tool instructions list
-  its actual configured source names.
+  `opencode`, `pi`, `prime-agent`, `prime-agent-subagents`, and `qwen-code`;
+  each server's MCP tool instructions list its actual configured source names.
 - When both are present, both predicates must match. Use `source` to distinguish
-  `pi` and `omp`, which share the `pi-coding-agent` harness.
+  `pi` and `omp`, which share the `pi-coding-agent` harness, or Prime Agent root
+  sessions from RLM child transcripts under the `prime-agent` harness.
 
 ### Search Scope Behavior
 
