@@ -15,7 +15,6 @@ pub const SEARCH_SESSIONS_TOOL: &str = "search_sessions";
 pub const OPEN_TOOL: &str = "open";
 pub const LIST_SESSIONS_TOOL: &str = "list_sessions";
 pub const GET_INGEST_STATUS_TOOL: &str = "get_ingest_status";
-pub const GET_INGEST_STATUS_DEADLINE_MS: u64 = 3_000;
 pub const SEARCH_SESSIONS_SCHEMA_VERSION: &str = "moraine.mcp.search_sessions.v1";
 pub const OPEN_SCHEMA_VERSION: &str = "moraine.mcp.open.v1";
 pub const LIST_SESSIONS_SCHEMA_VERSION: &str = "moraine.mcp.list_sessions.v1";
@@ -28,12 +27,10 @@ pub const OPEN_MIN_LIMIT: u16 = 1;
 pub const OPEN_CURSOR_MAX_CHARS: usize = 4096;
 pub const LIST_SESSIONS_DEFAULT_LIMIT: u16 = 20;
 pub const LIST_SESSIONS_MIN_LIMIT: u16 = 1;
-pub const LIST_SESSIONS_DEADLINE_MS: u64 = 3_000;
 pub const FILE_ATTENTION_TOOL: &str = "file_attention";
 pub const FILE_ATTENTION_SCHEMA_VERSION: &str = "moraine.mcp.file_attention.v1";
 pub const FILE_ATTENTION_MIN_LIMIT: u16 = 1;
 pub const FILE_ATTENTION_DEFAULT_LIMIT: u16 = 50;
-pub const FILE_ATTENTION_DEADLINE_MS: u64 = 4_000;
 /// Minimum number of non-empty, slash-separated segments a path tail must have
 /// before it is treated as specific enough to suffix-match without a
 /// low-confidence warning. A bare basename (`mod.rs`, depth 1) warns;
@@ -1033,7 +1030,10 @@ pub enum ToolErrorCode {
     InvalidId,
     NotFound,
     UnsupportedEventType,
+    Cancelled,
     DeadlineExceeded,
+    ResourceExhausted,
+    BackendFailure,
     InternalError,
 }
 
@@ -1044,7 +1044,10 @@ impl ToolErrorCode {
             Self::InvalidId => "invalid_id",
             Self::NotFound => "not_found",
             Self::UnsupportedEventType => "unsupported_event_type",
+            Self::Cancelled => "cancelled",
             Self::DeadlineExceeded => "deadline_exceeded",
+            Self::ResourceExhausted => "resource_exhausted",
+            Self::BackendFailure => "backend_failure",
             Self::InternalError => "internal_error",
         }
     }

@@ -31,8 +31,7 @@ struct BlockingRepository {
     state_changed: Notify,
     release_search: Notify,
     started_queries: Mutex<Vec<String>>,
-    block_cancellation: AtomicBool,
-    release_cancellation: Notify,
+    started_owners: StdMutex<Vec<Arc<QueryOwner>>>,
     cancelled_queries: Mutex<Vec<String>>,
 }
 
@@ -46,8 +45,7 @@ impl BlockingRepository {
             state_changed: Notify::new(),
             release_search: Notify::new(),
             started_queries: Mutex::new(Vec::new()),
-            block_cancellation: AtomicBool::new(false),
-            release_cancellation: Notify::new(),
+            started_owners: StdMutex::new(Vec::new()),
             cancelled_queries: Mutex::new(Vec::new()),
         }
     }
@@ -72,7 +70,17 @@ impl BlockingRepository {
         .expect("blocked repository requests were cancelled");
     }
 
+    fn record_current_owner(&self) {
+        let owner = QueryOwner::current().expect("repository work has an explicit query owner");
+        assert_eq!(owner.workload(), QueryWorkload::Mcp);
+        self.started_owners
+            .lock()
+            .expect("started owner registry poisoned")
+            .push(owner);
+    }
+
     async fn block_forever(&self) -> ! {
+        self.record_current_owner();
         struct DropSignal<'a> {
             dropped: &'a AtomicUsize,
             state_changed: &'a Notify,
@@ -95,6 +103,7 @@ impl BlockingRepository {
     }
 
     async fn delay_until_released(&self, query: String) {
+        self.record_current_owner();
         self.started_queries.lock().await.push(query);
         self.started.fetch_add(1, Ordering::AcqRel);
         self.state_changed.notify_one();
@@ -104,14 +113,32 @@ impl BlockingRepository {
     async fn wait_for_cancelled(&self, count: usize) {
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             loop {
-                if self.cancelled_queries.lock().await.len() >= count {
+                let cancelled = self
+                    .started_owners
+                    .lock()
+                    .expect("started owner registry poisoned")
+                    .iter()
+                    .filter(|owner| owner.cause().is_some())
+                    .map(|owner| owner.logical_id().to_string())
+                    .collect::<Vec<_>>();
+                if cancelled.len() >= count {
+                    *self.cancelled_queries.lock().await = cancelled;
                     break;
                 }
-                self.state_changed.notified().await;
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
         })
         .await
-        .expect("backend queries were explicitly cancelled");
+        .expect("query owners were cancelled");
+    }
+
+    fn cancelled_causes(&self) -> Vec<QueryCause> {
+        self.started_owners
+            .lock()
+            .expect("started owner registry poisoned")
+            .iter()
+            .filter_map(|owner| owner.cause())
+            .collect()
     }
 }
 
@@ -255,7 +282,10 @@ impl ConversationRepository for BlockingRepository {
             DELAY_SEARCH if query.query.starts_with("slow") => {
                 self.delay_until_released(query.query.clone()).await
             }
-            PANIC_SEARCH => panic!("simulated repository panic"),
+            PANIC_SEARCH => {
+                self.record_current_owner();
+                panic!("simulated repository panic");
+            }
             _ => {}
         }
         self.inner.search_mcp_events(query).await
@@ -284,18 +314,6 @@ impl ConversationRepository for BlockingRepository {
         }
         self.inner.file_attention(query).await
     }
-
-    async fn cancel_query(&self, query_id: &str) -> RepoResult<()> {
-        if self.block_cancellation.load(Ordering::Acquire) {
-            self.release_cancellation.notified().await;
-        }
-        self.cancelled_queries
-            .lock()
-            .await
-            .push(query_id.to_string());
-        self.state_changed.notify_one();
-        Ok(())
-    }
 }
 
 type ClientReader = BufReader<ReadHalf<tokio::io::DuplexStream>>;
@@ -319,6 +337,7 @@ fn test_state_with_admission(
             max_parallel_requests,
             max_queued_requests,
         )),
+        QueryRuntime::new(),
     )
 }
 
@@ -461,7 +480,7 @@ async fn full_queue_returns_structured_overload_within_one_hundred_milliseconds(
     assert_eq!(overloaded["result"]["isError"], json!(true));
     assert_eq!(
         overloaded["result"]["structuredContent"]["error"]["code"],
-        json!("deadline_exceeded")
+        json!("resource_exhausted")
     );
     assert_eq!(
         overloaded["result"]["structuredContent"]["error"]["details"]["reason"],
@@ -554,11 +573,10 @@ async fn ingest_status_obeys_shared_execution_and_queue_limits() {
 }
 
 #[tokio::test]
-async fn ingest_status_deadline_cancels_the_registered_backend_query() {
+async fn ingest_status_has_no_default_execution_deadline() {
     let repository = Arc::new(BlockingRepository::new(BLOCK_STATUS));
     let state = test_state_with_admission(repository.clone(), 1, 1);
     let (mut reader, mut writer, server) = start_connection_with_state(state);
-    let started_at = tokio::time::Instant::now();
 
     writer
         .write_all(tool_request("status", "get_ingest_status", json!({})).as_bytes())
@@ -566,33 +584,22 @@ async fn ingest_status_deadline_cancels_the_registered_backend_query() {
         .expect("send blocked status request");
     repository.wait_for_started(1).await;
     let mut line = String::new();
-    tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        reader.read_line(&mut line),
-    )
-    .await
-    .expect("status deadline response")
-    .expect("read status deadline response");
-    let response: Value = serde_json::from_str(line.trim()).expect("status response JSON");
-
-    assert_eq!(response["id"], json!("status"));
-    assert_eq!(response["result"]["isError"], json!(true));
-    assert_eq!(
-        response["result"]["structuredContent"]["error"]["code"],
-        json!("deadline_exceeded")
-    );
-    assert_eq!(
-        response["result"]["structuredContent"]["error"]["details"]["deadline_ms"],
-        json!(contract::GET_INGEST_STATUS_DEADLINE_MS)
-    );
     assert!(
-        started_at.elapsed()
-            >= std::time::Duration::from_millis(contract::GET_INGEST_STATUS_DEADLINE_MS)
+        tokio::time::timeout(
+            std::time::Duration::from_millis(3_100),
+            reader.read_line(&mut line),
+        )
+        .await
+        .is_err(),
+        "former three-second response deadline must not fire",
     );
-    repository.wait_for_dropped(1).await;
-    repository.wait_for_cancelled(1).await;
-    assert!(repository.cancelled_queries.lock().await[0].starts_with("moraine-ingest-status-"));
-
+    writer
+        .write_all(
+            br#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"status"}}
+"#,
+        )
+        .await
+        .expect("cancel status request");
     writer.shutdown().await.expect("half-close request stream");
     drop(writer);
     tokio::time::timeout(std::time::Duration::from_secs(1), server)
@@ -600,7 +607,9 @@ async fn ingest_status_deadline_cancels_the_registered_backend_query() {
         .expect("connection drained")
         .expect("connection task joined")
         .expect("connection succeeded");
+    repository.wait_for_dropped(1).await;
 }
+
 #[tokio::test]
 async fn queued_success_reports_wall_time_from_frame_acceptance() {
     let repository = Arc::new(BlockingRepository::new(DELAY_SEARCH));
@@ -966,11 +975,15 @@ async fn cancellation_is_registered_before_each_tool_first_repository_read() {
 
     let cancelled = repository.cancelled_queries.lock().await.clone();
     assert_eq!(cancelled.len(), 4);
-    assert!(cancelled[0].starts_with("moraine-search-sessions-"));
+    assert!(cancelled[0].starts_with("moraine-mcp-"));
     assert!(cancelled[1..3]
         .iter()
-        .all(|query_id| query_id.starts_with("moraine-request-")));
-    assert!(cancelled[3].starts_with("moraine-ingest-status-"));
+        .all(|query_id| query_id.starts_with("moraine-mcp-")));
+    assert!(cancelled[3].starts_with("moraine-mcp-"));
+    assert!(repository
+        .cancelled_causes()
+        .iter()
+        .all(|cause| *cause == QueryCause::Explicit));
 
     writer.shutdown().await.expect("half-close request stream");
     drop(writer);
@@ -1017,7 +1030,8 @@ async fn request_cancellation_propagates_unique_clickhouse_query_ids() {
     assert_ne!(cancelled[0], cancelled[1]);
     assert!(cancelled
         .iter()
-        .all(|query_id| query_id.starts_with("moraine-file-attention-")));
+        .all(|query_id| query_id.starts_with("moraine-mcp-")));
+    assert_eq!(repository.cancelled_causes(), vec![QueryCause::Explicit; 2]);
 
     writer
         .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":\"ping\",\"method\":\"ping\"}\n")
@@ -1081,7 +1095,8 @@ async fn full_socket_disconnect_cancels_blocked_repository_work() {
     repository.wait_for_cancelled(1).await;
     assert_eq!(repository.started.load(Ordering::Acquire), 1);
     assert_eq!(repository.cancelled_queries.lock().await.len(), 1);
-    assert!(repository.cancelled_queries.lock().await[0].starts_with("moraine-search-sessions-"));
+    assert!(repository.cancelled_queries.lock().await[0].starts_with("moraine-mcp-"));
+    assert_eq!(repository.cancelled_causes(), vec![QueryCause::Disconnect]);
 }
 
 #[tokio::test]
@@ -1108,6 +1123,7 @@ async fn clean_read_half_close_preserves_slow_admitted_response() {
         .expect("half-closed connection drained")
         .expect("connection task joined")
         .expect("connection succeeded");
+    assert!(repository.cancelled_causes().is_empty());
 }
 
 #[tokio::test]
@@ -1123,6 +1139,7 @@ async fn failed_request_task_releases_id_permit_and_backend_query() {
     assert_eq!(failed["id"], json!("reused"));
     assert_eq!(failed["error"]["code"], json!(-32603));
     repository.wait_for_cancelled(1).await;
+    assert_eq!(repository.cancelled_causes(), vec![QueryCause::Abandoned]);
 
     repository.mode.store(0, Ordering::Release);
     writer
@@ -1217,7 +1234,11 @@ async fn service_shutdown_cancels_in_flight_backend_query() {
         .lock()
         .await
         .iter()
-        .all(|query_id| query_id.starts_with("moraine-file-attention-")));
+        .all(|query_id| query_id.starts_with("moraine-mcp-")));
+    assert_eq!(
+        repository.cancelled_causes(),
+        vec![QueryCause::Shutdown; TEST_MAX_PARALLEL_REQUESTS]
+    );
 }
 
 #[cfg(unix)]
@@ -1241,6 +1262,7 @@ async fn central_service_shutdown_cancels_process_wide_queued_requests() {
     let router = Arc::new(
         BackendRepositoryRouter::from_preloaded_for_testing(
             cfg.clone(),
+            QueryRuntime::new(),
             [("default".to_string(), repository_trait)],
         )
         .expect("preload blocking repository"),
@@ -1300,7 +1322,77 @@ async fn central_service_shutdown_cancels_process_wide_queued_requests() {
     repository.wait_for_cancelled(1).await;
     assert_eq!(repository.started.load(Ordering::Acquire), 1);
     assert_eq!(repository.cancelled_queries.lock().await.len(), 1);
+    assert_eq!(repository.cancelled_causes(), vec![QueryCause::Shutdown]);
     assert!(!socket_path.exists(), "central socket was cleaned up");
+}
+
+#[tokio::test]
+async fn response_write_failure_cancels_in_flight_owner_as_disconnect() {
+    struct FailingWriter;
+
+    impl tokio::io::AsyncWrite for FailingWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "response transport closed",
+            )))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    let repository = Arc::new(BlockingRepository::new(BLOCK_SEARCH));
+    let state = test_state(repository.clone(), 1);
+    let (mut client_write, server_read) = tokio::io::duplex(64 * 1024);
+    let server = tokio::spawn(serve_connection_with_lifecycle(
+        state,
+        BufReader::new(server_read),
+        FailingWriter,
+        None,
+        pending(),
+        pending(),
+    ));
+
+    client_write
+        .write_all(search_request(1).as_bytes())
+        .await
+        .expect("send blocked request");
+    repository.wait_for_started(1).await;
+    client_write
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":\"write-barrier\",\"method\":\"ping\"}\n")
+        .await
+        .expect("send write barrier");
+
+    let error = tokio::time::timeout(std::time::Duration::from_secs(1), server)
+        .await
+        .expect("write failure cleanup deadline")
+        .expect("connection task joined")
+        .expect_err("closed response half must fail the write");
+    assert_eq!(
+        error
+            .downcast_ref::<std::io::Error>()
+            .map(std::io::Error::kind),
+        Some(std::io::ErrorKind::BrokenPipe)
+    );
+    repository.wait_for_dropped(1).await;
+    repository.wait_for_cancelled(1).await;
+    assert_eq!(repository.cancelled_causes(), vec![QueryCause::Disconnect]);
 }
 
 #[tokio::test]
@@ -1344,5 +1436,9 @@ async fn malformed_transport_still_cancels_in_flight_backend_query() {
     assert_eq!(
         repository.started.load(Ordering::Acquire),
         TEST_MAX_PARALLEL_REQUESTS
+    );
+    assert_eq!(
+        repository.cancelled_causes(),
+        vec![QueryCause::Disconnect; TEST_MAX_PARALLEL_REQUESTS]
     );
 }

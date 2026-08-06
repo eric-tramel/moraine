@@ -438,12 +438,13 @@ fn repo_error_tool_response(
     error: moraine_conversations::RepoError,
     started_at: Instant,
 ) -> Result<Value> {
+    let error = crate::repo_error_to_contract_error(error);
     error_tool_response(
         request,
         ToolError {
-            code: ToolErrorCode::InternalError,
-            message: format!("repository error: {error}"),
-            details: None,
+            code: error.code(),
+            message: error.message().to_string(),
+            details: error.details().cloned(),
         },
         started_at,
     )

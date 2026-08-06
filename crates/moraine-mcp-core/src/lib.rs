@@ -11,10 +11,10 @@ mod search_sessions_v1;
 use anyhow::{anyhow, Context, Result};
 use moraine_config::{AppConfig, KNOWN_INGEST_HARNESSES};
 use moraine_conversations::{
-    BackendRepositoryRouter, IngestConditionState, IngestConditionType, RepoError,
+    BackendRepositoryRouter, IngestConditionState, IngestConditionType, QueryCause, QueryOwner,
+    QueryRuntime, QueryWorkload, RepoError,
 };
 pub use moraine_conversations::{ConversationRepository, SessionOriginScope};
-pub use private_proxy::private_route_deadline;
 #[cfg(unix)]
 pub use private_proxy::{negotiate_private_route, PrivateProxyConnection, PrivateRouteNegotiation};
 use serde::Deserialize;
@@ -27,7 +27,9 @@ use std::sync::{
     Arc, Mutex as StdMutex,
 };
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::sync::{oneshot, watch, OwnedSemaphorePermit, Semaphore, TryAcquireError};
+#[cfg(test)]
+use tokio::sync::oneshot;
+use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
@@ -228,13 +230,7 @@ impl Drop for RequestPermit {
     }
 }
 
-const QUERY_CANCELLATION_DEADLINE: std::time::Duration = std::time::Duration::from_millis(1_000);
-const SERVICE_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_millis(1_250);
-
-type QueryCancellationSlot = Arc<StdMutex<Option<String>>>;
-
 tokio::task_local! {
-    static REQUEST_QUERY_CANCELLATION: QueryCancellationSlot;
     static REQUEST_ACCEPTED_AT: std::time::Instant;
 }
 
@@ -249,17 +245,6 @@ pub(crate) fn request_started_at() -> std::time::Instant {
     REQUEST_ACCEPTED_AT
         .try_with(|started_at| *started_at)
         .unwrap_or_else(|_| std::time::Instant::now())
-}
-
-pub(crate) fn backend_query_id(kind: &str) -> String {
-    static QUERY_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-    let sequence = QUERY_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("moraine-{kind}-{}-{nanos}-{sequence}", std::process::id())
 }
 
 #[derive(Debug, Deserialize)]
@@ -291,6 +276,7 @@ struct AppState {
     launch_dir: Option<PathBuf>,
     prewarm_started: Arc<AtomicBool>,
     request_admission: Arc<RequestAdmission>,
+    query_runtime: QueryRuntime,
 }
 
 fn tool_output_schema(tool: &str, data_schema: Value) -> Value {
@@ -312,7 +298,10 @@ fn tool_output_schema(tool: &str, data_schema: Value) -> Value {
                             "invalid_id",
                             "not_found",
                             "unsupported_event_type",
+                            "cancelled",
                             "deadline_exceeded",
+                            "resource_exhausted",
+                            "backend_failure",
                             "internal_error"
                         ]
                     },
@@ -370,8 +359,17 @@ impl AppState {
                         .is_ok()
                 {
                     let repo = self.repo.clone();
+                    let query_runtime = self.query_runtime.clone();
                     tokio::spawn(async move {
-                        if let Err(err) = repo.prewarm_mcp_search_state().await {
+                        let owner = match QueryOwner::new(&query_runtime, QueryWorkload::Background)
+                        {
+                            Ok(owner) => owner,
+                            Err(error) => {
+                                warn!("mcp prewarm owner creation failed: {error}");
+                                return;
+                            }
+                        };
+                        if let Err(err) = owner.scope(repo.prewarm_mcp_search_state()).await {
                             warn!("mcp prewarm failed: {}", err);
                         } else {
                             debug!("mcp prewarm completed");
@@ -908,7 +906,7 @@ impl AppState {
             return result;
         }
         let observed_at_unix_ms = get_ingest_status_v1::unix_now_ms();
-        let (state, reason, observed_at_unix_ms) = match self.read_ingest_status_bounded(1).await {
+        let (state, reason, observed_at_unix_ms) = match self.read_ingest_status(1).await {
             Ok(read) => read
                 .derive(observed_at_unix_ms)
                 .conditions
@@ -1049,7 +1047,20 @@ pub(crate) fn repo_error_to_contract_error(error: RepoError) -> contract::Contra
             "retryable": true,
             "retry_after_ms": SEARCH_PROJECTION_RETRY_AFTER_MS,
         })),
-        RepoError::Backend(message) | RepoError::Internal(message) => {
+        RepoError::Cancelled(message) => {
+            contract::ContractError::new(contract::ToolErrorCode::Cancelled, message)
+        }
+        RepoError::DeadlineExceeded(message) => {
+            contract::ContractError::new(contract::ToolErrorCode::DeadlineExceeded, message)
+        }
+        RepoError::ResourceExhausted(message) => {
+            contract::ContractError::new(contract::ToolErrorCode::ResourceExhausted, message)
+        }
+        RepoError::Backend(_) => contract::ContractError::new(
+            contract::ToolErrorCode::BackendFailure,
+            "backend request failed",
+        ),
+        RepoError::Internal(message) => {
             contract::ContractError::new(contract::ToolErrorCode::InternalError, message)
         }
     }
@@ -1071,6 +1082,7 @@ impl AppState {
         prewarm_started: Arc<AtomicBool>,
         launch_dir: Option<PathBuf>,
         request_admission: Arc<RequestAdmission>,
+        query_runtime: QueryRuntime,
     ) -> Arc<AppState> {
         Arc::new(AppState {
             cfg,
@@ -1078,10 +1090,21 @@ impl AppState {
             launch_dir,
             prewarm_started,
             request_admission,
+            query_runtime,
         })
     }
 
+    #[cfg(test)]
     fn embedded(cfg: AppConfig, repo: Arc<dyn ConversationRepository>) -> Arc<AppState> {
+        let query_runtime = repo.query_runtime().unwrap_or_default();
+        Self::embedded_with_runtime(cfg, repo, query_runtime)
+    }
+
+    fn embedded_with_runtime(
+        cfg: AppConfig,
+        repo: Arc<dyn ConversationRepository>,
+        query_runtime: QueryRuntime,
+    ) -> Arc<AppState> {
         let request_admission = build_request_admission(&cfg);
         Self::with_repository(
             cfg.into(),
@@ -1089,34 +1112,8 @@ impl AppState {
             Arc::new(AtomicBool::new(false)),
             std::env::current_dir().ok(),
             request_admission,
+            query_runtime,
         )
-    }
-}
-
-pub(crate) struct QueryCancellationGuard {
-    query_id: String,
-    slot: Option<QueryCancellationSlot>,
-}
-
-impl QueryCancellationGuard {
-    pub(crate) fn new(query_id: String) -> Self {
-        let slot = REQUEST_QUERY_CANCELLATION
-            .try_with(|slot| slot.clone())
-            .ok();
-        if let Some(slot) = &slot {
-            *slot.lock().expect("query cancellation slot poisoned") = Some(query_id.clone());
-        }
-        Self { query_id, slot }
-    }
-
-    pub(crate) fn disarm(&mut self) {
-        let Some(slot) = &self.slot else {
-            return;
-        };
-        let mut registered = slot.lock().expect("query cancellation slot poisoned");
-        if registered.as_ref() == Some(&self.query_id) {
-            *registered = None;
-        }
     }
 }
 
@@ -1156,17 +1153,6 @@ where
     serve_connection_with_lifecycle(state, reader, writer, first_line, shutdown, pending()).await
 }
 
-async fn wait_for_connection_shutdown(shutdown: &mut watch::Receiver<bool>) {
-    if *shutdown.borrow_and_update() {
-        return;
-    }
-    while shutdown.changed().await.is_ok() {
-        if *shutdown.borrow_and_update() {
-            return;
-        }
-    }
-}
-
 async fn serve_connection_with_lifecycle<R, W, S, D>(
     state: Arc<AppState>,
     reader: R,
@@ -1183,8 +1169,7 @@ where
 {
     let mut requests = JoinSet::new();
     let mut active = HashMap::new();
-    let (request_shutdown_tx, request_shutdown_rx) = watch::channel(false);
-    let mut shutdown_requested = false;
+    let mut cancellation_cause = None;
     let mut connection_error = None;
     tokio::pin!(shutdown);
     tokio::pin!(peer_disconnected);
@@ -1192,37 +1177,38 @@ where
     if let Some(first_line) = first_line {
         let first_line =
             std::str::from_utf8(&first_line).context("incoming RPC line is not valid UTF-8")?;
-        if let Some(response) = dispatch_rpc_line(
-            &state,
-            first_line,
-            &mut requests,
-            &mut active,
-            request_shutdown_rx.clone(),
-        )
-        .await?
+        if let Some(response) =
+            dispatch_rpc_line(&state, first_line, &mut requests, &mut active).await?
         {
             tokio::select! {
-                result = write_rpc_response(&mut writer, &response) => result?,
-                _ = &mut shutdown => shutdown_requested = true,
+                result = write_rpc_response(&mut writer, &response) => {
+                    if let Err(error) = result {
+                        connection_error = Some(error);
+                        cancellation_cause = Some(QueryCause::Disconnect);
+                    }
+                }
+                _ = &mut shutdown => cancellation_cause = Some(QueryCause::Shutdown),
+                _ = &mut peer_disconnected => cancellation_cause = Some(QueryCause::Disconnect),
             }
         }
     }
 
     let mut lines = reader.lines();
-    while !shutdown_requested && connection_error.is_none() {
+    while cancellation_cause.is_none() && connection_error.is_none() {
         tokio::select! {
-            _ = &mut shutdown => {
-                shutdown_requested = true;
-            }
+            _ = &mut shutdown => cancellation_cause = Some(QueryCause::Shutdown),
+            _ = &mut peer_disconnected => cancellation_cause = Some(QueryCause::Disconnect),
             completed = requests.join_next(), if !requests.is_empty() => {
-                if let Some(response) = finish_request(&state, completed, &mut active).await {
+                if let Some(response) = finish_request(completed, &mut active) {
                     tokio::select! {
                         result = write_rpc_response(&mut writer, &response) => {
                             if let Err(error) = result {
                                 connection_error = Some(error);
+                                cancellation_cause = Some(QueryCause::Disconnect);
                             }
                         }
-                        _ = &mut shutdown => shutdown_requested = true,
+                        _ = &mut shutdown => cancellation_cause = Some(QueryCause::Shutdown),
+                        _ = &mut peer_disconnected => cancellation_cause = Some(QueryCause::Disconnect),
                     }
                 }
             }
@@ -1232,81 +1218,82 @@ where
                     Ok(None) => break,
                     Err(error) => {
                         connection_error = Some(error.into());
+                        cancellation_cause = Some(QueryCause::Disconnect);
                         continue;
                     }
                 };
-                match dispatch_rpc_line(
-                    &state,
-                    &line,
-                    &mut requests,
-                    &mut active,
-                    request_shutdown_rx.clone(),
-                ).await {
+                match dispatch_rpc_line(&state, &line, &mut requests, &mut active).await {
                     Ok(Some(response)) => {
                         tokio::select! {
                             result = write_rpc_response(&mut writer, &response) => {
                                 if let Err(error) = result {
                                     connection_error = Some(error);
+                                    cancellation_cause = Some(QueryCause::Disconnect);
                                 }
                             }
-                            _ = &mut shutdown => shutdown_requested = true,
+                            _ = &mut shutdown => cancellation_cause = Some(QueryCause::Shutdown),
+                            _ = &mut peer_disconnected => cancellation_cause = Some(QueryCause::Disconnect),
                         }
                     }
                     Ok(None) => {}
-                    Err(error) => connection_error = Some(error),
+                    Err(error) => {
+                        connection_error = Some(error);
+                        cancellation_cause = Some(QueryCause::Disconnect);
+                    }
                 }
             }
         }
     }
 
-    // EOF only closes the request half of a stream. A client may continue
-    // reading responses after it has sent every frame, so admitted work keeps
-    // its normal lifecycle and every completed response is serialized before
-    // this connection closes. Socket transports separately report a full peer
-    // hangup, while service shutdown and write failures move directly to
-    // cancellation below.
-    if !shutdown_requested && connection_error.is_none() {
+    // A clean EOF closes only the request half. Continue admitted work and
+    // serialize every response unless the peer's read half also disappears.
+    if cancellation_cause.is_none() && connection_error.is_none() {
         while !requests.is_empty() {
             let completed = tokio::select! {
-                _ = &mut shutdown => break,
-                _ = &mut peer_disconnected => break,
+                _ = &mut shutdown => {
+                    cancellation_cause = Some(QueryCause::Shutdown);
+                    break;
+                }
+                _ = &mut peer_disconnected => {
+                    cancellation_cause = Some(QueryCause::Disconnect);
+                    break;
+                }
                 completed = requests.join_next() => completed,
             };
-            if let Some(response) = finish_request(&state, completed, &mut active).await {
+            if let Some(response) = finish_request(completed, &mut active) {
                 tokio::select! {
                     result = write_rpc_response(&mut writer, &response) => {
                         if let Err(error) = result {
                             connection_error = Some(error);
+                            cancellation_cause = Some(QueryCause::Disconnect);
                             break;
                         }
                     }
-                    _ = &mut shutdown => break,
+                    _ = &mut shutdown => {
+                        cancellation_cause = Some(QueryCause::Shutdown);
+                        break;
+                    }
+                    _ = &mut peer_disconnected => {
+                        cancellation_cause = Some(QueryCause::Disconnect);
+                        break;
+                    }
                 }
             }
         }
     }
 
-    let _ = request_shutdown_tx.send(true);
-
-    for request in active.values_mut() {
-        if let Some(cancellation) = request.cancellation.take() {
-            let _ = cancellation.send(());
+    if let Some(cause) = cancellation_cause {
+        for request in active.values() {
+            request.owner.cancel(cause);
         }
     }
 
-    // Request tasks own backend cancellation and must be given time to finish
-    // it before the connection or service reports itself drained.
-    let cancellation_deadline = tokio::time::Instant::now() + QUERY_CANCELLATION_DEADLINE;
-    while !requests.is_empty() {
-        match tokio::time::timeout_at(cancellation_deadline, requests.join_next()).await {
-            Ok(completed) => {
-                let _ = finish_request(&state, completed, &mut active).await;
-            }
-            Err(_) => break,
-        }
+    // Owner cancellation wakes queued and executing tasks. The unified
+    // composition root supplies the five-second outer bound and aborts this
+    // owner-bearing connection task only if it fails to drain by then.
+    while let Some(completed) = requests.join_next().await {
+        let _ = finish_request(Some(completed), &mut active);
     }
-    requests.abort_all();
-    while requests.join_next().await.is_some() {}
 
     if let Some(error) = connection_error {
         Err(error)
@@ -1325,9 +1312,8 @@ where
 
 struct ActiveRequest {
     id: Value,
-    task_id: tokio::task::Id,
-    query_cancellation: QueryCancellationSlot,
-    cancellation: Option<oneshot::Sender<()>>,
+    task_id: Option<tokio::task::Id>,
+    owner: Arc<QueryOwner>,
 }
 
 type RequestResult = (String, Option<Value>);
@@ -1337,7 +1323,6 @@ async fn dispatch_rpc_line(
     line: &str,
     requests: &mut JoinSet<RequestResult>,
     active: &mut HashMap<String, ActiveRequest>,
-    mut connection_shutdown: watch::Receiver<bool>,
 ) -> Result<Option<Value>> {
     let accepted_at = tokio::time::Instant::now();
     let line = line.trim();
@@ -1356,10 +1341,8 @@ async fn dispatch_rpc_line(
 
     if req.method == "notifications/cancelled" {
         if let Ok(params) = serde_json::from_value::<CancelledParams>(req.params) {
-            if let Some(request) = active.get_mut(&request_key(&params.request_id)?) {
-                if let Some(cancellation) = request.cancellation.take() {
-                    let _ = cancellation.send(());
-                }
+            if let Some(request) = active.get(&request_key(&params.request_id)?) {
+                request.owner.cancel(QueryCause::Explicit);
             }
         }
         return Ok(None);
@@ -1396,77 +1379,60 @@ async fn dispatch_rpc_line(
         Err(TryAdmissionError::Closed) => return Ok(None),
     };
 
-    let (cancel_tx, mut cancel_rx) = oneshot::channel();
-    let request_query_id = backend_query_id("request");
-    let query_cancellation = Arc::new(StdMutex::new(None));
-    let task_query_cancellation = query_cancellation.clone();
+    let owner = match QueryOwner::new(&state.query_runtime, QueryWorkload::Mcp) {
+        Ok(owner) => owner,
+        Err(_error) if state.query_runtime.is_closing() => return Ok(None),
+        Err(error) => {
+            return Ok(Some(rpc_err(
+                id,
+                -32603,
+                &format!("failed to create query owner: {error}"),
+            )));
+        }
+    };
+
+    // Publish the owner before spawning so explicit cancellation can never
+    // race a task-local registration step. Spawned work receives the owner
+    // directly and does not rely on task-local inheritance.
+    active.insert(
+        key.clone(),
+        ActiveRequest {
+            id,
+            task_id: None,
+            owner: owner.clone(),
+        },
+    );
+
     let request_state = state.clone();
     let task_key = key.clone();
+    let task_owner = owner.clone();
     let task = requests.spawn(async move {
-        enum AdmissionOutcome {
-            Admitted(RequestPermit),
-            Cancelled,
-        }
-
-        let admission = tokio::select! {
+        let cancellation = task_owner.cancellation_token();
+        let permit = tokio::select! {
             biased;
-            _ = &mut cancel_rx => AdmissionOutcome::Cancelled,
-            _ = wait_for_connection_shutdown(&mut connection_shutdown) => AdmissionOutcome::Cancelled,
-            permit = admission_ticket.acquire() => match permit {
-                Some(permit) => AdmissionOutcome::Admitted(permit),
-                None => AdmissionOutcome::Cancelled,
-            },
+            _ = cancellation.cancelled() => None,
+            permit = admission_ticket.acquire() => permit,
         };
-        let _permit = match admission {
-            AdmissionOutcome::Admitted(permit) => permit,
-            AdmissionOutcome::Cancelled => return (task_key, None),
+        let Some(_permit) = permit else {
+            return (task_key, None);
         };
-        let query_cancellation = task_query_cancellation;
-        *query_cancellation
-            .lock()
-            .expect("query cancellation slot poisoned") = Some(request_query_id.clone());
 
-        enum Outcome {
-            Completed(Option<Value>),
-            Cancelled,
-        }
-        let outcome = {
-            let request = REQUEST_ACCEPTED_AT.scope(
-                accepted_at.into_std(),
-                REQUEST_QUERY_CANCELLATION.scope(
-                    query_cancellation.clone(),
-                    moraine_conversations::with_repository_query_id(
-                        request_query_id,
-                        request_state.handle_request(req),
-                    ),
-                ),
-            );
-            tokio::pin!(request);
-            tokio::select! {
-                biased;
-                _ = &mut cancel_rx => Outcome::Cancelled,
-                _ = wait_for_connection_shutdown(&mut connection_shutdown) => Outcome::Cancelled,
-                response = &mut request => Outcome::Completed(response),
-            }
-        };
-        let response = match outcome {
-            Outcome::Completed(response) => response,
-            Outcome::Cancelled => {
-                cancel_registered_query(&request_state, &query_cancellation).await;
-                None
-            }
+        let request = REQUEST_ACCEPTED_AT.scope(
+            accepted_at.into_std(),
+            task_owner.scope(request_state.handle_request(req)),
+        );
+        tokio::pin!(request);
+        let response = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => None,
+            response = &mut request => response,
         };
         (task_key, response)
     });
-    active.insert(
-        key,
-        ActiveRequest {
-            id,
-            task_id: task.id(),
-            query_cancellation,
-            cancellation: Some(cancel_tx),
-        },
-    );
+    active
+        .get_mut(&key)
+        .expect("request owner was registered before spawn")
+        .task_id = Some(task.id());
     Ok(None)
 }
 
@@ -1484,7 +1450,7 @@ fn admission_error_response(
     max_queued: usize,
 ) -> Value {
     let error = contract::ContractError::new(
-        contract::ToolErrorCode::DeadlineExceeded,
+        contract::ToolErrorCode::ResourceExhausted,
         "MCP retrieval queue is full; retry later",
     )
     .with_details(json!({
@@ -1512,37 +1478,6 @@ fn admission_error_response(
             payload,
         ),
     )
-}
-
-async fn cancel_registered_query(state: &AppState, slot: &QueryCancellationSlot) {
-    let query_id = slot
-        .lock()
-        .expect("query cancellation slot poisoned")
-        .take();
-    let Some(query_id) = query_id else {
-        return;
-    };
-    cancel_query_with_deadline(state, &query_id).await;
-}
-
-pub(crate) async fn cancel_query_with_deadline(state: &AppState, query_id: &str) {
-    match tokio::time::timeout(
-        QUERY_CANCELLATION_DEADLINE,
-        state.repo.cancel_query(query_id),
-    )
-    .await
-    {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => warn!(
-            query_id,
-            error = %error,
-            "failed to cancel abandoned MCP ClickHouse query"
-        ),
-        Err(_) => warn!(
-            query_id,
-            "timed out cancelling abandoned MCP ClickHouse query"
-        ),
-    }
 }
 
 fn admitted_tool_call(req: &RpcRequest, max_results: u16) -> Option<AdmittedToolCall> {
@@ -1586,8 +1521,7 @@ fn request_key(id: &Value) -> Result<String> {
     serde_json::to_string(id).context("failed to encode JSON-RPC request id")
 }
 
-async fn finish_request(
-    state: &AppState,
+fn finish_request(
     completed: Option<Result<RequestResult, tokio::task::JoinError>>,
     active: &mut HashMap<String, ActiveRequest>,
 ) -> Option<Value> {
@@ -1599,11 +1533,13 @@ async fn finish_request(
         Some(Err(error)) => {
             let failed = active
                 .iter()
-                .find_map(|(key, request)| (request.task_id == error.id()).then(|| key.clone()))
+                .find_map(|(key, request)| {
+                    (request.task_id == Some(error.id())).then(|| key.clone())
+                })
                 .and_then(|key| active.remove(&key));
             debug!("mcp request task ended unexpectedly: {error}");
             if let Some(request) = failed {
-                cancel_registered_query(state, &request.query_cancellation).await;
+                request.owner.cancel(QueryCause::Abandoned);
                 Some(rpc_err(request.id, -32603, "request failed"))
             } else {
                 None
@@ -1633,8 +1569,9 @@ where
 pub async fn run_stdio_with_repository(
     cfg: AppConfig,
     repository: Arc<dyn ConversationRepository>,
+    query_runtime: QueryRuntime,
 ) -> Result<()> {
-    let state = AppState::embedded(cfg, repository);
+    let state = AppState::embedded_with_runtime(cfg, repository, query_runtime);
     serve_connection(
         state,
         BufReader::new(tokio::io::stdin()),
@@ -1861,15 +1798,6 @@ where
 
     state.request_admission.close();
     let _ = connection_shutdown_tx.send(true);
-    let drain_deadline = tokio::time::Instant::now() + SERVICE_DRAIN_GRACE;
-    while !connections.is_empty() {
-        match tokio::time::timeout_at(drain_deadline, connections.join_next()).await {
-            Ok(Some(_)) => {}
-            Ok(None) => break,
-            Err(_) => break,
-        }
-    }
-    connections.abort_all();
     while connections.join_next().await.is_some() {}
     Ok(())
 }
@@ -2070,6 +1998,7 @@ async fn serve_socket_connection(state: SocketState, stream: tokio::net::UnixStr
         prewarm_started,
         launch_dir,
         state.request_admission,
+        state.router.query_runtime(),
     );
     if negotiated {
         private_proxy::write_ack(&mut write_half).await?;
@@ -2234,6 +2163,80 @@ mod tests {
 
     fn test_state() -> Arc<AppState> {
         AppState::embedded(AppConfig::default(), repository_with_scope(None))
+    }
+
+    #[test]
+    fn repository_errors_keep_wire_categories_distinct() {
+        let cases = [
+            (
+                RepoError::cancelled("cancelled"),
+                contract::ToolErrorCode::Cancelled,
+            ),
+            (
+                RepoError::deadline_exceeded("deadline"),
+                contract::ToolErrorCode::DeadlineExceeded,
+            ),
+            (
+                RepoError::resource_exhausted("resource"),
+                contract::ToolErrorCode::ResourceExhausted,
+            ),
+            (
+                RepoError::backend("sensitive backend detail"),
+                contract::ToolErrorCode::BackendFailure,
+            ),
+            (
+                RepoError::internal("internal"),
+                contract::ToolErrorCode::InternalError,
+            ),
+        ];
+
+        for (error, expected) in cases {
+            let mapped = repo_error_to_contract_error(error);
+            assert_eq!(mapped.code(), expected);
+        }
+        assert_eq!(
+            repo_error_to_contract_error(RepoError::backend("secret")).message(),
+            "backend request failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn repository_failure_categories_reach_tool_wire_contract() {
+        let cases = [
+            (RepoError::cancelled("cancelled"), "cancelled"),
+            (
+                RepoError::deadline_exceeded("deadline"),
+                "deadline_exceeded",
+            ),
+            (
+                RepoError::resource_exhausted("resource"),
+                "resource_exhausted",
+            ),
+            (RepoError::backend("backend"), "backend_failure"),
+            (RepoError::internal("internal"), "internal_error"),
+        ];
+
+        for (index, (error, expected)) in cases.into_iter().enumerate() {
+            let repository = Arc::new(InMemoryConversationRepository::with_responses(
+                RepoConfig::default(),
+                InMemoryConversationResponses {
+                    list_mcp_sessions: Some(Err(error)),
+                    ..InMemoryConversationResponses::default()
+                },
+            ));
+            let state = AppState::embedded(AppConfig::default(), repository);
+            let response = call_tool_rpc(
+                &state,
+                index as u64,
+                contract::LIST_SESSIONS_TOOL,
+                json!({
+                    "start_datetime": "2026-07-11T00:00:00Z",
+                    "end_datetime": "2026-07-12T00:00:00Z"
+                }),
+            )
+            .await;
+            assert_handled_tool_error_exchange(&response, contract::LIST_SESSIONS_TOOL, expected);
+        }
     }
 
     #[test]
@@ -2972,6 +2975,7 @@ mod tests {
             (
                 contract::SEARCH_SESSIONS_TOOL,
                 json!({ "query": "nothing" }),
+                "internal_error",
             ),
             (
                 contract::LIST_SESSIONS_TOOL,
@@ -2979,17 +2983,23 @@ mod tests {
                     "start_datetime": "2026-07-11T00:00:00Z",
                     "end_datetime": "2026-07-12T00:00:00Z"
                 }),
+                "backend_failure",
             ),
-            (contract::OPEN_TOOL, json!({ "id": open_id })),
+            (
+                contract::OPEN_TOOL,
+                json!({ "id": open_id }),
+                "internal_error",
+            ),
             (
                 contract::FILE_ATTENTION_TOOL,
                 json!({ "path": "crates/moraine-mcp-core/src/lib.rs" }),
+                "backend_failure",
             ),
         ];
 
-        for (index, (tool, arguments)) in cases.into_iter().enumerate() {
+        for (index, (tool, arguments, expected_code)) in cases.into_iter().enumerate() {
             let response = call_tool_rpc(&state, index as u64 + 1, tool, arguments).await;
-            assert_handled_tool_error_exchange(&response, tool, "internal_error");
+            assert_handled_tool_error_exchange(&response, tool, expected_code);
             assert!(response["result"]["structuredContent"]["error"]
                 .get("details")
                 .is_none());
@@ -3079,6 +3089,7 @@ mod tests {
             Arc::new(InMemoryConversationRepository::default());
         let router = BackendRepositoryRouter::from_preloaded_for_testing(
             cfg.clone(),
+            QueryRuntime::new(),
             [("default".to_string(), repository)],
         )
         .expect("preloaded default router");
@@ -3120,6 +3131,7 @@ mod tests {
         }));
         let router = BackendRepositoryRouter::from_preloaded_for_testing(
             cfg.clone(),
+            QueryRuntime::new(),
             [
                 (
                     "default".to_string(),
@@ -3366,7 +3378,7 @@ mod tests {
     #[cfg(unix)]
     async fn accepted_test_connection(sock: &std::path::Path, cwd: &str) -> PrivateProxyConnection {
         let stream = connect_to_test_socket(sock).await;
-        match negotiate_private_route(stream, cwd, std::time::Duration::from_secs(3)).await {
+        match negotiate_private_route(stream, cwd).await {
             PrivateRouteNegotiation::Accepted(connection) => connection,
             PrivateRouteNegotiation::Incompatible { reason } => {
                 panic!("test daemon must be compatible: {reason}")
@@ -3456,6 +3468,7 @@ mod tests {
         let repository = Arc::new(InMemoryConversationRepository::default());
         let router = BackendRepositoryRouter::from_preloaded_for_testing(
             cfg.clone(),
+            QueryRuntime::new(),
             [(
                 "default".to_string(),
                 repository.clone() as Arc<dyn ConversationRepository>,
@@ -3656,6 +3669,7 @@ mod tests {
             Arc::new(InMemoryConversationRepository::default());
         let router = BackendRepositoryRouter::from_preloaded_for_testing(
             cfg.clone(),
+            QueryRuntime::new(),
             [("default".to_string(), default)],
         )
         .expect("router with lazy failing named backend");
@@ -3663,12 +3677,7 @@ mod tests {
             spawn_test_socket("route-reject", cfg, Arc::new(router)).await;
 
         let stream = connect_to_test_socket(&sock).await;
-        let outcome = negotiate_private_route(
-            stream,
-            "/work/team/project",
-            std::time::Duration::from_secs(3),
-        )
-        .await;
+        let outcome = negotiate_private_route(stream, "/work/team/project").await;
         match outcome {
             PrivateRouteNegotiation::Rejected { message } => {
                 assert!(

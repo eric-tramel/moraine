@@ -1,10 +1,10 @@
 use super::{
-    backend_query_id, cancel_query_with_deadline, handled_tool_error_result, request_performance,
-    tool_success_result, AppState, QueryCancellationGuard,
+    handled_tool_error_result, repo_error_to_contract_error, request_performance,
+    tool_success_result, AppState,
 };
 use crate::contract::{
     ContractError, GetIngestStatusArgs, Performance, ToolEnvelope, ToolErrorCode,
-    ToolErrorEnvelope, GET_INGEST_STATUS_DEADLINE_MS, GET_INGEST_STATUS_TOOL,
+    ToolErrorEnvelope, GET_INGEST_STATUS_TOOL,
 };
 use anyhow::{Context, Result};
 use moraine_conversations::{
@@ -14,15 +14,8 @@ use moraine_conversations::{
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::time::{timeout, Duration, Instant};
 
 const INGEST_STATUS_HISTORY_LIMIT: u16 = 61;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum IngestStatusReadError {
-    Deadline,
-    Unavailable,
-}
 
 #[derive(Debug, Serialize)]
 struct McpIngestStatus {
@@ -116,24 +109,10 @@ impl AppState {
             );
         }
 
-        let read = match self
-            .read_ingest_status_bounded(INGEST_STATUS_HISTORY_LIMIT)
-            .await
-        {
+        let read = match self.read_ingest_status(INGEST_STATUS_HISTORY_LIMIT).await {
             Ok(read) => read,
-            Err(IngestStatusReadError::Deadline) => {
-                return encode_error(
-                    request,
-                    ContractError::new(
-                        ToolErrorCode::DeadlineExceeded,
-                        "get_ingest_status exceeded its response deadline",
-                    )
-                    .with_details(json!({ "deadline_ms": GET_INGEST_STATUS_DEADLINE_MS })),
-                    perf.finish(),
-                );
-            }
-            Err(IngestStatusReadError::Unavailable) => {
-                return encode_error(request, status_unavailable_error(), perf.finish());
+            Err(error) => {
+                return encode_error(request, repo_error_to_contract_error(error), perf.finish());
             }
         };
         let status = McpIngestStatus::from(read.derive(unix_now_ms()));
@@ -148,39 +127,11 @@ impl AppState {
         Ok(tool_success_result(format_status_text(&status), payload))
     }
 
-    pub(crate) async fn read_ingest_status_bounded(
+    pub(crate) async fn read_ingest_status(
         &self,
         history_limit: u16,
-    ) -> std::result::Result<IngestStatusRead, IngestStatusReadError> {
-        let query_id = backend_query_id("ingest-status");
-        let duration = Duration::from_millis(GET_INGEST_STATUS_DEADLINE_MS);
-        let deadline = Instant::now() + duration;
-        let mut cancellation = QueryCancellationGuard::new(query_id.clone());
-        let repo_result = timeout(
-            duration,
-            moraine_conversations::with_repository_query_deadline(
-                query_id.clone(),
-                deadline,
-                self.repo.ingest_status(history_limit),
-            ),
-        )
-        .await;
-
-        match repo_result {
-            Ok(Ok(read)) => {
-                cancellation.disarm();
-                Ok(read)
-            }
-            Ok(Err(_)) => {
-                cancellation.disarm();
-                Err(IngestStatusReadError::Unavailable)
-            }
-            Err(_) => {
-                cancel_query_with_deadline(self, &query_id).await;
-                cancellation.disarm();
-                Err(IngestStatusReadError::Deadline)
-            }
-        }
+    ) -> moraine_conversations::RepoResult<IngestStatusRead> {
+        self.repo.ingest_status(history_limit).await
     }
 }
 
@@ -368,14 +319,6 @@ fn format_status_text(status: &McpIngestStatus) -> String {
     lines.join("\n")
 }
 
-fn status_unavailable_error() -> ContractError {
-    ContractError::new(
-        ToolErrorCode::InternalError,
-        "ingestion status is unavailable",
-    )
-    .with_details(json!({ "reason": "status_unavailable" }))
-}
-
 fn encode_error(request: Value, error: ContractError, performance: Performance) -> Result<Value> {
     let payload = serde_json::to_value(ToolErrorEnvelope::error(
         GET_INGEST_STATUS_TOOL,
@@ -400,6 +343,7 @@ mod tests {
         RepoConfig, RepoError,
     };
     use std::sync::Arc;
+    use std::time::Duration;
 
     fn raw_heartbeat(ts_unix_ms: i64, marker: &str) -> IngestHeartbeat {
         IngestHeartbeat {
@@ -610,7 +554,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repository_failure_returns_only_the_stable_status_unavailable_error() {
+    async fn repository_failure_returns_sanitized_backend_failure() {
         let raw_error = "SECRET_REPOSITORY_ERROR /private/source.db password=hunter2";
         let repository = Arc::new(InMemoryConversationRepository::with_responses(
             RepoConfig::default(),
@@ -629,9 +573,8 @@ mod tests {
         assert_eq!(
             response["structuredContent"]["error"],
             json!({
-                "code": "internal_error",
-                "message": "ingestion status is unavailable",
-                "details": { "reason": "status_unavailable" },
+                "code": "backend_failure",
+                "message": "backend request failed",
             })
         );
         assert_no_markers(
