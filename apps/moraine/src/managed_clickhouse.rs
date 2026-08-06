@@ -583,35 +583,6 @@ where
     }
 }
 
-async fn ping_without_deadline_with_progress<F>(
-    client: &ClickHouseClient,
-    started: Instant,
-    refresh_interval: Duration,
-    on_progress: &mut F,
-) -> Result<()>
-where
-    F: FnMut(ClickHouseStartupProgress),
-{
-    on_progress(ClickHouseStartupProgress::ProbingEndpoint {
-        elapsed: started.elapsed(),
-    });
-    let owner = QueryOwner::new(&client.runtime(), QueryWorkload::Internal)?;
-    let ping = owner.scope(client.ping());
-    tokio::pin!(ping);
-    let mut ticker = interval_at(Instant::now() + refresh_interval, refresh_interval);
-    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    loop {
-        tokio::select! {
-            result = &mut ping => return result,
-            _ = ticker.tick() => {
-                on_progress(ClickHouseStartupProgress::ProbingEndpoint {
-                    elapsed: started.elapsed(),
-                });
-            }
-        }
-    }
-}
-
 async fn wait_for_clickhouse(cfg: &AppConfig, query_runtime: &QueryRuntime) -> Result<()> {
     wait_for_clickhouse_with_progress(cfg, query_runtime, &mut |_| {}).await
 }
@@ -1472,11 +1443,15 @@ where
     let url_is_local = clickhouse_url_is_local(cfg)?;
     let client = ClickHouseClient::new_with_runtime(cfg.clickhouse.clone(), query_runtime.clone())?;
     let probe_started = Instant::now();
-    let probe = ping_without_deadline_with_progress(
+    let probe_timeout =
+        Duration::from_secs_f64(cfg.runtime.clickhouse_start_timeout_seconds.max(1.0));
+    let probe = ping_with_progress(
         &client,
         probe_started,
+        probe_started + probe_timeout,
         Duration::from_millis(cfg.runtime.healthcheck_interval_ms.max(100)),
         &mut on_progress,
+        |elapsed, _| ClickHouseStartupProgress::ProbingEndpoint { elapsed },
     )
     .await;
     match probe {
@@ -2037,7 +2012,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn endpoint_probe_does_not_reuse_connect_timeout_as_query_deadline() {
+    async fn endpoint_probe_uses_startup_deadline_not_connect_timeout() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind stalled endpoint probe server");
@@ -2051,19 +2026,31 @@ mod tests {
         cfg.clickhouse.timeout_seconds = 0.05;
         let client = ClickHouseClient::new(cfg.clickhouse).expect("stalled endpoint client");
         let started = Instant::now();
+        let deadline = started + Duration::from_millis(350);
 
-        let mut progress = |_| {};
-        let probe = ping_without_deadline_with_progress(
+        let error = ping_with_progress(
             &client,
             started,
+            deadline,
             Duration::from_millis(20),
-            &mut progress,
-        );
+            &mut |_| {},
+            |elapsed, _| ClickHouseStartupProgress::ProbingEndpoint { elapsed },
+        )
+        .await
+        .expect_err("stalled endpoint probe must reach its startup deadline");
+        server.abort();
+
         assert!(
-            timeout(Duration::from_millis(150), probe).await.is_err(),
+            started.elapsed() >= Duration::from_millis(300),
             "connect-only timeout incorrectly bounded admitted probe execution"
         );
-        server.abort();
+        let typed = error
+            .downcast_ref::<moraine_clickhouse::ClickHouseError>()
+            .expect("startup deadline must remain typed");
+        assert_eq!(
+            typed.category(),
+            moraine_clickhouse::ClickHouseErrorCategory::DeadlineExceeded
+        );
     }
 
     #[tokio::test]
