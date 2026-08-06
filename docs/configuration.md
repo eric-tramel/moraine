@@ -387,7 +387,8 @@ format = "jsonl"
 | `format` | inferred from `harness` and `glob` | On-disk parser: `jsonl`, `session_json`, `kiro_session`, `cursor_sqlite`, `nac_sqlite`, or `opencode_sqlite`. |
 
 Supported `harness` values are `codex`, `claude-code`, `cursor`, `hermes`,
-`kiro-cli`, `kimi-cli`, `nac`, `opencode`, `pi-coding-agent`, and `qwen-code`.
+`kiro-cli`, `kimi-cli`, `nac`, `opencode`, `pi-coding-agent`, `prime-agent`,
+and `qwen-code`.
 Each value maps to a
 registered ingest source adapter; see
 [Ingest Sources](development/ingest-sources.md) for the adapter contract and
@@ -430,6 +431,8 @@ The built-in defaults and `config/moraine.toml` reference cover these source fam
 | Cursor SQLite history | `cursor` | `~/Library/Application Support/Cursor/User/**/state.vscdb` (macOS) | `~/Library/Application Support/Cursor/User` | `cursor_sqlite` (default on) |
 | Pi Coding Agent (historical) | `pi-coding-agent` | `~/.pi/agent/sessions/**/*.jsonl` | `~/.pi/agent/sessions` | `jsonl` |
 | OMP (oh-my-pi) | `pi-coding-agent` | `~/.omp/agent/sessions/**/*.jsonl` | `~/.omp/agent/sessions` | `jsonl` |
+| Prime Agent root sessions | `prime-agent` | `~/.prime/agent/sessions/*.jsonl` | `~/.prime/agent/sessions` | `jsonl` |
+| Prime Agent RLM children | `prime-agent` | `~/.prime/agent/session-artifacts/**/sub-*/*.jsonl` | `~/.prime/agent/session-artifacts` | `jsonl` |
 | Hermes live sessions | `hermes` | `~/.hermes/sessions/session_*.json` | `~/.hermes/sessions` | `session_json` |
 | Hermes trajectories | `hermes` | user-provided trajectory JSONL | trajectory output directory | `jsonl` |
 
@@ -677,6 +680,56 @@ format = "jsonl"
 OMP uses the Pi session schema, so both sources share the `pi-coding-agent`
 adapter. Separate source names preserve historical `~/.pi` checkpoints while
 allowing startup backfill and live watching of current `~/.omp` sessions.
+
+Prime Agent:
+
+```toml
+[[ingest.sources]]
+name = "prime-agent"
+harness = "prime-agent"
+enabled = true
+glob = "~/.prime/agent/sessions/*.jsonl"
+watch_root = "~/.prime/agent/sessions"
+format = "jsonl"
+
+[[ingest.sources]]
+name = "prime-agent-subagents"
+harness = "prime-agent"
+enabled = true
+glob = "~/.prime/agent/session-artifacts/**/sub-*/*.jsonl"
+watch_root = "~/.prime/agent/session-artifacts"
+format = "jsonl"
+```
+
+The adapter pins normalized semantics to Prime Agent v0.7.0 session format v3.
+Other historical or future versions remain raw-preserved but are otherwise
+best-effort until covered by fixtures.
+
+The root and RLM-child sources use distinct checkpoint namespaces. Child
+sessions remain independently searchable, carry substream metadata, and link
+to the parent session ID recorded in their header. The setup-owned defaults
+strictly accept UUID-named transcripts at the canonical paths, so artifact
+journals such as `rlm-subagents.jsonl` never enter the ingest queue. Custom
+Prime sources remain configurable under a different glob.
+
+Both sources are enabled by default for fresh installs and backfill existing
+local Prime history on first startup. That makes ordinary prompts, responses,
+tool I/O, cwd, and allowed metadata durable and searchable under the configured
+ClickHouse/redaction/routing policy. Set `enabled = false` on both entries above
+before startup to opt out.
+
+When a pre-existing explicit source list still contains any setup-owned source
+with its canonical name, harness, glob, and watch root, config loading adds
+missing Prime defaults in memory. New entries stay disabled when all matching
+setup-owned entries are disabled. Custom-only source lists are unchanged, and
+a custom source whose name collides with either Prime default wins rather than
+being duplicated.
+
+Prime Agent orchestration records such as status snapshots, attributed child
+usage, session/git state, hidden custom records, and unknown future records are
+retained only in raw storage. They do not create searchable events or add to
+token totals; visible conversation messages, tool activity, summaries, and
+visible custom messages do.
 
 Hermes live sessions:
 

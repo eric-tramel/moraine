@@ -125,7 +125,7 @@ const TOKEN_NATIVE_UNIT_KEYS: &[&str] = &[
     "output_images",
 ];
 
-fn golden_cases() -> [GoldenCase; 13] {
+fn golden_cases() -> [GoldenCase; 14] {
     [
         GoldenCase {
             name: "codex",
@@ -230,6 +230,14 @@ fn golden_cases() -> [GoldenCase; 13] {
             source_name: "golden-pi",
             fixture_rel: "fixtures/pi/session.jsonl",
             source_file: "/fixtures/pi/session.jsonl",
+            format: GoldenFormat::Jsonl,
+        },
+        GoldenCase {
+            name: "prime_agent",
+            harness: "prime-agent",
+            source_name: "golden-prime-agent",
+            fixture_rel: "fixtures/prime-agent/session.jsonl",
+            source_file: "/fixtures/prime-agent/session.jsonl",
             format: GoldenFormat::Jsonl,
         },
     ]
