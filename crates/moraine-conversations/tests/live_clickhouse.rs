@@ -1,16 +1,16 @@
 use anyhow::{anyhow, bail, Context, Result};
-use moraine_clickhouse::ClickHouseClient;
+use moraine_clickhouse::{ClickHouseClient, ClickHouseError, ClickHouseErrorCategory};
 use moraine_config::{AppConfig, ClickHouseConfig, DEFAULT_BACKEND_NAME};
 use moraine_conversations::{
     AnalyticsRange, BackendRepositoryRouter, ClickHouseConversationRepository,
-    ConversationListSort, ConversationRepository, McpSessionListFilter, PageRequest, QueryOwner,
-    QueryRuntime, QueryWorkload, RepoConfig, SearchEventsQuery, SearchStrategyHint,
+    ConversationListSort, ConversationRepository, McpSessionListFilter, PageRequest, QueryCause,
+    QueryOwner, QueryRuntime, QueryWorkload, RepoConfig, SearchEventsQuery, SearchStrategyHint,
     SessionAnalyticsQuery, SessionLookback, TurnListFilter,
 };
 use reqwest::{Client, Url};
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io::{self, Write};
@@ -1114,6 +1114,534 @@ FORMAT JSONEachRow"#
         .collect::<Vec<_>>();
     assert_eq!(candidate_hits, baseline_hits);
     Ok(())
+}
+
+const OWNERSHIP_LONG_QUERY: &str =
+    "SELECT sleepEachRow(0.1) FROM numbers(310) SETTINGS max_block_size = 1 FORMAT Null";
+const OWNERSHIP_CANCEL_QUERY: &str =
+    "SELECT sleepEachRow(0.1) FROM numbers(600) SETTINGS max_block_size = 1 FORMAT Null";
+
+#[derive(Debug, Deserialize)]
+struct ActiveQueryIdRow {
+    query_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct OwnershipLogRow {
+    query_id: String,
+    event_type: String,
+    exception_code: u32,
+    has_deadline_settings: u8,
+}
+
+async fn administrative_request(
+    clickhouse: &ClickHouseClient,
+    runtime: &QueryRuntime,
+    query: &str,
+    database: Option<&str>,
+) -> Result<String> {
+    let owner = QueryOwner::new(runtime, QueryWorkload::Administrative)
+        .context("failed to create live-test administrative owner")?;
+    owner
+        .scope(clickhouse.request_text(query, None, database, false, None))
+        .await
+}
+
+async fn administrative_rows<T: DeserializeOwned>(
+    clickhouse: &ClickHouseClient,
+    runtime: &QueryRuntime,
+    query: &str,
+    database: Option<&str>,
+) -> Result<Vec<T>> {
+    let owner = QueryOwner::new(runtime, QueryWorkload::Administrative)
+        .context("failed to create live-test administrative owner")?;
+    owner.scope(clickhouse.query_rows(query, database)).await
+}
+
+fn query_id_list(ids: &[String]) -> String {
+    ids.iter()
+        .map(|id| format!("'{id}'"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+async fn active_query_ids(
+    clickhouse: &ClickHouseClient,
+    runtime: &QueryRuntime,
+    ids: &[String],
+) -> Result<HashSet<String>> {
+    let rows: Vec<ActiveQueryIdRow> = administrative_rows(
+        clickhouse,
+        runtime,
+        &format!(
+            "SELECT query_id FROM system.processes WHERE query_id IN ({}) FORMAT JSONEachRow",
+            query_id_list(ids)
+        ),
+        Some("system"),
+    )
+    .await
+    .context("failed to observe live owned queries")?;
+    Ok(rows.into_iter().map(|row| row.query_id).collect())
+}
+
+async fn wait_for_active_query_ids(
+    clickhouse: &ClickHouseClient,
+    runtime: &QueryRuntime,
+    ids: &[String],
+    expected_present: bool,
+    timeout: Duration,
+) -> Result<HashSet<String>> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let active = active_query_ids(clickhouse, runtime, ids).await?;
+        let condition = if expected_present {
+            ids.iter().all(|id| active.contains(id))
+        } else {
+            ids.iter().all(|id| !active.contains(id))
+        };
+        if condition {
+            return Ok(active);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            bail!(
+                "timed out waiting for query IDs to become {}: expected={ids:?} active={active:?}",
+                if expected_present {
+                    "visible"
+                } else {
+                    "absent"
+                }
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+fn child_ids(owner: &QueryOwner, count: u64) -> Vec<String> {
+    (0..count)
+        .map(|sequence| format!("{}-{sequence}", owner.logical_id()))
+        .collect()
+}
+
+fn validate_classed_child_id(query_id: &str) -> Result<String> {
+    const WORKLOADS: &[&str] = &[
+        "mcp",
+        "monitor",
+        "internal",
+        "export",
+        "migration",
+        "background",
+        "administrative",
+    ];
+    let (logical, child) = query_id
+        .rsplit_once('-')
+        .with_context(|| format!("query ID has no child sequence: {query_id}"))?;
+    let sequence: u64 = child
+        .parse()
+        .with_context(|| format!("query ID has a non-numeric child sequence: {query_id}"))?;
+    if sequence.to_string() != child {
+        bail!("query ID child sequence is not canonical: {query_id}");
+    }
+    let uuid = WORKLOADS
+        .iter()
+        .find_map(|workload| logical.strip_prefix(&format!("moraine-{workload}-")))
+        .with_context(|| format!("query ID has no allowed workload class: {query_id}"))?;
+    if uuid.len() != 32
+        || !uuid
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || Uuid::parse_str(uuid).is_err()
+    {
+        bail!("query ID does not contain a lowercase UUID-simple value: {query_id}");
+    }
+    Ok(logical.to_string())
+}
+
+fn require_error_category(
+    label: &str,
+    result: &Result<String>,
+    expected: ClickHouseErrorCategory,
+) -> Result<()> {
+    let error = result
+        .as_ref()
+        .err()
+        .with_context(|| format!("{label} unexpectedly completed"))?;
+    let clickhouse_error = error
+        .downcast_ref::<ClickHouseError>()
+        .with_context(|| format!("{label} returned a non-ClickHouse error: {error:#}"))?;
+    if clickhouse_error.category() != expected {
+        bail!(
+            "{label} returned {:?}, expected {:?}: {error:#}",
+            clickhouse_error.category(),
+            expected
+        );
+    }
+    Ok(())
+}
+
+async fn run_two_owned_queries(
+    owner: Arc<QueryOwner>,
+    clickhouse: ClickHouseClient,
+    database: String,
+    query: &'static str,
+) -> (Result<String>, Result<String>) {
+    owner
+        .scope(async {
+            tokio::join!(
+                clickhouse.request_text(query, None, Some(&database), false, None),
+                clickhouse.request_text(query, None, Some(&database), false, None),
+            )
+        })
+        .await
+}
+
+async fn query_ownership_acceptance(
+    prerequisites: &LivePrerequisites,
+    database: &OwnedDatabaseName,
+    query_runtime: &QueryRuntime,
+    normal: &ClickHouseClient,
+    admin_runtime: &QueryRuntime,
+    admin: &ClickHouseClient,
+    normal_user_agent: &str,
+) -> Result<()> {
+    administrative_request(
+        admin,
+        admin_runtime,
+        &format!("CREATE DATABASE `{}`", database.as_str()),
+        Some("system"),
+    )
+    .await
+    .context("failed to create query-ownership database")?;
+    let query_log_start = administrative_request(
+        admin,
+        admin_runtime,
+        "SELECT toString(now64(6))",
+        Some("system"),
+    )
+    .await?
+    .trim()
+    .to_string();
+
+    let grouped_owner = QueryOwner::new(query_runtime, QueryWorkload::Mcp)?;
+    let grouped_logical_id = grouped_owner.logical_id().to_string();
+    grouped_owner
+        .scope(async {
+            normal
+                .request_text(
+                    "SELECT 1 FORMAT Null",
+                    None,
+                    Some(database.as_str()),
+                    false,
+                    None,
+                )
+                .await?;
+            normal
+                .request_text(
+                    "SELECT 2 FORMAT Null",
+                    None,
+                    Some(database.as_str()),
+                    false,
+                    None,
+                )
+                .await?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .context("multi-child grouping queries failed")?;
+    let grouped_ids = child_ids(&grouped_owner, 2);
+    if grouped_ids.len() != 2 || grouped_ids[0] == grouped_ids[1] {
+        bail!("one logical owner did not produce two unique child IDs");
+    }
+
+    let isolated_owner = QueryOwner::new(query_runtime, QueryWorkload::Monitor)?;
+    let isolated_logical_id = isolated_owner.logical_id().to_string();
+    isolated_owner
+        .scope(normal.request_text(
+            "SELECT 3 FORMAT Null",
+            None,
+            Some(database.as_str()),
+            false,
+            None,
+        ))
+        .await
+        .context("different-owner isolation query failed")?;
+    let isolated_ids = child_ids(&isolated_owner, 1);
+    if grouped_logical_id == isolated_logical_id
+        || grouped_ids.iter().any(|id| isolated_ids.contains(id))
+    {
+        bail!("different query owners did not receive isolated logical/child IDs");
+    }
+
+    let cancelled_owner = QueryOwner::new(query_runtime, QueryWorkload::Mcp)?;
+    let cancelled_ids = child_ids(&cancelled_owner, 2);
+    let cancelled_task = tokio::spawn(run_two_owned_queries(
+        cancelled_owner.clone(),
+        normal.clone(),
+        database.as_str().to_string(),
+        OWNERSHIP_CANCEL_QUERY,
+    ));
+
+    let survivor_owner = QueryOwner::new(query_runtime, QueryWorkload::Monitor)?;
+    let survivor_ids = child_ids(&survivor_owner, 1);
+    let survivor_started = Instant::now();
+    let survivor_task = {
+        let owner = survivor_owner.clone();
+        let clickhouse = normal.clone();
+        let database = database.as_str().to_string();
+        tokio::spawn(async move {
+            owner
+                .scope(clickhouse.request_text(
+                    OWNERSHIP_LONG_QUERY,
+                    None,
+                    Some(&database),
+                    false,
+                    None,
+                ))
+                .await
+        })
+    };
+
+    let mut concurrent_ids = cancelled_ids.clone();
+    concurrent_ids.extend(survivor_ids.clone());
+    wait_for_active_query_ids(
+        admin,
+        admin_runtime,
+        &concurrent_ids,
+        true,
+        Duration::from_secs(10),
+    )
+    .await?;
+
+    cancelled_owner.cancel(QueryCause::Explicit);
+    let cancelled_results = tokio::time::timeout(Duration::from_secs(10), cancelled_task)
+        .await
+        .context("cancelled owner task did not return within ten seconds")?
+        .context("cancelled owner task panicked")?;
+    require_error_category(
+        "first explicitly cancelled child",
+        &cancelled_results.0,
+        ClickHouseErrorCategory::Cancelled,
+    )?;
+    require_error_category(
+        "second explicitly cancelled child",
+        &cancelled_results.1,
+        ClickHouseErrorCategory::Cancelled,
+    )?;
+
+    wait_for_active_query_ids(
+        admin,
+        admin_runtime,
+        &cancelled_ids,
+        false,
+        Duration::from_secs(8),
+    )
+    .await?;
+    let survivor_active = active_query_ids(admin, admin_runtime, &survivor_ids).await?;
+    if !survivor_ids.iter().all(|id| survivor_active.contains(id)) {
+        bail!("cancelling one owner also removed its unrelated live owner");
+    }
+
+    tokio::time::timeout(Duration::from_secs(45), survivor_task)
+        .await
+        .context("31-second no-deadline query exceeded its 45-second test wall")?
+        .context("31-second no-deadline query task panicked")??;
+    if survivor_started.elapsed() < Duration::from_secs(30) {
+        bail!(
+            "no-deadline live query did not remain connected for more than 30 seconds: {:?}",
+            survivor_started.elapsed()
+        );
+    }
+
+    let deadline_owner = QueryOwner::with_deadline(
+        query_runtime,
+        QueryWorkload::Internal,
+        tokio::time::Instant::now() + Duration::from_millis(1500),
+    )?;
+    let deadline_ids = child_ids(&deadline_owner, 2);
+    let deadline_task = tokio::spawn(run_two_owned_queries(
+        deadline_owner.clone(),
+        normal.clone(),
+        database.as_str().to_string(),
+        OWNERSHIP_CANCEL_QUERY,
+    ));
+    wait_for_active_query_ids(
+        admin,
+        admin_runtime,
+        &deadline_ids,
+        true,
+        Duration::from_secs(10),
+    )
+    .await?;
+    let deadline_results = tokio::time::timeout(Duration::from_secs(10), deadline_task)
+        .await
+        .context("absolute-deadline owner task did not return within ten seconds")?
+        .context("absolute-deadline owner task panicked")?;
+    require_error_category(
+        "first absolute-deadline child",
+        &deadline_results.0,
+        ClickHouseErrorCategory::DeadlineExceeded,
+    )?;
+    require_error_category(
+        "second absolute-deadline child",
+        &deadline_results.1,
+        ClickHouseErrorCategory::DeadlineExceeded,
+    )?;
+    if deadline_owner.cause() != Some(QueryCause::Deadline) {
+        bail!(
+            "absolute deadline recorded unexpected owner cause: {:?}",
+            deadline_owner.cause()
+        );
+    }
+    wait_for_active_query_ids(
+        admin,
+        admin_runtime,
+        &deadline_ids,
+        false,
+        Duration::from_secs(8),
+    )
+    .await?;
+
+    administrative_request(admin, admin_runtime, "SYSTEM FLUSH LOGS", Some("system"))
+        .await
+        .context("failed to flush query_log for query-ownership assertions")?;
+    let log_query = format!(
+        "SELECT query_id, toString(type) AS event_type, toUInt32(exception_code) AS exception_code, \
+         toUInt8(mapContains(Settings, 'max_execution_time') OR \
+                 mapContains(Settings, 'max_execution_time_leaf') OR \
+                 mapContains(Settings, 'timeout_overflow_mode') OR \
+                 mapContains(Settings, 'timeout_before_checking_execution_speed')) AS has_deadline_settings \
+         FROM system.query_log \
+         WHERE event_time_microseconds >= parseDateTime64BestEffort('{query_log_start}') \
+           AND current_database = '{}' \
+           AND http_user_agent = '{normal_user_agent}' \
+           AND type IN ('QueryStart', 'QueryFinish', 'ExceptionBeforeStart', 'ExceptionWhileProcessing') \
+         ORDER BY query_id, event_time_microseconds FORMAT JSONEachRow",
+        database.as_str()
+    );
+    let log_rows: Vec<OwnershipLogRow> =
+        administrative_rows(admin, admin_runtime, &log_query, Some("system"))
+            .await
+            .context("failed to read query-ownership query_log rows")?;
+
+    let mut expected_no_deadline = grouped_ids;
+    expected_no_deadline.extend(isolated_ids);
+    expected_no_deadline.extend(cancelled_ids.clone());
+    expected_no_deadline.extend(survivor_ids);
+    let mut expected_all = expected_no_deadline.clone();
+    expected_all.extend(deadline_ids.clone());
+    let expected_set: HashSet<_> = expected_all.iter().cloned().collect();
+    let observed_starts: Vec<_> = log_rows
+        .iter()
+        .filter(|row| row.event_type == "QueryStart")
+        .collect();
+    for id in &expected_all {
+        let count = observed_starts
+            .iter()
+            .filter(|row| row.query_id == *id)
+            .count();
+        if count != 1 {
+            bail!("expected exactly one QueryStart for {id}, observed {count}");
+        }
+    }
+    for row in &observed_starts {
+        if !expected_set.contains(&row.query_id) {
+            bail!(
+                "run-token/database query_log filter captured unexpected normal query ID {}",
+                row.query_id
+            );
+        }
+        let logical = validate_classed_child_id(&row.query_id)?;
+        if row.query_id.starts_with(&grouped_logical_id) && logical != grouped_logical_id {
+            bail!("multi-child query did not retain its logical owner prefix");
+        }
+    }
+    if expected_no_deadline.iter().any(|id| {
+        observed_starts
+            .iter()
+            .any(|row| row.query_id == *id && row.has_deadline_settings != 0)
+    }) {
+        bail!("a no-deadline normal query captured Moraine deadline settings");
+    }
+    for id in &deadline_ids {
+        if !observed_starts
+            .iter()
+            .any(|row| row.query_id == *id && row.has_deadline_settings != 0)
+        {
+            bail!("absolute-deadline query did not capture deadline settings: {id}");
+        }
+    }
+    for id in &cancelled_ids {
+        if !log_rows
+            .iter()
+            .any(|row| row.query_id == *id && row.exception_code == 394)
+        {
+            bail!("cancelled child has no QUERY_WAS_CANCELLED (394) query_log evidence: {id}");
+        }
+    }
+
+    eprintln!(
+        "query-ownership live acceptance: sandbox={} database={} normal_user_agent={} no-deadline runtime=>30s",
+        prerequisites.sandbox_id,
+        database.as_str(),
+        normal_user_agent
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires wrapper-owned live ClickHouse, destructive opt-in, and about 40 seconds"]
+async fn live_query_ownership_and_cancellation() -> Result<()> {
+    let prerequisites = LivePrerequisites::load()?;
+    let database = prepare_owned_database_identity(&prerequisites.sandbox_id)?;
+    let run_token = Uuid::new_v4().simple().to_string();
+    let normal_user_agent = format!("moraine-live-query-ownership/{run_token}");
+    let admin_user_agent = format!("moraine-live-query-ownership-admin/{run_token}");
+    let query_runtime = QueryRuntime::new();
+    let admin_runtime = QueryRuntime::new();
+    let normal = ClickHouseClient::new_with_runtime_and_user_agent(
+        prerequisites.clickhouse_config(&database),
+        query_runtime.clone(),
+        &normal_user_agent,
+    )?;
+    let admin = ClickHouseClient::new_with_runtime_and_user_agent(
+        prerequisites.clickhouse_config(&database),
+        admin_runtime.clone(),
+        admin_user_agent,
+    )?;
+
+    let outcome = query_ownership_acceptance(
+        &prerequisites,
+        &database,
+        &query_runtime,
+        &normal,
+        &admin_runtime,
+        &admin,
+        &normal_user_agent,
+    )
+    .await;
+
+    // Drain the normal runtime first so any failed assertion cannot leave a
+    // child query running while the owned database is dropped.
+    query_runtime.close_and_drain().await;
+    let cleanup = administrative_request(
+        &admin,
+        &admin_runtime,
+        &cleanup_statement(&database),
+        Some("system"),
+    )
+    .await;
+    let census = match QueryOwner::new(&admin_runtime, QueryWorkload::Administrative) {
+        Ok(owner) => {
+            owner
+                .scope(assert_owned_database_census_empty(
+                    &admin,
+                    "after query-ownership teardown",
+                ))
+                .await
+        }
+        Err(error) => Err(error.into()),
+    };
+    admin_runtime.close_and_drain().await;
+    finish_with_cleanup(outcome, finish_with_cleanup(cleanup.map(|_| ()), census))
 }
 
 #[tokio::test]

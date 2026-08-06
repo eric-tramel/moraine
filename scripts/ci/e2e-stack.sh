@@ -1913,6 +1913,11 @@ PY
     return 1
   fi
 
+  # Run-scoped lower bound for the final owner-ID acceptance query. This
+  # direct observer query uses curl's User-Agent and is excluded below.
+  local ownership_query_log_start
+  ownership_query_log_start="$(clickhouse_scalar "$clickhouse_url" "SELECT toString(now64(6))")"
+
   echo "[e2e] checking canonical monitor API routes"
   local path
   for path in \
@@ -2439,6 +2444,22 @@ if status.get("monitor_url") != expected_monitor_url:
         f"full-stack status monitor URL mismatch: {status.get('monitor_url')!r}"
     )
 PY
+
+  # Capture every normal service query exercised since the MCP/Monitor query-log
+  # marker. The direct curl probes use curl's User-Agent and are deliberately
+  # outside this service-role/run-PID filter.
+  echo "[e2e] checking classed owner grammar for exercised ClickHouse queries"
+  local ownership_query_log_end
+  ownership_query_log_end="$(clickhouse_scalar "$clickhouse_url" "SELECT toString(now64(6))")"
+  clickhouse_scalar "$clickhouse_url" "SYSTEM FLUSH LOGS" >/dev/null
+  local ownership_query_log_window="event_time_microseconds >= parseDateTime64BestEffort('${ownership_query_log_start}') AND event_time_microseconds < parseDateTime64BestEffort('${ownership_query_log_end}')"
+  local exercised_service_queries="type = 'QueryStart' AND ${ownership_query_log_window} AND current_database IN ('${clickhouse_database}', '${routed_clickhouse_database}', 'system', 'default') AND http_user_agent IN ('${expected_backend_ua}', '${expected_ingest_ua}')"
+  wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM system.query_log WHERE ${exercised_service_queries}" 30
+  assert_clickhouse_count \
+    "$clickhouse_url" \
+    "every exercised Moraine QueryStart uses classed UUID child grammar" \
+    "SELECT count() FROM system.query_log WHERE ${exercised_service_queries} AND NOT match(query_id, '^moraine-(mcp|monitor|internal|export|migration|background|administrative)-[0-9a-f]{32}-[0-9]+$')" \
+    "0"
 
   echo "[e2e] killing only the unified backend (crash/fallback scenario)"
   kill -KILL "$backend_pid"
