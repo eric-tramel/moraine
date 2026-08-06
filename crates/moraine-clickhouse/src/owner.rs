@@ -620,6 +620,7 @@ pub struct ClickHouseError {
     context: String,
     status: Option<StatusCode>,
     exception_code: Option<u32>,
+    exception_detail: Option<String>,
     source: Option<reqwest::Error>,
 }
 
@@ -632,6 +633,11 @@ impl ClickHouseError {
     }
     pub fn exception_code(&self) -> Option<u32> {
         self.exception_code
+    }
+    /// A bounded, single-line ClickHouse exception detail with stack traces
+    /// and control characters removed. It never contains the request URL.
+    pub fn exception_detail(&self) -> Option<&str> {
+        self.exception_detail.as_deref()
     }
     pub(crate) fn ownership(context: impl Into<String>) -> Self {
         Self::new(ClickHouseErrorCategory::OwnershipViolation, context)
@@ -658,19 +664,23 @@ impl ClickHouseError {
         context: impl Into<String>,
         status: StatusCode,
         exception_code: Option<u32>,
+        exception_detail: Option<&str>,
     ) -> Self {
         let mut value = Self::new(category, context);
         value.status = Some(status);
         value.exception_code = exception_code;
+        value.exception_detail = exception_detail.and_then(sanitize_exception_detail);
         value
     }
     pub(crate) fn exception(
         category: ClickHouseErrorCategory,
         context: impl Into<String>,
         exception_code: u32,
+        exception_detail: Option<&str>,
     ) -> Self {
         let mut value = Self::new(category, context);
         value.exception_code = Some(exception_code);
+        value.exception_detail = exception_detail.and_then(sanitize_exception_detail);
         value
     }
     fn new(category: ClickHouseErrorCategory, context: impl Into<String>) -> Self {
@@ -679,6 +689,7 @@ impl ClickHouseError {
             context: context.into(),
             status: None,
             exception_code: None,
+            exception_detail: None,
             source: None,
         }
     }
@@ -693,6 +704,9 @@ impl fmt::Display for ClickHouseError {
         if let Some(code) = self.exception_code {
             write!(f, " (ClickHouse code {code})")?;
         }
+        if let Some(detail) = &self.exception_detail {
+            write!(f, ": {detail}")?;
+        }
         Ok(())
     }
 }
@@ -703,6 +717,23 @@ impl std::error::Error for ClickHouseError {
             .as_ref()
             .map(|source| source as &(dyn std::error::Error + 'static))
     }
+}
+
+fn sanitize_exception_detail(detail: &str) -> Option<String> {
+    const MAX_CHARS: usize = 512;
+    let first_line = detail.lines().next()?.trim();
+    if first_line.is_empty() {
+        return None;
+    }
+    let mut sanitized = first_line
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect::<String>();
+    if sanitized.chars().count() > MAX_CHARS {
+        sanitized = sanitized.chars().take(MAX_CHARS - 3).collect();
+        sanitized.push_str("...");
+    }
+    Some(sanitized)
 }
 
 pub(crate) fn error_for_cause(cause: QueryCause, context: impl Into<String>) -> ClickHouseError {
@@ -799,6 +830,7 @@ impl AdminBackend {
                 "ClickHouse cleanup request was rejected",
                 status,
                 extract_exception_code(&body),
+                Some(&body),
             ));
         }
         Ok(body)

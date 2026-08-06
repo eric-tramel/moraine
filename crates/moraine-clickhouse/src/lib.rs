@@ -90,11 +90,13 @@ impl ClickHouseByteStream {
             }
 
             if let Some((code, start)) = find_exception_tail(&self.buffered) {
+                let detail = String::from_utf8_lossy(&self.buffered[start..]).into_owned();
                 self.buffered.truncate(start);
                 let error = classify_exception(
                     &self.owner,
                     code,
                     "ClickHouse stream ended with an exception",
+                    Some(&detail),
                 );
                 if let Some(mut ticket) = self.ticket.take() {
                     ticket.fail(cause_for_error(&error));
@@ -377,7 +379,7 @@ impl ClickHouseClient {
                 }
             };
             let code = header_code.or_else(|| extract_exception_code(&body));
-            let error = classify_response(&prepared.owner, status, code);
+            let error = classify_response(&prepared.owner, status, code, Some(&body));
             prepared.ticket.fail(cause_for_error(&error));
             return Err(error.into());
         }
@@ -438,9 +440,14 @@ impl ClickHouseClient {
                 return Err(error.into());
             }
         };
-        if let Some((code, _)) = find_exception_tail(&bytes) {
-            let error =
-                classify_exception(&owner, code, "ClickHouse response ended with an exception");
+        if let Some((code, start)) = find_exception_tail(&bytes) {
+            let detail = String::from_utf8_lossy(&bytes[start..]);
+            let error = classify_exception(
+                &owner,
+                code,
+                "ClickHouse response ended with an exception",
+                Some(&detail),
+            );
             ticket.fail(cause_for_error(&error));
             return Err(error.into());
         }
@@ -1108,13 +1115,25 @@ fn classify_response(
     owner: &Arc<QueryOwner>,
     status: StatusCode,
     code: Option<u32>,
+    detail: Option<&str>,
 ) -> ClickHouseError {
     let category = classify_code(owner, code);
-    ClickHouseError::response(category, "ClickHouse request was rejected", status, code)
+    ClickHouseError::response(
+        category,
+        "ClickHouse request was rejected",
+        status,
+        code,
+        detail,
+    )
 }
 
-fn classify_exception(owner: &Arc<QueryOwner>, code: u32, context: &str) -> ClickHouseError {
-    ClickHouseError::exception(classify_code(owner, Some(code)), context, code)
+fn classify_exception(
+    owner: &Arc<QueryOwner>,
+    code: u32,
+    context: &str,
+    detail: Option<&str>,
+) -> ClickHouseError {
+    ClickHouseError::exception(classify_code(owner, Some(code)), context, code, detail)
 }
 
 fn classify_code(owner: &Arc<QueryOwner>, code: Option<u32>) -> ClickHouseErrorCategory {
@@ -3543,6 +3562,42 @@ mod tests {
         let typed = error.downcast_ref::<ClickHouseError>().unwrap();
         assert_eq!(typed.category(), ClickHouseErrorCategory::ResourceExhausted);
         assert_eq!(typed.exception_code(), Some(241));
+        assert_eq!(
+            typed.exception_detail(),
+            Some("Code: 241. DB::Exception: memory limit exceeded")
+        );
+        assert!(error.to_string().contains("memory limit exceeded"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn typed_code_117_retains_bounded_detail_for_oversized_row_classification() {
+        async fn oversized() -> (StatusCode, &'static str) {
+            (
+                StatusCode::BAD_REQUEST,
+                "Code: 117. DB::Exception: Size of JSON object at position 42 is extremely large. Expected not greater than 10485760 bytes.\nstack trace omitted",
+            )
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, Router::new().route("/", post(oversized))).await;
+        });
+        let client =
+            ClickHouseClient::new(test_clickhouse_config(format!("http://{addr}"))).unwrap();
+        let error = owned(
+            &client,
+            client.request_text("INSERT INTO events", None, None, false, None),
+        )
+        .await
+        .expect_err("oversized response must fail");
+        let typed = error.downcast_ref::<ClickHouseError>().unwrap();
+        assert_eq!(typed.exception_code(), Some(117));
+        assert!(typed
+            .exception_detail()
+            .unwrap()
+            .contains("extremely large"));
+        assert!(!typed.exception_detail().unwrap().contains("stack trace"));
+        assert!(is_oversized_json_each_row_insert_error(&error));
     }
 
     #[tokio::test(flavor = "multi_thread")]
