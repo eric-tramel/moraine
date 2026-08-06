@@ -1,6 +1,6 @@
 [project]
 name = "prime-agent-skill-moraine"
-version = "0.7.2"
+version = "0.7.3"
 description = "Moraine MCP integration for Prime Agent."
 requires-python = ">=3.10"
 dependencies = ["mcp>=1,<2"]
