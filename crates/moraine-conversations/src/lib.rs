@@ -5,6 +5,7 @@ mod domain;
 mod error;
 mod in_memory_repo;
 mod repo;
+mod session_label;
 
 pub use backend_router::{BackendRepository, BackendRepositoryRouter};
 pub use clickhouse_repo::ClickHouseConversationRepository;

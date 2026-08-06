@@ -43,12 +43,21 @@ BINDING_LOCK_PACKAGES = {
 }
 
 RUNTIME_PLUGIN_JSON_MANIFESTS = [
-    ("Claude", "plugins/moraine/.claude-plugin/plugin.json"),
-    ("Codex", "plugins/moraine/.codex-plugin/plugin.json"),
+    ("Claude", "plugins/moraine/.claude-plugin/plugin.json", "moraine"),
+    ("Codex", "plugins/moraine/.codex-plugin/plugin.json", "moraine"),
+    ("Prime Agent", "plugins/prime-agent-moraine/package.json", "moraine-prime-agent"),
 ]
 
 RUNTIME_PLUGIN_YAML_MANIFESTS = [
     ("Hermes", "plugins/hermes-moraine/plugin.yaml"),
+]
+
+RUNTIME_PYTHON_PROJECTS = [
+    (
+        "Prime Agent Python skill",
+        "plugins/prime-agent-moraine/skills/moraine/pyproject.toml",
+        "prime-agent-skill-moraine",
+    ),
 ]
 
 VERSION_RE = re.compile(r"^v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$")
@@ -250,10 +259,10 @@ def bump_release_examples(
 def bump_runtime_plugin_manifests(
     repo_root: Path, current_version: str, target_version: str, *, dry_run: bool
 ) -> None:
-    for label, relpath in RUNTIME_PLUGIN_JSON_MANIFESTS:
+    for label, relpath, expected_name in RUNTIME_PLUGIN_JSON_MANIFESTS:
         path = repo_root / relpath
         data = json.loads(read_text(path))
-        if data.get("name") != "moraine":
+        if data.get("name") != expected_name:
             raise SystemExit(
                 f"unexpected {label} plugin name in {path}: {data.get('name')}"
             )
@@ -264,6 +273,26 @@ def bump_runtime_plugin_manifests(
             )
         data["version"] = target_version
         write_text(path, json.dumps(data, indent=2) + "\n", dry_run=dry_run)
+        print(f"{relpath}: {current_version} -> {target_version}")
+
+    for label, relpath, expected_name in RUNTIME_PYTHON_PROJECTS:
+        path = repo_root / relpath
+        text = read_text(path)
+        name = package_name(text, path)
+        if name != expected_name:
+            raise SystemExit(f"unexpected {label} package name in {path}: {name}")
+        version = package_version(text, path)
+        if version != current_version:
+            raise SystemExit(
+                f"{label} package has {version}, expected {current_version}"
+            )
+        new_text, _ = replace_single(
+            rf'^version = "{re.escape(version)}"$',
+            f'version = "{target_version}"',
+            text,
+            path,
+        )
+        write_text(path, new_text, dry_run=dry_run)
         print(f"{relpath}: {current_version} -> {target_version}")
 
     for label, relpath in RUNTIME_PLUGIN_YAML_MANIFESTS:

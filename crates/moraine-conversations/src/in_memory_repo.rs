@@ -617,6 +617,7 @@ mod tests {
             models: vec!["gpt-5".to_string()],
             trace_id: "trace".to_string(),
             first_user_text: "hello".to_string(),
+            display_label: "hello".to_string(),
             turns: Vec::new(),
         };
         let analytics = AnalyticsSnapshot {

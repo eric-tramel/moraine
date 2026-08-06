@@ -247,6 +247,25 @@ watch_root = "~/.omp/agent/sessions"
 format = "jsonl"
 
 [[ingest.sources]]
+# Prime Agent top-level JSONL sessions.
+name = "prime-agent"
+harness = "prime-agent"
+enabled = true
+glob = "~/.prime/agent/sessions/*.jsonl"
+watch_root = "~/.prime/agent/sessions"
+format = "jsonl"
+
+[[ingest.sources]]
+# Prime Agent RLM child transcripts. The adapter rejects neighboring artifact
+# journals such as rlm-subagents.jsonl.
+name = "prime-agent-subagents"
+harness = "prime-agent"
+enabled = true
+glob = "~/.prime/agent/session-artifacts/**/sub-*/*.jsonl"
+watch_root = "~/.prime/agent/session-artifacts"
+format = "jsonl"
+
+[[ingest.sources]]
 # Hermes live session JSON files rewritten in place.
 name = "hermes"
 harness = "hermes"

@@ -1285,6 +1285,7 @@ dependencies = [
  "tracing",
  "url",
  "urlencoding",
+ "uuid",
  "walkdir",
 ]
 

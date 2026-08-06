@@ -22,6 +22,7 @@ pub const KNOWN_INGEST_HARNESSES: &[&str] = &[
     "nac",
     "opencode",
     "pi-coding-agent",
+    "prime-agent",
     "qwen-code",
 ];
 
@@ -815,6 +816,22 @@ fn default_sources() -> Vec<IngestSource> {
             watch_root: "~/.omp/agent/sessions".to_string(),
             format: SourceFormat::Infer,
         },
+        IngestSource {
+            name: "prime-agent".to_string(),
+            harness: "prime-agent".to_string(),
+            enabled: true,
+            glob: "~/.prime/agent/sessions/*.jsonl".to_string(),
+            watch_root: "~/.prime/agent/sessions".to_string(),
+            format: SourceFormat::Jsonl,
+        },
+        IngestSource {
+            name: "prime-agent-subagents".to_string(),
+            harness: "prime-agent".to_string(),
+            enabled: true,
+            glob: "~/.prime/agent/session-artifacts/**/sub-*/*.jsonl".to_string(),
+            watch_root: "~/.prime/agent/session-artifacts".to_string(),
+            format: SourceFormat::Jsonl,
+        },
     ]);
     sources
 }
@@ -1591,6 +1608,53 @@ fn migrate_legacy_pi_source(sources: &mut Vec<IngestSource>) {
     });
 }
 
+fn source_matches_canonical_signature(source: &IngestSource, canonical: &IngestSource) -> bool {
+    source.name.trim() == canonical.name
+        && source.harness.trim() == canonical.harness
+        && source.glob.trim() == canonical.glob
+        && source.watch_root.trim() == canonical.watch_root
+        && (source.format == canonical.format
+            || source.format == SourceFormat::Infer
+            || canonical.format == SourceFormat::Infer && source.format == SourceFormat::Jsonl)
+}
+
+fn migrate_prime_agent_sources(sources: &mut Vec<IngestSource>) {
+    let defaults = default_sources();
+    let setup_owned_enabled = sources
+        .iter()
+        .filter(|source| {
+            defaults
+                .iter()
+                .any(|canonical| source_matches_canonical_signature(source, canonical))
+        })
+        .map(|source| source.enabled)
+        .collect::<Vec<_>>();
+    if setup_owned_enabled.is_empty() {
+        return;
+    }
+    let enable_new_defaults = setup_owned_enabled.into_iter().any(|enabled| enabled);
+
+    // Explicit source lists predate newly introduced defaults. Add each Prime
+    // source independently only when the config still contains at least one
+    // setup-owned canonical source. New defaults stay disabled when every
+    // matching setup-owned source is disabled. A name collision is treated as
+    // an explicit user choice, even when it has custom routing fields.
+    for mut canonical in defaults.into_iter().filter(|source| {
+        matches!(
+            source.name.as_str(),
+            "prime-agent" | "prime-agent-subagents"
+        )
+    }) {
+        canonical.enabled = enable_new_defaults;
+        if !sources
+            .iter()
+            .any(|source| source.name.trim() == canonical.name)
+        {
+            sources.push(canonical);
+        }
+    }
+}
+
 fn expand_ingest_source_path(
     source: &IngestSource,
     path: &str,
@@ -1633,6 +1697,7 @@ fn normalize_config(mut cfg: AppConfig) -> Result<AppConfig> {
     #[cfg(target_os = "macos")]
     migrate_legacy_claude_source(&mut cfg.ingest.sources);
     migrate_legacy_pi_source(&mut cfg.ingest.sources);
+    migrate_prime_agent_sources(&mut cfg.ingest.sources);
     let kiro_home = std::env::var_os("KIRO_HOME").map(PathBuf::from);
     for (source_idx, source) in cfg.ingest.sources.iter_mut().enumerate() {
         source.harness = normalize_harness(&source.harness, source_idx, &source.name)?;
@@ -3827,7 +3892,7 @@ watch_root = "~/.custom/sessions"
         std::fs::remove_file(&path).ok();
         assert!(
             format!("{err:#}").contains(
-                "expected one of: codex, claude-code, cursor, hermes, kiro-cli, kimi-cli, nac, opencode, pi-coding-agent, qwen-code"
+                "expected one of: codex, claude-code, cursor, hermes, kiro-cli, kimi-cli, nac, opencode, pi-coding-agent, prime-agent, qwen-code"
             ),
             "unexpected error: {err:#}"
         );
@@ -3850,7 +3915,7 @@ watch_root = "~/.claude/projects"
         std::fs::remove_file(&path).ok();
         assert!(
             format!("{err:#}").contains(
-                "expected one of: codex, claude-code, cursor, hermes, kiro-cli, kimi-cli, nac, opencode, pi-coding-agent, qwen-code"
+                "expected one of: codex, claude-code, cursor, hermes, kiro-cli, kimi-cli, nac, opencode, pi-coding-agent, prime-agent, qwen-code"
             ),
             "unexpected error: {err:#}"
         );
@@ -4200,6 +4265,30 @@ watch_root = "~/.cursor/projects"
     }
 
     #[test]
+    fn shipped_template_enables_prime_sources_by_default() {
+        let path = write_temp_config(
+            include_str!("../../../config/moraine.toml"),
+            "shipped-template-prime-agent",
+        );
+        let cfg = load_config(&path).expect("shipped template must parse");
+        std::fs::remove_file(&path).ok();
+
+        let sources = cfg
+            .ingest
+            .sources
+            .iter()
+            .filter(|source| source.harness == "prime-agent")
+            .collect::<Vec<_>>();
+        assert_eq!(sources.len(), 2);
+        assert_eq!(sources[0].name, "prime-agent");
+        assert_eq!(sources[1].name, "prime-agent-subagents");
+        assert!(sources.iter().all(|source| source.enabled));
+        assert!(sources
+            .iter()
+            .all(|source| source.format == SourceFormat::Jsonl));
+    }
+
+    #[test]
     fn default_sources_gate_cowork_to_macos() {
         let sources = default_sources();
         let cowork = sources.iter().find(|source| source.name == "claude-cowork");
@@ -4254,6 +4343,180 @@ watch_root = "~/.cursor/projects"
         assert_eq!(pi.watch_root, "~/.pi/agent/sessions");
         assert_eq!(omp.glob, "~/.omp/agent/sessions/**/*.jsonl");
         assert_eq!(omp.watch_root, "~/.omp/agent/sessions");
+    }
+
+    #[test]
+    fn default_sources_cover_prime_root_and_subagent_sessions() {
+        let sources = default_sources();
+        let root = sources
+            .iter()
+            .find(|source| source.name == "prime-agent")
+            .expect("defaults include Prime Agent root sessions");
+        let children = sources
+            .iter()
+            .find(|source| source.name == "prime-agent-subagents")
+            .expect("defaults include Prime Agent RLM child sessions");
+
+        for source in [root, children] {
+            assert!(source.enabled);
+            assert_eq!(source.harness, "prime-agent");
+            assert_eq!(source.format, SourceFormat::Jsonl);
+        }
+        assert_eq!(root.glob, "~/.prime/agent/sessions/*.jsonl");
+        assert_eq!(root.watch_root, "~/.prime/agent/sessions");
+        assert_eq!(
+            children.glob,
+            "~/.prime/agent/session-artifacts/**/sub-*/*.jsonl"
+        );
+        assert_eq!(children.watch_root, "~/.prime/agent/session-artifacts");
+    }
+
+    #[test]
+    fn load_config_migrates_prime_sources_from_each_canonical_signature() {
+        let mixed_path = write_temp_config(
+            r#"
+[[ingest.sources]]
+name = "codex"
+harness = "codex"
+enabled = false
+glob = "~/.codex/sessions/**/*.jsonl"
+watch_root = "~/.codex/sessions"
+
+[[ingest.sources]]
+name = "team-archive"
+harness = "prime-agent"
+enabled = true
+glob = "~/custom/prime/**/*.jsonl"
+watch_root = "~/custom/prime"
+format = "jsonl"
+"#,
+            "canonical-plus-custom-prime-migration",
+        );
+        let mixed = load_config(&mixed_path).expect("mixed canonical config should load");
+        std::fs::remove_file(&mixed_path).ok();
+        assert!(mixed
+            .ingest
+            .sources
+            .iter()
+            .any(|source| source.name == "team-archive"));
+        assert_eq!(
+            mixed
+                .ingest
+                .sources
+                .iter()
+                .filter(|source| source.harness == "prime-agent")
+                .count(),
+            3,
+            "the custom source and both new canonical sources coexist"
+        );
+        assert!(
+            mixed
+                .ingest
+                .sources
+                .iter()
+                .filter(|source| matches!(
+                    source.name.as_str(),
+                    "prime-agent" | "prime-agent-subagents"
+                ))
+                .all(|source| !source.enabled),
+            "new defaults inherit an all-disabled setup-owned posture"
+        );
+
+        let partial_path = write_temp_config(
+            r#"
+[[ingest.sources]]
+name = "prime-agent"
+harness = "prime-agent"
+enabled = false
+glob = "~/.prime/agent/sessions/*.jsonl"
+watch_root = "~/.prime/agent/sessions"
+format = "jsonl"
+"#,
+            "canonical-prime-root-only",
+        );
+        let partial =
+            load_config(&partial_path).expect("partial canonical Prime config should load");
+        std::fs::remove_file(&partial_path).ok();
+        assert_eq!(
+            partial
+                .ingest
+                .sources
+                .iter()
+                .filter(|source| source.name == "prime-agent")
+                .count(),
+            1
+        );
+        let migrated_child = partial
+            .ingest
+            .sources
+            .iter()
+            .find(|source| source.name == "prime-agent-subagents")
+            .expect("canonical root gains the missing child source");
+        assert!(
+            !migrated_child.enabled,
+            "the missing child source inherits the disabled setup-owned posture"
+        );
+    }
+
+    #[test]
+    fn load_config_prime_migration_respects_custom_only_configs_and_name_collisions() {
+        let custom_only_path = write_temp_config(
+            r#"
+[[ingest.sources]]
+name = "team-prime"
+harness = "prime-agent"
+enabled = true
+glob = "~/custom/prime/**/*.jsonl"
+watch_root = "~/custom/prime"
+format = "jsonl"
+"#,
+            "custom-only-prime-config",
+        );
+        let custom_only =
+            load_config(&custom_only_path).expect("custom-only Prime config should load");
+        std::fs::remove_file(&custom_only_path).ok();
+        assert_eq!(custom_only.ingest.sources.len(), 1);
+        assert_eq!(custom_only.ingest.sources[0].name, "team-prime");
+
+        let collision_path = write_temp_config(
+            r#"
+[[ingest.sources]]
+name = "codex"
+harness = "codex"
+enabled = true
+glob = "~/.codex/sessions/**/*.jsonl"
+watch_root = "~/.codex/sessions"
+
+[[ingest.sources]]
+name = "prime-agent"
+harness = "prime-agent"
+enabled = false
+glob = "~/custom/root-prime/*.jsonl"
+watch_root = "~/custom/root-prime"
+format = "jsonl"
+"#,
+            "custom-prime-name-collision",
+        );
+        let collision = load_config(&collision_path).expect("collision config should load");
+        std::fs::remove_file(&collision_path).ok();
+        let roots = collision
+            .ingest
+            .sources
+            .iter()
+            .filter(|source| source.name == "prime-agent")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            roots.len(),
+            1,
+            "the custom name collision is not duplicated"
+        );
+        assert!(!roots[0].enabled);
+        assert!(roots[0].glob.ends_with("/custom/root-prime/*.jsonl"));
+        assert!(collision
+            .ingest
+            .sources
+            .iter()
+            .any(|source| source.name == "prime-agent-subagents"));
     }
 
     #[test]

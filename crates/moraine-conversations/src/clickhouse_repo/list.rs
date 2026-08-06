@@ -281,6 +281,21 @@ event_rollups AS (
     ifNull(
       argMaxIf(
         coalesce(
+          nullIf(trimBoth(JSONExtractString(payload_json, 'title')), ''),
+          nullIf(trimBoth(JSONExtractString(payload_json, 'name')), '')
+        ),
+        tuple(event_ts, event_uid),
+        event_kind = 'session_meta'
+          AND (
+            notEmpty(trimBoth(JSONExtractString(payload_json, 'title')))
+            OR notEmpty(trimBoth(JSONExtractString(payload_json, 'name')))
+          )
+      ),
+      ''
+    ) AS latest_explicit_title,
+    ifNull(
+      argMaxIf(
+        coalesce(
           nullIf(JSONExtractString(payload_json, 'title'), ''),
           nullIf(JSONExtractString(payload_json, 'name'), ''),
           nullIf(JSONExtractString(payload_json, 'summary'), '')
@@ -350,6 +365,25 @@ event_rollups AS (
     ifNull(argMax(nullIf(e.harness, ''), tuple(event_ts, event_uid)), '') AS latest_harness,
     ifNull(argMax(nullIf(e.source_name, ''), tuple(event_ts, event_uid)), '') AS latest_source_name,
     ifNull(
+      argMinIf(
+        nullIf(trimBoth(substringUTF8(e.text_preview, 1, 320)), ''),
+        tuple(
+          e.event_ts,
+          e.source_name,
+          e.source_file,
+          e.source_generation,
+          e.source_offset,
+          e.source_line_no,
+          e.event_uid
+        ),
+        e.harness = 'codex'
+          AND e.actor_kind = 'user'
+          AND e.event_kind = 'event_msg'
+          AND e.payload_type = 'user_message'
+      ),
+      ''
+    ) AS codex_user_message_preview,
+    ifNull(
       argMaxIf(
         nullIf(JSONExtractString(payload_json, 'slug'), ''),
         tuple(event_ts, event_uid),
@@ -399,7 +433,13 @@ candidate_sessions AS (
         ''
       ),
       ifNull(r.latest_session_meta_summary, '')
-    ) AS session_summary
+    ) AS session_summary,
+    ifNull(r.latest_explicit_title, '') AS explicit_title,
+    if(
+      ifNull(r.latest_harness, '') = 'codex',
+      ifNull(r.codex_user_message_preview, ''),
+      ''
+    ) AS codex_user_message_preview
   FROM window_sessions AS w
   LEFT JOIN event_rollups AS r ON r.session_id = w.session_id
   {event_filter_sql}ORDER BY w.last_event_unix_ms {order_dir}, w.session_id {order_dir}
@@ -419,7 +459,9 @@ SELECT
   source,
   harness,
   session_slug,
-  session_summary
+  session_summary,
+  explicit_title,
+  codex_user_message_preview
 FROM candidate_sessions
 ORDER BY last_event_unix_ms {order_dir}, session_id {order_dir}
 FORMAT JSONEachRow",

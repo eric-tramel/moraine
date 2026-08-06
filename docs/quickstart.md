@@ -132,13 +132,13 @@ rerunning setup after installing a new harness CLI. Direct targets do not change
 ingest source selections:
 
 ```bash
-moraine setup --yes --mcp-target claude-code --mcp-target codex --mcp-target hermes --mcp-target kiro-cli --mcp-target kimi-cli --mcp-target qwen-code --mcp-target nac --mcp-target opencode --mcp-target cursor --mcp-target pi-coding-agent
+moraine setup --yes --mcp-target claude-code --mcp-target codex --mcp-target hermes --mcp-target kiro-cli --mcp-target kimi-cli --mcp-target qwen-code --mcp-target nac --mcp-target opencode --mcp-target cursor --mcp-target pi-coding-agent --mcp-target omp --mcp-target prime-agent
 ```
 
 Preview targeted MCP/plugin changes without touching host agent config:
 
 ```bash
-moraine setup --dry-run --mcp-target claude-code --mcp-target codex --mcp-target hermes --mcp-target kiro-cli --mcp-target kimi-cli --mcp-target qwen-code --mcp-target nac --mcp-target opencode --mcp-target cursor --mcp-target pi-coding-agent
+moraine setup --dry-run --mcp-target claude-code --mcp-target codex --mcp-target hermes --mcp-target kiro-cli --mcp-target kimi-cli --mcp-target qwen-code --mcp-target nac --mcp-target opencode --mcp-target cursor --mcp-target pi-coding-agent --mcp-target omp --mcp-target prime-agent
 ```
 
 The Claude Code, Codex, and Hermes plugins bundle Moraine search, realtime, and
@@ -149,7 +149,9 @@ managed search and realtime guidance under `$KIRO_HOME/steering` when
 ingest source at the matching `sessions/cli` directory. It also registers MCP
 directly or writes global MCP config for supported harnesses such as Qwen Code,
 Kimi CLI, NAC, OpenCode,
-Cursor, and Pi Coding Agent. For NAC, setup merges `[mcp_servers.moraine]` into the config at
+Cursor, Pi Coding Agent, OMP, and Prime Agent. Prime Agent setup manages
+`$PRIME_AGENT_CODING_AGENT_DIR/settings.json` and `skills/moraine` (defaulting to
+`~/.prime/agent`); stop Prime Agent and start a fresh session after setup. For NAC, setup merges `[mcp_servers.moraine]` into the config at
 `NAC_HOME`, then `XDG_CONFIG_HOME/nac`, then `~/.config/nac`, without replacing
 model, storage, sandbox, or unrelated MCP settings. It adds a `nac_sqlite`
 source only for the default store or an absolute `storage.store_path`; relative

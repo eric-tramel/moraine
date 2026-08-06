@@ -17,6 +17,7 @@ use crate::render::CliOutput;
 use toml_edit::{ArrayOfTables, DocumentMut, Item, Table};
 
 mod harnesses;
+mod prime_agent;
 use harnesses::{ManagedFileWrite, McpConfigFormat, McpConfigWrite};
 
 const DEFAULT_CONFIG_TEMPLATE: &str = include_str!("../../../../config/moraine.toml");
@@ -1811,6 +1812,11 @@ fn execute_mcp_plan_with_progress(
     }
 
     let mut config_files = Vec::new();
+    let prime_skill_first = plan.target == SetupMcpTarget::PrimeAgent;
+    if failed.is_none() && prime_skill_first {
+        failed = apply_prime_managed_file_writes(&plan.managed_writes, progress, &mut config_files);
+    }
+
     if failed.is_none() {
         for write in &plan.config_writes {
             progress.config_start(write);
@@ -1830,23 +1836,8 @@ fn execute_mcp_plan_with_progress(
         }
     }
 
-    if failed.is_none() {
-        for write in &plan.managed_writes {
-            progress.managed_file_start(write);
-            match apply_managed_file_write(write) {
-                Ok(report) => {
-                    progress.managed_file_success(write);
-                    config_files.push(report);
-                }
-                Err(exc) => {
-                    let error = format!("failed to update {}: {exc}", write.path().display());
-                    progress.managed_file_error(write, &exc.to_string());
-                    config_files.push(McpConfigFileReport::managed_error(write, &exc.to_string()));
-                    failed = Some(error);
-                    break;
-                }
-            }
-        }
+    if failed.is_none() && !prime_skill_first {
+        failed = apply_managed_file_writes(&plan.managed_writes, progress, &mut config_files);
     }
 
     if let Some(error) = failed {
@@ -2191,7 +2182,70 @@ impl McpConfigFileReport {
     }
 }
 
+fn apply_prime_managed_file_writes(
+    writes: &[ManagedFileWrite],
+    progress: &mut SetupProgress,
+    config_files: &mut Vec<McpConfigFileReport>,
+) -> Option<String> {
+    for write in writes {
+        progress.managed_file_start(write);
+    }
+    match prime_agent::publish_skill(writes) {
+        Ok(changed) => {
+            for (write, changed) in writes.iter().zip(changed) {
+                progress.managed_file_success(write);
+                config_files.push(if changed {
+                    McpConfigFileReport::managed_written(write)
+                } else {
+                    McpConfigFileReport::managed_unchanged(write)
+                });
+            }
+            None
+        }
+        Err(exc) => {
+            let first = writes.first();
+            if let Some(write) = first {
+                progress.managed_file_error(write, &exc.to_string());
+                config_files.push(McpConfigFileReport::managed_error(write, &exc.to_string()));
+            }
+            Some(format!(
+                "failed to publish Prime Agent Moraine skill: {exc}"
+            ))
+        }
+    }
+}
+
+fn apply_managed_file_writes(
+    writes: &[ManagedFileWrite],
+    progress: &mut SetupProgress,
+    config_files: &mut Vec<McpConfigFileReport>,
+) -> Option<String> {
+    for write in writes {
+        progress.managed_file_start(write);
+        match apply_managed_file_write(write) {
+            Ok(report) => {
+                progress.managed_file_success(write);
+                config_files.push(report);
+            }
+            Err(exc) => {
+                let error = format!("failed to update {}: {exc}", write.path().display());
+                progress.managed_file_error(write, &exc.to_string());
+                config_files.push(McpConfigFileReport::managed_error(write, &exc.to_string()));
+                return Some(error);
+            }
+        }
+    }
+    None
+}
+
 fn apply_mcp_config_write(write: &McpConfigWrite) -> Result<McpConfigFileReport> {
+    if write.is_prime_agent() {
+        return if prime_agent::apply_settings(write)? {
+            Ok(McpConfigFileReport::written(write))
+        } else {
+            Ok(McpConfigFileReport::unchanged(write))
+        };
+    }
     if matches!(write.format(), McpConfigFormat::Toml) {
         write.verify_nac_snapshot_current()?;
         if write.nac_is_unchanged() {
@@ -2899,8 +2953,12 @@ impl SetupMcpTarget {
         let Ok(paths) = harnesses::SetupPathContext::from_env() else {
             return false;
         };
+        self.has_default_probe_path(&paths)
+    }
+
+    fn has_default_probe_path(self, paths: &harnesses::SetupPathContext) -> bool {
         harnesses::spec(self)
-            .default_probe_paths(&paths)
+            .default_probe_paths(paths)
             .iter()
             .any(|path| path.exists())
     }
@@ -3358,6 +3416,8 @@ mod tests {
             xdg_config_home: None,
             kiro_home: None,
             nac_home: Some(nac_home),
+            prime_agent_dir: None,
+            current_exe: None,
             nac_snapshot: std::cell::OnceCell::new(),
             nac_expected_content: std::cell::OnceCell::new(),
         };
@@ -3427,6 +3487,8 @@ mod tests {
             xdg_config_home: None,
             kiro_home: None,
             nac_home: Some(nac_home),
+            prime_agent_dir: None,
+            current_exe: None,
             nac_snapshot: std::cell::OnceCell::new(),
             nac_expected_content: std::cell::OnceCell::new(),
         };
@@ -3462,6 +3524,8 @@ mod tests {
             xdg_config_home: None,
             kiro_home: None,
             nac_home: Some(nac_home),
+            prime_agent_dir: None,
+            current_exe: None,
             nac_snapshot: std::cell::OnceCell::new(),
             nac_expected_content: std::cell::OnceCell::new(),
         };
@@ -3529,6 +3593,8 @@ mod tests {
             xdg_config_home: None,
             kiro_home: None,
             nac_home: Some(nac_home.clone()),
+            prime_agent_dir: None,
+            current_exe: None,
             nac_snapshot: std::cell::OnceCell::new(),
             nac_expected_content: std::cell::OnceCell::new(),
         };
@@ -3724,7 +3790,69 @@ watch_root = "~/archive"
     }
 
     #[test]
-    fn ingest_selection_adds_omp_source_to_existing_pi_config() {
+    fn prime_agent_ingest_selection_reconciles_both_custom_root_sources() {
+        let mut document = r#"
+[ingest]
+
+[[ingest.sources]]
+name = "prime-agent"
+harness = "prime-agent"
+enabled = false
+glob = "~/stale/*.jsonl"
+watch_root = "~/stale"
+
+[[ingest.sources]]
+name = "prime-archive"
+harness = "prime-agent"
+enabled = false
+glob = "~/archive/*.jsonl"
+watch_root = "~/archive"
+"#
+        .parse::<DocumentMut>()
+        .expect("Prime Agent fixture parses");
+        let mut paths = harnesses::SetupPathContext::with_home(None);
+        paths.prime_agent_dir = Some(PathBuf::from("/custom/prime/agent"));
+        let selection = SetupTargetSelection {
+            target: SetupMcpTarget::PrimeAgent,
+            mode: SetupSelectionMode::IngestOnly,
+        };
+
+        let update =
+            apply_ingest_selections_to_document_with_paths(&mut document, &[selection], &paths)
+                .expect("reconcile Prime Agent sources");
+        assert_eq!(
+            update,
+            IngestSelectionUpdate {
+                enabled_sources: 1,
+                disabled_sources: 0,
+                added_sources: 1,
+                updated_sources: 1,
+            }
+        );
+        assert_eq!(
+            source_value(&document, "prime-agent", "glob"),
+            Some("/custom/prime/agent/sessions/*.jsonl")
+        );
+        assert_eq!(
+            source_value(&document, "prime-agent-subagents", "glob"),
+            Some("/custom/prime/agent/session-artifacts/**/sub-*/*.jsonl")
+        );
+        assert!(source_enabled(&document, "prime-agent"));
+        assert!(source_enabled(&document, "prime-agent-subagents"));
+        assert!(!source_enabled(&document, "prime-archive"));
+        assert_eq!(
+            source_value(&document, "prime-archive", "glob"),
+            Some("~/archive/*.jsonl")
+        );
+
+        let unchanged =
+            apply_ingest_selections_to_document_with_paths(&mut document, &[selection], &paths)
+                .expect("reapply Prime Agent sources");
+        assert_eq!(unchanged, IngestSelectionUpdate::default());
+    }
+
+    #[test]
+    fn omp_ingest_selection_adds_omp_source_without_changing_pi() {
         let mut document = r#"
 [ingest]
 
@@ -3742,11 +3870,11 @@ format = "jsonl"
         let update = apply_ingest_selections_to_document(
             &mut document,
             &[SetupTargetSelection {
-                target: SetupMcpTarget::PiCodingAgent,
+                target: SetupMcpTarget::Omp,
                 mode: SetupSelectionMode::IngestOnly,
             }],
         )
-        .expect("apply pi ingest selection");
+        .expect("apply OMP ingest selection");
 
         assert_eq!(
             update,
@@ -4956,6 +5084,24 @@ host = "127.42.0.9"
     }
 
     #[test]
+    fn omp_detection_accepts_executable_or_agent_directory_without_pi() {
+        let runner = FakeRunner::default().with_existing("omp");
+        assert!(runner.command_exists("omp"));
+        assert!(!runner.command_exists("pi"));
+        assert!(SetupMcpTarget::Omp.is_available_for_setup(&runner));
+
+        let home = temp_path("omp-detection-home");
+        fs::create_dir_all(home.join(".omp").join("agent")).expect("create OMP agent dir");
+        let paths = harnesses::SetupPathContext::with_home(Some(home.clone()));
+        let no_executables = FakeRunner::default();
+        assert!(SetupMcpTarget::Omp.has_default_probe_path(&paths));
+        assert!(!SetupMcpTarget::PiCodingAgent.has_default_probe_path(&paths));
+        assert!(!no_executables.command_exists("omp"));
+        assert!(!no_executables.command_exists("pi"));
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
     fn qwen_setup_detects_cli_and_builds_exact_registration_commands() {
         assert!(SetupMcpTarget::QwenCode
             .is_available_for_setup(&FakeRunner::default().with_existing("qwen")));
@@ -5301,6 +5447,8 @@ host = "127.42.0.9"
             xdg_config_home: None,
             kiro_home: None,
             nac_home: Some(nac_home.clone()),
+            prime_agent_dir: None,
+            current_exe: None,
             nac_snapshot: std::cell::OnceCell::new(),
             nac_expected_content: std::cell::OnceCell::new(),
         };
@@ -5459,6 +5607,189 @@ host = "127.42.0.9"
         );
         assert_eq!(value["mcpServers"]["moraine"]["lifecycle"], "eager");
         let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn omp_plan_merges_custom_config_independently_and_is_repeatable() {
+        let home = temp_path("omp-home");
+        let omp_dir = home.join(".omp").join("agent");
+        let pi_dir = home.join(".pi").join("agent");
+        fs::create_dir_all(&omp_dir).expect("create OMP dir");
+        fs::create_dir_all(&pi_dir).expect("create Pi dir");
+        fs::write(
+            omp_dir.join("mcp.json"),
+            r#"{"mcpServers":{"other":{"command":"other-server"}},"theme":"dark"}"#,
+        )
+        .expect("write OMP config");
+        fs::write(pi_dir.join("mcp.json"), "pi sentinel").expect("write Pi sentinel");
+
+        let target = ConfigTarget {
+            path: PathBuf::from("/tmp/custom-moraine.toml"),
+            source: ConfigTargetSource::Cli,
+        };
+        for _ in 0..2 {
+            let plan =
+                McpPlan::for_target_with_home(SetupMcpTarget::Omp, &target, Some(home.clone()));
+            assert_eq!(plan.action, McpAction::WriteConfig);
+            assert!(plan.commands().is_empty());
+            let mut runner = FakeRunner::default();
+            let report = execute_mcp_plan(plan, &mut runner).expect("execute OMP plan");
+            assert_eq!(report.status, SetupStatus::Ok);
+            assert!(runner.ran.is_empty());
+        }
+
+        let path = omp_dir.join("mcp.json");
+        let first = fs::read(&path).expect("read repeated OMP config");
+        let value: Value = serde_json::from_slice(&first).expect("OMP config JSON");
+        assert_eq!(value["theme"], "dark");
+        assert_eq!(value["mcpServers"]["other"]["command"], "other-server");
+        assert_eq!(value["mcpServers"]["moraine"]["command"], "moraine");
+        assert_eq!(
+            value["mcpServers"]["moraine"]["args"],
+            serde_json::json!(["run", "mcp", "--config", "/tmp/custom-moraine.toml"])
+        );
+        assert_eq!(
+            fs::read_to_string(pi_dir.join("mcp.json")).expect("read Pi sentinel"),
+            "pi sentinel"
+        );
+
+        let repeat_plan =
+            McpPlan::for_target_with_home(SetupMcpTarget::Omp, &target, Some(home.clone()));
+        let repeat_write = &repeat_plan.config_writes[0];
+        apply_mcp_config_write(repeat_write).expect("repeat OMP merge");
+        assert_eq!(fs::read(&path).expect("read stable OMP config"), first);
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn combined_pi_and_omp_setup_is_order_independent_and_repeatable() {
+        let home = temp_path("pi-omp-combined-home");
+        let pi_path = home.join(".pi").join("agent").join("mcp.json");
+        let omp_path = home.join(".omp").join("agent").join("mcp.json");
+        fs::create_dir_all(pi_path.parent().expect("Pi config parent")).expect("create Pi dir");
+        fs::create_dir_all(omp_path.parent().expect("OMP config parent")).expect("create OMP dir");
+        fs::write(
+            &pi_path,
+            r#"{"mcpServers":{"pi-only":{"command":"pi-server"}}}"#,
+        )
+        .expect("write Pi config");
+        fs::write(
+            &omp_path,
+            r#"{"mcpServers":{"omp-only":{"command":"omp-server"}}}"#,
+        )
+        .expect("write OMP config");
+
+        let config_target = ConfigTarget {
+            path: PathBuf::from("/tmp/custom-combined.toml"),
+            source: ConfigTargetSource::Cli,
+        };
+        let paths = harnesses::SetupPathContext::with_home(Some(home.clone()));
+        let pi_command = CommandSpec::new("pi", ["install", "npm:pi-mcp-extension"]);
+        let orders = [
+            vec![SetupMcpTarget::PiCodingAgent, SetupMcpTarget::Omp],
+            vec![SetupMcpTarget::Omp, SetupMcpTarget::PiCodingAgent],
+        ];
+        let mut stable_contents = None;
+
+        for targets in orders {
+            let args = SetupArgs {
+                yes: true,
+                dry_run: false,
+                skip_config: true,
+                skip_mcp: false,
+                repair_config: false,
+                mcp_targets: targets.clone(),
+            };
+            let mut runner = FakeRunner::default().with_existing("pi").with_response(
+                pi_command.clone(),
+                true,
+                "",
+            );
+            let report = run_setup_with_paths(
+                &plain_output(),
+                &args,
+                config_target.clone(),
+                false,
+                &mut runner,
+                &paths,
+            )
+            .expect("run combined Pi/OMP setup");
+            assert!(report.success);
+            assert_eq!(
+                report
+                    .mcp_targets
+                    .iter()
+                    .map(|target| target.target)
+                    .collect::<Vec<_>>(),
+                targets
+            );
+            assert_eq!(runner.ran, vec![pi_command.clone()]);
+
+            let contents = (
+                fs::read(&pi_path).expect("read Pi config"),
+                fs::read(&omp_path).expect("read OMP config"),
+            );
+            if let Some(expected) = &stable_contents {
+                assert_eq!(&contents, expected);
+            } else {
+                stable_contents = Some(contents);
+            }
+        }
+
+        let pi: Value = serde_json::from_slice(&fs::read(&pi_path).expect("read Pi JSON"))
+            .expect("parse Pi JSON");
+        let omp: Value = serde_json::from_slice(&fs::read(&omp_path).expect("read OMP JSON"))
+            .expect("parse OMP JSON");
+        assert_eq!(pi["mcpServers"]["pi-only"]["command"], "pi-server");
+        assert_eq!(omp["mcpServers"]["omp-only"]["command"], "omp-server");
+        for config in [&pi, &omp] {
+            assert_eq!(config["mcpServers"]["moraine"]["command"], "moraine");
+            assert_eq!(
+                config["mcpServers"]["moraine"]["args"],
+                serde_json::json!(["run", "mcp", "--config", "/tmp/custom-combined.toml"])
+            );
+        }
+
+        let omp_before_pi_only = fs::read(&omp_path).expect("read OMP before Pi-only setup");
+        let pi_plan = McpPlan::for_target_with_home(
+            SetupMcpTarget::PiCodingAgent,
+            &config_target,
+            Some(home.clone()),
+        );
+        let mut pi_runner =
+            FakeRunner::default()
+                .with_existing("pi")
+                .with_response(pi_command.clone(), true, "");
+        execute_mcp_plan(pi_plan, &mut pi_runner).expect("execute Pi-only plan");
+        assert_eq!(
+            fs::read(&omp_path).expect("read OMP after Pi-only setup"),
+            omp_before_pi_only
+        );
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn omp_dry_run_reports_only_omp_changes_without_side_effects() {
+        let home = temp_path("omp-dry-run");
+        let target = ConfigTarget {
+            path: PathBuf::from("/tmp/config.toml"),
+            source: ConfigTargetSource::HomeDefault,
+        };
+        let plan = McpPlan::for_target_with_home(SetupMcpTarget::Omp, &target, Some(home.clone()));
+        let report = McpTargetReport::planned(plan);
+        assert_eq!(report.target, SetupMcpTarget::Omp);
+        assert_eq!(report.status, SetupStatus::Planned);
+        assert!(report.commands.is_empty());
+        assert_eq!(report.config_files.len(), 1);
+        assert_eq!(
+            report.config_files[0].path,
+            home.join(".omp")
+                .join("agent")
+                .join("mcp.json")
+                .display()
+                .to_string()
+        );
+        assert!(!home.exists());
     }
 
     #[test]

@@ -159,6 +159,25 @@ glob = "~/.omp/agent/sessions/**/*.jsonl"
 watch_root = "~/.omp/agent/sessions"
 format = "jsonl"
 
+# Prime Agent stores top-level sessions in a flat JSONL directory and RLM
+# children in a separate recursive artifact tree. Keep the sources distinct so
+# child sessions can be linked to their parent without ingesting artifact journals.
+[[ingest.sources]]
+name = "prime-agent"
+harness = "prime-agent"
+enabled = true
+glob = "~/.prime/agent/sessions/*.jsonl"
+watch_root = "~/.prime/agent/sessions"
+format = "jsonl"
+
+[[ingest.sources]]
+name = "prime-agent-subagents"
+harness = "prime-agent"
+enabled = true
+glob = "~/.prime/agent/session-artifacts/**/sub-*/*.jsonl"
+watch_root = "~/.prime/agent/session-artifacts"
+format = "jsonl"
+
 # Hermes Agent LIVE sessions: one JSON file per conversation under
 # ~/.hermes/sessions/ that the agent rewrites in place every turn.
 # `format = "session_json"` opts into the rewrite-aware processor that emits

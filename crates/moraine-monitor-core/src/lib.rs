@@ -951,7 +951,7 @@ fn monitor_session_json(session: SessionAnalytics, now_ms: i64) -> Value {
 
     json!({
         "id": session.summary.session_id,
-        "title": derive_title(&session.first_user_text),
+        "title": session.display_label,
         "harness": harness_descriptor(&session.harness, &session.source_name),
         "startedAt": session.summary.first_event_unix_ms,
         "endedAt": session.summary.last_event_unix_ms,
@@ -1104,23 +1104,6 @@ fn sum_buckets(buckets: &std::collections::BTreeMap<String, u64>, names: &[&str]
         .filter_map(|name| buckets.get(*name))
         .copied()
         .fold(0_u64, u64::saturating_add)
-}
-
-fn derive_title(first_user_text: &str) -> String {
-    let trimmed = first_user_text.trim();
-    if trimmed.is_empty() {
-        return "(untitled session)".to_string();
-    }
-
-    let first_line = trimmed.lines().next().unwrap_or(trimmed).trim();
-    if first_line.chars().count() <= 120 {
-        first_line.to_string()
-    } else {
-        format!(
-            "{}\u{2026}",
-            first_line.chars().take(120).collect::<String>()
-        )
-    }
 }
 
 fn harness_descriptor(harness_id: &str, source_name: &str) -> Value {
@@ -1618,6 +1601,7 @@ mod tests {
             models: vec!["gpt-5.3-codex".to_string()],
             trace_id: "trace-1".to_string(),
             first_user_text: "Inspect the repository".to_string(),
+            display_label: "Inspect the repository".to_string(),
             turns: vec![SessionTurn {
                 summary: TurnSummary {
                     session_id: "session-1".to_string(),
@@ -1670,6 +1654,20 @@ mod tests {
                 ],
             }],
         }
+    }
+
+    #[test]
+    fn monitor_session_title_uses_precomputed_shared_label() {
+        let mut session = sample_session();
+        session.first_user_text = "<recommended_plugins>injected</recommended_plugins>".to_string();
+        session.display_label = "Inspect the repository".to_string();
+
+        let value = monitor_session_json(session, 1_771_243_300_000);
+        assert_eq!(value["title"], json!("Inspect the repository"));
+        assert_ne!(
+            value["title"],
+            json!("<recommended_plugins>injected</recommended_plugins>")
+        );
     }
 
     fn successful_responses() -> InMemoryConversationResponses {

@@ -8,7 +8,6 @@ use crate::contract::{
     ToolErrorEnvelope, LIST_SESSIONS_TOOL,
 };
 use anyhow::{Context, Result};
-use chrono::{Datelike, TimeZone, Timelike, Utc};
 use moraine_conversations::{
     ConversationListSort as RepoListSort, ConversationMode as RepoConversationMode,
     McpSessionListFilter, McpSessionListItem, Page, PageRequest,
@@ -152,7 +151,7 @@ fn list_sessions_data_json(
 
 fn session_json(rank: usize, session: &McpSessionListItem) -> Result<Value, ContractError> {
     let session_id = mcp_session_id(&session.session_id)?;
-    let display_label = session_display_label(session);
+    let display_label = session.display_label.clone();
 
     Ok(json!({
         "rank": rank,
@@ -176,82 +175,6 @@ fn session_json(rank: usize, session: &McpSessionListItem) -> Result<Value, Cont
             "session_id": session_id,
         }
     }))
-}
-
-fn session_display_label(session: &McpSessionListItem) -> String {
-    if let Some(label) = session
-        .title
-        .as_deref()
-        .filter(|label| !label.trim().is_empty())
-        .or(session.session_summary.as_deref())
-        .filter(|label| !label.trim().is_empty())
-        .or(session.session_slug.as_deref())
-        .filter(|label| !label.trim().is_empty())
-    {
-        return label.to_string();
-    }
-
-    let harness = readable_harness(session.harness.as_deref().unwrap_or("session"));
-    let mode = readable_mode(session.mode.as_str());
-    let updated_at = compact_utc_datetime(session.last_event_unix_ms);
-    let turns = pluralize(session.total_turns as u64, "turn", "turns");
-
-    format!("{harness}, {mode}, {updated_at}, {turns}")
-}
-
-fn readable_harness(harness: &str) -> &str {
-    match harness {
-        "codex" => "Codex",
-        "claude-code" => "Claude Code",
-        "cursor" => "Cursor",
-        "hermes" => "Hermes",
-        "kiro-cli" => "Kiro CLI",
-        "kimi-cli" => "Kimi CLI",
-        "nac" => "NAC",
-        "opencode" => "OpenCode",
-        "pi-coding-agent" => "Pi Coding Agent",
-        "qwen-code" => "Qwen Code",
-        _ => harness,
-    }
-}
-
-fn readable_mode(mode: &str) -> &'static str {
-    match mode {
-        "web_search" => "web search",
-        "tool_calling" => "tool session",
-        "mcp_internal" => "MCP session",
-        "chat" => "chat",
-        _ => "session",
-    }
-}
-
-fn compact_utc_datetime(unix_ms: i64) -> String {
-    const MONTHS: [&str; 12] = [
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    ];
-
-    let Some(datetime) = Utc.timestamp_millis_opt(unix_ms).single() else {
-        return format_rfc3339_utc_millis(unix_ms);
-    };
-    let month_name = MONTHS
-        .get(datetime.month0() as usize)
-        .copied()
-        .unwrap_or("Jan");
-
-    format!(
-        "{month_name} {} {:02}:{:02} UTC",
-        datetime.day(),
-        datetime.hour(),
-        datetime.minute()
-    )
-}
-
-fn pluralize(count: u64, singular: &str, plural: &str) -> String {
-    if count == 1 {
-        format!("1 {singular}")
-    } else {
-        format!("{count} {plural}")
-    }
 }
 
 fn mcp_session_id(session_id: &str) -> Result<String, ContractError> {
@@ -304,41 +227,11 @@ fn format_list_sessions_text(payload: &Value) -> String {
                 .pointer("/open/session_id")
                 .and_then(Value::as_str)
                 .unwrap_or("");
-            let title = session
-                .pointer("/session/title")
-                .and_then(Value::as_str)
-                .filter(|value| !value.trim().is_empty())
-                .or_else(|| {
-                    session
-                        .pointer("/session/session_summary")
-                        .and_then(Value::as_str)
-                        .filter(|value| !value.trim().is_empty())
-                })
-                .or_else(|| {
-                    session
-                        .pointer("/session/session_slug")
-                        .and_then(Value::as_str)
-                        .filter(|value| !value.trim().is_empty())
-                });
             let display_label = session
                 .pointer("/session/display_label")
                 .and_then(Value::as_str)
                 .unwrap_or("session");
-            let updated_at = session
-                .pointer("/session/updated_at")
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            let mode = session
-                .pointer("/session/mode")
-                .and_then(Value::as_str)
-                .unwrap_or("chat");
-            if let Some(title) = title {
-                lines.push(format!(
-                    "{rank}. {updated_at} {mode} {title} ({session_id})"
-                ));
-            } else {
-                lines.push(format!("{rank}. {display_label} ({session_id})"));
-            }
+            lines.push(format!("{rank}. {display_label} ({session_id})"));
         }
     }
 
@@ -369,7 +262,6 @@ mod tests {
     use moraine_conversations::{
         ConversationMode, InMemoryConversationRepository, InMemoryConversationResponses, RepoConfig,
     };
-    use std::collections::BTreeSet;
     use std::sync::Arc;
 
     #[test]
@@ -503,6 +395,7 @@ mod tests {
                 harness: Some("codex".to_string()),
                 session_slug: Some("build-failure".to_string()),
                 session_summary: Some("Build failure triage summary.".to_string()),
+                display_label: "Build failure triage".to_string(),
             }],
             next_cursor: None,
         };
@@ -566,6 +459,34 @@ mod tests {
     }
 
     #[test]
+    fn text_representation_uses_repository_display_label_over_wire_metadata() {
+        let payload = json!({
+            "request": {
+                "start_datetime": "2026-04-30T13:00:00.000Z",
+                "end_datetime": "2026-04-30T14:00:00.000Z"
+            },
+            "data": {
+                "result_count": 1,
+                "sessions": [{
+                    "rank": 1,
+                    "session": {
+                        "title": "Legacy wire title",
+                        "session_summary": "Legacy summary",
+                        "session_slug": "legacy-slug",
+                        "display_label": "Genuine bounded request"
+                    },
+                    "open": {"session_id": "session-id"}
+                }]
+            }
+        });
+
+        let text = format_list_sessions_text(&payload);
+        assert!(text.contains("Genuine bounded request"));
+        assert!(!text.contains("Legacy wire title"));
+        assert!(!text.contains("Legacy summary"));
+    }
+
+    #[test]
     fn untitled_session_gets_privacy_safe_display_label() {
         let args = parse_list_sessions_args(
             json!({
@@ -592,6 +513,7 @@ mod tests {
                 harness: Some("codex".to_string()),
                 session_slug: None,
                 session_summary: None,
+                display_label: "Codex, web search, Apr 30 13:10 UTC, 29 turns".to_string(),
             }],
             next_cursor: None,
         };
@@ -641,6 +563,7 @@ mod tests {
                 harness: Some("codex".to_string()),
                 session_slug: Some("useful-slug".to_string()),
                 session_summary: Some("\t\n".to_string()),
+                display_label: "useful-slug".to_string(),
             }],
             next_cursor: None,
         };
@@ -658,38 +581,6 @@ mod tests {
         let text = format_list_sessions_text(&payload);
         assert!(text.contains("useful-slug"));
         assert!(!text.contains("chat     "));
-    }
-
-    #[test]
-    fn readable_harness_covers_canonical_harness_ids() {
-        let cases = [
-            ("codex", "Codex"),
-            ("claude-code", "Claude Code"),
-            ("cursor", "Cursor"),
-            ("hermes", "Hermes"),
-            ("kiro-cli", "Kiro CLI"),
-            ("kimi-cli", "Kimi CLI"),
-            ("nac", "NAC"),
-            ("opencode", "OpenCode"),
-            ("pi-coding-agent", "Pi Coding Agent"),
-            ("qwen-code", "Qwen Code"),
-            ("future-harness", "future-harness"),
-        ];
-
-        for (raw, expected) in cases {
-            assert_eq!(readable_harness(raw), expected);
-        }
-
-        let covered: BTreeSet<&str> = cases
-            .iter()
-            .map(|(raw, _)| *raw)
-            .filter(|raw| *raw != "future-harness")
-            .collect();
-        let known: BTreeSet<&str> = moraine_config::KNOWN_INGEST_HARNESSES
-            .iter()
-            .copied()
-            .collect();
-        assert_eq!(covered, known);
     }
 
     #[test]
@@ -719,6 +610,7 @@ mod tests {
             harness: Some("claude-code".to_string()),
             session_slug: None,
             session_summary: None,
+            display_label: "test session".to_string(),
         };
 
         // A leading empty-session_id orphan (the #386 junk) must be dropped,
@@ -772,6 +664,7 @@ mod tests {
             harness: Some("claude-code".to_string()),
             session_slug: None,
             session_summary: None,
+            display_label: "test session".to_string(),
         };
 
         // A whitespace-only id (rejected by the contract's trim check) and a

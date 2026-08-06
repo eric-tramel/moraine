@@ -97,8 +97,8 @@ Fields:
 | `query` | Required keyword query. Empty strings are rejected. |
 | `within_id` | Optional `session:...` or `turn:...` ID to scope the search. Event IDs are not valid scopes. |
 | `event_types` | Optional filter. Searchable event types are `user_input`, `assistant_response`, `reasoning`, `tool_call`, `tool_response`, `compaction`, `system`, and `runtime`. |
-| `harness` | Optional exact, case-sensitive normalized harness filter. Supported values are `codex`, `claude-code`, `cursor`, `hermes`, `kiro-cli`, `kimi-cli`, `qwen-code`, `opencode`, and `pi-coding-agent`. |
-| `source` | Optional exact, case-sensitive ingest source filter. The default configured values are `claude`, macOS-only `claude-cowork`, `codex`, `cursor`, `cursor-sqlite`, `hermes`, `kimi-cli`, `kiro`, `omp`, `opencode`, `pi`, and `qwen-code`; each server's MCP tool instructions list its actual configured source names. |
+| `harness` | Optional exact, case-sensitive normalized harness filter. Supported values are `codex`, `claude-code`, `cursor`, `hermes`, `kiro-cli`, `kimi-cli`, `nac`, `opencode`, `pi-coding-agent`, `prime-agent`, and `qwen-code`. |
+| `source` | Optional exact, case-sensitive ingest source filter. The default configured values are `claude`, macOS-only `claude-cowork`, `codex`, `cursor`, `cursor-sqlite`, `hermes`, `kimi-cli`, `kiro`, `omp`, `opencode`, `pi`, `prime-agent`, `prime-agent-subagents`, and `qwen-code`; each server's MCP tool instructions list its actual configured source names. |
 | `n_hits` | Optional result limit from 1 to 50. Default is 10. |
 
 The default event type filter is `user_input` and `assistant_response`. This
@@ -111,7 +111,8 @@ session handle to `open`.
 Use `source` when the configured source is the distinction that matters. For
 example, the `pi` and `omp` sources both use the `pi-coding-agent` harness, so
 `source: "omp"` selects only OMP sessions while `harness: "pi-coding-agent"`
-selects both.
+selects both. Likewise, `harness: "prime-agent"` spans root and RLM child
+sessions, while `source: "prime-agent-subagents"` selects only children.
 
 Output data:
 
@@ -232,10 +233,12 @@ Output data includes compact session records:
 }
 ```
 
-`list_sessions` intentionally does not return transcript text. Open a listed
-session if you need to inspect its turns. For untitled sessions,
-`display_label` falls back to already exposed metadata such as harness, mode,
-update time, and turn count.
+`list_sessions` intentionally does not return raw transcript text, event snippets,
+or payloads. Open a listed session if you need to inspect its turns. The bounded
+`display_label` prefers an explicit title/name, then the first genuine Codex
+`event_msg/user_message` preview (trimmed first line, at most 120 Unicode scalar
+values plus an ellipsis), followed by existing title/summary/slug metadata and a
+privacy-safe harness/mode/time/turn-count descriptor.
 
 ## `file_attention`
 

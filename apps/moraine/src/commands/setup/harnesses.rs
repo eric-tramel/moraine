@@ -8,7 +8,7 @@ use anyhow::{bail, Context, Result};
 use serde_json::{Map, Value};
 use toml_edit::{value as toml_value, Table};
 
-use super::{CommandSpec, ConfigTarget, McpPlan, McpPlanStep, SetupMcpTarget};
+use super::{prime_agent, CommandSpec, ConfigTarget, McpPlan, McpPlanStep, SetupMcpTarget};
 
 pub(super) mod nac;
 
@@ -23,6 +23,8 @@ pub(super) struct SetupPathContext {
     pub(super) xdg_config_home: Option<PathBuf>,
     pub(super) kiro_home: Option<PathBuf>,
     pub(super) nac_home: Option<PathBuf>,
+    pub(super) prime_agent_dir: Option<PathBuf>,
+    pub(super) current_exe: Option<PathBuf>,
     pub(super) nac_snapshot: OnceCell<std::result::Result<nac::ConfigSnapshot, String>>,
     pub(super) nac_expected_content: OnceCell<Vec<u8>>,
 }
@@ -35,6 +37,12 @@ impl SetupPathContext {
             xdg_config_home: env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
             kiro_home: env::var_os("KIRO_HOME").map(PathBuf::from),
             nac_home: env::var_os("NAC_HOME").map(PathBuf::from),
+            prime_agent_dir: prime_agent::resolve_agent_dir(
+                env::var_os("PRIME_AGENT_CODING_AGENT_DIR").as_deref(),
+                env::var_os("HOME").as_deref().map(Path::new),
+                &env::current_dir().context("failed to resolve setup launch directory")?,
+            )?,
+            current_exe: env::current_exe().ok(),
             nac_snapshot: OnceCell::new(),
             nac_expected_content: OnceCell::new(),
         })
@@ -44,10 +52,12 @@ impl SetupPathContext {
     pub(super) fn with_home(home: Option<PathBuf>) -> Self {
         Self {
             launch_cwd: PathBuf::from("/"),
-            home,
+            home: home.clone(),
             xdg_config_home: None,
             kiro_home: None,
             nac_home: None,
+            prime_agent_dir: home.as_ref().map(|home| home.join(".prime").join("agent")),
+            current_exe: None,
             nac_snapshot: OnceCell::new(),
             nac_expected_content: OnceCell::new(),
         }
@@ -240,6 +250,8 @@ enum ProbePaths {
     Cursor,
     Nac,
     Pi,
+    Omp,
+    PrimeAgent,
 }
 
 impl ProbePaths {
@@ -259,6 +271,8 @@ impl ProbePaths {
             ],
             ProbePaths::Nac => vec![home.join(".config").join("nac")],
             ProbePaths::Pi => vec![home.join(".pi").join("agent")],
+            ProbePaths::Omp => vec![home.join(".omp").join("agent")],
+            ProbePaths::PrimeAgent => vec![home.join(".prime").join("agent")],
         }
     }
 }
@@ -289,6 +303,8 @@ impl HarnessSpec {
     pub(super) fn default_probe_paths(self, paths: &SetupPathContext) -> Vec<PathBuf> {
         if matches!(self.probe_paths, ProbePaths::Nac) {
             vec![paths.nac_home_dir()]
+        } else if matches!(self.probe_paths, ProbePaths::PrimeAgent) {
+            paths.prime_agent_dir.iter().cloned().collect()
         } else {
             paths
                 .home
@@ -404,25 +420,41 @@ const CURSOR_INGEST: [DefaultIngestSource; 2] = [
     },
 ];
 
-const PI_INGEST: [DefaultIngestSource; 2] = [
+const PI_INGEST: [DefaultIngestSource; 1] = [DefaultIngestSource {
+    name: "pi",
+    harness: "pi-coding-agent",
+    glob: "~/.pi/agent/sessions/**/*.jsonl",
+    watch_root: "~/.pi/agent/sessions",
+    format: Some("jsonl"),
+}];
+
+const PRIME_AGENT_INGEST: [DefaultIngestSource; 2] = [
     DefaultIngestSource {
-        name: "pi",
-        harness: "pi-coding-agent",
-        glob: "~/.pi/agent/sessions/**/*.jsonl",
-        watch_root: "~/.pi/agent/sessions",
+        name: "prime-agent",
+        harness: "prime-agent",
+        glob: "~/.prime/agent/sessions/*.jsonl",
+        watch_root: "~/.prime/agent/sessions",
         format: Some("jsonl"),
     },
     DefaultIngestSource {
-        name: "omp",
-        harness: "pi-coding-agent",
-        glob: "~/.omp/agent/sessions/**/*.jsonl",
-        watch_root: "~/.omp/agent/sessions",
+        name: "prime-agent-subagents",
+        harness: "prime-agent",
+        glob: "~/.prime/agent/session-artifacts/**/sub-*/*.jsonl",
+        watch_root: "~/.prime/agent/session-artifacts",
         format: Some("jsonl"),
     },
 ];
 
+const OMP_INGEST: [DefaultIngestSource; 1] = [DefaultIngestSource {
+    name: "omp",
+    harness: "pi-coding-agent",
+    glob: "~/.omp/agent/sessions/**/*.jsonl",
+    watch_root: "~/.omp/agent/sessions",
+    format: Some("jsonl"),
+}];
+
 const NAC_INGEST: [DefaultIngestSource; 0] = [];
-const SPECS: [HarnessSpec; 10] = [
+const SPECS: [HarnessSpec; 12] = [
     HarnessSpec {
         target: SetupMcpTarget::ClaudeCode,
         label: "Claude Code",
@@ -503,6 +535,22 @@ const SPECS: [HarnessSpec; 10] = [
         probe_paths: ProbePaths::Pi,
         ingest_sources: &PI_INGEST,
     },
+    HarnessSpec {
+        target: SetupMcpTarget::PrimeAgent,
+        label: "Prime Agent",
+        setup_kind: "MCP skill",
+        programs: &["prime-agent"],
+        probe_paths: ProbePaths::PrimeAgent,
+        ingest_sources: &PRIME_AGENT_INGEST,
+    },
+    HarnessSpec {
+        target: SetupMcpTarget::Omp,
+        label: "OMP",
+        setup_kind: "MCP config",
+        programs: &["omp"],
+        probe_paths: ProbePaths::Omp,
+        ingest_sources: &OMP_INGEST,
+    },
 ];
 
 pub(super) fn setup_targets() -> Vec<SetupMcpTarget> {
@@ -536,6 +584,30 @@ pub(super) fn default_ingest_sources(
                     .expect("Kiro CLI has one default ingest source");
                 source.glob = sessions_dir.join("*.jsonl").to_string_lossy().into_owned();
                 source.watch_root = sessions_dir.to_string_lossy().into_owned();
+            }
+        }
+        if target == SetupMcpTarget::PrimeAgent {
+            if let Some(agent_dir) = paths.prime_agent_dir.as_deref() {
+                let root = sources.get_mut(0).expect("Prime Agent has a root source");
+                let sessions = agent_dir.join("sessions");
+                let sessions_text = sessions
+                    .to_str()
+                    .context("Prime Agent sessions path is not valid UTF-8")?;
+                root.glob = format!(
+                    "{}/*.jsonl",
+                    moraine_config::escape_literal_glob(sessions_text)
+                );
+                root.watch_root = sessions_text.to_string();
+                let child = sources.get_mut(1).expect("Prime Agent has a child source");
+                let artifacts = agent_dir.join("session-artifacts");
+                let artifacts_text = artifacts
+                    .to_str()
+                    .context("Prime Agent session-artifacts path is not valid UTF-8")?;
+                child.glob = format!(
+                    "{}/**/sub-*/*.jsonl",
+                    moraine_config::escape_literal_glob(artifacts_text)
+                );
+                child.watch_root = artifacts_text.to_string();
             }
         }
         return Ok(sources);
@@ -877,6 +949,44 @@ pub(super) fn mcp_plan(
             }
             plan
         }
+        SetupMcpTarget::PrimeAgent => {
+            let Some(agent_dir) = paths.prime_agent_dir.as_deref() else {
+                return Ok(McpPlan::manual(
+                    target,
+                    "HOME and PRIME_AGENT_CODING_AGENT_DIR are not set, so Moraine cannot choose the Prime Agent global directory.".to_string(),
+                ));
+            };
+            let Some(current_exe) = paths.current_exe.as_deref() else {
+                return Ok(McpPlan::manual(
+                    target,
+                    "Moraine could not resolve its running executable; rerun setup from an installed Moraine bundle.".to_string(),
+                ));
+            };
+            let mcp = match prime_agent::resolve_mcp_executable(current_exe) {
+                Ok(path) => path,
+                Err(error) => return Ok(McpPlan::manual(target, format!("{error:#}"))),
+            };
+            let config_write = McpConfigWrite::prime_agent(agent_dir, config_target, &mcp);
+            prime_agent::preflight_settings(&config_write)?;
+            McpPlan {
+                target,
+                action: super::McpAction::WriteConfig,
+                steps: Vec::new(),
+                config_writes: vec![config_write],
+                managed_writes: prime_agent::skill_writes(agent_dir)?,
+                manual_snippet: if let Some(python) = env::var_os("PRIME_AGENT_KERNEL_PYTHON") {
+                    Some(prime_agent::activation_guidance(agent_dir, &python))
+                } else {
+                    Some("Start a fresh Prime Agent session to load the Moraine Python skill.".to_string())
+                },
+            }
+        }
+        SetupMcpTarget::Omp => McpPlan::write_config(
+            target,
+            home.as_ref()
+                .map(|home| McpConfigWrite::omp(home, config_target)),
+            omp_snippet(config_target),
+        ),
     })
 }
 
@@ -905,15 +1015,23 @@ fn nac_mcp_snippet(config_target: &ConfigTarget) -> String {
 pub(super) struct ManagedFileWrite {
     path: PathBuf,
     label: &'static str,
-    content: &'static str,
+    content: String,
 }
 
 impl ManagedFileWrite {
+    pub(super) fn new(path: PathBuf, label: &'static str, content: String) -> Self {
+        Self {
+            path,
+            label,
+            content,
+        }
+    }
+
     fn kiro_steering(kiro_home: &Path) -> Self {
         Self {
             path: kiro_home.join("steering").join("moraine.md"),
             label: "Kiro steering",
-            content: KIRO_STEERING,
+            content: KIRO_STEERING.to_string(),
         }
     }
 
@@ -925,8 +1043,8 @@ impl ManagedFileWrite {
         self.label
     }
 
-    pub(super) fn content(&self) -> &'static str {
-        self.content
+    pub(super) fn content(&self) -> &str {
+        &self.content
     }
 }
 
@@ -978,11 +1096,39 @@ impl McpConfigWrite {
         }
     }
 
+    pub(super) fn omp(home: &Path, config_target: &ConfigTarget) -> Self {
+        Self {
+            path: home.join(".omp").join("agent").join("mcp.json"),
+            kind: McpConfigKind::Omp,
+            command: mcp_run_args(config_target),
+            nac_write: None,
+        }
+    }
+
     pub(super) fn opencode(home: &Path, config_target: &ConfigTarget) -> Self {
         Self {
             path: home.join(".config").join("opencode").join("opencode.json"),
             kind: McpConfigKind::OpenCode,
             command: opencode_command(config_target),
+            nac_write: None,
+        }
+    }
+
+    pub(super) fn prime_agent(
+        agent_dir: &Path,
+        config_target: &ConfigTarget,
+        mcp_executable: &Path,
+    ) -> Self {
+        Self {
+            path: agent_dir.join("settings.json"),
+            kind: McpConfigKind::PrimeAgent,
+            command: vec![
+                mcp_executable.display().to_string(),
+                "--config".to_string(),
+                config_target.path.display().to_string(),
+                "--serve".to_string(),
+                "stdio".to_string(),
+            ],
             nac_write: None,
         }
     }
@@ -1015,6 +1161,10 @@ impl McpConfigWrite {
         self.kind.format()
     }
 
+    pub(super) fn is_prime_agent(&self) -> bool {
+        matches!(self.kind, McpConfigKind::PrimeAgent)
+    }
+
     pub(super) fn nac_rendered(&self) -> Option<&[u8]> {
         self.nac_write.as_ref().map(|write| write.rendered())
     }
@@ -1038,7 +1188,17 @@ impl McpConfigWrite {
                 let servers = object_entry_mut(root, "mcpServers")?;
                 servers.insert("moraine".to_string(), self.server_value());
             }
-            McpConfigKind::Pi => {
+            McpConfigKind::PrimeAgent => {
+                let desired = self.server_value();
+                let servers = object_entry_mut(root, "mcpServers")?;
+                if let Some(existing) = servers.get("moraine") {
+                    if existing != &desired && !prime_agent::is_known_moraine_server(existing) {
+                        bail!("Prime Agent mcpServers.moraine is customized; refusing to overwrite it");
+                    }
+                }
+                servers.insert("moraine".to_string(), desired);
+            }
+            McpConfigKind::Pi | McpConfigKind::Omp => {
                 let servers = object_entry_mut(root, "mcpServers")?;
                 servers.insert("moraine".to_string(), self.server_value());
             }
@@ -1060,7 +1220,13 @@ impl McpConfigWrite {
                 "command": "moraine",
                 "args": self.command.clone(),
             }),
-            McpConfigKind::Pi => serde_json::json!({
+            McpConfigKind::PrimeAgent => serde_json::json!({
+                "type": "stdio",
+                "command": self.command[0],
+                "args": self.command[1..],
+                "enabled": true,
+            }),
+            McpConfigKind::Pi | McpConfigKind::Omp => serde_json::json!({
                 "transport": "stdio",
                 "command": "moraine",
                 "args": self.command.clone(),
@@ -1087,6 +1253,8 @@ impl McpConfigWrite {
 enum McpConfigKind {
     Cursor,
     Pi,
+    Omp,
+    PrimeAgent,
     OpenCode,
     Nac,
 }
@@ -1096,6 +1264,8 @@ impl McpConfigKind {
         match self {
             McpConfigKind::Cursor => "Cursor",
             McpConfigKind::Pi => "Pi",
+            McpConfigKind::Omp => "OMP",
+            McpConfigKind::PrimeAgent => "Prime Agent settings",
             McpConfigKind::OpenCode => "OpenCode",
             McpConfigKind::Nac => "NAC",
         }
@@ -1103,7 +1273,10 @@ impl McpConfigKind {
 
     fn format(self) -> McpConfigFormat {
         match self {
-            McpConfigKind::Cursor | McpConfigKind::Pi => McpConfigFormat::Json,
+            McpConfigKind::Cursor
+            | McpConfigKind::Pi
+            | McpConfigKind::Omp
+            | McpConfigKind::PrimeAgent => McpConfigFormat::Json,
             McpConfigKind::OpenCode => McpConfigFormat::Jsonc,
             McpConfigKind::Nac => McpConfigFormat::Toml,
         }
@@ -1326,6 +1499,12 @@ fn pi_snippet(config_target: &ConfigTarget) -> String {
     )
 }
 
+fn omp_snippet(config_target: &ConfigTarget) -> String {
+    snippet(
+        "Add this server to ~/.omp/agent/mcp.json; OMP loads this file natively",
+        Value::Object(McpConfigWrite::omp(Path::new("~"), config_target).snippet_root()),
+    )
+}
 fn snippet(intro: &str, value: Value) -> String {
     format!(
         "{intro}:\n{}",
@@ -1361,6 +1540,36 @@ mod tests {
     }
 
     #[test]
+    fn pi_and_omp_have_independent_detection_and_ingest_ownership() {
+        let home = Path::new("/home/example");
+        assert_eq!(
+            ProbePaths::Pi.paths(home),
+            vec![home.join(".pi").join("agent")]
+        );
+        assert_eq!(
+            ProbePaths::Omp.paths(home),
+            vec![home.join(".omp").join("agent")]
+        );
+
+        let paths = SetupPathContext::with_home(Some(home.to_path_buf()));
+        let pi = default_ingest_sources(SetupMcpTarget::PiCodingAgent, &paths, true)
+            .expect("resolve Pi sources");
+        let omp =
+            default_ingest_sources(SetupMcpTarget::Omp, &paths, true).expect("resolve OMP sources");
+        assert_eq!(pi.len(), 1);
+        assert_eq!(pi[0].name, "pi");
+        assert_eq!(omp.len(), 1);
+        assert_eq!(omp[0].name, "omp");
+        assert_eq!(omp[0].harness, "pi-coding-agent");
+        assert_eq!(omp[0].format.as_deref(), Some("jsonl"));
+        assert_eq!(
+            spec(SetupMcpTarget::PiCodingAgent).program_candidates(),
+            &["pi"]
+        );
+        assert_eq!(spec(SetupMcpTarget::Omp).program_candidates(), &["omp"]);
+    }
+
+    #[test]
     fn nac_home_obeys_explicit_and_xdg_precedence() {
         let home = PathBuf::from("/home/example");
         let xdg = PathBuf::from("/xdg");
@@ -1371,6 +1580,8 @@ mod tests {
             xdg_config_home: Some(xdg.clone()),
             kiro_home: None,
             nac_home: None,
+            prime_agent_dir: None,
+            current_exe: None,
             nac_snapshot: OnceCell::new(),
             nac_expected_content: OnceCell::new(),
         };
@@ -1394,6 +1605,8 @@ mod tests {
             xdg_config_home: None,
             kiro_home: None,
             nac_home: Some(nac_home.clone()),
+            prime_agent_dir: None,
+            current_exe: None,
             nac_snapshot: OnceCell::new(),
             nac_expected_content: OnceCell::new(),
         };
@@ -1427,6 +1640,8 @@ mod tests {
             xdg_config_home: None,
             kiro_home: None,
             nac_home: Some(nac_home),
+            prime_agent_dir: None,
+            current_exe: None,
             nac_snapshot: OnceCell::new(),
             nac_expected_content: OnceCell::new(),
         };
@@ -1456,6 +1671,8 @@ mod tests {
             xdg_config_home: None,
             kiro_home: None,
             nac_home: Some(nac_home),
+            prime_agent_dir: None,
+            current_exe: None,
             nac_snapshot: OnceCell::new(),
             nac_expected_content: OnceCell::new(),
         };
@@ -1484,6 +1701,8 @@ mod tests {
             xdg_config_home: None,
             kiro_home: None,
             nac_home: None,
+            prime_agent_dir: None,
+            current_exe: None,
             nac_snapshot: OnceCell::new(),
             nac_expected_content: OnceCell::new(),
         };
@@ -1507,6 +1726,8 @@ mod tests {
             xdg_config_home: None,
             kiro_home: None,
             nac_home: Some(PathBuf::from("nac-state")),
+            prime_agent_dir: None,
+            current_exe: None,
             nac_snapshot: OnceCell::new(),
             nac_expected_content: OnceCell::new(),
         };
@@ -1549,6 +1770,8 @@ mod tests {
             xdg_config_home: None,
             kiro_home: None,
             nac_home: Some(PathBuf::from("relative-nac")),
+            prime_agent_dir: None,
+            current_exe: None,
             nac_snapshot: OnceCell::new(),
             nac_expected_content: OnceCell::new(),
         };
@@ -1576,6 +1799,8 @@ mod tests {
             xdg_config_home: None,
             kiro_home: None,
             nac_home: Some(nac_home.clone()),
+            prime_agent_dir: None,
+            current_exe: None,
             nac_snapshot: OnceCell::new(),
             nac_expected_content: OnceCell::new(),
         };
@@ -1619,6 +1844,8 @@ mod tests {
                 xdg_config_home: None,
                 kiro_home: None,
                 nac_home: Some(nac_home.clone()),
+                prime_agent_dir: None,
+                current_exe: None,
                 nac_snapshot: OnceCell::new(),
                 nac_expected_content: OnceCell::new(),
             };
@@ -1644,6 +1871,8 @@ mod tests {
             xdg_config_home: None,
             kiro_home: None,
             nac_home: Some(nac_home),
+            prime_agent_dir: None,
+            current_exe: None,
             nac_snapshot: OnceCell::new(),
             nac_expected_content: OnceCell::new(),
         };
@@ -1651,5 +1880,47 @@ mod tests {
         let error = default_ingest_sources(SetupMcpTarget::Nac, &paths, true)
             .expect_err("reject non-UTF-8 store/watch paths");
         assert!(format!("{error:#}").contains("not valid UTF-8"));
+    }
+
+    #[test]
+    fn prime_agent_sources_follow_resolved_agent_directory() {
+        let agent_dir = PathBuf::from("/custom/prime/agent");
+        let mut paths = SetupPathContext::with_home(None);
+        paths.prime_agent_dir = Some(agent_dir.clone());
+        let sources = default_ingest_sources(SetupMcpTarget::PrimeAgent, &paths, true)
+            .expect("Prime Agent sources");
+        assert_eq!(sources.len(), 2);
+        assert_eq!(sources[0].name, "prime-agent");
+        assert_eq!(sources[0].harness, "prime-agent");
+        assert_eq!(
+            sources[0].glob,
+            format!("{}/sessions/*.jsonl", agent_dir.display())
+        );
+        assert_eq!(
+            sources[0].watch_root,
+            agent_dir.join("sessions").to_string_lossy()
+        );
+        assert_eq!(sources[1].name, "prime-agent-subagents");
+        assert_eq!(
+            sources[1].glob,
+            format!("{}/session-artifacts/**/sub-*/*.jsonl", agent_dir.display())
+        );
+        assert_eq!(
+            sources[1].watch_root,
+            agent_dir.join("session-artifacts").to_string_lossy()
+        );
+
+        let escaped_dir = PathBuf::from("/custom/[prime]*?/agent");
+        paths.prime_agent_dir = Some(escaped_dir);
+        let escaped = default_ingest_sources(SetupMcpTarget::PrimeAgent, &paths, true)
+            .expect("escaped Prime Agent sources");
+        assert_eq!(
+            escaped[0].glob,
+            "/custom/[[]prime[]][*][?]/agent/sessions/*.jsonl"
+        );
+        assert_eq!(
+            escaped[1].glob,
+            "/custom/[[]prime[]][*][?]/agent/session-artifacts/**/sub-*/*.jsonl"
+        );
     }
 }

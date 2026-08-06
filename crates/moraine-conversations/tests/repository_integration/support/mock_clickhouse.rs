@@ -383,7 +383,9 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
                             "source": "codex",
                             "harness": "codex",
                             "session_slug": "",
-                            "session_summary": ""
+                            "session_summary": "",
+                            "explicit_title": "",
+                            "codex_user_message_preview": "Genuine A request"
                         }
                     ])),
                 );
@@ -409,7 +411,9 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
                         "origin_cwd": "/work/acme-secret-merger",
                         "project": "acme-secret-merger",
                         "session_slug": "project-c",
-                        "session_summary": "Session C summary"
+                        "session_summary": "Session C summary",
+                        "explicit_title": "Session C title",
+                        "codex_user_message_preview": "Genuine C request"
                     },
                     {
                         "session_id": "sess_b",
@@ -425,7 +429,9 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
                         "source": "codex",
                         "harness": "codex",
                         "session_slug": "project-b",
-                        "session_summary": "Session B summary"
+                        "session_summary": "Session B summary",
+                        "explicit_title": "",
+                        "codex_user_message_preview": "Genuine B request"
                     },
                     {
                         "session_id": "sess_a",
@@ -441,7 +447,9 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
                         "source": "codex",
                         "harness": "codex",
                         "session_slug": "",
-                        "session_summary": ""
+                        "session_summary": "",
+                        "explicit_title": "",
+                        "codex_user_message_preview": "Genuine A request"
                     }
                 ])),
             );

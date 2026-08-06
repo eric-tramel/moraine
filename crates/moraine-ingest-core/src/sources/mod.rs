@@ -11,6 +11,8 @@ pub(crate) mod kiro_cli;
 pub(crate) mod nac;
 pub(crate) mod opencode;
 pub(crate) mod pi;
+mod pi_family;
+pub(crate) mod prime_agent;
 pub(crate) mod qwen_code;
 pub(crate) mod record_view;
 pub(crate) mod shared;
@@ -189,6 +191,7 @@ pub(crate) fn registry() -> &'static SourceRegistry {
             .register(&nac::NAC)
             .register(&opencode::OPENCODE)
             .register(&pi::PI_CODING_AGENT)
+            .register(&prime_agent::PRIME_AGENT)
             .register(&qwen_code::QWEN_CODE)
     })
 }

@@ -417,6 +417,7 @@ pub struct McpSessionListItem {
     pub session_slug: Option<String>,
     #[serde(default)]
     pub session_summary: Option<String>,
+    pub display_label: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1170,6 +1171,7 @@ pub struct SessionAnalytics {
     pub models: Vec<String>,
     pub trace_id: String,
     pub first_user_text: String,
+    pub display_label: String,
     pub turns: Vec<SessionTurn>,
 }
 
