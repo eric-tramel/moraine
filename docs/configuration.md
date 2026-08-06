@@ -436,6 +436,10 @@ The built-in defaults and `config/moraine.toml` reference cover these source fam
 | Hermes live sessions | `hermes` | `~/.hermes/sessions/session_*.json` | `~/.hermes/sessions` | `session_json` |
 | Hermes trajectories | `hermes` | user-provided trajectory JSONL | trajectory output directory | `jsonl` |
 
+`moraine setup` derives both Prime Agent paths from the absolute
+`PRIME_AGENT_CODING_AGENT_DIR` override when it is set, so ingestion and the
+managed runtime skill remain rooted together.
+
 Hermes supports both live session JSON and offline trajectory JSONL because the
 harness is the same but the file format differs. Use a separate
 `[[ingest.sources]]` entry for each watched directory. Cursor likewise has two

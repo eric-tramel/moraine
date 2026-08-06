@@ -17,6 +17,7 @@ use crate::render::CliOutput;
 use toml_edit::{ArrayOfTables, DocumentMut, Item, Table};
 
 mod harnesses;
+mod prime_agent;
 use harnesses::{ManagedFileWrite, McpConfigFormat, McpConfigWrite};
 
 const DEFAULT_CONFIG_TEMPLATE: &str = include_str!("../../../../config/moraine.toml");
@@ -1811,6 +1812,11 @@ fn execute_mcp_plan_with_progress(
     }
 
     let mut config_files = Vec::new();
+    let prime_skill_first = plan.target == SetupMcpTarget::PrimeAgent;
+    if failed.is_none() && prime_skill_first {
+        failed = apply_prime_managed_file_writes(&plan.managed_writes, progress, &mut config_files);
+    }
+
     if failed.is_none() {
         for write in &plan.config_writes {
             progress.config_start(write);
@@ -1830,23 +1836,8 @@ fn execute_mcp_plan_with_progress(
         }
     }
 
-    if failed.is_none() {
-        for write in &plan.managed_writes {
-            progress.managed_file_start(write);
-            match apply_managed_file_write(write) {
-                Ok(report) => {
-                    progress.managed_file_success(write);
-                    config_files.push(report);
-                }
-                Err(exc) => {
-                    let error = format!("failed to update {}: {exc}", write.path().display());
-                    progress.managed_file_error(write, &exc.to_string());
-                    config_files.push(McpConfigFileReport::managed_error(write, &exc.to_string()));
-                    failed = Some(error);
-                    break;
-                }
-            }
-        }
+    if failed.is_none() && !prime_skill_first {
+        failed = apply_managed_file_writes(&plan.managed_writes, progress, &mut config_files);
     }
 
     if let Some(error) = failed {
@@ -2191,7 +2182,70 @@ impl McpConfigFileReport {
     }
 }
 
+fn apply_prime_managed_file_writes(
+    writes: &[ManagedFileWrite],
+    progress: &mut SetupProgress,
+    config_files: &mut Vec<McpConfigFileReport>,
+) -> Option<String> {
+    for write in writes {
+        progress.managed_file_start(write);
+    }
+    match prime_agent::publish_skill(writes) {
+        Ok(changed) => {
+            for (write, changed) in writes.iter().zip(changed) {
+                progress.managed_file_success(write);
+                config_files.push(if changed {
+                    McpConfigFileReport::managed_written(write)
+                } else {
+                    McpConfigFileReport::managed_unchanged(write)
+                });
+            }
+            None
+        }
+        Err(exc) => {
+            let first = writes.first();
+            if let Some(write) = first {
+                progress.managed_file_error(write, &exc.to_string());
+                config_files.push(McpConfigFileReport::managed_error(write, &exc.to_string()));
+            }
+            Some(format!(
+                "failed to publish Prime Agent Moraine skill: {exc}"
+            ))
+        }
+    }
+}
+
+fn apply_managed_file_writes(
+    writes: &[ManagedFileWrite],
+    progress: &mut SetupProgress,
+    config_files: &mut Vec<McpConfigFileReport>,
+) -> Option<String> {
+    for write in writes {
+        progress.managed_file_start(write);
+        match apply_managed_file_write(write) {
+            Ok(report) => {
+                progress.managed_file_success(write);
+                config_files.push(report);
+            }
+            Err(exc) => {
+                let error = format!("failed to update {}: {exc}", write.path().display());
+                progress.managed_file_error(write, &exc.to_string());
+                config_files.push(McpConfigFileReport::managed_error(write, &exc.to_string()));
+                return Some(error);
+            }
+        }
+    }
+    None
+}
+
 fn apply_mcp_config_write(write: &McpConfigWrite) -> Result<McpConfigFileReport> {
+    if write.is_prime_agent() {
+        return if prime_agent::apply_settings(write)? {
+            Ok(McpConfigFileReport::written(write))
+        } else {
+            Ok(McpConfigFileReport::unchanged(write))
+        };
+    }
     if matches!(write.format(), McpConfigFormat::Toml) {
         write.verify_nac_snapshot_current()?;
         if write.nac_is_unchanged() {
@@ -3362,6 +3416,8 @@ mod tests {
             xdg_config_home: None,
             kiro_home: None,
             nac_home: Some(nac_home),
+            prime_agent_dir: None,
+            current_exe: None,
             nac_snapshot: std::cell::OnceCell::new(),
             nac_expected_content: std::cell::OnceCell::new(),
         };
@@ -3431,6 +3487,8 @@ mod tests {
             xdg_config_home: None,
             kiro_home: None,
             nac_home: Some(nac_home),
+            prime_agent_dir: None,
+            current_exe: None,
             nac_snapshot: std::cell::OnceCell::new(),
             nac_expected_content: std::cell::OnceCell::new(),
         };
@@ -3466,6 +3524,8 @@ mod tests {
             xdg_config_home: None,
             kiro_home: None,
             nac_home: Some(nac_home),
+            prime_agent_dir: None,
+            current_exe: None,
             nac_snapshot: std::cell::OnceCell::new(),
             nac_expected_content: std::cell::OnceCell::new(),
         };
@@ -3533,6 +3593,8 @@ mod tests {
             xdg_config_home: None,
             kiro_home: None,
             nac_home: Some(nac_home.clone()),
+            prime_agent_dir: None,
+            current_exe: None,
             nac_snapshot: std::cell::OnceCell::new(),
             nac_expected_content: std::cell::OnceCell::new(),
         };
@@ -3724,6 +3786,68 @@ watch_root = "~/archive"
             }],
         )
         .expect("reapply Qwen source");
+        assert_eq!(unchanged, IngestSelectionUpdate::default());
+    }
+
+    #[test]
+    fn prime_agent_ingest_selection_reconciles_both_custom_root_sources() {
+        let mut document = r#"
+[ingest]
+
+[[ingest.sources]]
+name = "prime-agent"
+harness = "prime-agent"
+enabled = false
+glob = "~/stale/*.jsonl"
+watch_root = "~/stale"
+
+[[ingest.sources]]
+name = "prime-archive"
+harness = "prime-agent"
+enabled = false
+glob = "~/archive/*.jsonl"
+watch_root = "~/archive"
+"#
+        .parse::<DocumentMut>()
+        .expect("Prime Agent fixture parses");
+        let mut paths = harnesses::SetupPathContext::with_home(None);
+        paths.prime_agent_dir = Some(PathBuf::from("/custom/prime/agent"));
+        let selection = SetupTargetSelection {
+            target: SetupMcpTarget::PrimeAgent,
+            mode: SetupSelectionMode::IngestOnly,
+        };
+
+        let update =
+            apply_ingest_selections_to_document_with_paths(&mut document, &[selection], &paths)
+                .expect("reconcile Prime Agent sources");
+        assert_eq!(
+            update,
+            IngestSelectionUpdate {
+                enabled_sources: 1,
+                disabled_sources: 0,
+                added_sources: 1,
+                updated_sources: 1,
+            }
+        );
+        assert_eq!(
+            source_value(&document, "prime-agent", "glob"),
+            Some("/custom/prime/agent/sessions/*.jsonl")
+        );
+        assert_eq!(
+            source_value(&document, "prime-agent-subagents", "glob"),
+            Some("/custom/prime/agent/session-artifacts/**/sub-*/*.jsonl")
+        );
+        assert!(source_enabled(&document, "prime-agent"));
+        assert!(source_enabled(&document, "prime-agent-subagents"));
+        assert!(!source_enabled(&document, "prime-archive"));
+        assert_eq!(
+            source_value(&document, "prime-archive", "glob"),
+            Some("~/archive/*.jsonl")
+        );
+
+        let unchanged =
+            apply_ingest_selections_to_document_with_paths(&mut document, &[selection], &paths)
+                .expect("reapply Prime Agent sources");
         assert_eq!(unchanged, IngestSelectionUpdate::default());
     }
 
@@ -5323,6 +5447,8 @@ host = "127.42.0.9"
             xdg_config_home: None,
             kiro_home: None,
             nac_home: Some(nac_home.clone()),
+            prime_agent_dir: None,
+            current_exe: None,
             nac_snapshot: std::cell::OnceCell::new(),
             nac_expected_content: std::cell::OnceCell::new(),
         };

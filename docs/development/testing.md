@@ -19,6 +19,7 @@ Run focused suites first, then expand according to the changed contract.
 | Root Rust workspace tests | `make test` | `cargo test --workspace --locked`; excludes frontend, browser, bindings, stack, paid-agent, packaging, and benchmark runs. |
 | Local Rust/policy baseline | `make ci-check` | Dependency policy, fmt, strict clippy, locked workspace build, and root workspace tests. It is not repository-wide validation. |
 | Source-tree functional stack | `bash scripts/ci/e2e-stack.sh` | One owned ClickHouse/ingest/backend/MCP lifecycle. |
+| Prime Agent setup contract | `cargo build -p moraine -p moraine-mcp -p moraine-ingest --locked && scripts/dev/prime-agent-setup-smoke` | Isolated settings/skill install, idempotency, dry-run, and Python integration contracts; add `--live` for the credentialed Prime Agent v0.7.0 turn against a running stack. |
 | Installed-artifact functional stack | `bash scripts/ci/e2e-install-artifact.sh <target-triple>` | Package, install into an isolated home, then run the canonical stack lifecycle. |
 | Frontend deterministic checks | `cd web/monitor && bun install --frozen-lockfile && bun run typecheck && bun run test` | Svelte/TypeScript plus Vitest; not Playwright. |
 | Mocked browser | `cd web/monitor && bun install --frozen-lockfile && bunx playwright@1.58.2 install chromium && bun run test:e2e:mocked` | Exactly two Chromium cases, one worker, no retries. |
