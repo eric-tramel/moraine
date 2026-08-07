@@ -403,7 +403,14 @@ SELECT event_uid, event_version, ingested_at, session_id, source_name, source_fi
   ))),
   toUInt8(positionCaseInsensitiveUTF8(payload_json, 'codex-mcp') > 0)
 FROM moraine.events FINAL
-WHERE notEmpty(session_id);
+WHERE notEmpty(session_id)
+SETTINGS max_block_size = 1024,
+  preferred_max_column_in_block_size_bytes = 33554432,
+  min_insert_block_size_rows = 0,
+  min_insert_block_size_bytes = 0,
+  max_insert_threads = 1,
+  max_threads = 1,
+  max_memory_usage = 1073741824;
 
 INSERT INTO moraine.mcp_event_navigation
 SELECT session_id,
@@ -416,28 +423,25 @@ SELECT session_id,
   toUInt8(actor_kind = 'user' AND event_kind = 'message'),
   toUInt8(event_kind = 'session_meta' OR (source_name = 'omp' AND JSONExtractString(payload_json, 'type') IN ('title', 'title_change')))
 FROM moraine.events FINAL
-WHERE notEmpty(session_id);
+WHERE notEmpty(session_id)
+SETTINGS max_block_size = 1024,
+  preferred_max_column_in_block_size_bytes = 33554432,
+  min_insert_block_size_rows = 0,
+  min_insert_block_size_bytes = 0,
+  max_insert_threads = 1,
+  max_threads = 1,
+  max_memory_usage = 1073741824;
 
-INSERT INTO moraine.search_postings
-SELECT d.event_version, d.term, d.event_uid, d.session_id, d.source_name,
-  d.harness, d.inference_provider, d.event_class, d.payload_type, d.actor_role,
-  d.name, d.phase, d.source_ref, d.doc_len, toUInt16(count())
-FROM
-(
-  SELECT event_version, event_uid, session_id, source_name, harness,
-    inference_provider, event_kind AS event_class, payload_type,
-    actor_kind AS actor_role, tool_name AS name,
-    if(tool_phase != '', tool_phase, op_status) AS phase, source_ref,
-    toUInt32(length(extractAll(lowerUTF8(text_content), '[a-z0-9_]+'))) AS doc_len,
-    arrayJoin(extractAll(lowerUTF8(text_content), '[a-z0-9_]+')) AS term
-  FROM moraine.events FINAL
-) AS d
-WHERE d.doc_len > 0 AND lengthUTF8(d.term) BETWEEN 2 AND 64
-GROUP BY d.event_version, d.term, d.event_uid, d.session_id, d.source_name,
-  d.harness, d.inference_provider, d.event_class, d.payload_type, d.actor_role,
-  d.name, d.phase, d.source_ref, d.doc_len
-SETTINGS max_bytes_before_external_group_by = 67108864,
-  max_bytes_before_external_sort = 67108864;
+DROP VIEW IF EXISTS moraine.search_postings_source_031;
+CREATE VIEW moraine.search_postings_source_031 AS
+SELECT event_version,
+  arrayJoin(extractAll(lowerUTF8(text_content), '[a-z0-9_]+')) AS term,
+  event_uid, session_id, source_name, harness, inference_provider,
+  event_kind AS event_class, payload_type, actor_kind AS actor_role,
+  tool_name AS name, if(tool_phase != '', tool_phase, op_status) AS phase,
+  source_ref,
+  toUInt32(length(extractAll(lowerUTF8(text_content), '[a-z0-9_]+'))) AS doc_len
+FROM moraine.events FINAL;
 
 INSERT INTO moraine.file_attention_project_roots
 SELECT project_id, worktree_root, max(observed_version)
@@ -449,7 +453,14 @@ FROM
   FROM moraine.events FINAL
 )
 WHERE startsWith(project_id, 'git:') AND worktree_root != ''
-GROUP BY project_id, worktree_root;
+GROUP BY project_id, worktree_root
+SETTINGS max_block_size = 1024,
+  preferred_max_column_in_block_size_bytes = 33554432,
+  min_insert_block_size_rows = 0,
+  min_insert_block_size_bytes = 0,
+  max_insert_threads = 1,
+  max_threads = 1,
+  max_memory_usage = 1073741824;
 
 -- Nothing below is a runtime content authority after this point. The frozen
 -- source is emptied here but retained until this migration's ledger write.
