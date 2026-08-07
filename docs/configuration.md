@@ -139,10 +139,68 @@ deadline. Every statement is tagged with a collision-safe
 `moraine-<workload>-<uuid>-<child>` query ID. Abandoned logical work cancels all
 of its active child statements through a separate administrative path; cleanup
 is best effort and bounded to five seconds. The `url` query string and
-per-request parameters may not override Moraine's reserved ownership/deadline
-settings (`query_id`, `replace_running_query`, `max_execution_time`,
-`max_execution_time_leaf`, `timeout_overflow_mode`, or
-`timeout_before_checking_execution_speed`).
+per-request parameters may not override Moraine's reserved ownership, deadline,
+or resource settings (`query_id`, `replace_running_query`,
+`max_execution_time`, `max_execution_time_leaf`, `timeout_overflow_mode`,
+`timeout_before_checking_execution_speed`, `workload`, `max_memory_usage`,
+`max_memory_usage_for_user`, `max_bytes_before_external_group_by`,
+`max_bytes_before_external_sort`,
+`max_bytes_ratio_before_external_group_by`,
+`max_bytes_ratio_before_external_sort`,
+`max_temporary_data_on_disk_size_for_query`, or
+`max_temporary_data_on_disk_size_for_user`).
+
+### Query resource governance
+
+Moraine assigns every ClickHouse statement to one of four fixed resource
+profiles. These limits are internal safety policy rather than user-facing TOML:
+
+| Profile | Workloads | Running | Waiting | Per-query memory | Group/sort spill threshold | Temporary disk |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| interactive | MCP, Monitor, Export | 4 | 16 | 256 MiB | 64 MiB | 512 MiB |
+| background | Background ingest and maintenance | 2 | 8 | 256 MiB | 64 MiB | 512 MiB |
+| migration | Migration | 1 | 1 | 1 GiB | 256 MiB | 2 GiB |
+| administrative | Internal health and cancellation | 2 | 8 | 128 MiB | 32 MiB | 128 MiB |
+
+The running and waiting bounds apply per Moraine process and per statement, not
+per logical multi-statement operation. Waiting work opens no ClickHouse
+connection and allocates no server query memory. A full client or server
+admission queue returns the typed `busy` outcome. ClickHouse memory, disk, row,
+and byte limits return the distinct `resource_exhausted` outcome. Cancellation,
+caller deadlines, and service shutdown also wake queued work without waiting
+for a slot.
+
+Managed ClickHouse adds server-wide backstops. It permits at most 16 concurrent
+queries, limits query memory for the `default` user to the smaller of 2 GiB or
+one quarter of detected host/container memory, caps each mark and uncompressed
+cache at the smaller of 256 MiB or one sixteenth of memory, and limits total
+server memory to 75% of memory. The remaining server envelope is reserved for
+merges and other server work. Effective per-query memory is therefore the
+smaller of the profile cap and the remaining aggregate user allowance.
+
+Managed startup creates four ClickHouse workload queues matching the profiles.
+Each queue has its own running and waiting capacity, so saturated interactive
+reads cannot consume background, migration, or administrative slots. New
+installs and existing managed installs receive the rendered memory and disk
+settings on `moraine up`; startup idempotently refreshes the workload scheduler
+on the already-running server before declaring ClickHouse ready. Moraine
+refuses to manage ClickHouse when the detected memory limit is below 2 GiB.
+
+For named or remote ClickHouse backends, Moraine checks `system.workloads` once
+per client. It attaches a managed `workload` only when all required scheduler
+nodes exist. A missing hierarchy, denied probe, malformed response, or probe
+timeout leaves the workload setting unset instead of failing the caller; the
+per-query memory, spill, and temporary-disk settings still apply. This keeps
+external servers compatible without assuming Moraine owns their scheduler.
+
+Sorts and groups spill to `~/.moraine/clickhouse/tmp` after the profile's
+absolute byte threshold; managed profiles disable ClickHouse's competing
+available-memory ratio so that the lower per-query memory ceiling cannot fire
+before the spill threshold. A statement may use only the profile's
+temporary-disk allowance, while all queries by the managed user share a 4 GiB
+temporary-disk ceiling.
+These are hard limits: exhausting either returns `resource_exhausted` rather
+than risking an unbounded allocation or filling the managed disk.
 
 ### Environment-backed ClickHouse values
 
@@ -854,7 +912,7 @@ default_exclude_codex_mcp = true
 prewarm_on_initialize = false
 async_log_writes = true
 protocol_version = "2024-11-05"
-# max_parallel_requests = 16 # optional; omitted defaults to 8
+# max_parallel_requests = 16 # optional; omitted defaults to 4
 use_central_server = true
 central_socket_path = "mcp.sock"
 central_connect_timeout_ms = 250
@@ -871,7 +929,7 @@ central_connect_timeout_ms = 250
 | `prewarm_on_initialize` | `false` | Warms query metadata during MCP initialize, trading startup work for lower first-search latency. |
 | `async_log_writes` | `true` | Writes MCP observability rows asynchronously so tool calls stay responsive. |
 | `protocol_version` | `2024-11-05` | MCP protocol version advertised by the server. |
-| `max_parallel_requests` | `8` | Maximum retrieval requests executed concurrently by each MCP server process. At most 16 additional requests wait in FIFO order until capacity is available or the request is cancelled. A full queue is rejected immediately with a structured retryable error. A configured value must be greater than zero. |
+| `max_parallel_requests` | `4` | Maximum retrieval requests executed concurrently by each MCP server process. At most 16 additional requests wait in FIFO order until capacity is available or the request is cancelled. A full queue is rejected immediately with a structured retryable error. A configured value must be greater than zero. |
 | `use_central_server` | `true` | Makes `moraine run mcp` prefer the shared central server socket, with embedded fallback. |
 | `central_socket_path` | `mcp.sock` | Unix socket path. Bare filenames resolve under `runtime.pids_dir`; absolute paths are used verbatim. |
 | `central_connect_timeout_ms` | `250` | Milliseconds a proxy client waits for the central socket before falling back to embedded mode. |
@@ -888,7 +946,7 @@ budget is busy. Queued and running retrievals have no fixed admission deadline;
 they continue until completion, client cancellation, full disconnect, or service
 shutdown. A clean request-side EOF is only a half-close: already admitted work
 finishes and its response is still written. A full queue is rejected immediately
-with a structured `resource_exhausted` tool error. An embedded fallback is a
+with a structured `busy` tool error. An embedded fallback is a
 separate process, so its execution budget is process-local. Validation and
 control requests continue to run while retrievals wait.
 

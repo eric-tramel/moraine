@@ -3,7 +3,7 @@ use moraine_clickhouse::{ClickHouseClient, QueryOwner, QueryRuntime, QueryWorklo
 use moraine_config::{AppConfig, LoadedConfigPath};
 use reqwest::{Client, Url};
 use sha2::{Digest, Sha256};
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, ExitStatus, Stdio};
@@ -23,8 +23,8 @@ use std::os::unix::{
 use crate::paths::{ensure_runtime_dirs, RuntimePaths};
 use crate::process::{
     cleanup_legacy_clickhouse_pipe_log, clickhouse_supervisor_log_path, pid_path,
-    remove_pid_if_matches, service_running, write_pid, RollingLog, RollingLogPolicy, StartOutcome,
-    StartState,
+    remove_pid_if_matches, service_running, stop_pid_path, stop_service, write_pid, RollingLog,
+    RollingLogPolicy, StartOutcome, StartState,
 };
 use crate::render::ClickhouseStatusSnapshot;
 use crate::service::Service;
@@ -51,6 +51,177 @@ struct ClickHouseAsset {
     url: &'static str,
     sha256: &'static str,
     is_archive: bool,
+}
+
+const MIB: u64 = 1_048_576;
+const GIB: u64 = 1_073_741_824;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ManagedResourcePolicy {
+    max_query_memory_bytes: u64,
+    max_user_query_memory_bytes: u64,
+    cache_bytes: u64,
+    default_spill_bytes: u64,
+}
+
+impl ManagedResourcePolicy {
+    fn for_memory(machine_memory_bytes: u64) -> Result<Self> {
+        if machine_memory_bytes < 2 * GIB {
+            bail!(
+                "managed ClickHouse requires at least 2 GiB of detectable memory; found {} bytes",
+                machine_memory_bytes
+            );
+        }
+        let max_user_query_memory_bytes = (machine_memory_bytes / 4).min(2 * GIB);
+        let max_query_memory_bytes = (max_user_query_memory_bytes / 2).min(GIB);
+        let cache_bytes = (machine_memory_bytes / 16).min(256 * MIB);
+        Ok(Self {
+            max_query_memory_bytes,
+            max_user_query_memory_bytes,
+            cache_bytes,
+            default_spill_bytes: max_query_memory_bytes / 4,
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn append_cgroup_limit_paths(
+    paths: &mut Vec<PathBuf>,
+    root: &Path,
+    membership: &str,
+    limit_file: &str,
+) {
+    let mut current = root.to_path_buf();
+    for component in Path::new(membership).components() {
+        if let std::path::Component::Normal(component) = component {
+            current.push(component);
+        }
+    }
+    loop {
+        paths.push(current.join(limit_file));
+        if current == root {
+            break;
+        }
+        if !current.pop() || !current.starts_with(root) {
+            break;
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn cgroup_memory_limit_paths(memberships: &str) -> Vec<PathBuf> {
+    let unified_root = Path::new("/sys/fs/cgroup");
+    let legacy_root = Path::new("/sys/fs/cgroup/memory");
+    let mut paths = vec![
+        unified_root.join("memory.max"),
+        legacy_root.join("memory.limit_in_bytes"),
+    ];
+    for line in memberships.lines() {
+        let mut fields = line.splitn(3, ':');
+        let Some(_) = fields.next() else {
+            continue;
+        };
+        let Some(controllers) = fields.next() else {
+            continue;
+        };
+        let Some(membership) = fields.next() else {
+            continue;
+        };
+        if controllers.is_empty() {
+            append_cgroup_limit_paths(&mut paths, unified_root, membership, "memory.max");
+        } else if controllers.split(',').any(|name| name == "memory") {
+            append_cgroup_limit_paths(&mut paths, legacy_root, membership, "memory.limit_in_bytes");
+        }
+    }
+    paths
+}
+
+#[cfg(target_os = "linux")]
+fn read_cgroup_memory_limit(paths: impl IntoIterator<Item = PathBuf>) -> Option<u64> {
+    paths
+        .into_iter()
+        .filter_map(|path| fs::read_to_string(path).ok())
+        .filter_map(|value| {
+            let value = value.trim();
+            (value != "max")
+                .then(|| value.parse::<u64>().ok())
+                .flatten()
+        })
+        .filter(|value| *value > 0 && *value < (1_u64 << 60))
+        .min()
+}
+
+#[cfg(target_os = "linux")]
+fn detect_cgroup_memory_limit() -> Option<u64> {
+    let memberships = fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
+    read_cgroup_memory_limit(cgroup_memory_limit_paths(&memberships))
+}
+
+fn detect_effective_memory_bytes() -> Result<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let meminfo = fs::read_to_string("/proc/meminfo")
+            .context("failed reading /proc/meminfo for managed ClickHouse limits")?;
+        let physical = meminfo
+            .lines()
+            .find_map(|line| {
+                let value = line.strip_prefix("MemTotal:")?.trim();
+                let kib = value.strip_suffix("kB")?.trim().parse::<u64>().ok()?;
+                kib.checked_mul(1024)
+            })
+            .ok_or_else(|| anyhow!("failed parsing MemTotal from /proc/meminfo"))?;
+        return Ok(detect_cgroup_memory_limit().map_or(physical, |limit| physical.min(limit)));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let output = Command::new("/usr/sbin/sysctl")
+            .args(["-n", "hw.memsize"])
+            .output()
+            .context("failed running sysctl for managed ClickHouse limits")?;
+        if !output.status.success() {
+            bail!("sysctl hw.memsize failed while sizing managed ClickHouse");
+        }
+        String::from_utf8(output.stdout)
+            .context("sysctl hw.memsize returned non-UTF-8 output")?
+            .trim()
+            .parse::<u64>()
+            .context("failed parsing sysctl hw.memsize")
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        bail!("managed ClickHouse memory detection is unsupported on this platform")
+    }
+}
+
+fn write_atomic_if_changed(path: &Path, contents: &str) -> Result<bool> {
+    if fs::read_to_string(path).ok().as_deref() == Some(contents) {
+        return Ok(false);
+    }
+    let temp = path.with_extension(format!("moraine-tmp-{}", std::process::id()));
+    let result = (|| -> Result<()> {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&temp)
+            .with_context(|| format!("failed opening temporary config {}", temp.display()))?;
+        file.write_all(contents.as_bytes())
+            .with_context(|| format!("failed writing temporary config {}", temp.display()))?;
+        file.sync_all()
+            .with_context(|| format!("failed syncing temporary config {}", temp.display()))?;
+        fs::rename(&temp, path).with_context(|| {
+            format!(
+                "failed atomically replacing managed config {}",
+                path.display()
+            )
+        })
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result.map(|()| true)
 }
 
 fn clickhouse_ports_from_url(cfg: &AppConfig) -> Result<(u16, u16, u16)> {
@@ -90,8 +261,9 @@ fn clickhouse_url_is_local(cfg: &AppConfig) -> Result<bool> {
     ))
 }
 
-fn materialize_clickhouse_config(cfg: &AppConfig, paths: &RuntimePaths) -> Result<()> {
+fn materialize_clickhouse_config(cfg: &AppConfig, paths: &RuntimePaths) -> Result<bool> {
     let (http_port, tcp_port, interserver_http_port) = clickhouse_ports_from_url(cfg)?;
+    let policy = ManagedResourcePolicy::for_memory(detect_effective_memory_bytes()?)?;
     let rendered_clickhouse = CLICKHOUSE_TEMPLATE
         .replace("__MORAINE_HOME__", &cfg.runtime.root_dir)
         .replace("__CLICKHOUSE_HTTP_PORT__", &http_port.to_string())
@@ -99,22 +271,123 @@ fn materialize_clickhouse_config(cfg: &AppConfig, paths: &RuntimePaths) -> Resul
         .replace(
             "__CLICKHOUSE_INTERSERVER_HTTP_PORT__",
             &interserver_http_port.to_string(),
+        )
+        .replace(
+            "__UNCOMPRESSED_CACHE_BYTES__",
+            &policy.cache_bytes.to_string(),
+        )
+        .replace("__MARK_CACHE_BYTES__", &policy.cache_bytes.to_string());
+    let rendered_users = USERS_TEMPLATE
+        .replace("__MORAINE_HOME__", &cfg.runtime.root_dir)
+        .replace(
+            "__MAX_QUERY_MEMORY_BYTES__",
+            &policy.max_query_memory_bytes.to_string(),
+        )
+        .replace(
+            "__MAX_USER_QUERY_MEMORY_BYTES__",
+            &policy.max_user_query_memory_bytes.to_string(),
+        )
+        .replace(
+            "__DEFAULT_SPILL_BYTES__",
+            &policy.default_spill_bytes.to_string(),
         );
-    let rendered_users = USERS_TEMPLATE.replace("__MORAINE_HOME__", &cfg.runtime.root_dir);
 
-    fs::write(&paths.clickhouse_config, rendered_clickhouse).with_context(|| {
-        format!(
-            "failed writing clickhouse config {}",
-            paths.clickhouse_config.display()
-        )
-    })?;
-    fs::write(&paths.clickhouse_users, rendered_users).with_context(|| {
-        format!(
-            "failed writing users config {}",
-            paths.clickhouse_users.display()
-        )
-    })?;
+    let config_changed = write_atomic_if_changed(&paths.clickhouse_config, &rendered_clickhouse)?;
+    let users_changed = write_atomic_if_changed(&paths.clickhouse_users, &rendered_users)?;
+    Ok(config_changed || users_changed)
+}
 
+const WORKLOAD_BOOTSTRAP: &[&str] = &[
+    "CREATE RESOURCE IF NOT EXISTS moraine_query_slots (QUERY)",
+    "CREATE OR REPLACE WORKLOAD moraine_all SETTINGS max_concurrent_queries = 11",
+    "CREATE OR REPLACE WORKLOAD moraine_interactive IN moraine_all SETTINGS max_concurrent_queries = 4, max_waiting_queries = 16",
+    "CREATE OR REPLACE WORKLOAD moraine_background IN moraine_all SETTINGS max_concurrent_queries = 2, max_waiting_queries = 8",
+    "CREATE OR REPLACE WORKLOAD moraine_migration IN moraine_all SETTINGS max_concurrent_queries = 1, max_waiting_queries = 1",
+    "CREATE OR REPLACE WORKLOAD moraine_administrative IN moraine_all SETTINGS max_concurrent_queries = 2, max_waiting_queries = 8",
+    "CREATE OR REPLACE WORKLOAD `default` IN moraine_all SETTINGS max_concurrent_queries = 2, max_waiting_queries = 2",
+];
+
+async fn apply_managed_resource_governance(
+    cfg: &AppConfig,
+    query_runtime: &QueryRuntime,
+) -> Result<()> {
+    let client = ClickHouseClient::new_with_runtime(cfg.clickhouse.clone(), query_runtime.clone())?;
+    client
+        .execute_administrative("SYSTEM RELOAD CONFIG", Duration::from_secs(5))
+        .await
+        .context("failed reloading managed ClickHouse resource configuration")?;
+
+    let policy = ManagedResourcePolicy::for_memory(detect_effective_memory_bytes()?)?;
+    let settings_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let user_settings = client
+            .execute_administrative(
+                "SELECT name, value FROM system.settings WHERE name IN ('max_memory_usage', 'max_memory_usage_for_user', 'max_bytes_ratio_before_external_group_by', 'max_bytes_ratio_before_external_sort', 'max_temporary_data_on_disk_size_for_query', 'max_temporary_data_on_disk_size_for_user') ORDER BY name FORMAT TabSeparated",
+                Duration::from_secs(2),
+            )
+            .await
+            .unwrap_or_default();
+        let server_settings = client
+            .execute_administrative(
+                "SELECT name, value FROM system.server_settings WHERE name IN ('max_concurrent_queries', 'max_server_memory_usage_to_ram_ratio', 'mark_cache_size', 'uncompressed_cache_size') ORDER BY name FORMAT TabSeparated",
+                Duration::from_secs(2),
+            )
+            .await
+            .unwrap_or_default();
+        let expected_user = [
+            format!("max_memory_usage\t{}", policy.max_query_memory_bytes),
+            format!(
+                "max_memory_usage_for_user\t{}",
+                policy.max_user_query_memory_bytes
+            ),
+            "max_bytes_ratio_before_external_group_by\t0".to_string(),
+            "max_bytes_ratio_before_external_sort\t0".to_string(),
+            "max_temporary_data_on_disk_size_for_query\t2147483648".to_string(),
+            "max_temporary_data_on_disk_size_for_user\t4294967296".to_string(),
+        ];
+        let expected_server = [
+            "max_concurrent_queries\t16".to_string(),
+            "max_server_memory_usage_to_ram_ratio\t0.75".to_string(),
+            format!("mark_cache_size\t{}", policy.cache_bytes),
+            format!("uncompressed_cache_size\t{}", policy.cache_bytes),
+        ];
+        if expected_user
+            .iter()
+            .all(|setting| user_settings.lines().any(|line| line == setting))
+            && expected_server
+                .iter()
+                .all(|setting| server_settings.lines().any(|line| line == setting))
+        {
+            break;
+        }
+        if Instant::now() >= settings_deadline {
+            bail!(
+                "managed ClickHouse did not apply resource settings after SYSTEM RELOAD CONFIG \
+                 (user settings: {user_settings:?}; server settings: {server_settings:?})"
+            );
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+
+    for statement in WORKLOAD_BOOTSTRAP {
+        client
+            .execute_administrative(statement, Duration::from_secs(5))
+            .await
+            .with_context(|| format!("failed applying managed ClickHouse workload: {statement}"))?;
+    }
+    let workload_count = client
+        .execute_administrative(
+            "SELECT count() FROM system.workloads WHERE name IN ('moraine_all', 'moraine_interactive', 'moraine_background', 'moraine_migration', 'moraine_administrative', 'default') FORMAT TabSeparated",
+            Duration::from_secs(2),
+        )
+        .await
+        .context("failed verifying managed ClickHouse workloads")?;
+    if workload_count.trim() != "6" {
+        bail!(
+            "managed ClickHouse workload bootstrap incomplete: expected 6 workloads, observed {}",
+            workload_count.trim()
+        );
+    }
     Ok(())
 }
 
@@ -1430,14 +1703,25 @@ where
     F: FnMut(ClickHouseStartupProgress),
 {
     let supervisor_log = clickhouse_supervisor_log_path(paths);
+    let mut restarting_managed = false;
     if let Some(pid) = service_running(paths, Service::ClickHouse) {
-        wait_for_clickhouse_with_progress(cfg, query_runtime, &mut on_progress).await?;
-        return Ok(StartOutcome {
-            service: Service::ClickHouse,
-            state: StartState::AlreadyRunning,
-            pid: Some(pid),
-            log_path: Some(supervisor_log.display().to_string()),
-        });
+        let config_changed = materialize_clickhouse_config(cfg, paths)?;
+        let restart_required = config_changed && managed_clickhouse_version(paths).is_some();
+        if !restart_required {
+            wait_for_clickhouse_with_progress(cfg, query_runtime, &mut on_progress).await?;
+            apply_managed_resource_governance(cfg, query_runtime).await?;
+            return Ok(StartOutcome {
+                service: Service::ClickHouse,
+                state: StartState::AlreadyRunning,
+                pid: Some(pid),
+                log_path: Some(supervisor_log.display().to_string()),
+            });
+        }
+        stop_service(paths, Service::ClickHouse)
+            .context("failed restarting managed ClickHouse after its configuration changed")?;
+        stop_pid_path(&paths.managed_clickhouse_dir.join("clickhouse.pid"), 50)
+            .context("failed stopping managed ClickHouse server before configuration upgrade")?;
+        restarting_managed = true;
     }
 
     let url_is_local = clickhouse_url_is_local(cfg)?;
@@ -1455,6 +1739,12 @@ where
     )
     .await;
     match probe {
+        Ok(()) if restarting_managed => {
+            bail!(
+                "managed ClickHouse endpoint '{}' remained healthy after stopping the pre-upgrade server",
+                cfg.clickhouse.url
+            );
+        }
         Ok(()) => {
             return Ok(StartOutcome {
                 service: Service::ClickHouse,
@@ -1535,6 +1825,7 @@ where
             ))),
         };
     }
+    apply_managed_resource_governance(cfg, query_runtime).await?;
 
     Ok(StartOutcome {
         service: Service::ClickHouse,
@@ -1949,12 +2240,26 @@ mod tests {
 
     #[tokio::test]
     async fn ping_progress_refreshes_while_response_is_stalled() {
+        use tokio::io::AsyncWriteExt;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind stalled ping server");
         let addr = listener.local_addr().expect("stalled ping server addr");
         let (request_tx, request_rx) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
+            let (mut capability_stream, _) =
+                listener.accept().await.expect("accept capability probe");
+            let mut capability_request = [0_u8; 4096];
+            let capability_request_len = capability_stream
+                .read(&mut capability_request)
+                .await
+                .expect("read capability probe");
+            assert!(capability_request_len > 0, "empty capability probe");
+            capability_stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nConnection: close\r\n\r\n0")
+                .await
+                .expect("answer capability probe");
+
             let (mut stream, _) = listener.accept().await.expect("accept stalled ping");
             let mut request = [0_u8; 4096];
             let request_len = stream.read(&mut request).await.expect("read stalled ping");
@@ -2163,6 +2468,35 @@ mod tests {
         assert_eq!(policy.stability_window, Duration::from_secs(300));
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cgroup_memory_limit_walks_nested_membership_ancestors() {
+        let root = temp_dir("nested-cgroup-memory");
+        let leaf = root.join("workload.slice").join("moraine.scope");
+        fs::create_dir_all(&leaf).expect("create nested cgroup fixture");
+        fs::write(leaf.join("memory.max"), "max\n").expect("write unbounded leaf");
+        fs::write(
+            root.join("workload.slice").join("memory.max"),
+            format!("{}\n", 2 * GIB),
+        )
+        .expect("write bounded parent");
+        fs::write(root.join("memory.max"), format!("{}\n", 4 * GIB)).expect("write bounded root");
+
+        let mut paths = Vec::new();
+        append_cgroup_limit_paths(
+            &mut paths,
+            &root,
+            "/workload.slice/moraine.scope",
+            "memory.max",
+        );
+        assert_eq!(paths[0], leaf.join("memory.max"));
+        assert_eq!(paths[1], root.join("workload.slice").join("memory.max"));
+        assert_eq!(paths[2], root.join("memory.max"));
+        assert_eq!(read_cgroup_memory_limit(paths), Some(2 * GIB));
+
+        fs::remove_dir_all(root).expect("remove cgroup fixture");
+    }
+
     #[test]
     fn stable_ready_generation_resets_failure_budget() {
         assert_eq!(
@@ -2181,7 +2515,8 @@ mod tests {
         let cfg = test_config(&root, "http://127.0.0.1:18123".to_string());
         let paths = crate::paths::runtime_paths(&cfg);
         ensure_runtime_dirs(&paths).expect("runtime dirs");
-        materialize_clickhouse_config(&cfg, &paths).expect("materialize config");
+        assert!(materialize_clickhouse_config(&cfg, &paths).expect("materialize config"));
+        assert!(!materialize_clickhouse_config(&cfg, &paths).expect("stable materialized config"));
         let rendered_config = fs::read_to_string(&paths.clickhouse_config).expect("read config");
         let rendered_users = fs::read_to_string(&paths.clickhouse_users).expect("read users");
 
@@ -2219,6 +2554,37 @@ mod tests {
                 .count(),
             1
         );
+        let policy = ManagedResourcePolicy::for_memory(
+            detect_effective_memory_bytes().expect("effective memory"),
+        )
+        .expect("managed policy");
+        for expected in [
+            format!(
+                "<max_memory_usage>{}</max_memory_usage>",
+                policy.max_query_memory_bytes
+            ),
+            format!(
+                "<max_memory_usage_for_user>{}</max_memory_usage_for_user>",
+                policy.max_user_query_memory_bytes
+            ),
+            format!(
+                "<uncompressed_cache_size>{}</uncompressed_cache_size>",
+                policy.cache_bytes
+            ),
+            format!("<mark_cache_size>{}</mark_cache_size>", policy.cache_bytes),
+            "<max_concurrent_queries>16</max_concurrent_queries>".to_string(),
+            "<max_server_memory_usage_to_ram_ratio>0.75</max_server_memory_usage_to_ram_ratio>"
+                .to_string(),
+            "<max_temporary_data_on_disk_size_for_query>2147483648</max_temporary_data_on_disk_size_for_query>".to_string(),
+            "<max_temporary_data_on_disk_size_for_user>4294967296</max_temporary_data_on_disk_size_for_user>".to_string(),
+        ] {
+            assert!(
+                rendered_config.contains(&expected) || rendered_users.contains(&expected),
+                "managed config omitted {expected}"
+            );
+        }
+        assert!(!rendered_config.contains("__"));
+        assert!(!rendered_users.contains("__"));
         assert_eq!(
             rendered_config.matches("<console>false</console>").count(),
             1
@@ -2226,6 +2592,41 @@ mod tests {
         assert!(!rendered_config.contains("<max_thread_pool_size>"));
         assert!(!rendered_users.contains("<max_threads>"));
         let _ = fs::remove_dir_all(root);
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cgroup_memory_paths_include_nested_memberships_and_ancestors() {
+        let paths =
+            cgroup_memory_limit_paths("0::/system.slice/moraine.service\n5:cpu,memory:/docker/abc");
+        for expected in [
+            "/sys/fs/cgroup/system.slice/moraine.service/memory.max",
+            "/sys/fs/cgroup/system.slice/memory.max",
+            "/sys/fs/cgroup/memory.max",
+            "/sys/fs/cgroup/memory/docker/abc/memory.limit_in_bytes",
+            "/sys/fs/cgroup/memory/docker/memory.limit_in_bytes",
+            "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+        ] {
+            assert!(
+                paths.iter().any(|path| path == Path::new(expected)),
+                "missing cgroup limit path {expected}: {paths:?}"
+            );
+        }
+    }
+    #[test]
+    fn managed_memory_policy_reserves_merge_headroom() {
+        for memory in [2 * GIB, 4 * GIB, 8 * GIB, 32 * GIB] {
+            let policy = ManagedResourcePolicy::for_memory(memory).expect("managed policy");
+            assert!(policy.max_user_query_memory_bytes <= memory / 4);
+            assert!(policy.max_query_memory_bytes <= policy.max_user_query_memory_bytes / 2);
+            assert!(policy.cache_bytes <= memory / 16);
+            assert!(policy.default_spill_bytes < policy.max_query_memory_bytes);
+            assert!(policy.max_user_query_memory_bytes > 256 * MIB);
+            let server_envelope = memory * 3 / 4;
+            let reserved =
+                server_envelope - policy.max_user_query_memory_bytes - 2 * policy.cache_bytes;
+            assert!(reserved >= memory * 3 / 8);
+        }
+        assert!(ManagedResourcePolicy::for_memory((2 * GIB) - 1).is_err());
     }
 
     #[cfg(unix)]

@@ -82,6 +82,12 @@ unreachable. Human output labels the source as `daemon API` or `direct DB`;
 JSON output adds the compatible top-level `data_source` field with
 `daemon_api` or `direct_db`.
 
+When the daemon API is available, status also reports a `Query Pressure`
+section (and JSON `query_pressure` object) with per-profile running, queued, and
+rejected counts plus a content-free resource-limit event total.
+These counters describe the local backend process only; direct-database fallback
+omits them. They never include SQL, query text, credentials, or user content.
+
 For a local ClickHouse process started by `moraine up`, Moraine keeps a small
 supervisor running after startup. If ClickHouse exits unexpectedly, the
 supervisor waits 1, 2, 4, 8, then 16 seconds between at most five consecutive

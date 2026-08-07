@@ -273,6 +273,311 @@ assert_clickhouse_count() {
   assert_clickhouse_scalar "$clickhouse_url" "$label" "$query" "$expected"
 }
 
+assert_managed_clickhouse_resource_upgrade() {
+  local python_bin="$1"
+  local moraine_bin="$2"
+  local config_path="$3"
+  local runtime_root="$4"
+  local clickhouse_url="$5"
+
+  local clickhouse_config="$runtime_root/clickhouse/config.xml"
+  local clickhouse_users="$runtime_root/clickhouse/users.xml"
+  local clickhouse_pid_file="$runtime_root/run/clickhouse.pid"
+  local previous_pid
+  previous_pid="$(read_live_pid_file "$clickhouse_pid_file" "pre-upgrade clickhouse")"
+
+  "$python_bin" - "$clickhouse_config" "$clickhouse_users" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+config_path, users_path = map(Path, sys.argv[1:])
+config = config_path.read_text()
+users = users_path.read_text()
+config_old = config.replace(
+    "<max_concurrent_queries>16</max_concurrent_queries>",
+    "<max_concurrent_queries>500</max_concurrent_queries>",
+)
+users_old = re.sub(
+    r"<max_memory_usage_for_user>\d+</max_memory_usage_for_user>",
+    "<max_memory_usage_for_user>0</max_memory_usage_for_user>",
+    users,
+    count=1,
+)
+if config_old == config:
+    raise RuntimeError("managed config did not contain governed concurrency")
+if users_old == users:
+    raise RuntimeError("managed users config did not contain aggregate memory")
+config_path.write_text(config_old)
+users_path.write_text(users_old)
+PY
+
+  "$moraine_bin" up --config "$config_path"
+  local upgraded_pid
+  upgraded_pid="$(read_live_pid_file "$clickhouse_pid_file" "upgraded clickhouse")"
+  if [[ "$upgraded_pid" == "$previous_pid" ]]; then
+    echo "[e2e] managed ClickHouse did not restart after stale resource config" >&2
+    return 1
+  fi
+  assert_clickhouse_count \
+    "$clickhouse_url" \
+    "upgraded aggregate query-memory limit" \
+    "SELECT count() FROM system.settings WHERE name = 'max_memory_usage_for_user' AND toUInt64(value) > 0" \
+    "1"
+  assert_clickhouse_count \
+    "$clickhouse_url" \
+    "upgraded workload hierarchy" \
+    "SELECT count() FROM system.workloads WHERE name IN ('moraine_all', 'moraine_interactive', 'moraine_background', 'moraine_migration', 'moraine_administrative', 'default')" \
+    "6"
+}
+
+assert_clickhouse_resource_governance() {
+  local python_bin="$1"
+  local clickhouse_url="$2"
+  local clickhouse_database="$3"
+  local run_stamp="$4"
+
+  "$python_bin" - "$clickhouse_url" "$clickhouse_database" "$run_stamp" <<'PY'
+import concurrent.futures
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import sys
+
+base_url, database, run_stamp = sys.argv[1:]
+table = f"resource_governance_{run_stamp}"
+interactive = {
+    "workload": "moraine_interactive",
+    "max_memory_usage": "268435456",
+    "max_bytes_before_external_group_by": "67108864",
+    "max_bytes_before_external_sort": "67108864",
+    "max_temporary_data_on_disk_size_for_query": "536870912",
+}
+background = {
+    "workload": "moraine_background",
+    "max_memory_usage": "268435456",
+    "max_bytes_before_external_group_by": "67108864",
+    "max_bytes_before_external_sort": "67108864",
+    "max_temporary_data_on_disk_size_for_query": "536870912",
+}
+
+
+def query(sql, timeout=60, **params):
+    url = base_url + "?" + urllib.parse.urlencode(params)
+    try:
+        with urllib.request.urlopen(url, data=sql.encode(), timeout=timeout) as response:
+            return response.read().decode().strip()
+    except urllib.error.HTTPError as error:
+        raise RuntimeError(error.read().decode()) from error
+
+def require(condition, message):
+    if not condition:
+        raise RuntimeError(message)
+
+def wait_for_profile_event(query_id, event_filter, expected):
+    deadline = time.monotonic() + 5
+    events = ""
+    while time.monotonic() < deadline:
+        query("SYSTEM FLUSH LOGS")
+        events = query(
+            "SELECT arrayStringConcat(arrayFilter("
+            f"x -> positionCaseInsensitive(x, '{event_filter}') > 0, "
+            "mapKeys(ProfileEvents)), ',') "
+            "FROM system.query_log "
+            f"WHERE query_id = '{query_id}' AND type = 'QueryFinish' "
+            "ORDER BY event_time_microseconds DESC LIMIT 1"
+        )
+        if expected in events:
+            return events
+        time.sleep(0.1)
+    raise RuntimeError(f"{expected} was not recorded: {events}")
+
+
+
+
+
+
+require(
+    query("SELECT value FROM system.server_settings WHERE name = 'max_concurrent_queries'")
+    == "16",
+    "managed max_concurrent_queries is not 16",
+)
+require(
+    query(
+        "SELECT value FROM system.server_settings "
+        "WHERE name = 'max_server_memory_usage_to_ram_ratio'"
+    )
+    == "0.75",
+    "managed memory ratio is not 0.75",
+)
+memory_ceiling = int(
+    query(
+        "SELECT toUInt64(value) FROM system.settings "
+        "WHERE name = 'max_memory_usage_for_user'"
+    )
+)
+require(
+    0 < memory_ceiling <= 2147483648,
+    f"aggregate query memory ceiling is invalid: {memory_ceiling}",
+)
+require(
+    query(
+        "SELECT count() FROM system.workloads WHERE name IN "
+        "('moraine_all', 'moraine_interactive', 'moraine_background', "
+        "'moraine_migration', 'moraine_administrative', 'default')"
+    )
+    == "6",
+    "managed workload hierarchy is incomplete",
+)
+
+query(
+    f"CREATE TABLE {database}.{table} (value UInt64) "
+    "ENGINE = MergeTree ORDER BY value"
+)
+try:
+    query(f"INSERT INTO {database}.{table} SELECT number FROM numbers(1000)")
+    query(f"INSERT INTO {database}.{table} SELECT number FROM numbers(1000, 1000)")
+    heartbeat_before = query(
+        f"SELECT toString(max(ts)) FROM {database}.ingest_heartbeats"
+    )
+
+    def slow(index):
+        result = ""
+        for iteration in range(3):
+            result = query(
+                "SELECT sleep(3)",
+                query_id=f"resource-fixture-{run_stamp}-{index}-{iteration}",
+                **interactive,
+            )
+        return result
+
+    def fast():
+        return query(
+            "SELECT 1",
+            query_id=f"resource-fixture-{run_stamp}-queued",
+            **interactive,
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+        active = [pool.submit(slow, index) for index in range(4)]
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            running = int(
+                query(
+                    "SELECT count() FROM system.processes WHERE "
+                    f"startsWith(query_id, 'resource-fixture-{run_stamp}-')"
+                )
+            )
+            if running == 4:
+                break
+            time.sleep(0.05)
+        require(running == 4, f"expected four interactive queries, observed {running}")
+        peak_query_memory = int(
+            query(
+                "SELECT coalesce(sum(memory_usage), 0) FROM system.processes WHERE "
+                f"startsWith(query_id, 'resource-fixture-{run_stamp}-')"
+            )
+        )
+        require(
+            peak_query_memory <= memory_ceiling,
+            f"query memory {peak_query_memory} exceeded user ceiling {memory_ceiling}",
+        )
+
+        queued_started = time.monotonic()
+        queued = pool.submit(fast)
+        time.sleep(0.1)
+        require(not queued.done(), "fifth interactive query was admitted instead of queued")
+        background_started = time.monotonic()
+        require(query("SELECT 1", **background) == "1", "reserved background query failed")
+        query(f"OPTIMIZE TABLE {database}.{table} FINAL", **background)
+        background_elapsed = time.monotonic() - background_started
+        heartbeat_deadline = time.monotonic() + 7
+        while time.monotonic() < heartbeat_deadline:
+            heartbeat_after = query(
+                f"SELECT toString(max(ts)) FROM {database}.ingest_heartbeats"
+            )
+            if heartbeat_after > heartbeat_before:
+                break
+            time.sleep(0.2)
+        require(
+            heartbeat_after > heartbeat_before,
+            "ingest heartbeat stopped while interactive reads were active",
+        )
+        require(
+            all(not future.done() for future in active),
+            "interactive pressure ended before ingestion continuity was observed",
+        )
+        require(queued.result() == "1", "queued interactive query returned an unexpected value")
+        queued_elapsed = time.monotonic() - queued_started
+        for future in active:
+            future.result()
+
+    require(
+        background_elapsed < 1.0,
+        f"reserved background capacity stalled for {background_elapsed:.3f}s",
+    )
+    require(
+        queued_elapsed > 1.5,
+        f"fifth interactive query did not queue: {queued_elapsed:.3f}s",
+    )
+    require(
+        query(
+            "SELECT count() FROM system.parts WHERE active "
+            f"AND database = '{database}' AND table = '{table}'"
+        )
+        == "1",
+        "background merge did not complete under interactive pressure",
+    )
+    require(
+        heartbeat_after > heartbeat_before,
+        "ingest heartbeat did not advance under interactive pressure",
+    )
+
+    spill_query_id = f"resource-spill-{run_stamp}"
+    query(
+        "SELECT count() FROM "
+        "(SELECT number, count() FROM numbers(2000000) GROUP BY number) FORMAT Null",
+        workload="moraine_interactive",
+        query_id=spill_query_id,
+        max_memory_usage="268435456",
+        max_bytes_before_external_group_by="1048576",
+        max_bytes_ratio_before_external_group_by="0",
+        max_temporary_data_on_disk_size_for_query="536870912",
+    )
+    sort_query_id = f"resource-sort-spill-{run_stamp}"
+    query(
+        "SELECT number FROM numbers(2000000) "
+        "ORDER BY sipHash64(number) FORMAT Null",
+        workload="moraine_interactive",
+        query_id=sort_query_id,
+        max_memory_usage="268435456",
+        max_bytes_before_external_sort="1048576",
+        max_bytes_ratio_before_external_sort="0",
+        max_temporary_data_on_disk_size_for_query="536870912",
+    )
+    spill_events = wait_for_profile_event(
+        spill_query_id,
+        "External",
+        "ExternalAggregationWritePart",
+    )
+    sort_spill_events = wait_for_profile_event(
+        sort_query_id,
+        "ExternalSort",
+        "ExternalSortWritePart",
+    )
+finally:
+    query(f"DROP TABLE IF EXISTS {database}.{table}")
+
+print(
+    "resource governance PASS: "
+    f"background={background_elapsed:.3f}s queued={queued_elapsed:.3f}s "
+    f"peak_memory={peak_query_memory}/{memory_ceiling} "
+    f"group_spill={spill_events} sort_spill={sort_spill_events}"
+)
+PY
+}
+
 read_live_pid_file() {
   local path="$1"
   local label="$2"
@@ -1510,6 +1815,22 @@ EOF
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_postings WHERE term = '${nac_keyword}'" 120
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-nac' AND tool_call_id = '${nac_tool_call_id}'" 120
 
+  echo "[e2e] checking managed ClickHouse resource upgrade"
+  assert_managed_clickhouse_resource_upgrade \
+    "$python_bin" \
+    "$moraine_bin" \
+    "$config_path" \
+    "$runtime_root" \
+    "$clickhouse_url"
+  clickhouse_pid="$(read_live_pid_file "$clickhouse_pid_file" "clickhouse after resource upgrade")"
+
+  echo "[e2e] checking managed ClickHouse resource governance"
+  assert_clickhouse_resource_governance \
+    "$python_bin" \
+    "$clickhouse_url" \
+    "$clickhouse_database" \
+    "$run_stamp"
+
   echo "[e2e] checking ClickHouse normalized ingest rows"
   assert_clickhouse_count "$clickhouse_url" "non-Qwen ingest errors" "SELECT count() FROM ${clickhouse_database}.ingest_errors WHERE source_name != 'qwen-code'" "0"
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.ingest_errors WHERE source_name = 'qwen-code' AND error_kind = 'timestamp_parse_error'" 120
@@ -2443,6 +2764,25 @@ if status.get("monitor_url") != expected_monitor_url:
     raise SystemExit(
         f"full-stack status monitor URL mismatch: {status.get('monitor_url')!r}"
     )
+pressure = status.get("query_pressure")
+profiles = ("interactive", "background", "migration", "administrative")
+if not isinstance(pressure, dict) or pressure.get("scope") != "process":
+    raise SystemExit(f"full-stack status omitted process-local query pressure: {pressure!r}")
+for profile in profiles:
+    counters = pressure.get(profile)
+    if not isinstance(counters, dict):
+        raise SystemExit(f"full-stack status omitted {profile} pressure: {pressure!r}")
+    for name in ("running", "queued", "rejected"):
+        if not isinstance(counters.get(name), int):
+            raise SystemExit(
+                f"full-stack status returned invalid {profile}.{name}: {counters!r}"
+            )
+if not isinstance(pressure.get("resource_limit_events"), int):
+    raise SystemExit(f"full-stack status omitted resource-limit events: {pressure!r}")
+serialized_pressure = json.dumps(pressure)
+for forbidden in ("query_text", "SELECT", "password", "text_content"):
+    if forbidden in serialized_pressure:
+        raise SystemExit(f"query pressure leaked content marker {forbidden!r}")
 PY
 
   # Capture every normal service query exercised since the MCP/Monitor query-log

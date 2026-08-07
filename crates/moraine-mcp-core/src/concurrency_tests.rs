@@ -480,7 +480,7 @@ async fn full_queue_returns_structured_overload_within_one_hundred_milliseconds(
     assert_eq!(overloaded["result"]["isError"], json!(true));
     assert_eq!(
         overloaded["result"]["structuredContent"]["error"]["code"],
-        json!("resource_exhausted")
+        json!("busy")
     );
     assert_eq!(
         overloaded["result"]["structuredContent"]["error"]["details"]["reason"],

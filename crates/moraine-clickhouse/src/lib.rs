@@ -17,10 +17,13 @@ use std::time::Duration;
 
 pub mod mcp_tool_names;
 pub mod owner;
-use owner::{error_for_cause, extract_exception_code, AdminBackend, StatementTicket};
+use owner::{
+    error_for_cause, extract_exception_code, AdminBackend, QueryResourceProfile,
+    StatementAdmission, StatementTicket,
+};
 pub use owner::{
-    ClickHouseError, ClickHouseErrorCategory, OwnerGuard, QueryCause, QueryOwner, QueryRuntime,
-    QueryWorkload, QUERY_CLEANUP_GRACE,
+    ClickHouseError, ClickHouseErrorCategory, OwnerGuard, QueryCause, QueryOwner,
+    QueryPressureSnapshot, QueryProfilePressure, QueryRuntime, QueryWorkload, QUERY_CLEANUP_GRACE,
 };
 
 const MAX_INSERT_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
@@ -32,6 +35,15 @@ const RESERVED_PARAMS: &[&str] = &[
     "max_execution_time_leaf",
     "timeout_overflow_mode",
     "timeout_before_checking_execution_speed",
+    "workload",
+    "max_memory_usage",
+    "max_memory_usage_for_user",
+    "max_bytes_before_external_group_by",
+    "max_bytes_before_external_sort",
+    "max_bytes_ratio_before_external_group_by",
+    "max_bytes_ratio_before_external_sort",
+    "max_temporary_data_on_disk_size_for_query",
+    "max_temporary_data_on_disk_size_for_user",
 ];
 
 #[derive(Clone)]
@@ -44,6 +56,7 @@ struct ClientInner {
     http: Client,
     admin: Arc<AdminBackend>,
     runtime: QueryRuntime,
+    workload_capability: tokio::sync::Mutex<Option<bool>>,
 }
 
 pub struct ClickHouseByteStream {
@@ -239,6 +252,7 @@ impl ClickHouseClient {
             cfg.username.clone(),
             cfg.password.clone(),
             default_headers,
+            &runtime,
         )?;
 
         Ok(Self {
@@ -247,6 +261,7 @@ impl ClickHouseClient {
                 http,
                 admin,
                 runtime,
+                workload_capability: tokio::sync::Mutex::new(None),
             }),
         })
     }
@@ -263,6 +278,75 @@ impl ClickHouseClient {
         validate_base_url(&self.cfg.url).map_err(Into::into)
     }
 
+    pub async fn execute_administrative(&self, query: &str, timeout: Duration) -> Result<String> {
+        self.inner
+            .admin
+            .execute_unprofiled(query, timeout)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn managed_workloads_available(
+        &self,
+        owner: &QueryOwner,
+        admission: StatementAdmission,
+    ) -> Result<(bool, StatementAdmission)> {
+        let cancellation = owner.cancellation_token();
+        let capability = self.inner.workload_capability.lock();
+        tokio::pin!(capability);
+        let mut capability = tokio::select! {
+            capability = &mut capability => capability,
+            _ = cancellation.cancelled() => {
+                return Err(error_for_cause(
+                    owner.cause().unwrap_or(QueryCause::Abandoned),
+                    "query owner is no longer active",
+                )
+                .into());
+            }
+        };
+        if let Some(available) = *capability {
+            return Ok((available, admission));
+        }
+        let probe_timeout = owner
+            .remaining()?
+            .map_or(Duration::from_secs(2), |remaining| {
+                remaining.min(Duration::from_secs(2))
+            });
+        let mut ticket =
+            owner.register_statement(&self.inner.runtime, self.inner.admin.clone(), admission)?;
+        let probe_query_id = ticket.query_id().to_owned();
+        let probe = self.inner.admin.probe_unprofiled(
+            "SELECT count() FROM system.workloads WHERE name IN ('moraine_all', 'moraine_interactive', 'moraine_background', 'moraine_migration', 'moraine_administrative', 'default') FORMAT TabSeparated",
+            probe_timeout,
+            &probe_query_id,
+        );
+        ticket.mark_attempted();
+        tokio::pin!(probe);
+        let response = tokio::select! {
+            response = &mut probe => response,
+            _ = cancellation.cancelled() => {
+                return Err(error_for_cause(
+                    owner.cause().unwrap_or(QueryCause::Abandoned),
+                    "query owner is no longer active",
+                )
+                .into());
+            }
+        };
+        owner.remaining()?;
+        let available = match response {
+            Ok(value) => value.trim().parse::<u64>().ok() == Some(6),
+            Err(error) if error.status().is_some() => false,
+            Err(error) => {
+                ticket.fail(QueryCause::Backend);
+                return Err(error.into());
+            }
+        };
+        let admission = ticket.succeed_reusing_admission();
+        self.inner.admin.set_managed_workloads_available(available);
+        *capability = Some(available);
+        Ok((available, admission))
+    }
+
     async fn request_builder(
         &self,
         query: &str,
@@ -275,8 +359,12 @@ impl ClickHouseClient {
         })?;
         owner.ensure_runtime(&self.inner.runtime)?;
         validate_request_params(options.params)?;
+        owner.remaining()?;
+        let admission = self.inner.runtime.admit_statement(&owner).await?;
+        let profile = QueryResourceProfile::from(owner.workload());
+        let (managed_workloads, admission) =
+            self.managed_workloads_available(&owner, admission).await?;
         let mut url = self.base_url()?;
-
         let (body, content_encoding) = match (self.cfg.request_compression, body.is_empty()) {
             (_, true) | (ClickHouseRequestCompression::None, false) => (body, None),
             (ClickHouseRequestCompression::Gzip, false) => {
@@ -298,12 +386,31 @@ impl ClickHouseClient {
         // The absolute deadline is checked again after potentially expensive
         // compression. Expired operations register no child and send zero bytes.
         let remaining = owner.remaining()?;
-        let ticket = owner.register_statement(&self.inner.runtime, self.inner.admin.clone())?;
+        let ticket =
+            owner.register_statement(&self.inner.runtime, self.inner.admin.clone(), admission)?;
         {
             let mut qp = url.query_pairs_mut();
             qp.append_pair("query", query);
             qp.append_pair("query_id", ticket.query_id());
             qp.append_pair("replace_running_query", "0");
+            if managed_workloads {
+                qp.append_pair("workload", profile.workload_name());
+            }
+            qp.append_pair("max_memory_usage", &profile.memory_bytes().to_string());
+            qp.append_pair(
+                "max_bytes_before_external_group_by",
+                &profile.spill_bytes().to_string(),
+            );
+            qp.append_pair(
+                "max_bytes_before_external_sort",
+                &profile.spill_bytes().to_string(),
+            );
+            qp.append_pair("max_bytes_ratio_before_external_group_by", "0");
+            qp.append_pair("max_bytes_ratio_before_external_sort", "0");
+            qp.append_pair(
+                "max_temporary_data_on_disk_size_for_query",
+                &profile.temporary_disk_bytes().to_string(),
+            );
             if let Some(database) = options.database {
                 qp.append_pair("database", database);
             }
@@ -1128,11 +1235,13 @@ fn classify_exception(
 }
 
 fn classify_code(owner: &Arc<QueryOwner>, code: Option<u32>) -> ClickHouseErrorCategory {
-    match code {
+    let category = match code {
         Some(159 | 160 | 209) => ClickHouseErrorCategory::DeadlineExceeded,
-        Some(158 | 202 | 241 | 307 | 396) => ClickHouseErrorCategory::ResourceExhausted,
+        Some(202 | 745) => ClickHouseErrorCategory::Busy,
+        Some(158 | 241 | 243 | 307 | 396) => ClickHouseErrorCategory::ResourceExhausted,
         Some(394) => match owner.cause() {
             Some(QueryCause::Deadline) => ClickHouseErrorCategory::DeadlineExceeded,
+            Some(QueryCause::Busy) => ClickHouseErrorCategory::Busy,
             Some(
                 QueryCause::Explicit
                 | QueryCause::Disconnect
@@ -1142,13 +1251,23 @@ fn classify_code(owner: &Arc<QueryOwner>, code: Option<u32>) -> ClickHouseErrorC
             _ => ClickHouseErrorCategory::Backend,
         },
         _ => ClickHouseErrorCategory::Backend,
+    };
+    if category == ClickHouseErrorCategory::ResourceExhausted {
+        owner.runtime().record_resource_limit_event();
     }
+    if matches!(code, Some(202 | 745)) {
+        owner
+            .runtime()
+            .record_rejection(QueryResourceProfile::from(owner.workload()));
+    }
+    category
 }
 
 fn cause_for_error(error: &ClickHouseError) -> QueryCause {
     match error.category() {
         ClickHouseErrorCategory::Cancelled => QueryCause::Explicit,
         ClickHouseErrorCategory::DeadlineExceeded => QueryCause::Deadline,
+        ClickHouseErrorCategory::Busy => QueryCause::Busy,
         ClickHouseErrorCategory::ResourceExhausted => QueryCause::ResourceExhausted,
         ClickHouseErrorCategory::Backend | ClickHouseErrorCategory::OwnershipViolation => {
             QueryCause::Backend
@@ -1553,6 +1672,12 @@ mod tests {
         }
     }
 
+    fn is_workload_capability_probe(params: &HashMap<String, String>) -> bool {
+        params
+            .get("query")
+            .is_some_and(|query| query.contains("FROM system.workloads"))
+    }
+
     async fn spawn_mock_server() -> String {
         async fn handler(
             Query(params): Query<HashMap<String, String>>,
@@ -1565,6 +1690,9 @@ mod tests {
                 );
             }
 
+            if is_workload_capability_probe(&params) {
+                return (StatusCode::OK, "0".to_string());
+            }
             let query = params.get("query").cloned().unwrap_or_default();
             if query.contains("FAIL") {
                 return (StatusCode::INTERNAL_SERVER_ERROR, "boom".to_string());
@@ -1605,6 +1733,9 @@ mod tests {
             State(state): State<MigrationMockState>,
             Query(params): Query<HashMap<String, String>>,
         ) -> (StatusCode, String) {
+            if is_workload_capability_probe(&params) {
+                return (StatusCode::OK, "0".to_string());
+            }
             let query = params.get("query").cloned().unwrap_or_default();
             state
                 .queries
@@ -1644,12 +1775,19 @@ mod tests {
     }
 
     async fn spawn_insert_capture_server(lengths: Arc<Mutex<Vec<usize>>>) -> String {
-        async fn handler(State(lengths): State<Arc<Mutex<Vec<usize>>>>, body: Bytes) -> StatusCode {
+        async fn handler(
+            State(lengths): State<Arc<Mutex<Vec<usize>>>>,
+            Query(params): Query<HashMap<String, String>>,
+            body: Bytes,
+        ) -> (StatusCode, &'static str) {
+            if is_workload_capability_probe(&params) {
+                return (StatusCode::OK, "0");
+            }
             lengths
                 .lock()
                 .expect("length capture mutex poisoned")
                 .push(body.len());
-            StatusCode::OK
+            (StatusCode::OK, "")
         }
 
         let app = Router::new()
@@ -1688,6 +1826,9 @@ mod tests {
             headers: HeaderMap,
             body: Bytes,
         ) -> (StatusCode, &'static str) {
+            if is_workload_capability_probe(&params) {
+                return (StatusCode::OK, "6");
+            }
             state
                 .requests
                 .lock()
@@ -1723,8 +1864,12 @@ mod tests {
     ) -> String {
         async fn handler(
             State(user_agents): State<Arc<Mutex<Vec<Option<String>>>>>,
+            Query(params): Query<HashMap<String, String>>,
             headers: HeaderMap,
         ) -> (StatusCode, &'static str) {
+            if is_workload_capability_probe(&params) {
+                return (StatusCode::OK, "0");
+            }
             user_agents
                 .lock()
                 .expect("user-agent capture mutex poisoned")
@@ -1764,6 +1909,9 @@ mod tests {
             Query(params): Query<HashMap<String, String>>,
             headers: HeaderMap,
         ) -> (StatusCode, &'static str) {
+            if is_workload_capability_probe(&params) {
+                return (StatusCode::OK, "0");
+            }
             state
                 .params
                 .lock()
@@ -1808,6 +1956,9 @@ mod tests {
             State(state): State<SkewMockState>,
             Query(params): Query<HashMap<String, String>>,
         ) -> (StatusCode, String) {
+            if is_workload_capability_probe(&params) {
+                return (StatusCode::OK, "0".to_string());
+            }
             let query = params.get("query").cloned().unwrap_or_default();
             state
                 .queries
@@ -1861,7 +2012,20 @@ mod tests {
             if let Ok((mut stream, _)) = listener.accept() {
                 let mut request = [0_u8; 4096];
                 let _ = stream.read(&mut request);
-
+                let response = concat!(
+                    "HTTP/1.1 200 OK\r\n",
+                    "Content-Type: text/plain; charset=utf-8\r\n",
+                    "Content-Length: 1\r\n",
+                    "Connection: close\r\n",
+                    "\r\n",
+                    "0",
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut request = [0_u8; 4096];
+                let _ = stream.read(&mut request);
                 let response = concat!(
                     "HTTP/1.1 200 OK\r\n",
                     "Content-Type: text/plain; charset=utf-8\r\n",
@@ -2799,6 +2963,45 @@ mod tests {
         assert_eq!(requests.len(), 1);
         assert!(requests[0].headers.get("content-encoding").is_none());
         assert_eq!(requests[0].body, payload);
+        let params = &requests[0].params;
+        assert_eq!(
+            params.get("workload").map(String::as_str),
+            Some("moraine_administrative")
+        );
+        assert_eq!(
+            params.get("max_memory_usage").map(String::as_str),
+            Some("134217728")
+        );
+        assert_eq!(
+            params
+                .get("max_bytes_before_external_group_by")
+                .map(String::as_str),
+            Some("33554432")
+        );
+        assert_eq!(
+            params
+                .get("max_bytes_before_external_sort")
+                .map(String::as_str),
+            Some("33554432")
+        );
+        assert_eq!(
+            params
+                .get("max_bytes_ratio_before_external_group_by")
+                .map(String::as_str),
+            Some("0")
+        );
+        assert_eq!(
+            params
+                .get("max_bytes_ratio_before_external_sort")
+                .map(String::as_str),
+            Some("0")
+        );
+        assert_eq!(
+            params
+                .get("max_temporary_data_on_disk_size_for_query")
+                .map(String::as_str),
+            Some("134217728")
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2830,6 +3033,126 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("0")
         );
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn workload_probe_observes_owner_cancellation_before_data_egress() {
+        #[derive(Clone)]
+        struct ProbeState {
+            started: Arc<tokio::sync::Notify>,
+            probe_query_id: Arc<Mutex<Option<String>>>,
+            process_polls: Arc<std::sync::atomic::AtomicUsize>,
+            kill_requests: Arc<std::sync::atomic::AtomicUsize>,
+            data_requests: Arc<std::sync::atomic::AtomicUsize>,
+        }
+
+        async fn handler(
+            State(state): State<ProbeState>,
+            Query(params): Query<HashMap<String, String>>,
+        ) -> (StatusCode, String) {
+            if is_workload_capability_probe(&params) {
+                *state
+                    .probe_query_id
+                    .lock()
+                    .expect("probe query id mutex poisoned") = params.get("query_id").cloned();
+                state.started.notify_one();
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                return (StatusCode::OK, "0".to_string());
+            }
+            let query = params.get("query").map(String::as_str).unwrap_or_default();
+            if query.starts_with("KILL QUERY") {
+                state
+                    .kill_requests
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return (StatusCode::OK, String::new());
+            }
+            if query.starts_with("SELECT query_id FROM system.processes") {
+                let poll = state
+                    .process_polls
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let body = if poll == 0 {
+                    state
+                        .probe_query_id
+                        .lock()
+                        .expect("probe query id mutex poisoned")
+                        .as_ref()
+                        .map(|query_id| format!("{{\"query_id\":\"{query_id}\"}}\n"))
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                return (StatusCode::OK, body);
+            }
+            state
+                .data_requests
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (StatusCode::OK, "ok".to_string())
+        }
+
+        let state = ProbeState {
+            started: Arc::new(tokio::sync::Notify::new()),
+            probe_query_id: Arc::new(Mutex::new(None)),
+            process_polls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            kill_requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            data_requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+        let app = Router::new()
+            .route("/", post(handler))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind workload probe server");
+        let addr = listener.local_addr().expect("workload probe address");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let runtime = QueryRuntime::new();
+        let client = ClickHouseClient::new_with_runtime(
+            test_clickhouse_config(format!("http://{addr}")),
+            runtime.clone(),
+        )
+        .expect("new client");
+        let owner = QueryOwner::new(&runtime, QueryWorkload::Mcp).expect("query owner");
+        let request_owner = owner.clone();
+        let task = tokio::spawn(async move {
+            request_owner
+                .scope(client.request_text("SELECT 1", None, None, false, None))
+                .await
+        });
+        state.started.notified().await;
+        owner.cancel(QueryCause::Explicit);
+        let error = tokio::time::timeout(Duration::from_millis(250), task)
+            .await
+            .expect("owner cancellation interrupts capability probe")
+            .expect("request task")
+            .expect_err("cancelled capability probe");
+        assert_eq!(
+            error
+                .downcast_ref::<ClickHouseError>()
+                .map(ClickHouseError::category),
+            Some(ClickHouseErrorCategory::Cancelled)
+        );
+        assert_eq!(
+            state
+                .data_requests
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if state
+                    .kill_requests
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    > 0
+                    && runtime.active_owner_count() == 0
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cancelled capability probe is killed and drained");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2925,6 +3248,11 @@ mod tests {
             .is_some_and(|id| id.starts_with("moraine-internal-")));
         assert_eq!(params[0].get("readonly").map(String::as_str), Some("1"));
         assert!(!params[0].contains_key("max_execution_time"));
+        assert!(!params[0].contains_key("workload"));
+        assert_eq!(
+            params[0].get("max_memory_usage").map(String::as_str),
+            Some("134217728")
+        );
 
         let content_lengths = content_lengths
             .lock()
@@ -3517,12 +3845,21 @@ mod tests {
                     ClickHouseErrorCategory::DeadlineExceeded
                 );
             }
-            for code in [158, 202, 241, 307, 396] {
+            for code in [202, 745] {
+                assert_eq!(
+                    classify_code(&owner, Some(code)),
+                    ClickHouseErrorCategory::Busy
+                );
+            }
+            for code in [158, 241, 243, 307, 396] {
                 assert_eq!(
                     classify_code(&owner, Some(code)),
                     ClickHouseErrorCategory::ResourceExhausted
                 );
             }
+            let pressure = domain.pressure_snapshot();
+            assert_eq!(pressure.administrative.rejected, 2);
+            assert_eq!(pressure.resource_limit_events, 5);
             assert_eq!(
                 classify_code(&owner, Some(394)),
                 ClickHouseErrorCategory::Backend
@@ -3539,7 +3876,11 @@ mod tests {
     async fn malformed_json_envelope_is_not_replayed() {
         async fn malformed(
             State(requests): State<Arc<Mutex<Vec<()>>>>,
+            Query(params): Query<HashMap<String, String>>,
         ) -> (StatusCode, &'static str) {
+            if is_workload_capability_probe(&params) {
+                return (StatusCode::OK, "0");
+            }
             requests.lock().unwrap().push(());
             (StatusCode::OK, "not-json")
         }
@@ -3642,6 +3983,9 @@ mod tests {
             State(state): State<StateData>,
             Query(params): Query<HashMap<String, String>>,
         ) -> Response<Body> {
+            if is_workload_capability_probe(&params) {
+                return Response::new(Body::from("0"));
+            }
             let query = params.get("query").cloned().unwrap_or_default();
             state.requests.lock().unwrap().push(params);
             if query.starts_with("KILL QUERY") {
@@ -3763,6 +4107,9 @@ mod tests {
             headers: HeaderMap,
             body: Bytes,
         ) -> (StatusCode, String) {
+            if is_workload_capability_probe(&params) {
+                return (StatusCode::OK, "6".to_string());
+            }
             let query = params.get("query").cloned().unwrap_or_default();
             state.requests.lock().unwrap().push(CapturedRequest {
                 params,
@@ -3865,9 +4212,22 @@ mod tests {
                 .all(|request| request.headers.get("content-length").unwrap() == "0"),
             "empty administrative POSTs must carry an explicit zero content length"
         );
+        assert!(
+            captured.iter().all(|request| {
+                request.params.get("workload").map(String::as_str) == Some("moraine_administrative")
+                    && request.params.get("max_memory_usage").map(String::as_str)
+                        == Some("134217728")
+                    && request
+                        .params
+                        .get("max_temporary_data_on_disk_size_for_query")
+                        .map(String::as_str)
+                        == Some("134217728")
+            }),
+            "administrative cleanup requests must use the reserved bounded profile"
+        );
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn still_visible_cleanup_is_bounded_even_when_admin_requests_succeed() {
         #[derive(Clone)]
         struct VisibleState {
@@ -3911,6 +4271,7 @@ mod tests {
         let client =
             ClickHouseClient::new_with_runtime(test_clickhouse_config(base_url), runtime.clone())
                 .unwrap();
+        *client.inner.workload_capability.lock().await = Some(false);
         let owner = QueryOwner::new(&runtime, QueryWorkload::Administrative).unwrap();
         let mut stream = owner
             .scope(client.request_stream_with_params("SELECT 1", None, None, &[]))
@@ -3924,7 +4285,7 @@ mod tests {
         }
         let elapsed = tokio::time::Instant::now() - started;
         assert!(elapsed >= QUERY_CLEANUP_GRACE);
-        assert!(elapsed <= QUERY_CLEANUP_GRACE + Duration::from_millis(20));
+        assert!(elapsed <= QUERY_CLEANUP_GRACE + Duration::from_secs(1));
         assert!(state.kills.load(std::sync::atomic::Ordering::SeqCst) > 1);
     }
 }

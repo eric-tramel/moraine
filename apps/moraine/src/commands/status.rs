@@ -12,7 +12,7 @@ use crate::render::{
 };
 use crate::service::Service;
 use anyhow::{bail, Context, Result};
-use moraine_clickhouse::DoctorReport;
+use moraine_clickhouse::{DoctorReport, QueryPressureSnapshot};
 use moraine_config::AppConfig;
 use moraine_conversations::{
     ConversationRepository, IngestHeartbeatRead, IngestStatus, StoreDiagnostics,
@@ -70,6 +70,8 @@ struct DaemonStatusResponse {
     ingestor: DaemonIngestorStatus,
     #[serde(default)]
     ingest_status: Option<IngestStatus>,
+    #[serde(default)]
+    query_pressure: Option<QueryPressureSnapshot>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -103,6 +105,7 @@ struct StatusData {
     report: DoctorReport,
     heartbeat: HeartbeatSnapshot,
     ingest_status: Option<IngestStatus>,
+    query_pressure: Option<QueryPressureSnapshot>,
     source: StatusDataSource,
     fallback_note: Option<String>,
     clickhouse_health_url: String,
@@ -223,6 +226,7 @@ fn daemon_status_data(payload: DaemonStatusResponse) -> Result<StatusData> {
         report,
         heartbeat,
         ingest_status: payload.ingest_status,
+        query_pressure: payload.query_pressure,
         source: StatusDataSource::DaemonApi,
         fallback_note: None,
         clickhouse_health_url: payload.clickhouse.url,
@@ -420,6 +424,7 @@ async fn read_preferred_status(
                     report,
                     heartbeat,
                     ingest_status,
+                    query_pressure: None,
                     source: StatusDataSource::DirectDb,
                     fallback_note: Some(format!(
                         "daemon status API is incompatible ({}); using direct DB fallback",
@@ -437,6 +442,7 @@ async fn read_preferred_status(
         report,
         heartbeat,
         ingest_status,
+        query_pressure: None,
         source: StatusDataSource::DirectDb,
         fallback_note: None,
         clickhouse_health_url: cfg.clickhouse.url.clone(),
@@ -471,6 +477,7 @@ pub(super) async fn cmd_status(
         source: data_source,
         ingest_status,
         fallback_note,
+        query_pressure,
         clickhouse_health_url,
     } = read_preferred_status(
         cfg,
@@ -511,6 +518,7 @@ pub(super) async fn cmd_status(
         status_notes,
         doctor: report,
         ingest_status,
+        query_pressure,
         heartbeat,
     })
 }
