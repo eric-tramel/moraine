@@ -15,8 +15,13 @@ use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
 
+mod adaptive_backfill;
 pub mod mcp_tool_names;
 pub mod owner;
+use adaptive_backfill::{
+    can_split, is_memory_limit_exceeded, join_lookup_memory_budget, parse_byte_estimate,
+    push_split_children, render_hash_insert_sql, MAX_MODULUS, SAFETY_BUDGET_BYTES,
+};
 use owner::{
     error_for_cause, extract_exception_code, AdminBackend, QueryResourceProfile,
     StatementAdmission, StatementTicket,
@@ -813,6 +818,16 @@ impl ClickHouseClient {
 
             let sql = materialize_migration_sql(migration.sql, &self.cfg.database)?;
             for statement in split_sql_statements(&sql) {
+                let statement = self
+                    .prepare_migration_statement(migration.version, &statement)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed preparing migration {} statement: {}",
+                            migration.name,
+                            truncate_for_error(&statement)
+                        )
+                    })?;
                 self.request_text_with_options(
                     &statement,
                     None,
@@ -830,6 +845,11 @@ impl ClickHouseClient {
                     )
                 })?;
             }
+            self.run_migration_after_sql(migration.version)
+                .await
+                .with_context(|| {
+                    format!("failed migration {} post-SQL backfill", migration.name)
+                })?;
 
             let log_stmt = format!(
                 "INSERT INTO {}.schema_migrations (version, name) VALUES ({}, {})",
@@ -868,6 +888,149 @@ impl ClickHouseClient {
             .filter(|m| !applied.contains(m.version))
             .map(|m| m.version.to_string())
             .collect())
+    }
+
+    async fn prepare_migration_statement(&self, version: &str, statement: &str) -> Result<String> {
+        if version == "033" && is_event_uid_lookup_insert(statement) {
+            let map_bytes = self.event_uid_map_byte_estimate().await?;
+            let user_limit_bytes = self.max_user_query_memory_bytes().await?;
+            let budget = join_lookup_memory_budget(map_bytes, user_limit_bytes);
+            return Ok(rewrite_max_memory_usage(statement, budget));
+        }
+        Ok(statement.to_string())
+    }
+
+    async fn run_migration_after_sql(&self, version: &str) -> Result<()> {
+        if version == "031" {
+            self.backfill_search_postings_adaptive().await?;
+        }
+        Ok(())
+    }
+
+    async fn event_uid_map_byte_estimate(&self) -> Result<u64> {
+        let sql = format!(
+            "SELECT toUInt64(ifNull(sum(length(old_event_uid) + length(new_event_uid) + 16), 0)) \
+             FROM {}.event_uid_map_033",
+            escape_identifier(&self.cfg.database)
+        );
+        let text = self
+            .request_text_with_options(&sql, None, Some(&self.cfg.database), false, None, &[])
+            .await
+            .context("failed estimating event_uid_map_033 size")?;
+        parse_byte_estimate(&text)
+    }
+
+    async fn max_user_query_memory_bytes(&self) -> Result<u64> {
+        let text = self
+            .request_text_with_options(
+                "SELECT toUInt64(getSetting('max_memory_usage_for_user'))",
+                None,
+                Some(&self.cfg.database),
+                false,
+                None,
+                &[],
+            )
+            .await
+            .context("failed reading ClickHouse user memory limit")?;
+        parse_byte_estimate(&text)
+    }
+    async fn request_adaptive_migration_attempt(&self, query: &str) -> Result<String> {
+        let parent = QueryOwner::current().ok_or_else(|| {
+            ClickHouseError::ownership("adaptive migration attempt requires an explicit QueryOwner")
+        })?;
+        parent.ensure_runtime(&self.inner.runtime)?;
+        let owner = match parent.deadline() {
+            Some(deadline) => {
+                QueryOwner::with_deadline(&self.inner.runtime, QueryWorkload::Migration, deadline)?
+            }
+            None => QueryOwner::new(&self.inner.runtime, QueryWorkload::Migration)?,
+        };
+        let parent_token = parent.cancellation_token();
+        let attempt = owner.scope(self.request_text_with_options(
+            query,
+            None,
+            Some(&self.cfg.database),
+            false,
+            None,
+            &[],
+        ));
+        tokio::pin!(attempt);
+
+        tokio::select! {
+            result = &mut attempt => result,
+            _ = parent_token.cancelled() => {
+                let cause = parent.cause().unwrap_or(QueryCause::Abandoned);
+                owner.cancel(cause);
+                Err(error_for_cause(cause, "adaptive migration attempt cancelled").into())
+            }
+        }
+    }
+
+    async fn backfill_search_postings_adaptive(&self) -> Result<()> {
+        let db = escape_identifier(&self.cfg.database);
+        let template = format!(
+            "INSERT INTO {db}.search_postings\n\
+             SELECT d.event_version, d.term, d.event_uid, d.session_id, d.source_name,\n\
+               d.harness, d.inference_provider, d.event_class, d.payload_type, d.actor_role,\n\
+               d.name, d.phase, d.source_ref, d.doc_len, toUInt16(count())\n\
+             FROM {db}.search_postings_source_031 AS d\n\
+             WHERE d.doc_len > 0 AND lengthUTF8(d.term) BETWEEN 2 AND 64\n\
+               AND cityHash64(d.event_uid) % {{modulus}} = {{shard}}\n\
+             GROUP BY d.event_version, d.term, d.event_uid, d.session_id, d.source_name,\n\
+               d.harness, d.inference_provider, d.event_class, d.payload_type, d.actor_role,\n\
+               d.name, d.phase, d.source_ref, d.doc_len\n\
+             SETTINGS max_bytes_before_external_group_by = 67108864,\n\
+               max_bytes_before_external_sort = 67108864,\n\
+               max_block_size = 1024,\n\
+               min_insert_block_size_rows = 0,\n\
+               min_insert_block_size_bytes = 0,\n\
+               max_insert_threads = 1,\n\
+               max_threads = 1,\n\
+               max_memory_usage = {{budget}}"
+        );
+
+        let mut stack = vec![(1u64, 0u64)];
+        while let Some((modulus, shard)) = stack.pop() {
+            if modulus > MAX_MODULUS {
+                bail!(
+                    "adaptive search_postings backfill exceeded max modulus {MAX_MODULUS}; \
+                     a single partition still exceeds the safety budget"
+                );
+            }
+            let sql = render_hash_insert_sql(&template, modulus, shard, SAFETY_BUDGET_BYTES);
+            match self.request_adaptive_migration_attempt(&sql).await {
+                Ok(_) => {}
+                Err(err) if is_memory_limit_exceeded(&err) => {
+                    if !can_split(modulus, MAX_MODULUS) {
+                        return Err(err).context(format!(
+                            "adaptive search_postings backfill OOM at modulus {modulus} shard {shard}"
+                        ));
+                    }
+                    push_split_children(&mut stack, modulus, shard);
+                }
+                Err(err) => {
+                    return Err(err).context(format!(
+                        "adaptive search_postings backfill failed at modulus {modulus} shard {shard}"
+                    ));
+                }
+            }
+        }
+
+        let drop_view = format!(
+            "DROP VIEW IF EXISTS {}.search_postings_source_031",
+            escape_identifier(&self.cfg.database)
+        );
+        self.request_text_with_options(
+            &drop_view,
+            None,
+            Some(&self.cfg.database),
+            false,
+            None,
+            &[],
+        )
+        .await
+        .context("failed dropping search_postings_source_031 after adaptive backfill")?;
+        Ok(())
     }
 
     /// Probe schema skew between the server's migration ledger and this
@@ -1559,6 +1722,44 @@ fn materialize_migration_sql(sql: &str, database: &str) -> Result<String> {
     Ok(text)
 }
 
+fn is_event_uid_lookup_insert(statement: &str) -> bool {
+    let compact = statement.split_whitespace().collect::<Vec<_>>().join(" ");
+    compact
+        .split_once("INSERT INTO ")
+        .and_then(|(_, tail)| tail.split_whitespace().next())
+        .and_then(|target| target.rsplit('.').next())
+        == Some("event_uid_lookup_033")
+}
+
+fn rewrite_max_memory_usage(statement: &str, budget: u64) -> String {
+    let mut out = String::with_capacity(statement.len() + 16);
+    let needle = "max_memory_usage";
+    let mut rest = statement;
+    if let Some(idx) = rest.find(needle) {
+        out.push_str(&rest[..idx]);
+        out.push_str(needle);
+        rest = &rest[idx + needle.len()..];
+        let trimmed = rest.trim_start();
+        if let Some(eq_rest) = trimmed.strip_prefix('=') {
+            out.push_str(" = ");
+            let after_eq = eq_rest.trim_start();
+            let digits = after_eq
+                .chars()
+                .take_while(|ch| ch.is_ascii_digit())
+                .count();
+            out.push_str(&budget.to_string());
+            rest = &after_eq[digits..];
+            out.push_str(rest);
+            return out;
+        }
+    }
+    if statement.contains("SETTINGS") {
+        format!("{statement}, max_memory_usage = {budget}")
+    } else {
+        format!("{statement}\nSETTINGS max_memory_usage = {budget}")
+    }
+}
+
 fn split_sql_statements(sql: &str) -> Vec<String> {
     let mut statements = Vec::new();
     let mut current = String::new();
@@ -1751,6 +1952,11 @@ mod tests {
                     .collect::<Vec<_>>();
                 return (StatusCode::OK, json!({ "data": data }).to_string());
             }
+            if query.starts_with("SELECT toUInt64(ifNull(sum(length(old_event_uid)")
+                && query.contains("event_uid_map_033")
+            {
+                return (StatusCode::OK, "536870912\n".to_string());
+            }
             if state.fail_ledger_insert
                 && query.starts_with("INSERT INTO")
                 && query.contains("schema_migrations")
@@ -1768,6 +1974,47 @@ mod tests {
             .await
             .expect("bind migration mock listener");
         let addr = listener.local_addr().expect("migration mock listener addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}")
+    }
+    #[derive(Clone)]
+    struct AdaptiveBackfillMockState {
+        queries: Arc<Mutex<Vec<String>>>,
+    }
+
+    async fn spawn_adaptive_backfill_mock_server(state: AdaptiveBackfillMockState) -> String {
+        async fn handler(
+            State(state): State<AdaptiveBackfillMockState>,
+            Query(params): Query<HashMap<String, String>>,
+        ) -> (StatusCode, String) {
+            let query = params.get("query").cloned().unwrap_or_default();
+            state
+                .queries
+                .lock()
+                .expect("adaptive backfill query mutex poisoned")
+                .push(query.clone());
+
+            if query.contains("cityHash64(d.event_uid) % 1 = 0")
+                || query.contains("cityHash64(d.event_uid) % 2 = 0")
+            {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Code: 241. DB::Exception: Memory limit exceeded (MEMORY_LIMIT_EXCEEDED)"
+                        .to_string(),
+                );
+            }
+            (StatusCode::OK, String::new())
+        }
+
+        let app = Router::new().route("/", post(handler)).with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind adaptive backfill mock listener");
+        let addr = listener
+            .local_addr()
+            .expect("adaptive backfill mock listener addr");
         tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
@@ -2040,6 +2287,30 @@ mod tests {
         });
 
         format!("http://{}", addr)
+    }
+
+    #[test]
+    fn rewrite_max_memory_usage_replaces_existing_budget() {
+        let rewritten = rewrite_max_memory_usage(
+            "INSERT INTO t SELECT 1 SETTINGS max_block_size = 1, max_memory_usage = 1073741824",
+            42,
+        );
+        assert!(rewritten.contains("max_memory_usage = 42"));
+        assert!(!rewritten.contains("1073741824"));
+    }
+
+    #[test]
+    fn is_event_uid_lookup_insert_detects_load() {
+        assert!(is_event_uid_lookup_insert(
+            "INSERT INTO other_db.event_uid_lookup_033\nSELECT 1\nSETTINGS max_memory_usage = 1"
+        ));
+        assert!(!is_event_uid_lookup_insert(
+            "CREATE TABLE other_db.event_uid_lookup_033 (x String) ENGINE = Join(ANY, LEFT, x)"
+        ));
+        assert!(!is_event_uid_lookup_insert(
+            "INSERT INTO other_db.event_links_replay_stable_033\n\
+             SELECT joinGet('other_db.event_uid_lookup_033', 'new_event_uid', event_uid)"
+        ));
     }
 
     #[test]
@@ -2465,6 +2736,11 @@ mod tests {
                 >= 6,
             "every bulk migration insert must have a fixed memory budget"
         );
+        let uid_lookup_insert = statements
+            .iter()
+            .find(|statement| statement.starts_with("INSERT INTO other_db.event_uid_lookup_033"))
+            .expect("UID lookup load must be registered");
+        assert!(uid_lookup_insert.contains("max_memory_usage = 1073741824"));
     }
 
     #[test]
@@ -2507,6 +2783,29 @@ mod tests {
         assert_eq!(live_path_expression.matches("extractAll(").count(), 2);
         assert!(!live_path_expression.contains("[A-Za-z0-9_./-]+"));
         assert!(!live_path_expression.contains("\n      '\"((?:[^\""));
+    }
+
+    #[test]
+    fn migration_031_defers_search_postings_to_adaptive_backfill() {
+        let migration = bundled_migrations()
+            .into_iter()
+            .find(|migration| migration.version == "031")
+            .expect("migration 031 must be registered");
+        let sql = materialize_migration_sql(migration.sql, "other_db")
+            .expect("materialize migration 031");
+        let statements = split_sql_statements(&sql);
+        assert!(statements
+            .iter()
+            .any(|s| { s.starts_with("CREATE VIEW other_db.search_postings_source_031") }));
+        assert!(!statements
+            .iter()
+            .any(|s| s.starts_with("INSERT INTO other_db.search_postings")));
+        assert!(statements
+            .iter()
+            .any(|statement| statement.starts_with("INSERT INTO other_db.mcp_event_locator")));
+        assert!(statements
+            .iter()
+            .any(|statement| statement.starts_with("INSERT INTO other_db.mcp_event_navigation")));
     }
 
     #[test]
@@ -3314,6 +3613,40 @@ mod tests {
             }]
         );
     }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn adaptive_backfill_recovers_from_deep_memory_limit() {
+        let queries = Arc::new(Mutex::new(Vec::new()));
+        let base_url = spawn_adaptive_backfill_mock_server(AdaptiveBackfillMockState {
+            queries: queries.clone(),
+        })
+        .await;
+        let client = ClickHouseClient::new(test_clickhouse_config(base_url)).expect("new client");
+
+        owned(&client, client.backfill_search_postings_adaptive())
+            .await
+            .expect("adaptive backfill");
+
+        let queries = queries
+            .lock()
+            .expect("adaptive backfill query mutex poisoned");
+        let inserts = queries
+            .iter()
+            .filter(|query| query.starts_with("INSERT INTO `moraine`.search_postings"))
+            .collect::<Vec<_>>();
+        assert_eq!(inserts.len(), 5);
+        for (query, predicate) in inserts.iter().zip([
+            "cityHash64(d.event_uid) % 1 = 0",
+            "cityHash64(d.event_uid) % 2 = 0",
+            "cityHash64(d.event_uid) % 4 = 0",
+            "cityHash64(d.event_uid) % 4 = 2",
+            "cityHash64(d.event_uid) % 2 = 1",
+        ]) {
+            assert!(query.contains(predicate), "{query}");
+        }
+        assert!(queries.last().is_some_and(|query| {
+            query == "DROP VIEW IF EXISTS `moraine`.search_postings_source_031"
+        }));
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn migration_progress_applies_post_v071_migrations() {
@@ -3384,6 +3717,22 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(ledger_indices.len(), pending.len());
         assert_eq!(ledger_indices.last().copied(), Some(queries.len() - 1));
+        let map_estimates = queries
+            .iter()
+            .filter(|query| query.starts_with("SELECT toUInt64(ifNull(sum(length(old_event_uid)"))
+            .collect::<Vec<_>>();
+        assert_eq!(map_estimates.len(), 1);
+        assert!(!map_estimates[0].contains(" FINAL"));
+        let lookup_insert = queries
+            .iter()
+            .find(|query| query.starts_with("INSERT INTO moraine.event_uid_lookup_033"))
+            .expect("event UID lookup insert");
+        assert!(lookup_insert.contains("max_memory_usage = 2147483648"));
+        let links_insert = queries
+            .iter()
+            .find(|query| query.starts_with("INSERT INTO moraine.event_links_replay_stable_033"))
+            .expect("event links replay insert");
+        assert!(links_insert.contains("max_memory_usage = 1073741824"));
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -418,26 +418,16 @@ SELECT session_id,
 FROM moraine.events FINAL
 WHERE notEmpty(session_id);
 
-INSERT INTO moraine.search_postings
-SELECT d.event_version, d.term, d.event_uid, d.session_id, d.source_name,
-  d.harness, d.inference_provider, d.event_class, d.payload_type, d.actor_role,
-  d.name, d.phase, d.source_ref, d.doc_len, toUInt16(count())
-FROM
-(
-  SELECT event_version, event_uid, session_id, source_name, harness,
-    inference_provider, event_kind AS event_class, payload_type,
-    actor_kind AS actor_role, tool_name AS name,
-    if(tool_phase != '', tool_phase, op_status) AS phase, source_ref,
-    toUInt32(length(extractAll(lowerUTF8(text_content), '[a-z0-9_]+'))) AS doc_len,
-    arrayJoin(extractAll(lowerUTF8(text_content), '[a-z0-9_]+')) AS term
-  FROM moraine.events FINAL
-) AS d
-WHERE d.doc_len > 0 AND lengthUTF8(d.term) BETWEEN 2 AND 64
-GROUP BY d.event_version, d.term, d.event_uid, d.session_id, d.source_name,
-  d.harness, d.inference_provider, d.event_class, d.payload_type, d.actor_role,
-  d.name, d.phase, d.source_ref, d.doc_len
-SETTINGS max_bytes_before_external_group_by = 67108864,
-  max_bytes_before_external_sort = 67108864;
+DROP VIEW IF EXISTS moraine.search_postings_source_031;
+CREATE VIEW moraine.search_postings_source_031 AS
+SELECT event_version,
+  arrayJoin(extractAll(lowerUTF8(text_content), '[a-z0-9_]+')) AS term,
+  event_uid, session_id, source_name, harness, inference_provider,
+  event_kind AS event_class, payload_type, actor_kind AS actor_role,
+  tool_name AS name, if(tool_phase != '', tool_phase, op_status) AS phase,
+  source_ref,
+  toUInt32(length(extractAll(lowerUTF8(text_content), '[a-z0-9_]+'))) AS doc_len
+FROM moraine.events FINAL;
 
 INSERT INTO moraine.file_attention_project_roots
 SELECT project_id, worktree_root, max(observed_version)
