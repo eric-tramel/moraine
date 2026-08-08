@@ -10,9 +10,11 @@ use std::io::{ErrorKind, IsTerminal, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::cli::{SetupArgs, SetupMcpTarget};
+use crate::mcp_health::{probe_mcp_backend, McpHealthSnapshot};
+use crate::paths::load_cfg;
 use crate::render::CliOutput;
 use toml_edit::{ArrayOfTables, DocumentMut, Item, Table};
 
@@ -23,16 +25,19 @@ use harnesses::{ManagedFileWrite, McpConfigFormat, McpConfigWrite};
 const DEFAULT_CONFIG_TEMPLATE: &str = include_str!("../../../../config/moraine.toml");
 const HOST_WIDE_ACCESS_WARNING: &str =
     "Selected harness integrations get host-wide Moraine session history access visible to your user.";
+const SETUP_MCP_HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
 
-pub(super) fn handle(
+pub(super) async fn handle(
     output: &CliOutput,
     raw_config: Option<PathBuf>,
     args: SetupArgs,
 ) -> Result<ExitCode> {
     let target = resolve_setup_config_target(raw_config)?;
+    let config_path = target.path.clone();
     let interactive = can_prompt(output);
     let mut runner = RealCommandRunner;
-    let report = run_setup(output, &args, target, interactive, &mut runner)?;
+    let mut report = run_setup(output, &args, target, interactive, &mut runner)?;
+    record_setup_mcp_health(&mut report, &args, &config_path).await;
     render_report(output, &report)?;
 
     if report.success {
@@ -40,6 +45,33 @@ pub(super) fn handle(
     } else {
         Ok(ExitCode::from(1))
     }
+}
+
+async fn record_setup_mcp_health(report: &mut SetupReport, args: &SetupArgs, config_path: &Path) {
+    if args.dry_run
+        || args.skip_mcp
+        || !report
+            .mcp_targets
+            .iter()
+            .any(|target| target.status == SetupStatus::Ok)
+    {
+        return;
+    }
+
+    let health = match load_cfg(Some(config_path.to_path_buf())) {
+        Ok((_, cfg)) => {
+            probe_mcp_backend(
+                &cfg.mcp.central_socket_path,
+                &cfg.mcp.protocol_version,
+                SETUP_MCP_HEALTH_TIMEOUT,
+            )
+            .await
+        }
+        Err(_) => McpHealthSnapshot::unhealthy(
+            "load configured runtime: Moraine config could not be loaded",
+        ),
+    };
+    report.record_mcp_health(health);
 }
 
 fn can_prompt(output: &CliOutput) -> bool {
@@ -242,6 +274,7 @@ fn run_setup_with_paths(
         success,
         config,
         mcp_targets,
+        mcp_health: None,
     })
 }
 
@@ -2527,6 +2560,15 @@ struct SetupReport {
     success: bool,
     config: ConfigReport,
     mcp_targets: Vec<McpTargetReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mcp_health: Option<McpHealthSnapshot>,
+}
+
+impl SetupReport {
+    fn record_mcp_health(&mut self, health: McpHealthSnapshot) {
+        self.success &= health.healthy;
+        self.mcp_health = Some(health);
+    }
 }
 
 fn report_for_json(report: &SetupReport, verbose: bool) -> SetupReport {
@@ -2772,6 +2814,30 @@ fn render_report(output: &CliOutput, report: &SetupReport) -> Result<()> {
     }
     if !detail_lines.is_empty() {
         output.section("Integration Details", &detail_lines);
+    }
+    if let Some(health) = &report.mcp_health {
+        let status = if health.healthy {
+            SetupStatus::Ok
+        } else {
+            SetupStatus::Error
+        };
+        let mut lines = vec![format!(
+            "{} MCP initialize + ping {}",
+            status_mark(status, output.unicode),
+            if health.healthy {
+                "healthy"
+            } else {
+                "unhealthy"
+            }
+        )];
+        if let (Some(protocol), Some(server)) = (&health.protocol_version, &health.server_version) {
+            lines.push(format!("protocol: {protocol}  |  server: {server}"));
+        }
+        if let Some(error) = &health.error {
+            lines.push(format!("diagnostic: {error}"));
+            lines.push("remediation: run `moraine up`, then rerun `moraine setup`".to_string());
+        }
+        output.section("MCP Backend", &lines);
     }
 
     Ok(())
@@ -6269,6 +6335,7 @@ watch_root = "~/.codex/sessions"
                     stderr: "/sensitive/path".to_string(),
                 }],
             }],
+            mcp_health: None,
         };
 
         let redacted = report_for_json(&report, false);
@@ -6280,5 +6347,47 @@ watch_root = "~/.codex/sessions"
         let result = &verbose.mcp_targets[0].command_results[0];
         assert_eq!(result.stdout, "account@example.test");
         assert_eq!(result.stderr, "/sensitive/path");
+    }
+
+    #[tokio::test]
+    async fn unhealthy_mcp_probe_marks_setup_unsuccessful() {
+        let dir = temp_path("setup-mcp-health");
+        fs::create_dir_all(&dir).expect("create setup health directory");
+        let config_path = dir.join("moraine.toml");
+        fs::write(
+            &config_path,
+            format!(
+                "[mcp]\ncentral_socket_path = \"{}\"\n",
+                dir.join("missing.sock").display()
+            ),
+        )
+        .expect("write setup health config");
+        let args = SetupArgs {
+            yes: true,
+            dry_run: false,
+            skip_config: true,
+            skip_mcp: false,
+            repair_config: false,
+            mcp_targets: vec![SetupMcpTarget::Codex],
+        };
+        let mut target = McpTargetReport::error(SetupMcpTarget::Codex, "placeholder");
+        target.status = SetupStatus::Ok;
+        target.error = None;
+        let mut report = SetupReport {
+            success: true,
+            config: ConfigReport::skipped(&config_path, "skipped by --skip-config"),
+            mcp_targets: vec![target],
+            mcp_health: None,
+        };
+
+        record_setup_mcp_health(&mut report, &args, &config_path).await;
+
+        assert!(!report.success);
+        let health = report.mcp_health.expect("MCP health report");
+        assert!(!health.healthy);
+        let error = health.error.expect("MCP health error");
+        assert!(error.starts_with("connect: MCP socket"), "{error}");
+        assert!(!error.contains(dir.to_str().expect("UTF-8 test path")));
+        let _ = fs::remove_dir_all(dir);
     }
 }

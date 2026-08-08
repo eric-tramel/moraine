@@ -81,6 +81,10 @@ automatically falls back to a direct database read when the backend is
 unreachable. Human output labels the source as `daemon API` or `direct DB`;
 JSON output adds the compatible top-level `data_source` field with
 `daemon_api` or `direct_db`.
+It also connects directly to the backend MCP socket, completes an `initialize`
+handshake, sends the MCP `ping` health check, and reports the result as
+`mcp_health` in JSON output. This checks Moraine's shared MCP service without
+starting Codex, Claude Code, or another harness.
 
 For a local ClickHouse process started by `moraine up`, Moraine keeps a small
 supervisor running after startup. If ClickHouse exits unexpectedly, the
@@ -160,6 +164,12 @@ described in [Agent MCP Search → NAC](agent-mcp-search/install.md#nac).
 These user-scoped integrations can search the host-wide Moraine history visible
 to your user, so enable them only in trusted harness environments.
 Qwen registration does not enable Qwen's MCP trust option.
+After at least one integration is configured, setup runs the same backend MCP
+`initialize` and `ping` check. An unhealthy or stopped backend makes setup exit
+nonzero while leaving the per-target result as configured, so plugin installation
+is distinguishable from MCP service health. Run `moraine up` and rerun setup; no
+harness session is launched by this check. Dry runs and manual-only targets do
+not contact the backend.
 
 The same Codex marketplace also contains the contributor-only `moraine-dev`
 plugin for Moraine maintainers; end users should install `moraine@moraine`.

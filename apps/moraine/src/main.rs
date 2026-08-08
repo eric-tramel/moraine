@@ -1,6 +1,7 @@
 mod cli;
 mod commands;
 mod managed_clickhouse;
+mod mcp_health;
 mod paths;
 mod process;
 mod progress;
