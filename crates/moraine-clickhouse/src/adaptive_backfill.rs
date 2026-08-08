@@ -4,6 +4,7 @@ use crate::owner::{ClickHouseError, ClickHouseErrorCategory};
 
 pub(super) const SAFETY_BUDGET_BYTES: u64 = 1 << 30;
 pub(super) const MAX_MODULUS: u64 = 1 << 14;
+const MAX_JOIN_LOOKUP_BUDGET_BYTES: u64 = 2 << 30;
 
 pub(super) fn is_memory_limit_exceeded(error: &anyhow::Error) -> bool {
     for cause in error.chain() {
@@ -44,9 +45,15 @@ pub(super) fn render_hash_insert_sql(
         .replace("{budget}", &budget.to_string())
 }
 
-pub(super) fn join_lookup_memory_budget(map_bytes: u64) -> u64 {
-    let estimated = map_bytes.saturating_mul(4);
-    estimated.max(SAFETY_BUDGET_BYTES)
+pub(super) fn join_lookup_memory_budget(map_bytes: u64, user_limit_bytes: u64) -> u64 {
+    let user_limit = match user_limit_bytes {
+        0 => MAX_JOIN_LOOKUP_BUDGET_BYTES,
+        limit => limit.min(MAX_JOIN_LOOKUP_BUDGET_BYTES),
+    };
+    map_bytes
+        .saturating_mul(4)
+        .max(SAFETY_BUDGET_BYTES)
+        .min(user_limit)
 }
 
 pub(super) fn parse_byte_estimate(text: &str) -> Result<u64> {
@@ -88,12 +95,19 @@ mod tests {
     }
 
     #[test]
-    fn join_budget_scales_with_map_and_floors_at_safety() {
-        assert_eq!(join_lookup_memory_budget(0), SAFETY_BUDGET_BYTES);
-        assert_eq!(join_lookup_memory_budget(100), SAFETY_BUDGET_BYTES);
+    fn join_budget_scales_with_map_and_stays_bounded() {
+        assert_eq!(join_lookup_memory_budget(0, 0), SAFETY_BUDGET_BYTES);
         assert_eq!(
-            join_lookup_memory_budget(SAFETY_BUDGET_BYTES),
-            SAFETY_BUDGET_BYTES * 4
+            join_lookup_memory_budget(SAFETY_BUDGET_BYTES / 2, 0),
+            MAX_JOIN_LOOKUP_BUDGET_BYTES
+        );
+        assert_eq!(
+            join_lookup_memory_budget(u64::MAX, 0),
+            MAX_JOIN_LOOKUP_BUDGET_BYTES
+        );
+        assert_eq!(
+            join_lookup_memory_budget(SAFETY_BUDGET_BYTES, SAFETY_BUDGET_BYTES / 2),
+            SAFETY_BUDGET_BYTES / 2
         );
     }
 

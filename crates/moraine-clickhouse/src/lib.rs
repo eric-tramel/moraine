@@ -893,7 +893,8 @@ impl ClickHouseClient {
     async fn prepare_migration_statement(&self, version: &str, statement: &str) -> Result<String> {
         if version == "033" && is_event_uid_lookup_insert(statement) {
             let map_bytes = self.event_uid_map_byte_estimate().await?;
-            let budget = join_lookup_memory_budget(map_bytes);
+            let user_limit_bytes = self.max_user_query_memory_bytes().await?;
+            let budget = join_lookup_memory_budget(map_bytes, user_limit_bytes);
             return Ok(rewrite_max_memory_usage(statement, budget));
         }
         Ok(statement.to_string())
@@ -916,6 +917,21 @@ impl ClickHouseClient {
             .request_text_with_options(&sql, None, Some(&self.cfg.database), false, None, &[])
             .await
             .context("failed estimating event_uid_map_033 size")?;
+        parse_byte_estimate(&text)
+    }
+
+    async fn max_user_query_memory_bytes(&self) -> Result<u64> {
+        let text = self
+            .request_text_with_options(
+                "SELECT toUInt64(getSetting('max_memory_usage_for_user'))",
+                None,
+                Some(&self.cfg.database),
+                false,
+                None,
+                &[],
+            )
+            .await
+            .context("failed reading ClickHouse user memory limit")?;
         parse_byte_estimate(&text)
     }
     async fn request_adaptive_migration_attempt(&self, query: &str) -> Result<String> {
