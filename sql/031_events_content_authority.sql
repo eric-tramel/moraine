@@ -403,14 +403,7 @@ SELECT event_uid, event_version, ingested_at, session_id, source_name, source_fi
   ))),
   toUInt8(positionCaseInsensitiveUTF8(payload_json, 'codex-mcp') > 0)
 FROM moraine.events FINAL
-WHERE notEmpty(session_id)
-SETTINGS max_block_size = 1024,
-  preferred_max_column_in_block_size_bytes = 33554432,
-  min_insert_block_size_rows = 0,
-  min_insert_block_size_bytes = 0,
-  max_insert_threads = 1,
-  max_threads = 1,
-  max_memory_usage = 1073741824;
+WHERE notEmpty(session_id);
 
 INSERT INTO moraine.mcp_event_navigation
 SELECT session_id,
@@ -423,14 +416,7 @@ SELECT session_id,
   toUInt8(actor_kind = 'user' AND event_kind = 'message'),
   toUInt8(event_kind = 'session_meta' OR (source_name = 'omp' AND JSONExtractString(payload_json, 'type') IN ('title', 'title_change')))
 FROM moraine.events FINAL
-WHERE notEmpty(session_id)
-SETTINGS max_block_size = 1024,
-  preferred_max_column_in_block_size_bytes = 33554432,
-  min_insert_block_size_rows = 0,
-  min_insert_block_size_bytes = 0,
-  max_insert_threads = 1,
-  max_threads = 1,
-  max_memory_usage = 1073741824;
+WHERE notEmpty(session_id);
 
 DROP VIEW IF EXISTS moraine.search_postings_source_031;
 CREATE VIEW moraine.search_postings_source_031 AS
@@ -453,14 +439,7 @@ FROM
   FROM moraine.events FINAL
 )
 WHERE startsWith(project_id, 'git:') AND worktree_root != ''
-GROUP BY project_id, worktree_root
-SETTINGS max_block_size = 1024,
-  preferred_max_column_in_block_size_bytes = 33554432,
-  min_insert_block_size_rows = 0,
-  min_insert_block_size_bytes = 0,
-  max_insert_threads = 1,
-  max_threads = 1,
-  max_memory_usage = 1073741824;
+GROUP BY project_id, worktree_root;
 
 -- Nothing below is a runtime content authority after this point. The frozen
 -- source is emptied here but retained until this migration's ledger write.

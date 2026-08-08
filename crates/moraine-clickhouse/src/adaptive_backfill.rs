@@ -1,11 +1,11 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 
 use crate::owner::{ClickHouseError, ClickHouseErrorCategory};
 
-pub const SAFETY_BUDGET_BYTES: u64 = 1 << 30;
-pub const MAX_MODULUS: u64 = 1 << 14;
+pub(super) const SAFETY_BUDGET_BYTES: u64 = 1 << 30;
+pub(super) const MAX_MODULUS: u64 = 1 << 14;
 
-pub fn is_memory_limit_exceeded(error: &anyhow::Error) -> bool {
+pub(super) fn is_memory_limit_exceeded(error: &anyhow::Error) -> bool {
     for cause in error.chain() {
         if let Some(ch) = cause.downcast_ref::<ClickHouseError>() {
             if ch.exception_code() == Some(241) {
@@ -23,57 +23,33 @@ pub fn is_memory_limit_exceeded(error: &anyhow::Error) -> bool {
     false
 }
 
-pub fn can_split(modulus: u64, max_modulus: u64) -> bool {
+pub(super) fn can_split(modulus: u64, max_modulus: u64) -> bool {
     modulus <= max_modulus / 2
 }
 
-pub fn push_split_children(stack: &mut Vec<(u64, u64)>, modulus: u64, shard: u64) {
-    stack.push((modulus * 2, shard * 2 + 1));
-    stack.push((modulus * 2, shard * 2));
+pub(super) fn push_split_children(stack: &mut Vec<(u64, u64)>, modulus: u64, shard: u64) {
+    stack.push((modulus * 2, shard + modulus));
+    stack.push((modulus * 2, shard));
 }
 
-pub fn run_adaptive_hash_shards(
-    mut execute: impl FnMut(u64, u64) -> Result<()>,
-    is_oom: impl Fn(&anyhow::Error) -> bool,
-    max_modulus: u64,
-) -> Result<()> {
-    let mut stack = vec![(1u64, 0u64)];
-    while let Some((modulus, shard)) = stack.pop() {
-        if modulus > max_modulus {
-            bail!(
-                "adaptive hash insert exceeded max modulus {max_modulus}; \
-                 a single partition still exceeds the safety budget"
-            );
-        }
-        match execute(modulus, shard) {
-            Ok(()) => {}
-            Err(err) if is_oom(&err) => {
-                if !can_split(modulus, max_modulus) {
-                    return Err(err).context(format!(
-                        "adaptive hash insert OOM at modulus {modulus} shard {shard}"
-                    ));
-                }
-                push_split_children(&mut stack, modulus, shard);
-            }
-            Err(err) => return Err(err),
-        }
-    }
-    Ok(())
-}
-
-pub fn render_hash_insert_sql(template: &str, modulus: u64, shard: u64, budget: u64) -> String {
+pub(super) fn render_hash_insert_sql(
+    template: &str,
+    modulus: u64,
+    shard: u64,
+    budget: u64,
+) -> String {
     template
         .replace("{modulus}", &modulus.to_string())
         .replace("{shard}", &shard.to_string())
         .replace("{budget}", &budget.to_string())
 }
 
-pub fn join_lookup_memory_budget(map_bytes: u64) -> u64 {
+pub(super) fn join_lookup_memory_budget(map_bytes: u64) -> u64 {
     let estimated = map_bytes.saturating_mul(4);
     estimated.max(SAFETY_BUDGET_BYTES)
 }
 
-pub fn parse_byte_estimate(text: &str) -> Result<u64> {
+pub(super) fn parse_byte_estimate(text: &str) -> Result<u64> {
     let text = text.trim();
     if text.is_empty() {
         return Ok(0);
@@ -85,98 +61,19 @@ pub fn parse_byte_estimate(text: &str) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anyhow::bail;
-    use std::cell::RefCell;
 
     #[test]
-    fn small_corpus_runs_one_shard() {
-        let calls = RefCell::new(Vec::new());
-        run_adaptive_hash_shards(
-            |modulus, shard| {
-                calls.borrow_mut().push((modulus, shard));
-                Ok(())
-            },
-            |_| false,
-            MAX_MODULUS,
-        )
-        .unwrap();
-        assert_eq!(*calls.borrow(), vec![(1, 0)]);
-    }
+    fn split_children_exactly_partition_parent_remainder() {
+        let mut children = Vec::new();
+        push_split_children(&mut children, 8, 3);
 
-    #[test]
-    fn oom_at_root_splits_once() {
-        let calls = RefCell::new(Vec::new());
-        run_adaptive_hash_shards(
-            |modulus, shard| {
-                calls.borrow_mut().push((modulus, shard));
-                if modulus == 1 {
-                    bail!("oom");
-                }
-                Ok(())
-            },
-            |err| err.to_string().contains("oom"),
-            MAX_MODULUS,
-        )
-        .unwrap();
-        assert_eq!(*calls.borrow(), vec![(1, 0), (2, 0), (2, 1)]);
-    }
-
-    #[test]
-    fn deep_oom_splits_only_failing_branch() {
-        let calls = RefCell::new(Vec::new());
-        run_adaptive_hash_shards(
-            |modulus, shard| {
-                calls.borrow_mut().push((modulus, shard));
-                if modulus < 4 || (modulus == 4 && shard == 3) {
-                    bail!("oom");
-                }
-                Ok(())
-            },
-            |err| err.to_string().contains("oom"),
-            MAX_MODULUS,
-        )
-        .unwrap();
-        assert_eq!(
-            *calls.borrow(),
-            vec![
-                (1, 0),
-                (2, 0),
-                (4, 0),
-                (4, 1),
-                (2, 1),
-                (4, 2),
-                (4, 3),
-                (8, 6),
-                (8, 7),
-            ]
-        );
-    }
-
-    #[test]
-    fn persistent_oom_hits_max_modulus() {
-        let err = run_adaptive_hash_shards(
-            |_, _| bail!("oom"),
-            |err| err.to_string().contains("oom"),
-            4,
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("max modulus") || err.to_string().contains("OOM at"));
-    }
-
-    #[test]
-    fn non_oom_errors_do_not_split() {
-        let calls = RefCell::new(Vec::new());
-        let err = run_adaptive_hash_shards(
-            |modulus, shard| {
-                calls.borrow_mut().push((modulus, shard));
-                bail!("syntax");
-            },
-            |err| err.to_string().contains("oom"),
-            MAX_MODULUS,
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("syntax"));
-        assert_eq!(*calls.borrow(), vec![(1, 0)]);
+        assert_eq!(children, vec![(16, 11), (16, 3)]);
+        let mut child_remainders = children.iter().map(|(_, shard)| *shard).collect::<Vec<_>>();
+        child_remainders.sort_unstable();
+        let parent_remainders = (0..16)
+            .filter(|remainder| remainder % 8 == 3)
+            .collect::<Vec<_>>();
+        assert_eq!(child_remainders, parent_remainders);
     }
 
     #[test]

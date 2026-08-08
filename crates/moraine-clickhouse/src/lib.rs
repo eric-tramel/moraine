@@ -15,7 +15,7 @@ use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
 
-pub mod adaptive_backfill;
+mod adaptive_backfill;
 pub mod mcp_tool_names;
 pub mod owner;
 use adaptive_backfill::{
@@ -802,7 +802,7 @@ impl ClickHouseClient {
     async fn event_uid_map_byte_estimate(&self) -> Result<u64> {
         let sql = format!(
             "SELECT toUInt64(ifNull(sum(length(old_event_uid) + length(new_event_uid) + 16), 0)) \
-             FROM {}.event_uid_map_033 FINAL",
+             FROM {}.event_uid_map_033",
             escape_identifier(&self.cfg.database)
         );
         let text = self
@@ -810,6 +810,37 @@ impl ClickHouseClient {
             .await
             .context("failed estimating event_uid_map_033 size")?;
         parse_byte_estimate(&text)
+    }
+    async fn request_adaptive_migration_attempt(&self, query: &str) -> Result<String> {
+        let parent = QueryOwner::current().ok_or_else(|| {
+            ClickHouseError::ownership("adaptive migration attempt requires an explicit QueryOwner")
+        })?;
+        parent.ensure_runtime(&self.inner.runtime)?;
+        let owner = match parent.deadline() {
+            Some(deadline) => {
+                QueryOwner::with_deadline(&self.inner.runtime, QueryWorkload::Migration, deadline)?
+            }
+            None => QueryOwner::new(&self.inner.runtime, QueryWorkload::Migration)?,
+        };
+        let parent_token = parent.cancellation_token();
+        let attempt = owner.scope(self.request_text_with_options(
+            query,
+            None,
+            Some(&self.cfg.database),
+            false,
+            None,
+            &[],
+        ));
+        tokio::pin!(attempt);
+
+        tokio::select! {
+            result = &mut attempt => result,
+            _ = parent_token.cancelled() => {
+                let cause = parent.cause().unwrap_or(QueryCause::Abandoned);
+                owner.cancel(cause);
+                Err(error_for_cause(cause, "adaptive migration attempt cancelled").into())
+            }
+        }
     }
 
     async fn backfill_search_postings_adaptive(&self) -> Result<()> {
@@ -844,10 +875,7 @@ impl ClickHouseClient {
                 );
             }
             let sql = render_hash_insert_sql(&template, modulus, shard, SAFETY_BUDGET_BYTES);
-            match self
-                .request_text_with_options(&sql, None, Some(&self.cfg.database), false, None, &[])
-                .await
-            {
+            match self.request_adaptive_migration_attempt(&sql).await {
                 Ok(_) => {}
                 Err(err) if is_memory_limit_exceeded(&err) => {
                     if !can_split(modulus, MAX_MODULUS) {
@@ -1561,9 +1589,11 @@ fn materialize_migration_sql(sql: &str, database: &str) -> Result<String> {
 
 fn is_event_uid_lookup_insert(statement: &str) -> bool {
     let compact = statement.split_whitespace().collect::<Vec<_>>().join(" ");
-    compact.contains("INSERT INTO")
-        && compact.contains("event_uid_lookup_033")
-        && !compact.contains("CREATE TABLE")
+    compact
+        .split_once("INSERT INTO ")
+        .and_then(|(_, tail)| tail.split_whitespace().next())
+        .and_then(|target| target.rsplit('.').next())
+        == Some("event_uid_lookup_033")
 }
 
 fn rewrite_max_memory_usage(statement: &str, budget: u64) -> String {
@@ -1775,6 +1805,11 @@ mod tests {
                     .collect::<Vec<_>>();
                 return (StatusCode::OK, json!({ "data": data }).to_string());
             }
+            if query.starts_with("SELECT toUInt64(ifNull(sum(length(old_event_uid)")
+                && query.contains("event_uid_map_033")
+            {
+                return (StatusCode::OK, "536870912\n".to_string());
+            }
             if state.fail_ledger_insert
                 && query.starts_with("INSERT INTO")
                 && query.contains("schema_migrations")
@@ -1792,6 +1827,47 @@ mod tests {
             .await
             .expect("bind migration mock listener");
         let addr = listener.local_addr().expect("migration mock listener addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}")
+    }
+    #[derive(Clone)]
+    struct AdaptiveBackfillMockState {
+        queries: Arc<Mutex<Vec<String>>>,
+    }
+
+    async fn spawn_adaptive_backfill_mock_server(state: AdaptiveBackfillMockState) -> String {
+        async fn handler(
+            State(state): State<AdaptiveBackfillMockState>,
+            Query(params): Query<HashMap<String, String>>,
+        ) -> (StatusCode, String) {
+            let query = params.get("query").cloned().unwrap_or_default();
+            state
+                .queries
+                .lock()
+                .expect("adaptive backfill query mutex poisoned")
+                .push(query.clone());
+
+            if query.contains("cityHash64(d.event_uid) % 1 = 0")
+                || query.contains("cityHash64(d.event_uid) % 2 = 0")
+            {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Code: 241. DB::Exception: Memory limit exceeded (MEMORY_LIMIT_EXCEEDED)"
+                        .to_string(),
+                );
+            }
+            (StatusCode::OK, String::new())
+        }
+
+        let app = Router::new().route("/", post(handler)).with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind adaptive backfill mock listener");
+        let addr = listener
+            .local_addr()
+            .expect("adaptive backfill mock listener addr");
         tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
@@ -2050,6 +2126,10 @@ mod tests {
         ));
         assert!(!is_event_uid_lookup_insert(
             "CREATE TABLE other_db.event_uid_lookup_033 (x String) ENGINE = Join(ANY, LEFT, x)"
+        ));
+        assert!(!is_event_uid_lookup_insert(
+            "INSERT INTO other_db.event_links_replay_stable_033\n\
+             SELECT joinGet('other_db.event_uid_lookup_033', 'new_event_uid', event_uid)"
         ));
     }
 
@@ -2478,9 +2558,7 @@ mod tests {
         );
         let uid_lookup_insert = statements
             .iter()
-            .find(|statement| {
-                statement.starts_with("INSERT INTO other_db.event_uid_lookup_033")
-            })
+            .find(|statement| statement.starts_with("INSERT INTO other_db.event_uid_lookup_033"))
             .expect("UID lookup load must be registered");
         assert!(uid_lookup_insert.contains("max_memory_usage = 1073741824"));
     }
@@ -2536,22 +2614,18 @@ mod tests {
         let sql = materialize_migration_sql(migration.sql, "other_db")
             .expect("materialize migration 031");
         let statements = split_sql_statements(&sql);
-        assert!(statements.iter().any(|s| {
-            s.starts_with("CREATE VIEW other_db.search_postings_source_031")
-        }));
+        assert!(statements
+            .iter()
+            .any(|s| { s.starts_with("CREATE VIEW other_db.search_postings_source_031") }));
         assert!(!statements
             .iter()
             .any(|s| s.starts_with("INSERT INTO other_db.search_postings")));
-        for name in [
-            "INSERT INTO other_db.mcp_event_locator",
-            "INSERT INTO other_db.mcp_event_navigation",
-        ] {
-            let statement = statements
-                .iter()
-                .find(|s| s.starts_with(name))
-                .unwrap_or_else(|| panic!("{name}"));
-            assert!(statement.contains("max_memory_usage = 1073741824"));
-        }
+        assert!(statements
+            .iter()
+            .any(|statement| statement.starts_with("INSERT INTO other_db.mcp_event_locator")));
+        assert!(statements
+            .iter()
+            .any(|statement| statement.starts_with("INSERT INTO other_db.mcp_event_navigation")));
     }
 
     #[test]
@@ -3195,6 +3269,40 @@ mod tests {
             }]
         );
     }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn adaptive_backfill_recovers_from_deep_memory_limit() {
+        let queries = Arc::new(Mutex::new(Vec::new()));
+        let base_url = spawn_adaptive_backfill_mock_server(AdaptiveBackfillMockState {
+            queries: queries.clone(),
+        })
+        .await;
+        let client = ClickHouseClient::new(test_clickhouse_config(base_url)).expect("new client");
+
+        owned(&client, client.backfill_search_postings_adaptive())
+            .await
+            .expect("adaptive backfill");
+
+        let queries = queries
+            .lock()
+            .expect("adaptive backfill query mutex poisoned");
+        let inserts = queries
+            .iter()
+            .filter(|query| query.starts_with("INSERT INTO `moraine`.search_postings"))
+            .collect::<Vec<_>>();
+        assert_eq!(inserts.len(), 5);
+        for (query, predicate) in inserts.iter().zip([
+            "cityHash64(d.event_uid) % 1 = 0",
+            "cityHash64(d.event_uid) % 2 = 0",
+            "cityHash64(d.event_uid) % 4 = 0",
+            "cityHash64(d.event_uid) % 4 = 2",
+            "cityHash64(d.event_uid) % 2 = 1",
+        ]) {
+            assert!(query.contains(predicate), "{query}");
+        }
+        assert!(queries.last().is_some_and(|query| {
+            query == "DROP VIEW IF EXISTS `moraine`.search_postings_source_031"
+        }));
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn migration_progress_applies_post_v071_migrations() {
@@ -3265,6 +3373,22 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(ledger_indices.len(), pending.len());
         assert_eq!(ledger_indices.last().copied(), Some(queries.len() - 1));
+        let map_estimates = queries
+            .iter()
+            .filter(|query| query.starts_with("SELECT toUInt64(ifNull(sum(length(old_event_uid)"))
+            .collect::<Vec<_>>();
+        assert_eq!(map_estimates.len(), 1);
+        assert!(!map_estimates[0].contains(" FINAL"));
+        let lookup_insert = queries
+            .iter()
+            .find(|query| query.starts_with("INSERT INTO moraine.event_uid_lookup_033"))
+            .expect("event UID lookup insert");
+        assert!(lookup_insert.contains("max_memory_usage = 2147483648"));
+        let links_insert = queries
+            .iter()
+            .find(|query| query.starts_with("INSERT INTO moraine.event_links_replay_stable_033"))
+            .expect("event links replay insert");
+        assert!(links_insert.contains("max_memory_usage = 1073741824"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
