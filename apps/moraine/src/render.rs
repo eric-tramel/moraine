@@ -9,6 +9,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Cell, Paragraph, Row, Table, 
 use std::io::IsTerminal;
 
 use crate::cli::{Cli, OutputFormat};
+use crate::mcp_health::McpHealthSnapshot;
 use crate::process::{StartOutcome, StartState};
 use crate::service::Service;
 
@@ -92,6 +93,8 @@ pub(crate) enum HeartbeatSnapshot {
 pub(crate) struct StatusSnapshot {
     pub(crate) services: Vec<ServiceRuntimeStatus>,
     pub(crate) monitor_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) mcp_health: Option<McpHealthSnapshot>,
     pub(crate) data_source: StatusDataSource,
     pub(crate) managed_clickhouse_installed: bool,
     pub(crate) managed_clickhouse_path: String,
@@ -476,6 +479,25 @@ pub(crate) fn render_status(output: &CliOutput, snapshot: &StatusSnapshot) -> Re
         output.table("Services", &["", "state", "endpoint", "pid"], &service_rows);
     } else {
         output.table("Services", &["", "state", "endpoint"], &service_rows);
+    }
+
+    if let Some(health) = &snapshot.mcp_health {
+        let mut mcp_lines = vec![format!(
+            "{} MCP initialize + ping {}",
+            stoplight(health.healthy),
+            health_label(health.healthy)
+        )];
+        if let (Some(protocol), Some(server)) = (&health.protocol_version, &health.server_version) {
+            mcp_lines.push(format!("protocol: {protocol}  |  server: {server}"));
+        }
+        if let Some(error) = &health.error {
+            mcp_lines.push(format!("diagnostic: {error}"));
+            mcp_lines.push(
+                "remediation: run `moraine up`; if the check still fails, inspect `moraine logs backend`"
+                    .to_string(),
+            );
+        }
+        output.section("MCP", &mcp_lines);
     }
 
     // -- Database Health (concise) --
