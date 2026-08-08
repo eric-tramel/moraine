@@ -147,6 +147,7 @@ fn map_clickhouse_error(error: anyhow::Error) -> RepoError {
     match category {
         Some(ClickHouseErrorCategory::Cancelled) => RepoError::cancelled(message),
         Some(ClickHouseErrorCategory::DeadlineExceeded) => RepoError::deadline_exceeded(message),
+        Some(ClickHouseErrorCategory::Busy) => RepoError::busy(message),
         Some(ClickHouseErrorCategory::ResourceExhausted) => RepoError::resource_exhausted(message),
         Some(ClickHouseErrorCategory::Backend | ClickHouseErrorCategory::OwnershipViolation)
         | None => RepoError::backend(message),

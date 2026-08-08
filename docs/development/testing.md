@@ -30,6 +30,23 @@ Run focused suites first, then expand according to the changed contract.
 Rare/manual benchmark, paid-agent, and raw ignored-test commands stay direct and are
 listed in their owning sections rather than gaining Make wrappers.
 
+### Managed ClickHouse resource-governance fixture
+
+Run `bash scripts/ci/e2e-stack.sh` from the repository root. The command builds
+the source tree, owns an isolated managed ClickHouse/ingest/backend stack, and
+cleans it up; it requires the normal stack prerequisites listed above.
+
+The `assert_clickhouse_resource_governance` phase first verifies an in-place
+upgrade from stale permissive managed config. It then holds four interactive
+reads open, admits a fifth into the interactive queue, and concurrently checks
+that a background query, a `MergeTree` merge, and a newer ingest heartbeat all
+complete while the reads remain active. It asserts aggregate query memory
+stays below the rendered user ceiling, both `GROUP BY` and `ORDER BY` spill to
+temporary disk, the queued read eventually completes, and the slow
+low-resource reads are not killed by elapsed time. A passing run prints
+`resource governance PASS` with background/queue timing, peak memory, and both
+spill event names.
+
 ## Taxonomy and placement
 
 Classification describes the observable boundary, not the filename.

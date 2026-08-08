@@ -141,7 +141,11 @@ async fn diagnostics_maps_doctor_partial_report_and_ping_short_circuit() {
     assert!(diagnostics.errors[0].contains("version query failed"));
     assert!(diagnostics.errors[0].contains("ClickHouse request was rejected"));
     assert!(diagnostics.errors[1].contains("database existence query failed"));
-    assert!(diagnostics.errors[1].contains("query owner is no longer active"));
+    assert!(
+        diagnostics.errors[1].contains("query owner is no longer active"),
+        "{:?}",
+        diagnostics.errors
+    );
     assert_eq!(state.queries.lock().expect("query lock").len(), 2);
 
     let (down_repo, down_state) = build_scripted_repo(vec![ScriptedResponse::failure(

@@ -568,6 +568,9 @@ mod tests {
             headers: HeaderMap,
         ) -> (StatusCode, String) {
             let query = params.get("query").cloned().unwrap_or_default();
+            if query.contains("FROM system.workloads") {
+                return (StatusCode::OK, "0".to_string());
+            }
             let request_index = state.requests.fetch_add(1, Ordering::SeqCst);
             state
                 .captured

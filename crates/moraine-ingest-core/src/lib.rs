@@ -705,20 +705,24 @@ mod tests {
             .await
             .expect("ingest ClickHouse ping");
 
+        let expected_user_agent = format!(
+            "moraine-ingest/{} (pid={})",
+            moraine_config::BUILD_VERSION,
+            std::process::id()
+        );
         assert_eq!(
             user_agents
                 .lock()
                 .expect("user-agent capture mutex poisoned")
                 .as_slice(),
-            &[format!(
-                "moraine-ingest/{} (pid={})",
-                moraine_config::BUILD_VERSION,
-                std::process::id()
-            )]
+            &[expected_user_agent.clone(), expected_user_agent]
         );
         let query_ids = query_ids.lock().expect("query-id capture mutex poisoned");
-        assert_eq!(query_ids.len(), 1);
-        assert!(query_ids[0].starts_with("moraine-background-"));
+        assert_eq!(query_ids.len(), 2);
+        assert!(query_ids
+            .iter()
+            .all(|query_id| query_id.starts_with("moraine-background-")));
+        assert_ne!(query_ids[0], query_ids[1]);
     }
 
     #[test]

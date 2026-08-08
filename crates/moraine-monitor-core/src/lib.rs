@@ -12,9 +12,10 @@ use axum::{
 use moraine_config::AppConfig;
 use moraine_conversations::{
     AnalyticsRange, BackendRepository, BackendRepositoryRouter, IngestHeartbeat,
-    IngestHeartbeatRead, QueryCause, QueryOwner, QueryWorkload, RepoError, SessionAnalytics,
-    SessionAnalyticsQuery, SessionLookback, SessionStep, SessionTurn, StoreConnectionMetrics,
-    StoreHealth, StoreProbe, TablePreviewQuery, TableSummaries, QUERY_CLEANUP_GRACE,
+    IngestHeartbeatRead, QueryCause, QueryOwner, QueryRuntime, QueryWorkload, RepoError,
+    SessionAnalytics, SessionAnalyticsQuery, SessionLookback, SessionStep, SessionTurn,
+    StoreConnectionMetrics, StoreHealth, StoreProbe, TablePreviewQuery, TableSummaries,
+    QUERY_CLEANUP_GRACE,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -346,15 +347,21 @@ fn monitor_router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
+fn monitor_workload(path: &str) -> QueryWorkload {
+    match path {
+        "/health" | "/status" | "/api/health" | "/api/status" | "/api/v1/health"
+        | "/api/v1/status" => QueryWorkload::Administrative,
+        _ => QueryWorkload::Monitor,
+    }
+}
+
 async fn own_monitor_operation(
     State(state): State<Arc<AppState>>,
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    let owner = match QueryOwner::new(
-        &state.backend_router.query_runtime(),
-        QueryWorkload::Monitor,
-    ) {
+    let workload = monitor_workload(request.uri().path());
+    let owner = match QueryOwner::new(&state.backend_router.query_runtime(), workload) {
         Ok(owner) => owner,
         Err(error) => {
             warn!(error = %error, "failed to create monitor query owner");
@@ -445,6 +452,9 @@ async fn select_backend_repository(
             );
         }
     };
+    request
+        .extensions_mut()
+        .insert(backend_router.query_runtime());
     request.extensions_mut().insert(backend);
     next.run(request).await
 }
@@ -549,6 +559,7 @@ fn repo_error_http(error: &RepoError) -> (StatusCode, &'static str) {
             "cancelled",
         ),
         RepoError::DeadlineExceeded(_) => (StatusCode::GATEWAY_TIMEOUT, "deadline_exceeded"),
+        RepoError::Busy(_) => (StatusCode::TOO_MANY_REQUESTS, "busy"),
         RepoError::ResourceExhausted(_) => (StatusCode::TOO_MANY_REQUESTS, "resource_exhausted"),
         RepoError::Backend(_) => (StatusCode::SERVICE_UNAVAILABLE, "backend_failure"),
         RepoError::Internal(_) | RepoError::ReadModelChanged => {
@@ -684,6 +695,7 @@ fn health_failure_response(
 async fn api_status(
     Query(query): Query<StatusQuery>,
     Extension(backend): Extension<Arc<BackendRepository>>,
+    Extension(query_runtime): Extension<QueryRuntime>,
 ) -> Response {
     let health = match backend.repository().read_store_health().await {
         Ok(health) => health,
@@ -726,6 +738,7 @@ async fn api_status(
             },
             "ingestor": heartbeat_payload(&heartbeat),
             "ingest_status": ingest_status,
+            "query_pressure": query_runtime.pressure_snapshot(),
         }),
         StatusCode::OK,
     )
@@ -1357,6 +1370,23 @@ mod tests {
     use std::fs;
     use tower::ServiceExt;
 
+    #[test]
+    fn health_and_status_use_reserved_administrative_capacity() {
+        for path in [
+            "/health",
+            "/status",
+            "/api/health",
+            "/api/status",
+            "/api/v1/health",
+            "/api/v1/status",
+        ] {
+            assert_eq!(monitor_workload(path), QueryWorkload::Administrative);
+        }
+        for path in ["/analytics", "/api/v1/sessions", "/tables"] {
+            assert_eq!(monitor_workload(path), QueryWorkload::Monitor);
+        }
+    }
+
     fn temp_path(suffix: &str) -> PathBuf {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1896,13 +1926,29 @@ mod tests {
             json!({"backend_sinks": {"team-ch": "healthy"}})
         );
 
-        let response = api_status(Query(StatusQuery::default()), Extension(backend.clone())).await;
+        let response = api_status(
+            Query(StatusQuery::default()),
+            Extension(backend.clone()),
+            Extension(QueryRuntime::new()),
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::OK);
         let status = response_json(response).await;
         assert_eq!(status["database"]["exists"], json!(true));
         assert_eq!(status["database"]["table_count"], json!(1));
         assert_eq!(status["database"]["estimated_total_rows"], json!(7));
         assert_eq!(status["ingestor"]["latest"]["host"], json!("host-a"));
+        assert_eq!(status["query_pressure"]["scope"], json!("process"));
+        assert_eq!(status["query_pressure"]["interactive"]["running"], json!(0));
+        assert_eq!(status["query_pressure"]["interactive"]["queued"], json!(0));
+        assert_eq!(
+            status["query_pressure"]["interactive"]["rejected"],
+            json!(0)
+        );
+        assert_eq!(status["query_pressure"]["resource_limit_events"], json!(0));
+        let serialized_status = status.to_string();
+        assert!(!serialized_status.contains("query_text"));
+        assert!(!serialized_status.contains("SELECT"));
         let status_latest = status["ingestor"]["latest"]
             .as_object()
             .expect("status latest");
@@ -2132,9 +2178,15 @@ mod tests {
         let health = response_json(api_health(Extension(backend.clone())).await).await;
         assert_eq!(health["ingestor"]["latest"]["backend_sinks"], json!({}));
 
-        let status =
-            response_json(api_status(Query(StatusQuery::default()), Extension(backend)).await)
-                .await;
+        let status = response_json(
+            api_status(
+                Query(StatusQuery::default()),
+                Extension(backend),
+                Extension(QueryRuntime::new()),
+            )
+            .await,
+        )
+        .await;
         let latest = status["ingestor"]["latest"].as_object().expect("latest");
         assert!(!latest.contains_key("backend_sinks"));
         assert!(!latest.contains_key("watcher_backend"));
@@ -2704,6 +2756,11 @@ mod tests {
                 RepoError::deadline_exceeded("too late"),
                 StatusCode::GATEWAY_TIMEOUT,
                 "deadline_exceeded",
+            ),
+            (
+                RepoError::busy("queue full"),
+                StatusCode::TOO_MANY_REQUESTS,
+                "busy",
             ),
             (
                 RepoError::resource_exhausted("busy"),

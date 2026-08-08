@@ -138,6 +138,12 @@ rows. They do not use `null` to mean an empty collection.
   non-2xx response as described below. When present, its independent `health`,
   `coverage`, `freshness`, and `readiness` conditions use `true`, `false`, or
   `unknown` states with stable reason codes.
+- `query_pressure` is always present in a successful status response. Its
+  `scope` is `process`; `interactive`, `background`, `migration`, and
+  `administrative` each report current `running`/`queued` counts and a
+  cumulative `rejected` count. `resource_limit_events` is cumulative for that
+  backend process. No counter or label contains SQL, query text, credentials,
+  or user content.
 - `ingest_status.heartbeat.latest.progress` is absent on pre-034 heartbeat rows.
   A present progress snapshot freezes the startup file/byte denominator for one
   ingestor instance and advances only after checkpoint rows are durably
@@ -180,7 +186,7 @@ should branch on the HTTP status and `code`, not match arbitrary message text.
 | `403 Forbidden` | Static-file path traversal or a path that resolves outside the configured static root. The JSON error is `{"ok":false,"error":"forbidden"}`. |
 | `404 Not Found` | No requested static file exists. The JSON error is `{"ok":false,"error":"not found"}`. |
 | `405 Method Not Allowed` | The path exists but does not support the requested HTTP method. A JSON error envelope is not guaranteed. |
-| `429 Too Many Requests` | ClickHouse or admission resources are exhausted (`resource_exhausted`). |
+| `429 Too Many Requests` | Admission is full (`busy`), or a ClickHouse memory, disk, row, or byte limit was reached (`resource_exhausted`). |
 | `499 Client Closed Request` | Admitted repository work was cancelled (`cancelled`) while an HTTP response was still possible. A fully disconnected client cannot receive this response. |
 | `500 Internal Server Error` | A Moraine invariant/implementation failed (`internal_error`), or the static root/file cannot be resolved/read. |
 | `503 Service Unavailable` | A required repository, ClickHouse, or transport operation failed (`backend_failure`). |

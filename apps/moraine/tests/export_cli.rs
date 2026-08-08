@@ -126,22 +126,23 @@ fn export_uses_one_logical_owner_without_elapsed_deadline_params() {
     let captured = targets.clone();
     let versions = bundled_migration_versions();
     let server = thread::spawn(move || {
-        for index in 0..3 {
+        for index in 0..4 {
             let (mut stream, _) = listener.accept().expect("accept request");
             captured
                 .lock()
                 .expect("capture lock")
                 .push(read_request_target(&mut stream));
             let body = match index {
-                0 => json!({"data": [{"exists": 1}]}).to_string(),
-                1 => json!({
+                0 => "6".to_string(),
+                1 => json!({"data": [{"exists": 1}]}).to_string(),
+                2 => json!({
                     "data": versions
                         .iter()
                         .map(|version| json!({"version": version}))
                         .collect::<Vec<_>>()
                 })
                 .to_string(),
-                2 => "{\"event_uid\":\"event-1\",\"event_ts\":1780317296789}\n".to_string(),
+                3 => "{\"event_uid\":\"event-1\",\"event_ts\":1780317296789}\n".to_string(),
                 _ => unreachable!(),
             };
             write!(
@@ -198,7 +199,7 @@ timeout_seconds = 1.0
     assert!(logical_id.starts_with("moraine-export-"), "{logical_id}");
 
     let targets = targets.lock().expect("targets lock");
-    assert_eq!(targets.len(), 3);
+    assert_eq!(targets.len(), 4);
     for target in targets.iter() {
         assert!(!target.contains("max_execution_time"), "{target}");
         assert!(
@@ -223,27 +224,28 @@ fn broken_pipe_cancels_export_owner_before_root_drain() {
     let captured = targets.clone();
     let server = thread::spawn(move || {
         let mut export_child_id = String::new();
-        for index in 0..7 {
+        for index in 0..8 {
             let (mut stream, _) = listener.accept().expect("accept request");
             let target = read_request_target(&mut stream);
-            if index == 2 {
+            if index == 3 {
                 export_child_id = query_param(&target, "query_id")
                     .expect("export child query_id")
                     .to_string();
             }
             captured.lock().expect("capture lock").push(target);
             let body = match index {
-                0 => json!({"data": [{"exists": 1}]}).to_string(),
-                1 => json!({
+                0 => "6".to_string(),
+                1 => json!({"data": [{"exists": 1}]}).to_string(),
+                2 => json!({
                     "data": versions
                         .iter()
                         .map(|version| json!({"version": version}))
                         .collect::<Vec<_>>()
                 })
                 .to_string(),
-                2 => format!("{{\"event_uid\":\"{}\"}}\n", "x".repeat(256 * 1024)),
-                4 => format!("{{\"query_id\":\"{export_child_id}\"}}\n"),
-                3 | 5 | 6 => String::new(),
+                3 => format!("{{\"event_uid\":\"{}\"}}\n", "x".repeat(256 * 1024)),
+                5 => format!("{{\"query_id\":\"{export_child_id}\"}}\n"),
+                4 | 6 | 7 => String::new(),
                 _ => unreachable!(),
             };
             write!(
@@ -296,13 +298,13 @@ timeout_seconds = 1.0
         String::from_utf8_lossy(&output.stderr)
     );
     let targets = targets.lock().expect("targets lock");
-    let child_id = query_param(&targets[2], "query_id").expect("export child id");
+    let child_id = query_param(&targets[3], "query_id").expect("export child id");
     let decoded_child_id = child_id;
     assert!(
-        targets[3].contains("KILL+QUERY") || targets[3].contains("KILL%20QUERY"),
+        targets[4].contains("KILL+QUERY") || targets[4].contains("KILL%20QUERY"),
         "{}",
-        targets[3]
+        targets[4]
     );
-    assert!(targets[3].contains(decoded_child_id), "{}", targets[3]);
-    assert!(targets[5].contains(decoded_child_id), "{}", targets[5]);
+    assert!(targets[4].contains(decoded_child_id), "{}", targets[4]);
+    assert!(targets[6].contains(decoded_child_id), "{}", targets[6]);
 }

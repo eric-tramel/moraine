@@ -591,7 +591,7 @@ pub(crate) fn backend_endpoint_status(cfg: &AppConfig) -> BackendEndpointStatus 
     }
 }
 
-fn stop_pid_path(path: &Path, wait_attempts: usize) -> Result<bool> {
+pub(crate) fn stop_pid_path(path: &Path, wait_attempts: usize) -> Result<bool> {
     let _lock = lock_pid_path(path)?;
     let Some(pid) = read_pid(path) else {
         return Ok(false);
@@ -622,8 +622,14 @@ fn stop_pid_path(path: &Path, wait_attempts: usize) -> Result<bool> {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
-    let _ = fs::remove_file(path);
-    Ok(true)
+    for _ in 0..25 {
+        if !is_pid_running(pid) {
+            let _ = fs::remove_file(path);
+            return Ok(true);
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    anyhow::bail!("process {pid} did not stop after SIGKILL")
 }
 
 pub(crate) fn stop_service(paths: &RuntimePaths, service: Service) -> Result<bool> {

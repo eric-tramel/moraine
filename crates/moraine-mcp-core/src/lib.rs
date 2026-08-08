@@ -48,7 +48,7 @@ impl RequestLimitSource {
     }
 }
 
-const AUTOMATIC_MAX_PARALLEL_REQUESTS: usize = 8;
+const AUTOMATIC_MAX_PARALLEL_REQUESTS: usize = 4;
 const MAX_QUEUED_REQUESTS: usize = 16;
 const SEARCH_PROJECTION_RETRY_AFTER_MS: u64 = 250;
 
@@ -300,6 +300,7 @@ fn tool_output_schema(tool: &str, data_schema: Value) -> Value {
                             "unsupported_event_type",
                             "cancelled",
                             "deadline_exceeded",
+                            "busy",
                             "resource_exhausted",
                             "backend_failure",
                             "internal_error"
@@ -1053,6 +1054,9 @@ pub(crate) fn repo_error_to_contract_error(error: RepoError) -> contract::Contra
         RepoError::DeadlineExceeded(message) => {
             contract::ContractError::new(contract::ToolErrorCode::DeadlineExceeded, message)
         }
+        RepoError::Busy(message) => {
+            contract::ContractError::new(contract::ToolErrorCode::Busy, message)
+        }
         RepoError::ResourceExhausted(message) => {
             contract::ContractError::new(contract::ToolErrorCode::ResourceExhausted, message)
         }
@@ -1449,7 +1453,7 @@ fn admission_error_response(
     max_queued: usize,
 ) -> Value {
     let error = contract::ContractError::new(
-        contract::ToolErrorCode::ResourceExhausted,
+        contract::ToolErrorCode::Busy,
         "MCP retrieval queue is full; retry later",
     )
     .with_details(json!({
@@ -2202,6 +2206,7 @@ mod tests {
                 RepoError::deadline_exceeded("deadline"),
                 contract::ToolErrorCode::DeadlineExceeded,
             ),
+            (RepoError::busy("busy"), contract::ToolErrorCode::Busy),
             (
                 RepoError::resource_exhausted("resource"),
                 contract::ToolErrorCode::ResourceExhausted,
@@ -2234,6 +2239,7 @@ mod tests {
                 RepoError::deadline_exceeded("deadline"),
                 "deadline_exceeded",
             ),
+            (RepoError::busy("busy"), "busy"),
             (
                 RepoError::resource_exhausted("resource"),
                 "resource_exhausted",
@@ -2266,14 +2272,14 @@ mod tests {
     }
 
     #[test]
-    fn effective_parallel_request_limit_prefers_config_and_defaults_to_eight() {
+    fn effective_parallel_request_limit_prefers_config_and_defaults_to_four() {
         assert_eq!(
-            effective_max_parallel_requests(Some(12)),
-            (12, RequestLimitSource::Config)
+            effective_max_parallel_requests(Some(7)),
+            (7, RequestLimitSource::Config)
         );
         assert_eq!(
             effective_max_parallel_requests(None),
-            (8, RequestLimitSource::Automatic)
+            (4, RequestLimitSource::Automatic)
         );
     }
 
@@ -2288,10 +2294,10 @@ mod tests {
     }
 
     #[test]
-    fn embedded_state_defaults_to_eight_executing_and_sixteen_queued() {
+    fn embedded_state_defaults_to_four_executing_and_sixteen_queued() {
         let state = test_state();
-        assert_eq!(state.request_admission.execution.available_permits(), 8);
-        assert_eq!(state.request_admission.slots.available_permits(), 24);
+        assert_eq!(state.request_admission.execution.available_permits(), 4);
+        assert_eq!(state.request_admission.slots.available_permits(), 20);
     }
 
     #[test]

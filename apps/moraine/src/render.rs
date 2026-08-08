@@ -1,5 +1,5 @@
 use anyhow::Result;
-use moraine_clickhouse::DoctorReport;
+use moraine_clickhouse::{DoctorReport, QueryPressureSnapshot};
 use moraine_conversations::{IngestAlertCode, IngestConditionState, IngestStatus};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Rect};
@@ -108,6 +108,8 @@ pub(crate) struct StatusSnapshot {
     pub(crate) heartbeat: HeartbeatSnapshot,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) ingest_status: Option<IngestStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) query_pressure: Option<QueryPressureSnapshot>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -652,6 +654,25 @@ pub(crate) fn render_status(output: &CliOutput, snapshot: &StatusSnapshot) -> Re
     }
     if !ingest_lines.is_empty() {
         output.section("Ingest", &ingest_lines);
+    }
+    if let Some(pressure) = &snapshot.query_pressure {
+        let profile = |name: &str, value: &moraine_clickhouse::QueryProfilePressure| {
+            format!(
+                "{name}: {} running  |  {} queued  |  {} rejected",
+                value.running, value.queued, value.rejected
+            )
+        };
+        output.section(
+            "Query Pressure",
+            &[
+                format!("scope: {}", pressure.scope),
+                profile("interactive", &pressure.interactive),
+                profile("background", &pressure.background),
+                profile("migration", &pressure.migration),
+                profile("administrative", &pressure.administrative),
+                format!("resource-limit events: {}", pressure.resource_limit_events),
+            ],
+        );
     }
 
     // -- ClickHouse runtime details (verbose only) --

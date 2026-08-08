@@ -12,6 +12,8 @@ pub enum RepoError {
     Cancelled(String),
     #[error("query deadline exceeded: {0}")]
     DeadlineExceeded(String),
+    #[error("query admission busy: {0}")]
+    Busy(String),
     #[error("query resources exhausted: {0}")]
     ResourceExhausted(String),
     #[error("backend error: {0}")]
@@ -37,6 +39,9 @@ impl RepoError {
 
     pub fn deadline_exceeded(message: impl Into<String>) -> Self {
         Self::DeadlineExceeded(message.into())
+    }
+    pub fn busy(message: impl Into<String>) -> Self {
+        Self::Busy(message.into())
     }
 
     pub fn resource_exhausted(message: impl Into<String>) -> Self {
