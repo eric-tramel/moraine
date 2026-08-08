@@ -1560,6 +1560,9 @@ mod tests {
         body: String,
     ) -> (StatusCode, String) {
         let query = params.get("query").cloned().unwrap_or_default();
+        if query.contains("FROM system.workloads") {
+            return (StatusCode::OK, "0".to_string());
+        }
         state
             .query_ids
             .lock()

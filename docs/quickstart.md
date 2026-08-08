@@ -86,6 +86,12 @@ handshake, sends the MCP `ping` health check, and reports the result as
 `mcp_health` in JSON output. This checks Moraine's shared MCP service without
 starting Codex, Claude Code, or another harness.
 
+When the daemon API is available, status also reports a `Query Pressure`
+section (and JSON `query_pressure` object) with per-profile running, queued, and
+rejected counts plus a content-free resource-limit event total.
+These counters describe the local backend process only; direct-database fallback
+omits them. They never include SQL, query text, credentials, or user content.
+
 For a local ClickHouse process started by `moraine up`, Moraine keeps a small
 supervisor running after startup. If ClickHouse exits unexpectedly, the
 supervisor waits 1, 2, 4, 8, then 16 seconds between at most five consecutive

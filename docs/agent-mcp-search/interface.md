@@ -369,10 +369,11 @@ Successful structured responses share this shape:
 Tool-level errors return `schema_version: "moraine.mcp.error.v1"` with an
 `error` object. Common error codes are `invalid_request`, `invalid_id`,
 `not_found`, `unsupported_event_type`, `cancelled`, `deadline_exceeded`,
-`resource_exhausted`, `backend_failure`, and `internal_error`. Moraine adds no
-default query deadline: `deadline_exceeded` is reserved for an explicit caller
-deadline. A full request queue is `resource_exhausted`; database or transport
-failure is `backend_failure`.
+`busy`, `resource_exhausted`, `backend_failure`, and `internal_error`. Moraine
+adds no default query deadline: `deadline_exceeded` is reserved for an explicit
+caller deadline. A full request queue is `busy`; a ClickHouse memory, disk,
+row, or byte limit is `resource_exhausted`; database or transport failure is
+`backend_failure`.
 
 While the search read model is publishing an active-ingest update,
 `search_sessions` returns `internal_error` with
