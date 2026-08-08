@@ -2,6 +2,7 @@ use crate::managed_clickhouse::{
     active_clickhouse_source, managed_clickhouse_bin, managed_clickhouse_checksum_state,
     managed_clickhouse_version,
 };
+use crate::mcp_health::probe_mcp_backend;
 use crate::paths::RuntimePaths;
 use crate::process::{
     backend_endpoint_status, backend_http_connect_host, legacy_service_running_read_only,
@@ -21,6 +22,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const STATUS_API_TIMEOUT: Duration = Duration::from_secs(2);
 const STATUS_API_MAX_RESPONSE_BYTES: usize = 256 * 1024;
+const STATUS_MCP_TIMEOUT: Duration = Duration::from_secs(2);
 fn unix_now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -454,6 +456,23 @@ pub(super) async fn cmd_status(
     cfg: &AppConfig,
     repository: &dyn ConversationRepository,
 ) -> Result<StatusSnapshot> {
+    collect_status(paths, cfg, repository, true).await
+}
+
+pub(super) async fn cmd_status_for_up(
+    paths: &RuntimePaths,
+    cfg: &AppConfig,
+    repository: &dyn ConversationRepository,
+) -> Result<StatusSnapshot> {
+    collect_status(paths, cfg, repository, false).await
+}
+
+async fn collect_status(
+    paths: &RuntimePaths,
+    cfg: &AppConfig,
+    repository: &dyn ConversationRepository,
+    probe_mcp: bool,
+) -> Result<StatusSnapshot> {
     let backend_endpoints = backend_endpoint_status(cfg);
     let services = vec![
         managed_runtime_status(
@@ -503,10 +522,23 @@ pub(super) async fn cmd_status(
     let monitor_url = backend_endpoints
         .http_listening
         .then(|| monitor_runtime_url(cfg));
+    let mcp_health = if probe_mcp {
+        Some(
+            probe_mcp_backend(
+                &cfg.mcp.central_socket_path,
+                &cfg.mcp.protocol_version,
+                STATUS_MCP_TIMEOUT,
+            )
+            .await,
+        )
+    } else {
+        None
+    };
 
     Ok(StatusSnapshot {
         services,
         monitor_url,
+        mcp_health,
         data_source,
         managed_clickhouse_installed: managed_server.exists(),
         managed_clickhouse_path: managed_server.display().to_string(),
@@ -1052,5 +1084,26 @@ mod tests {
         assert_eq!(status(None, false, false), ServiceRuntimeState::Stopped);
         assert_eq!(status(Some(200), true, false), ServiceRuntimeState::Partial);
         assert_eq!(status(None, false, true), ServiceRuntimeState::Partial);
+    }
+    #[tokio::test]
+    async fn up_status_collection_does_not_probe_or_serialize_mcp_health() {
+        let mut cfg = test_config(0);
+        let root =
+            std::env::temp_dir().join(format!("moraine-up-status-unit-{}", std::process::id()));
+        cfg.runtime.root_dir = root.display().to_string();
+        cfg.runtime.logs_dir = root.join("logs").display().to_string();
+        cfg.runtime.pids_dir = root.join("run").display().to_string();
+        cfg.runtime.service_bin_dir = root.join("services").display().to_string();
+        cfg.runtime.managed_clickhouse_dir = root.join("managed").display().to_string();
+        cfg.mcp.central_socket_path = root.join("must-not-probe.sock").display().to_string();
+        let paths = crate::paths::runtime_paths(&cfg);
+
+        let snapshot = cmd_status_for_up(&paths, &cfg, &test_repository())
+            .await
+            .expect("collect status for up");
+
+        assert!(snapshot.mcp_health.is_none());
+        let json = serde_json::to_value(snapshot).expect("serialize up status");
+        assert!(json.get("mcp_health").is_none());
     }
 }

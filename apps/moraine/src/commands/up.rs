@@ -25,7 +25,7 @@ use crate::render::{render_up, CliOutput, MigrationOutcome, StatusSnapshot, UpSn
 use crate::service::Service;
 
 use super::{
-    conversation_repository, doctor_is_healthy, migrate_database_for_up, status::cmd_status,
+    conversation_repository, doctor_is_healthy, migrate_database_for_up, status::cmd_status_for_up,
     writer_barrier_required, WRITER_BARRIER_SERVICES,
 };
 
@@ -494,7 +494,7 @@ async fn start_selected_services<W: Write>(
     let status_owner = QueryOwner::new(query_runtime, QueryWorkload::Administrative)?;
     let status_started = Instant::now();
     let status = drive_status_progress(
-        status_owner.scope(cmd_status(paths, cfg, &repository)),
+        status_owner.scope(cmd_status_for_up(paths, cfg, &repository)),
         status_started,
         progress,
     )
