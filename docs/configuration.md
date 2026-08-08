@@ -878,12 +878,13 @@ central_connect_timeout_ms = 250
 
 Raise `max_results` only when clients need larger result windows. Increase
 context defaults when retrieval snippets are too narrow.
-Leave `prewarm_on_initialize` disabled for harnesses that launch multiple MCP
-processes at once; enabling it trades startup CPU/database work for lower
-first-search latency.
+Leave `prewarm_on_initialize` disabled for compatibility harnesses that launch
+multiple stdio MCP processes at once; enabling it trades startup CPU/database
+work for lower first-search latency.
 
-The shared central server applies one parallel-request budget across every MCP
-socket connection and queues at most 16 valid retrievals in FIFO order when that
+The shared backend applies one parallel-request budget across every direct HTTP
+request and private-socket MCP connection and queues at most 16 valid
+retrievals in FIFO order when that
 budget is busy. Queued and running retrievals have no fixed admission deadline;
 they continue until completion, client cancellation, full disconnect, or service
 shutdown. A clean request-side EOF is only a half-close: already admitted work
@@ -892,37 +893,37 @@ with a structured `resource_exhausted` tool error. An embedded fallback is a
 separate process, so its execution budget is process-local. Validation and
 control requests continue to run while retrievals wait.
 
-### Shared central MCP server
+### Shared MCP service
 
-When the backend daemon is running, Moraine uses one repository, ClickHouse
-client, and warm cache set for every MCP proxy session and the monitor HTTP
-server. Every `moraine up` starts the daemon. `use_central_server` controls
-whether `moraine run mcp` attempts that shared socket before falling back to an
-embedded server:
+Every `moraine up` starts one backend process that owns the default repository,
+ClickHouse client, warm caches, and MCP admission budget. It exposes two MCP
+transports:
+
+- Streamable HTTP at `http://<backend.bind>:<monitor.port>/mcp`, used directly
+  by Codex and Claude Code after `moraine setup`.
+- A private Unix socket used by the retained `moraine run mcp` stdio
+  compatibility client.
+
+Direct HTTP clients require the backend to be running; they do not start a
+tunnel process or fall back to an embedded server. The endpoint supports
+single-message JSON POST requests and returns JSON responses (or `202` for
+notifications). It does not allocate MCP session IDs or expose batch and SSE
+response modes.
+
+The following fields control only the stdio compatibility path:
 
 | Field | Default | Purpose |
 | --- | --- | --- |
-| `use_central_server` | `true` | When set, `moraine run mcp` connects to the central server's socket and proxies to it; if the socket is missing or unreachable it transparently falls back to an embedded server. Set to `false` to always run embedded (pre-central behavior). In a directory routed to a non-default backend the central proxy is bypassed regardless of this flag (see [MCP in routed directories](#mcp-in-routed-directories)). |
+| `use_central_server` | `true` | When set, `moraine run mcp` connects to the central server's socket and proxies to it; if the socket is missing or unreachable it transparently falls back to an embedded server. Set to `false` to always run embedded. In a directory routed to a non-default backend the central proxy is bypassed regardless of this flag (see [MCP in routed directories](#mcp-in-routed-directories)). |
 | `central_socket_path` | `mcp.sock` | Unix socket path. A bare filename resolves under the runtime pids dir (`~/.moraine/run/mcp.sock`, mode `0o600`); an absolute path is used verbatim. |
-| `central_connect_timeout_ms` | `250` | How long a client waits to connect before falling back to embedded. |
+| `central_connect_timeout_ms` | `250` | How long a stdio client waits to connect before falling back to embedded. |
 
-The MCP registration command is unchanged — agents still launch
-`moraine run mcp`. The proxy-vs-embedded decision is internal, with one
-exception: directories routed to a non-default backend always run embedded
-against that backend and fail fast when it is unreachable or skewed (see
-[MCP in routed directories](#mcp-in-routed-directories)). The daemon and
-its clients must resolve the same `central_socket_path` (i.e. load the same
-config) to share a server; otherwise clients silently fall back to embedded.
-The `0o600` socket scopes the server to a single user, so on a shared host each
-user runs their own central server. See
-[Agent MCP Search → Install](agent-mcp-search/install.md#shared-central-server-default)
-for operational notes.
-
-One exception: `moraine run mcp --project-only` (retrieval restricted to
-sessions that originated from the launch directory) always runs an embedded
-server, because the shared central server serves every project on the host.
-See
+Directories routed to a non-default backend and
+`moraine run mcp --project-only` still use embedded stdio because direct HTTP
+requests have no launch-directory context. See
+[MCP in routed directories](#mcp-in-routed-directories) and
 [Agent MCP Search → Install](agent-mcp-search/install.md#project-scoped-retrieval-project-only).
+The private socket remains mode `0o600`; keep the HTTP listener on loopback.
 
 The up-managed MCP service is the unified backend daemon; the legacy per-`up`
 stdio daemon and standalone monitor service are gone. The old
@@ -969,7 +970,7 @@ start_on_up = true
 
 | Field | Default | Purpose |
 | --- | --- | --- |
-| `bind` | `127.0.0.1` | Interface for the monitor HTTP listener. Keep the loopback default for local-only access. |
+| `bind` | `127.0.0.1` | Interface for the monitor HTTP listener. An explicit loopback bind also enables the shared `/mcp` endpoint. |
 | `auth_token` | unset | Experimental startup prerequisite for a non-loopback effective bind. It does not authenticate HTTP requests. |
 | `start_on_up` | `true` | Deprecated compatibility key. Every `moraine up` starts one unified backend; an existing loopback `false` value is accepted but ignored. |
 
@@ -988,14 +989,15 @@ non-loopback, `backend.auth_token` must contain at least one non-whitespace
 character or backend startup fails before creating any listener.
 
 This is experimental configuration groundwork and a startup prerequisite only.
-It does not authenticate HTTP requests: the monitor API and UI remain
-unauthenticated, and exposing them to an untrusted network remains unsafe. Real
-monitor authentication is tracked in
+It does not authenticate monitor HTTP requests, and exposing the monitor API or
+UI to an untrusted network remains unsafe. Real monitor authentication is
+tracked in
 [issue #383, Phase 3](https://github.com/eric-tramel/moraine/issues/383).
 
-The guard does not change the MCP transport. The MCP server continues to use
-the same per-user Unix socket and proxy/embedded fallback behavior described in
-[Shared central MCP server](#shared-central-mcp-server).
+The private Unix-socket MCP transport remains user-scoped. The direct `/mcp`
+endpoint is mounted only when `backend.bind` is an explicit loopback IP; a
+non-loopback listener does not serve MCP even when its startup guard token is
+configured.
 
 ## Monitor
 

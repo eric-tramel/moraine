@@ -108,14 +108,17 @@ status output should show fresh ingest activity.
 
 ## Add MCP Retrieval
 
-Moraine MCP search uses a local stdio launcher. Each agent harness starts
-`moraine run mcp` when it needs the tools, so keep ClickHouse available with
-`moraine up`.
+For Codex and Claude Code, `moraine setup` registers the Streamable HTTP MCP
+endpoint served by the unified backend:
 
-Bare `moraine up` starts the shared backend so each `moraine run mcp` can proxy
-to one shared server instead of booting a full server per session. Registration
-is unchanged; if the shared backend crashes or is otherwise unreachable, a new
-`moraine run mcp` falls back to an embedded server automatically. See
+```text
+http://127.0.0.1:8080/mcp
+```
+
+Both harnesses connect to the same backend process; they do not start a
+per-client `moraine run mcp` tunnel. Keep the backend running with `moraine up`.
+Other harnesses and project-scoped compatibility setups may still use the stdio
+launcher and its Unix-socket/embedded fallback. See
 [Agent MCP Search → Install](agent-mcp-search/install.md#shared-central-server-default).
 
 Use `moraine setup` to connect your agent harnesses. In an interactive terminal,

@@ -18,6 +18,5 @@
     "session-search",
     "realtime-agents",
     "bug-report"
-  ],
-  "mcpServers": "./.claude-mcp.json"
+  ]
 }

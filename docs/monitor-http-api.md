@@ -236,14 +236,25 @@ Because unmatched paths enter static-file handling, an unknown path under
 `/api/v1` is not evidence that an API resource exists. In particular, clients
 must not probe an inferred `/api/v1/sessions/:id` path.
 
-## MCP Protocol Is Unchanged
+## Shared MCP Endpoint
 
-The versioned HTTP API does not replace or tunnel MCP. Agent harnesses still
-launch `moraine run mcp` over stdio, and its existing local central-server proxy
-continues to use the configured Unix socket and existing socket protocol. MCP
-tool names, request/response schemas, and fallback behavior are unchanged by
-this HTTP API version.
+When `backend.bind` is an explicit loopback IP, the unified backend also serves
+MCP at `POST /mcp` on this listener. The endpoint accepts one JSON-RPC message
+per request using `Content-Type: application/json`. Clients should send
+`Accept: application/json, text/event-stream`; responses are JSON. Calls after
+`initialize` must include the negotiated `MCP-Protocol-Version` header.
+Notifications return `202 Accepted` with an empty body.
 
-There are no MCP tool endpoints under `/api/v1`, and HTTP clients cannot select
-a named backend through this API. This API version also does not introduce HTTP
-authentication or a remote-deployment contract.
+`GET /mcp` returns `405 Method Not Allowed`. This endpoint does not allocate
+MCP session IDs or expose batch and SSE response modes. It shares the same
+repository, caches, request admission, and cancellation behavior as the
+backend's private Unix-socket MCP service.
+
+MCP routes do not live under `/api/v1`, and HTTP clients cannot select a named
+backend or launch-directory project scope through this endpoint. Use
+`moraine run mcp --project-only` for scoped retrieval.
+
+The endpoint is mounted only for an explicit loopback `backend.bind`. A
+configured auth token may permit non-loopback monitor startup, but `/mcp`
+remains disabled on that listener because HTTP request authentication is not
+implemented.

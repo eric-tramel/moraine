@@ -39,6 +39,10 @@ fn normalize_listener_bind(bind: String) -> String {
     }
 }
 
+fn permits_direct_mcp_http(bind: &str) -> bool {
+    is_explicit_loopback_bind(bind)
+}
+
 fn validate_backend_bind_policy(bind: &str, auth_token: Option<&str>) -> Result<()> {
     let has_nonempty_token = auth_token
         .map(|token| !token.trim().is_empty())
@@ -237,6 +241,7 @@ async fn run_backend(
     static_dir: PathBuf,
 ) -> Result<()> {
     validate_backend_bind_policy(&host, cfg.backend.auth_token.as_deref())?;
+    let serve_mcp_http = permits_direct_mcp_http(&host);
     let host = normalize_listener_bind(host);
     // This is the daemon mode's sole routing/factory owner. Both services
     // receive clones of this exact router Arc; each selected backend therefore
@@ -261,16 +266,20 @@ async fn run_backend(
         return Err(error);
     }
 
+    let mcp_state = moraine_mcp_core::McpDaemonState::new(cfg.clone(), router.clone());
+    let mcp_http_routes = if serve_mcp_http {
+        moraine_mcp_core::http_router(mcp_state.clone())
+    } else {
+        warn!("direct MCP HTTP endpoint disabled for non-loopback backend bind");
+        axum::Router::new()
+    };
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut services = JoinSet::new();
 
-    let socket_cfg = cfg.clone();
-    let socket_router = router.clone();
     let socket_shutdown = shutdown_rx.clone();
     services.spawn(async move {
-        let result = moraine_mcp_core::run_socket_with_router(
-            socket_cfg,
-            socket_router,
+        let result = moraine_mcp_core::run_socket_with_state(
+            mcp_state,
             socket_path,
             wait_for_shutdown(socket_shutdown),
         )
@@ -279,11 +288,12 @@ async fn run_backend(
     });
 
     services.spawn(async move {
-        let result = moraine_monitor_core::run_server_with_router(
+        let result = moraine_monitor_core::run_server_with_router_and_routes(
             router,
             host,
             port,
             static_dir,
+            mcp_http_routes,
             wait_for_shutdown(shutdown_rx),
         )
         .await;
@@ -507,6 +517,23 @@ mod tests {
         for bind in ["0.0.0.0", "::", "192.0.2.10", "localhost"] {
             validate_backend_bind_policy(bind, Some("sandbox-only-guard-token"))
                 .unwrap_or_else(|error| panic!("guarded bind `{bind}` rejected: {error:#}"));
+        }
+    }
+
+    #[test]
+    fn direct_mcp_http_is_limited_to_explicit_loopback_binds() {
+        for bind in ["127.0.0.1", "127.42.0.9", "::1", "[::1]"] {
+            assert!(permits_direct_mcp_http(bind), "{bind}");
+        }
+        for bind in [
+            "0.0.0.0",
+            "::",
+            "[::]",
+            "192.0.2.10",
+            "localhost",
+            "127.0.0.1 ",
+        ] {
+            assert!(!permits_direct_mcp_http(bind), "{bind}");
         }
     }
 

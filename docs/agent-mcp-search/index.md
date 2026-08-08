@@ -8,8 +8,8 @@ commands, errors, and active agent work without copying session logs by hand.
 
 Start with these pages:
 
-- [Install by Harness](install.md) shows how to connect common clients to
-  `moraine run mcp`.
+- [Install by Harness](install.md) shows how to connect common clients to the
+  shared HTTP endpoint or the retained stdio compatibility command.
 - [Patterns](patterns.md) explains the system instructions and search habits
   that make lexical session search work well.
 - [MCP Interface](interface.md) explains what the tools are, what they return,

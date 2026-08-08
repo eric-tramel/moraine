@@ -19,7 +19,7 @@ on your machine and writes runtime state under `~/.moraine`.
 - **Monitor UI.** Browse sessions, inspect indexing health, and check what has
   been captured at `http://127.0.0.1:8080`.
 - **MCP retrieval.** Agents can search prior decisions, fixes, errors, and
-  session context through `moraine run mcp`.
+  session context through the shared local MCP endpoint.
 - **Direct database access.** Query `moraine.events` and related views with your
   own SQL, dashboards, or experiments.
 - **Fully local by default.** Runtime state lives under `~/.moraine`; nothing

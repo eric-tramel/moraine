@@ -1294,6 +1294,7 @@ name = "moraine-mcp"
 version = "0.7.3"
 dependencies = [
  "anyhow",
+ "axum",
  "moraine-config",
  "moraine-conversations",
  "moraine-mcp-core",
@@ -1309,6 +1310,7 @@ version = "0.7.3"
 dependencies = [
  "anyhow",
  "async-trait",
+ "axum",
  "chrono",
  "libc",
  "moraine-config",
@@ -1316,6 +1318,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tower",
  "tracing",
 ]
 

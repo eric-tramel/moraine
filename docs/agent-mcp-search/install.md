@@ -1,60 +1,55 @@
 # Install by Harness
 
-Moraine MCP search is a stdio MCP server. Configure your harness to launch:
+Codex and Claude Code connect directly to the MCP endpoint served by the
+unified local backend:
 
-```bash
-moraine run mcp
+```text
+http://127.0.0.1:8080/mcp
 ```
 
-Run `moraine up` first so ClickHouse, ingest, the monitor UI, and the shared MCP
-socket are available. Every `moraine up` includes the unified backend. If that
-backend is unreachable, a new `moraine run mcp` automatically falls back to an
-embedded server. If you use a non-default Moraine config, pass it through the
-harness's environment support as
-`MORAINE_MCP_CONFIG=/path/to/moraine.toml`.
+Run `moraine setup` to register the endpoint from your effective
+`backend.bind` and `monitor.port`, then run `moraine up`. The backend must be
+running while these URL clients use Moraine. The stdio command
+`moraine run mcp` remains available for other harnesses, project-scoped
+retrieval, and compatibility workflows.
+
+For a custom config, use the same file for registration and startup:
+
+```bash
+moraine setup --config /absolute/path/to/moraine.toml
+moraine up --config /absolute/path/to/moraine.toml
+```
+
+Setup persists a URL derived from that file. Ad hoc `moraine up --host` or
+`--port` overrides are runtime-only and are not reflected in the registered
+URL; change `backend.bind` or `monitor.port` in the config and rerun setup
+instead.
 
 <a id="environment-backed-clickhouse-credentials"></a>
 ## Environment-backed ClickHouse credentials
 
 If the Moraine config uses `{ env = "VARIABLE_NAME" }` for a ClickHouse value,
-the MCP process needs the same environment injector as `moraine up`. Guided
-setup installs the plugin with its normal `moraine run mcp` command. Run guided
-setup first, then disable only the plugin-provided MCP server and add a custom
-server when the variables are not already present in the agent's environment.
-The plugin's skills remain enabled.
+start the backend through the same environment injector that provides that
+variable. Codex and Claude Code connect to the already-running `/mcp` endpoint;
+their MCP configuration does not need the ClickHouse credential.
 
-For example, Codex can inject a 1Password environment into Moraine alone:
+For example:
 
-```toml
-[plugins."moraine@moraine".mcp_servers.moraine]
-enabled = false
-
-[mcp_servers.moraine]
-command = "op"
-args = [
-  "run",
-  "--env-file=/absolute/path/to/.env.1password",
-  "--",
-  "moraine",
-  "run",
-  "mcp",
-]
+```bash
+op run --env-file=/absolute/path/to/.env.1password -- moraine up
 ```
 
-Codex supports `command` and `args` for user-configured stdio servers, while a
-plugin-provided server's transport command is fixed by the plugin. Disabling
-the bundled server before adding the custom one avoids two Moraine MCP
-processes with the same purpose.
+`moraine setup` still needs the variable when it loads and validates the
+config. Launch setup through the injector too when necessary:
 
-Use the equivalent command-and-arguments form in other harnesses, or point the
-harness at a small wrapper executable that performs the same `op run`. Keep the
-path absolute because an MCP process may start in any repository. Do not launch
-the whole agent through the injector solely for Moraine: commands spawned by the
-agent would inherit the ClickHouse credentials too.
+```bash
+op run --env-file=/absolute/path/to/.env.1password -- moraine setup
+```
 
-Each MCP launch loads the config independently. The injected environment is
-therefore required even when `moraine up --backend` already started the shared
-central server; it is also required if MCP falls back to its embedded server.
+Do not launch the whole agent through the injector solely for Moraine:
+commands spawned by the agent would inherit the ClickHouse credentials. Other
+harnesses that still launch `moraine run mcp` need the same environment as
+before.
 
 ## Guided setup (recommended)
 
@@ -73,13 +68,17 @@ not want before applying. Use `moraine setup --dry-run` to preview the default
 setup without writing files. Use the manual sections below for project-scoped
 servers, `--project-only`, or custom environment wiring.
 
+For Codex and Claude Code, setup refreshes the Moraine plugin and removes any
+obsolete bundled stdio MCP declaration from the installed manifest before
+registering the backend URL.
+
 ## Claude Code plugin marketplace (recommended)
 
-For Claude Code, the recommended user-scoped setup is the Moraine plugin. The
-plugin registers the MCP server and bundles Moraine search, realtime, and
-bug-report skills, but it does not install Moraine itself and it does not start
-ClickHouse, ingest, or the unified backend. Install the CLI first, or upgrade it
-if Moraine is already installed. Then start the core stack:
+For Claude Code, the recommended user-scoped setup installs the Moraine plugin
+for search, realtime, and bug-report skills and registers the backend URL as a
+native HTTP MCP server. The plugin does not install Moraine or start ClickHouse,
+ingest, or the unified backend. Install or upgrade the CLI first, then start the
+core stack:
 
 ```bash
 uv tool install moraine-cli
@@ -111,33 +110,28 @@ claude plugin update moraine@moraine
 Start a new Claude Code session after installation or update so it loads the
 current plugin version.
 
-The Claude plugin MCP launcher looks for `moraine` on `PATH` and then runs
-`moraine run mcp`. If the CLI is missing, it reports a `binary_missing` message
-with install guidance instead of failing as a raw command-not-found error.
-
-Security note: the user-scoped plugin launches unscoped `moraine run mcp`, so
-Claude Code can search the host-wide Moraine history visible to your user. Enable
-the plugin only in trusted Claude Code environments. For untrusted repositories,
-or when you want retrieval limited to the current project, use the manual
-project-scoped `--project-only` registration below. Also start Claude Code from a
-trusted shell where `moraine` resolves to the installed CLI, not to a repo-local
-shim or relative `PATH` entry.
-
-If you previously registered Moraine manually with `claude mcp add`, remove that
-manual entry before relying on the plugin to avoid duplicate MCP servers:
+The plugin contains skills and commands only; `moraine setup` owns MCP
+transport registration. It removes an older `moraine` stdio entry and runs:
 
 ```bash
-claude mcp remove moraine --scope user
+claude mcp add --transport http --scope user moraine http://127.0.0.1:8080/mcp
 ```
 
-Manual Claude MCP registration remains useful for project-scoped setup,
-`--project-only`, and custom environment wiring such as `MORAINE_MCP_CONFIG`.
+The actual URL follows the selected Moraine config. Start a new Claude Code
+session after setup or plugin update so it loads the current skills and MCP
+registration.
+
+Security note: the user-scoped endpoint searches the host-wide Moraine history
+visible to your user. Enable it only in trusted Claude Code environments. For
+untrusted repositories, or when retrieval must be limited to the current
+project, use the manual project-scoped `--project-only` stdio registration
+below.
 
 ## Codex plugin marketplace (recommended)
 
-For Codex, the recommended user-scoped setup is the Moraine plugin. The plugin
-registers the MCP server and bundles Moraine search, realtime, and bug-report
-skills, but it does not install Moraine itself and it does not start ClickHouse,
+For Codex, the recommended user-scoped setup installs the Moraine plugin for
+search, realtime, and bug-report skills and registers the backend URL as a
+native HTTP MCP server. The plugin does not install Moraine or start ClickHouse,
 ingest, or the unified backend.
 Install or upgrade the CLI first, then start the core stack:
 
@@ -163,56 +157,45 @@ codex plugin add moraine@moraine
 The same marketplace also exposes the contributor-only `moraine-dev` plugin for
 Moraine maintainers; end users should install `moraine@moraine`.
 
-The Codex plugin registers a hardened stdio launcher that finds an installed
-`moraine` on `PATH` and then runs `moraine run mcp`. If the CLI is missing, the
-launcher reports `binary_missing`; reinstall or upgrade it with
-`uv tool install moraine-cli` or `uv tool upgrade moraine-cli`, then restart
-Codex from a shell where `moraine` is on `PATH`.
-
-Security note: the user-scoped plugin launches unscoped `moraine run mcp`, so
-Codex can search the host-wide Moraine history visible to your user. Enable the
-plugin only in trusted Codex environments. For untrusted repositories, or when
-you want retrieval limited to the current project, use the manual
-project-scoped `--project-only` registration below. Also start Codex from a
-trusted shell where `moraine` resolves to the installed CLI, not to a repo-local
-shim or relative `PATH` entry.
-
-If you previously registered Moraine manually with `codex mcp add`, remove that
-manual entry before relying on the plugin to avoid duplicate MCP servers:
+The plugin contains skills and commands only; `moraine setup` owns MCP
+transport registration. It refreshes the marketplace, removes an older
+`moraine` stdio entry, and runs:
 
 ```bash
-codex mcp list
-codex mcp remove moraine
+codex mcp add moraine --url http://127.0.0.1:8080/mcp
 ```
 
-Manual Codex MCP registration remains useful for project-scoped setup,
-`--project-only`, and custom environment wiring such as `MORAINE_MCP_CONFIG`.
+The actual URL follows the selected Moraine config. Restart Codex after setup
+or plugin update so it loads the current skills and MCP registration.
+
+Security note: the user-scoped endpoint searches the host-wide Moraine history
+visible to your user. Enable it only in trusted Codex environments. For
+untrusted repositories, or when retrieval must be limited to the current
+project, use the manual project-scoped `--project-only` stdio registration
+below.
 
 <a id="shared-central-server-default"></a>
 ## Shared central server
 
-`moraine up` starts the unified backend. When it is running, every
-`moraine run mcp` becomes
-a thin stdio↔socket proxy to its shared repository, ClickHouse client, caches,
-and runtime threads. The same process also serves the monitor HTTP API and
-static UI.
+`moraine up` starts one unified backend. The same process serves the monitor UI
+and API, the direct Streamable HTTP MCP endpoint at `/mcp`, and the private
+Unix socket used by compatibility stdio clients. All of those surfaces share
+the default repository, ClickHouse client, caches, and request budget.
 
 What this means for you:
 
-- **Registration is unchanged.** Keep registering `moraine run mcp` exactly as
-  shown below. The proxy-vs-embedded choice is made internally.
-- **The backend is required for the shared server.** Start the stack with bare
-  `moraine up`. The backend listens on a Unix socket at
-  `~/.moraine/run/mcp.sock` (mode `0o600`, so it is scoped to your user).
-  `moraine down` stops it and removes the socket.
-- **Automatic fallback.** If the backend is unreachable or crashed, a new
-  `moraine run mcp` transparently falls back to an embedded server after
-  ~250&nbsp;ms, so retrieval keeps working either way.
-- **Crash blast radius.** A backend crash drops all live sessions' MCP
-  connections at once; harnesses re-establish the connection on their next tool
-  use. Restart it with `moraine up`. To opt out and return to a server per session,
-  set `use_central_server = false` (see
-  [Configuration → MCP](../configuration.md#shared-central-mcp-server)).
+- **Codex and Claude Code connect directly.** Guided setup registers
+  `http://127.0.0.1:8080/mcp` by default. No per-client tunnel process or
+  `mcp.pid` is created.
+- **The backend is required for URL clients.** Start it with `moraine up`.
+  `moraine down` closes `/mcp`; URL clients reconnect after the backend starts
+  again.
+- **The URL serves the default backend.** Named-backend routing and
+  `--project-only` rely on launch-directory context and therefore remain on the
+  stdio path.
+- **Stdio compatibility remains.** `moraine run mcp` still proxies through the
+  private Unix socket and falls back to an embedded server when the backend is
+  unreachable.
 
 ## Project-scoped retrieval (`--project-only`)
 
@@ -245,22 +228,17 @@ Details worth knowing:
   `instructions` field, so agents can tell they are looking at a filtered
   view.
 
-The remaining sections register the unchanged `moraine run mcp` command with
-each harness, including manual Codex and Claude Code registration for
-project-scoped or custom setups.
+The remaining sections document direct URL registration where supported and
+the retained `moraine run mcp` command for project-scoped or compatibility
+setups.
 
 ## Manual Codex
 
 Codex stores user-level configuration in `~/.codex/config.toml`, and the Codex
-CLI can add MCP servers directly. The plugin is the recommended user-scoped path
-above. Use manual registration when you want project scope, `--project-only`, or
-custom environment handling. OpenAI's Codex docs note that the CLI and IDE
-extension share MCP configuration, so a CLI install is enough for both clients:
-[Codex MCP docs](https://developers.openai.com/codex/mcp) and
-[Codex configuration reference](https://developers.openai.com/codex/config-reference).
+CLI can add the shared HTTP endpoint directly:
 
 ```bash
-codex mcp add moraine -- moraine run mcp
+codex mcp add moraine --url http://127.0.0.1:8080/mcp
 codex mcp list
 ```
 
@@ -268,32 +246,38 @@ Equivalent manual config:
 
 ```toml
 [mcp_servers.moraine]
-command = "moraine"
-args = ["run", "mcp"]
+url = "http://127.0.0.1:8080/mcp"
 ```
+
+Use a stdio command instead only when you need project scope,
+`--project-only`, or compatibility environment handling:
+
+```bash
+codex mcp add moraine -- moraine run mcp --project-only
+```
+
+See [Codex MCP docs](https://developers.openai.com/codex/mcp) and the
+[Codex configuration reference](https://developers.openai.com/codex/config-reference).
 
 ## Manual Claude Code
 
-Claude Code supports stdio MCP servers through `claude mcp add`. The plugin is
-the recommended user-scoped path above. Use manual registration when you want
-project scope, `--project-only`, or custom environment handling. See the official
-[Claude Code MCP docs](https://code.claude.com/docs/en/mcp).
-
-User scope:
+Claude Code can add the shared HTTP endpoint directly:
 
 ```bash
-claude mcp add --transport stdio --scope user moraine -- moraine run mcp
+claude mcp add --transport http --scope user moraine http://127.0.0.1:8080/mcp
 claude mcp list
 ```
 
-Project scope:
+Use the retained stdio transport for project-scoped retrieval:
 
 ```bash
-claude mcp add --transport stdio --scope project moraine -- moraine run mcp
+claude mcp add --transport stdio --scope project moraine -- moraine run mcp --project-only
 ```
 
 Project scope writes or updates `.mcp.json` in the current project. Claude Code
-may ask you to approve project-scoped MCP servers before it uses them.
+may ask you to approve project-scoped MCP servers before it uses them. See the
+official [Claude Code MCP docs](https://code.claude.com/docs/en/mcp).
+
 
 ## Hermes
 
@@ -540,10 +524,9 @@ agent mcp list-tools moraine
 For project-only use, put the same JSON in `.cursor/mcp.json` at the project
 root.
 
-If Cursor reports a spawn error for a path such as
-`/path/to/project/scripts/launch.sh`, replace that stale server entry with the
-JSON above. That launcher path belongs to the Claude plugin bundle and is not a
-valid Cursor command.
+If Cursor reports a spawn error for a stale plugin-local command, rerun
+`moraine setup --mcp-target cursor` or replace that entry with the JSON above.
+Cursor should invoke the installed `moraine` command directly.
 
 ## Pi Coding Agent
 

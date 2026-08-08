@@ -356,7 +356,7 @@ default_min_should_match = 1
 max_query_terms = 32
 
 [backend]
-# Interface for the monitor HTTP listener.
+# Interface for the monitor listener and, on loopback, the shared `/mcp` endpoint.
 bind = "127.0.0.1"
 
 # Experimental startup guard for a non-loopback bind. This is not HTTP request
@@ -369,7 +369,7 @@ bind = "127.0.0.1"
 start_on_up = true
 
 [monitor]
-# Monitor HTTP port.
+# Monitor HTTP and shared MCP port. On loopback the MCP URL is http://<bind>:<port>/mcp.
 port = 8080
 
 [runtime]

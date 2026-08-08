@@ -815,6 +815,8 @@ mod tests {
             launch_cwd: root.clone(),
             home: Some(root.clone()),
             xdg_config_home: None,
+            codex_home: None,
+            claude_config_dir: None,
             kiro_home: None,
             nac_home: None,
             prime_agent_dir: Some(agent.clone()),
@@ -827,7 +829,7 @@ mod tests {
             source: ConfigTargetSource::Cli,
         };
 
-        let error = mcp_plan(SetupMcpTarget::PrimeAgent, &config, &paths)
+        let error = mcp_plan(SetupMcpTarget::PrimeAgent, &config, &paths, None)
             .expect_err("custom settings conflict");
         assert!(format!("{error:#}").contains("customized"));
         assert!(!agent.join("skills/moraine").exists());

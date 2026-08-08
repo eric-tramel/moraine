@@ -20,7 +20,6 @@
     "bug-report"
   ],
   "skills": "./skills/",
-  "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "Moraine",
     "shortDescription": "Use Moraine guidance from Codex.",

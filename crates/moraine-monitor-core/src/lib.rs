@@ -183,12 +183,35 @@ pub async fn run_server_with_router<S>(
 where
     S: Future<Output = ()> + Send + 'static,
 {
+    run_server_with_router_and_routes(
+        backend_router,
+        host,
+        port,
+        static_dir,
+        Router::new(),
+        shutdown,
+    )
+    .await
+}
+
+pub async fn run_server_with_router_and_routes<S>(
+    backend_router: Arc<BackendRepositoryRouter>,
+    host: String,
+    port: u16,
+    static_dir: PathBuf,
+    extra_routes: Router,
+    shutdown: S,
+) -> Result<()>
+where
+    S: Future<Output = ()> + Send + 'static,
+{
     let static_dir_display = static_dir.display().to_string();
     let active_monitor_owners = Arc::new(ActiveMonitorOwners::default());
     let app = router_with_backend_router_and_owners(
         backend_router,
         static_dir,
         active_monitor_owners.clone(),
+        extra_routes,
     )?;
     let bind = format!("{host}:{port}")
         .parse::<SocketAddr>()
@@ -228,12 +251,33 @@ pub async fn run_server_with_listener<S>(
 where
     S: Future<Output = ()> + Send + 'static,
 {
+    run_server_with_listener_and_routes(
+        backend_router,
+        listener,
+        static_dir,
+        Router::new(),
+        shutdown,
+    )
+    .await
+}
+
+pub async fn run_server_with_listener_and_routes<S>(
+    backend_router: Arc<BackendRepositoryRouter>,
+    listener: tokio::net::TcpListener,
+    static_dir: PathBuf,
+    extra_routes: Router,
+    shutdown: S,
+) -> Result<()>
+where
+    S: Future<Output = ()> + Send + 'static,
+{
     let static_dir_display = static_dir.display().to_string();
     let active_monitor_owners = Arc::new(ActiveMonitorOwners::default());
     let app = router_with_backend_router_and_owners(
         backend_router,
         static_dir,
         active_monitor_owners.clone(),
+        extra_routes,
     )?;
     let bind = listener
         .local_addr()
@@ -300,6 +344,7 @@ fn router_with_backend_router(
         backend_router,
         static_dir,
         Arc::new(ActiveMonitorOwners::default()),
+        Router::new(),
     )
 }
 
@@ -307,6 +352,7 @@ fn router_with_backend_router_and_owners(
     backend_router: Arc<BackendRepositoryRouter>,
     static_dir: PathBuf,
     active_monitor_owners: Arc<ActiveMonitorOwners>,
+    extra_routes: Router,
 ) -> Result<Router> {
     validate_static_dir(&static_dir)?;
     let state = Arc::new(AppState {
@@ -314,10 +360,10 @@ fn router_with_backend_router_and_owners(
         static_dir,
         active_monitor_owners,
     });
-    Ok(monitor_router(state))
+    Ok(monitor_router(state, extra_routes))
 }
 
-fn monitor_router(state: Arc<AppState>) -> Router {
+fn monitor_router(state: Arc<AppState>, extra_routes: Router) -> Router {
     let data_routes = dashboard_routes().route_layer(middleware::from_fn_with_state(
         state.backend_router.clone(),
         select_backend_repository,
@@ -344,6 +390,7 @@ fn monitor_router(state: Arc<AppState>) -> Router {
         .nest("/api", compatibility_routes)
         .fallback(get(static_fallback))
         .with_state(state)
+        .merge(extra_routes)
 }
 
 async fn own_monitor_operation(
@@ -1793,7 +1840,7 @@ mod tests {
             analytics_series: Some(Err(RepoError::backend("analytics unavailable"))),
             ..Default::default()
         });
-        let app = monitor_router(state);
+        let app = monitor_router(state, Router::new());
 
         let canonical = router_json(&app, "/api/v1/analytics?range=24h").await;
         let legacy = router_json(&app, "/api/analytics?range=24h").await;
@@ -1818,6 +1865,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn extra_routes_coexist_with_monitor_and_precede_static_fallback() {
+        use axum::routing::post;
+
+        let (state, _) = fake_state(successful_responses());
+        let extra = Router::new().route("/mcp", post(|| async { StatusCode::ACCEPTED }));
+        let app = monitor_router(state, extra);
+
+        let mcp = app
+            .clone()
+            .oneshot(
+                Request::post("/mcp")
+                    .body(Body::empty())
+                    .expect("MCP request"),
+            )
+            .await
+            .expect("MCP response");
+        assert_eq!(mcp.status(), StatusCode::ACCEPTED);
+
+        let get_mcp = app
+            .clone()
+            .oneshot(
+                Request::get("/mcp")
+                    .body(Body::empty())
+                    .expect("GET MCP request"),
+            )
+            .await
+            .expect("GET MCP response");
+        assert_eq!(get_mcp.status(), StatusCode::METHOD_NOT_ALLOWED);
+
+        let health = app
+            .oneshot(
+                Request::get("/api/v1/health")
+                    .body(Body::empty())
+                    .expect("health request"),
+            )
+            .await
+            .expect("health response");
+        assert_eq!(health.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn status_history_query_defaults_to_zero_clamps_and_rejects_malformed_values() {
         let heartbeat = sample_heartbeat();
         let mut template = heartbeat.latest.clone().expect("sample heartbeat");
@@ -1834,7 +1922,7 @@ mod tests {
         let mut responses = successful_responses();
         responses.ingest_status = Some(Ok(IngestStatusRead { heartbeat, history }));
         let (state, repository) = fake_state(responses);
-        let app = monitor_router(state);
+        let app = monitor_router(state, Router::new());
 
         for path in ["/api/v1/status", "/api/status?history=0"] {
             let (status, payload) = router_json(&app, path).await;

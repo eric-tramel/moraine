@@ -3,12 +3,14 @@
 pub mod contract;
 mod file_attention_v1;
 mod get_ingest_status_v1;
+mod http;
 mod list_sessions_v1;
 mod open_v1;
 mod private_proxy;
 mod search_sessions_v1;
 
 use anyhow::{anyhow, Context, Result};
+pub use http::http_router;
 use moraine_config::{AppConfig, KNOWN_INGEST_HARNESSES};
 use moraine_conversations::{
     BackendRepositoryRouter, IngestConditionState, IngestConditionType, QueryCause, QueryOwner,
@@ -29,7 +31,7 @@ use std::sync::{
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 #[cfg(test)]
 use tokio::sync::oneshot;
-use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore, TryAcquireError};
+use tokio::sync::{watch, OnceCell, OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
@@ -51,6 +53,13 @@ impl RequestLimitSource {
 const AUTOMATIC_MAX_PARALLEL_REQUESTS: usize = 8;
 const MAX_QUEUED_REQUESTS: usize = 16;
 const SEARCH_PROJECTION_RETRY_AFTER_MS: u64 = 250;
+const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &[
+    "2024-11-05",
+    "2025-03-26",
+    "2025-06-18",
+    "2025-11-25",
+    "2026-07-28",
+];
 
 fn effective_max_parallel_requests(configured: Option<u16>) -> (usize, RequestLimitSource) {
     let (requested, source) = match configured {
@@ -346,6 +355,15 @@ fn tool_output_schema(tool: &str, data_schema: Value) -> Value {
     })
 }
 
+fn negotiated_protocol_version(configured: &str, params: &Value) -> String {
+    params
+        .get("protocolVersion")
+        .and_then(Value::as_str)
+        .filter(|requested| SUPPORTED_PROTOCOL_VERSIONS.contains(requested))
+        .unwrap_or(configured)
+        .to_string()
+}
+
 impl AppState {
     async fn handle_request(&self, req: RpcRequest) -> Option<Value> {
         let id = req.id.clone();
@@ -378,7 +396,10 @@ impl AppState {
                 }
 
                 let mut result = json!({
-                    "protocolVersion": self.cfg.mcp.protocol_version,
+                    "protocolVersion": negotiated_protocol_version(
+                        &self.cfg.mcp.protocol_version,
+                        &req.params,
+                    ),
                     "capabilities": {
                         "tools": {
                             "listChanged": false
@@ -1338,6 +1359,16 @@ async fn dispatch_rpc_line(
         }
     };
 
+    dispatch_rpc_request(state, req, accepted_at, requests, active).await
+}
+
+async fn dispatch_rpc_request(
+    state: &Arc<AppState>,
+    req: RpcRequest,
+    accepted_at: tokio::time::Instant,
+    requests: &mut JoinSet<RequestResult>,
+    active: &mut HashMap<String, ActiveRequest>,
+) -> Result<Option<Value>> {
     if req.method == "notifications/cancelled" {
         if let Ok(params) = serde_json::from_value::<CancelledParams>(req.params) {
             if let Some(request) = active.get(&request_key(&params.request_id)?) {
@@ -1390,9 +1421,6 @@ async fn dispatch_rpc_line(
         }
     };
 
-    // Publish the owner before spawning so explicit cancellation can never
-    // race a task-local registration step. Spawned work receives the owner
-    // directly and does not rely on task-local inheritance.
     active.insert(
         key.clone(),
         ActiveRequest {
@@ -1407,26 +1435,28 @@ async fn dispatch_rpc_line(
     let task_owner = owner.clone();
     let task = requests.spawn(async move {
         let cancellation = task_owner.cancellation_token();
-        let permit = tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => None,
-            permit = admission_ticket.acquire() => permit,
-        };
-        let Some(_permit) = permit else {
-            return (task_key, None);
-        };
+        task_owner
+            .scope(async move {
+                let permit = tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => None,
+                    permit = admission_ticket.acquire() => permit,
+                };
+                let Some(_permit) = permit else {
+                    return (task_key, None);
+                };
 
-        let request = REQUEST_ACCEPTED_AT.scope(
-            accepted_at.into_std(),
-            task_owner.scope(request_state.handle_request(req)),
-        );
-        tokio::pin!(request);
-        let response = tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => None,
-            response = &mut request => response,
-        };
-        (task_key, response)
+                let request = REQUEST_ACCEPTED_AT
+                    .scope(accepted_at.into_std(), request_state.handle_request(req));
+                tokio::pin!(request);
+                let response = tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => None,
+                    response = &mut request => response,
+                };
+                (task_key, response)
+            })
+            .await
     });
     active
         .get_mut(&key)
@@ -1579,13 +1609,11 @@ pub async fn run_stdio_with_repository(
     .await
 }
 
-#[cfg(unix)]
 #[derive(Clone)]
 struct BackendPrewarmGates {
     by_backend: Arc<std::collections::HashMap<String, Arc<AtomicBool>>>,
 }
 
-#[cfg(unix)]
 impl BackendPrewarmGates {
     fn new(cfg: &AppConfig) -> Self {
         let by_backend = cfg
@@ -1606,13 +1634,51 @@ impl BackendPrewarmGates {
     }
 }
 
-#[cfg(unix)]
 #[derive(Clone)]
-struct SocketState {
+pub struct McpDaemonState {
     cfg: Arc<AppConfig>,
     router: Arc<BackendRepositoryRouter>,
     prewarm_gates: BackendPrewarmGates,
     request_admission: Arc<RequestAdmission>,
+    default_state: Arc<OnceCell<Arc<AppState>>>,
+}
+
+impl McpDaemonState {
+    pub fn new(cfg: Arc<AppConfig>, router: Arc<BackendRepositoryRouter>) -> Self {
+        let prewarm_gates = BackendPrewarmGates::new(&cfg);
+        let request_admission = build_request_admission(&cfg);
+        Self {
+            cfg,
+            router,
+            prewarm_gates,
+            request_admission,
+            default_state: Arc::new(OnceCell::new()),
+        }
+    }
+
+    async fn default_app_state(&self) -> Result<Arc<AppState>> {
+        self.default_state
+            .get_or_try_init(|| async {
+                let backend = self.router.default_repository().await?;
+                let prewarm_started = self.prewarm_gates.for_backend(backend.backend_name())?;
+                Ok(AppState::with_repository(
+                    self.cfg.clone(),
+                    backend.repository().clone(),
+                    prewarm_started,
+                    None,
+                    self.request_admission.clone(),
+                    self.router.query_runtime(),
+                ))
+            })
+            .await
+            .cloned()
+    }
+}
+
+#[cfg(unix)]
+#[derive(Clone)]
+struct SocketState {
+    daemon: McpDaemonState,
     shutdown: watch::Receiver<bool>,
 }
 
@@ -1636,17 +1702,24 @@ pub async fn run_socket_with_router<S>(
 where
     S: Future<Output = ()> + Send,
 {
+    run_socket_with_state(McpDaemonState::new(cfg, router), socket_path, shutdown).await
+}
+
+#[cfg(unix)]
+pub async fn run_socket_with_state<S>(
+    daemon: McpDaemonState,
+    socket_path: PathBuf,
+    shutdown: S,
+) -> Result<()>
+where
+    S: Future<Output = ()> + Send,
+{
     use tokio::net::{UnixListener, UnixStream};
     use tokio::task::JoinSet;
-
     let (connection_shutdown_tx, connection_shutdown_rx) = watch::channel(false);
-    let request_admission = build_request_admission(&cfg);
     let state = SocketState {
-        prewarm_gates: BackendPrewarmGates::new(&cfg),
-        request_admission,
+        daemon,
         shutdown: connection_shutdown_rx,
-        cfg,
-        router,
     };
 
     if let Some(parent) = socket_path.parent().filter(|p| !p.as_os_str().is_empty()) {
@@ -1796,7 +1869,7 @@ where
         }
     }
 
-    state.request_admission.close();
+    state.daemon.request_admission.close();
     let _ = connection_shutdown_tx.send(true);
     while connections.join_next().await.is_some() {}
     Ok(())
@@ -1962,7 +2035,7 @@ async fn serve_socket_connection(state: SocketState, stream: tokio::net::UnixStr
         match private_proxy::classify_server_first_line(&first_line) {
             ServerFirstLine::Route { cwd } => {
                 let selected = tokio::select! {
-                    selected = state.router.repository_for_project_dir(Some(&cwd)) => selected,
+                    selected = state.daemon.router.repository_for_project_dir(Some(&cwd)) => selected,
                     _ = &mut peer_disconnected => return Ok(()),
                 };
                 match selected {
@@ -1991,7 +2064,7 @@ async fn serve_socket_connection(state: SocketState, stream: tokio::net::UnixStr
             }
             ServerFirstLine::Raw => {
                 let backend = tokio::select! {
-                    backend = state.router.default_repository() => backend?,
+                    backend = state.daemon.router.default_repository() => backend?,
                     _ = &mut peer_disconnected => return Ok(()),
                 };
                 (
@@ -2003,7 +2076,11 @@ async fn serve_socket_connection(state: SocketState, stream: tokio::net::UnixStr
             }
         };
 
-    let prewarm_started = match state.prewarm_gates.for_backend(backend.backend_name()) {
+    let prewarm_started = match state
+        .daemon
+        .prewarm_gates
+        .for_backend(backend.backend_name())
+    {
         Ok(gate) => gate,
         Err(error) if negotiated => {
             let message = error.to_string();
@@ -2016,12 +2093,12 @@ async fn serve_socket_connection(state: SocketState, stream: tokio::net::UnixStr
         Err(error) => return Err(error),
     };
     let app_state = AppState::with_repository(
-        state.cfg,
+        state.daemon.cfg.clone(),
         backend.repository().clone(),
         prewarm_started,
         launch_dir,
-        state.request_admission,
-        state.router.query_runtime(),
+        state.daemon.request_admission.clone(),
+        state.daemon.router.query_runtime(),
     );
     if negotiated {
         tokio::select! {
@@ -2158,6 +2235,18 @@ pub fn project_scope_from_launch_dir() -> Result<SessionOriginScope> {
 pub async fn run_socket_with_router<S>(
     _cfg: Arc<AppConfig>,
     _router: Arc<BackendRepositoryRouter>,
+    _socket_path: PathBuf,
+    _shutdown: S,
+) -> Result<()>
+where
+    S: Future<Output = ()> + Send,
+{
+    anyhow::bail!("the central MCP socket server is only supported on Unix platforms")
+}
+
+#[cfg(not(unix))]
+pub async fn run_socket_with_state<S>(
+    _state: McpDaemonState,
     _socket_path: PathBuf,
     _shutdown: S,
 ) -> Result<()>

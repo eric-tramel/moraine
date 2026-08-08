@@ -1510,6 +1510,13 @@ EOF
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_postings WHERE term = '${nac_keyword}'" 120
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-nac' AND tool_call_id = '${nac_tool_call_id}'" 120
 
+  echo "[e2e] checking concurrent clients through shared HTTP MCP endpoint"
+  "$python_bin" "$repo_root/scripts/ci/mcp_http_smoke.py" \
+    --url "http://127.0.0.1:${monitor_port}/mcp" \
+    --query "$codex_keyword" \
+    --pids-dir "$pids_dir"
+  assert_canonical_pid_layout "$pids_dir"
+
   echo "[e2e] checking ClickHouse normalized ingest rows"
   assert_clickhouse_count "$clickhouse_url" "non-Qwen ingest errors" "SELECT count() FROM ${clickhouse_database}.ingest_errors WHERE source_name != 'qwen-code'" "0"
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.ingest_errors WHERE source_name = 'qwen-code' AND error_kind = 'timestamp_parse_error'" 120

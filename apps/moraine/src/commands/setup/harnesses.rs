@@ -1,6 +1,7 @@
 use std::cell::OnceCell;
 use std::collections::BTreeSet;
 use std::env;
+use std::fs;
 use std::iter;
 use std::path::{Path, PathBuf};
 
@@ -21,6 +22,8 @@ pub(super) struct SetupPathContext {
     pub(super) launch_cwd: PathBuf,
     pub(super) home: Option<PathBuf>,
     pub(super) xdg_config_home: Option<PathBuf>,
+    pub(super) codex_home: Option<PathBuf>,
+    pub(super) claude_config_dir: Option<PathBuf>,
     pub(super) kiro_home: Option<PathBuf>,
     pub(super) nac_home: Option<PathBuf>,
     pub(super) prime_agent_dir: Option<PathBuf>,
@@ -35,6 +38,8 @@ impl SetupPathContext {
             launch_cwd: env::current_dir().context("failed to resolve setup launch directory")?,
             home: env::var_os("HOME").map(PathBuf::from),
             xdg_config_home: env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
+            codex_home: env::var_os("CODEX_HOME").map(PathBuf::from),
+            claude_config_dir: env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from),
             kiro_home: env::var_os("KIRO_HOME").map(PathBuf::from),
             nac_home: env::var_os("NAC_HOME").map(PathBuf::from),
             prime_agent_dir: prime_agent::resolve_agent_dir(
@@ -54,6 +59,8 @@ impl SetupPathContext {
             launch_cwd: PathBuf::from("/"),
             home: home.clone(),
             xdg_config_home: None,
+            codex_home: None,
+            claude_config_dir: None,
             kiro_home: None,
             nac_home: None,
             prime_agent_dir: home.as_ref().map(|home| home.join(".prime").join("agent")),
@@ -61,6 +68,17 @@ impl SetupPathContext {
             nac_snapshot: OnceCell::new(),
             nac_expected_content: OnceCell::new(),
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_plugin_roots(
+        mut self,
+        codex_home: Option<PathBuf>,
+        claude_config_dir: Option<PathBuf>,
+    ) -> Self {
+        self.codex_home = codex_home;
+        self.claude_config_dir = claude_config_dir;
+        self
     }
 
     fn resolve_from_launch(&self, path: &Path) -> PathBuf {
@@ -634,38 +652,79 @@ pub(super) fn default_ingest_sources(
     }])
 }
 
+fn obsolete_plugin_manifest_writes(
+    paths: &SetupPathContext,
+    target: SetupMcpTarget,
+) -> Vec<McpConfigWrite> {
+    let (harness_root, manifest_path) = match target {
+        SetupMcpTarget::ClaudeCode => (
+            paths
+                .claude_config_dir
+                .as_deref()
+                .map(|path| paths.resolve_from_launch(path))
+                .or_else(|| paths.home.as_ref().map(|home| home.join(".claude"))),
+            ".claude-plugin/plugin.json",
+        ),
+        SetupMcpTarget::Codex => (
+            paths
+                .codex_home
+                .as_deref()
+                .map(|path| paths.resolve_from_launch(path))
+                .or_else(|| paths.home.as_ref().map(|home| home.join(".codex"))),
+            ".codex-plugin/plugin.json",
+        ),
+        _ => return Vec::new(),
+    };
+    let Some(harness_root) = harness_root else {
+        return Vec::new();
+    };
+    let cache_root = harness_root.join("plugins/cache/moraine/moraine");
+    if !is_real_directory(&cache_root) {
+        return Vec::new();
+    }
+    let Ok(versions) = fs::read_dir(&cache_root) else {
+        return Vec::new();
+    };
+    versions
+        .filter_map(std::result::Result::ok)
+        .filter(|version| version.file_type().is_ok_and(|kind| kind.is_dir()))
+        .map(|version| version.path().join(manifest_path))
+        .filter(|manifest| {
+            manifest.parent().is_some_and(is_real_directory)
+                && is_real_file(manifest)
+                && fs::read(manifest)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                    .is_some_and(|value| value.get("mcpServers").is_some())
+        })
+        .map(|manifest| McpConfigWrite::plugin_manifest_cleanup(cache_root.clone(), manifest))
+        .collect()
+}
+
+fn is_real_directory(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+}
+
+fn is_real_file(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+}
+
 pub(super) fn mcp_plan(
     target: SetupMcpTarget,
     config_target: &ConfigTarget,
     paths: &SetupPathContext,
+    http_endpoint: Option<&str>,
 ) -> Result<McpPlan> {
     let home = &paths.home;
+    let http_endpoint = match target {
+        SetupMcpTarget::ClaudeCode | SetupMcpTarget::Codex => Some(
+            http_endpoint.context("missing MCP HTTP endpoint for native harness registration")?,
+        ),
+        _ => None,
+    };
     Ok(match target {
-        SetupMcpTarget::ClaudeCode if config_target.requires_explicit_mcp_config() => {
-            let mut args = vec![
-                "mcp".to_string(),
-                "add".to_string(),
-                "--transport".to_string(),
-                "stdio".to_string(),
-                "--scope".to_string(),
-                "user".to_string(),
-                "moraine".to_string(),
-                "--".to_string(),
-                "moraine".to_string(),
-                "run".to_string(),
-                "mcp".to_string(),
-                "--config".to_string(),
-            ];
-            args.push(config_target.path.display().to_string());
-            let command = CommandSpec::new("claude", args);
-            McpPlan::manual(
-                target,
-                format!(
-                    "Claude Code plugin installs use the default Moraine config. For this custom config target, use manual MCP registration:\n{}",
-                    command.display()
-                ),
-            )
-        }
         SetupMcpTarget::ClaudeCode => McpPlan {
             target,
             action: super::McpAction::Execute,
@@ -725,27 +784,37 @@ pub(super) fn mcp_plan(
                     CommandSpec::new("claude", ["mcp", "remove", "moraine", "--scope", "user"]),
                     "Existing manual Claude Code MCP registration could not be removed; continuing in case it was absent",
                 )
+                .with_config_writes_before()
                 .with_progress(
                     "Cleaning up old Claude Code MCP registration",
                     "Old Claude Code MCP registration removed or absent",
                     "Old Claude Code MCP registration left unchanged",
                     "Old Claude Code MCP cleanup failed",
                 ),
+                McpPlanStep::required(CommandSpec::new(
+                    "claude",
+                    vec![
+                        "mcp".to_string(),
+                        "add".to_string(),
+                        "--transport".to_string(),
+                        "http".to_string(),
+                        "--scope".to_string(),
+                        "user".to_string(),
+                        "moraine".to_string(),
+                        http_endpoint.expect("Claude endpoint was validated").to_string(),
+                    ],
+                ))
+                .with_progress(
+                    "Registering Moraine MCP endpoint with Claude Code",
+                    "Claude Code MCP endpoint registered",
+                    "Claude Code MCP endpoint registration warning",
+                    "Claude Code MCP endpoint registration failed",
+                ),
             ],
-            config_writes: Vec::new(),
+            config_writes: obsolete_plugin_manifest_writes(paths, SetupMcpTarget::ClaudeCode),
             managed_writes: Vec::new(),
             manual_snippet: None,
         },
-        SetupMcpTarget::Codex if config_target.requires_explicit_mcp_config() => {
-            let command = CommandSpec::new("codex", codex_args(config_target));
-            McpPlan::manual(
-                target,
-                format!(
-                    "Codex plugin installs use the default Moraine config. For this custom config target, use manual MCP registration:\n{}",
-                    command.display()
-                ),
-            )
-        }
         SetupMcpTarget::Codex => McpPlan {
             target,
             action: super::McpAction::Execute,
@@ -776,6 +845,16 @@ pub(super) fn mcp_plan(
                 ),
                 McpPlanStep::required(CommandSpec::new(
                     "codex",
+                    ["plugin", "marketplace", "upgrade", "moraine"],
+                ))
+                .with_progress(
+                    "Refreshing Codex plugin marketplace",
+                    "Codex marketplace refreshed",
+                    "Codex marketplace refresh warning",
+                    "Codex marketplace refresh failed",
+                ),
+                McpPlanStep::required(CommandSpec::new(
+                    "codex",
                     ["plugin", "add", "moraine@moraine"],
                 ))
                 .with_progress(
@@ -788,14 +867,31 @@ pub(super) fn mcp_plan(
                     CommandSpec::new("codex", ["mcp", "remove", "moraine"]),
                     "Existing manual Codex MCP registration could not be removed; continuing in case it was absent",
                 )
+                .with_config_writes_before()
                 .with_progress(
                     "Cleaning up old Codex MCP registration",
                     "Old Codex MCP registration removed or absent",
                     "Old Codex MCP registration left unchanged",
                     "Old Codex MCP cleanup failed",
                 ),
+                McpPlanStep::required(CommandSpec::new(
+                    "codex",
+                    vec![
+                        "mcp".to_string(),
+                        "add".to_string(),
+                        "moraine".to_string(),
+                        "--url".to_string(),
+                        http_endpoint.expect("Codex endpoint was validated").to_string(),
+                    ],
+                ))
+                .with_progress(
+                    "Registering Moraine MCP endpoint with Codex",
+                    "Codex MCP endpoint registered",
+                    "Codex MCP endpoint registration warning",
+                    "Codex MCP endpoint registration failed",
+                ),
             ],
-            config_writes: Vec::new(),
+            config_writes: obsolete_plugin_manifest_writes(paths, SetupMcpTarget::Codex),
             managed_writes: Vec::new(),
             manual_snippet: None,
         },
@@ -1075,15 +1171,27 @@ pub(super) struct McpConfigWrite {
     kind: McpConfigKind,
     command: Vec<String>,
     nac_write: Option<nac::PreparedMcpWrite>,
+    plugin_cache_root: Option<PathBuf>,
 }
 
 impl McpConfigWrite {
+    fn plugin_manifest_cleanup(cache_root: PathBuf, path: PathBuf) -> Self {
+        Self {
+            path,
+            kind: McpConfigKind::PluginManifestCleanup,
+            command: Vec::new(),
+            nac_write: None,
+            plugin_cache_root: Some(cache_root),
+        }
+    }
+
     pub(super) fn cursor(home: &Path, config_target: &ConfigTarget) -> Self {
         Self {
             path: home.join(".cursor").join("mcp.json"),
             kind: McpConfigKind::Cursor,
             command: mcp_run_args(config_target),
             nac_write: None,
+            plugin_cache_root: None,
         }
     }
 
@@ -1093,6 +1201,7 @@ impl McpConfigWrite {
             kind: McpConfigKind::Pi,
             command: mcp_run_args(config_target),
             nac_write: None,
+            plugin_cache_root: None,
         }
     }
 
@@ -1102,6 +1211,7 @@ impl McpConfigWrite {
             kind: McpConfigKind::Omp,
             command: mcp_run_args(config_target),
             nac_write: None,
+            plugin_cache_root: None,
         }
     }
 
@@ -1111,6 +1221,7 @@ impl McpConfigWrite {
             kind: McpConfigKind::OpenCode,
             command: opencode_command(config_target),
             nac_write: None,
+            plugin_cache_root: None,
         }
     }
 
@@ -1130,6 +1241,7 @@ impl McpConfigWrite {
                 "stdio".to_string(),
             ],
             nac_write: None,
+            plugin_cache_root: None,
         }
     }
 
@@ -1141,6 +1253,7 @@ impl McpConfigWrite {
             kind: McpConfigKind::Nac,
             command,
             nac_write: Some(nac_write),
+            plugin_cache_root: None,
         })
     }
 
@@ -1163,6 +1276,13 @@ impl McpConfigWrite {
 
     pub(super) fn is_prime_agent(&self) -> bool {
         matches!(self.kind, McpConfigKind::PrimeAgent)
+    }
+    pub(super) fn is_plugin_manifest_cleanup(&self) -> bool {
+        matches!(self.kind, McpConfigKind::PluginManifestCleanup)
+    }
+
+    pub(super) fn plugin_cache_root(&self) -> Option<&Path> {
+        self.plugin_cache_root.as_deref()
     }
 
     pub(super) fn nac_rendered(&self) -> Option<&[u8]> {
@@ -1209,6 +1329,9 @@ impl McpConfigWrite {
                 servers.insert("moraine".to_string(), self.server_value());
             }
             McpConfigKind::Nac => bail!("NAC MCP config uses TOML, not JSON"),
+            McpConfigKind::PluginManifestCleanup => {
+                root.remove("mcpServers");
+            }
         }
         Ok(())
     }
@@ -1237,7 +1360,7 @@ impl McpConfigWrite {
                 "command": self.command.clone(),
                 "enabled": true,
             }),
-            McpConfigKind::Nac => Value::Null,
+            McpConfigKind::Nac | McpConfigKind::PluginManifestCleanup => Value::Null,
         }
     }
 
@@ -1257,6 +1380,7 @@ enum McpConfigKind {
     PrimeAgent,
     OpenCode,
     Nac,
+    PluginManifestCleanup,
 }
 
 impl McpConfigKind {
@@ -1268,6 +1392,7 @@ impl McpConfigKind {
             McpConfigKind::PrimeAgent => "Prime Agent settings",
             McpConfigKind::OpenCode => "OpenCode",
             McpConfigKind::Nac => "NAC",
+            McpConfigKind::PluginManifestCleanup => "Installed Moraine plugin manifest",
         }
     }
 
@@ -1276,7 +1401,8 @@ impl McpConfigKind {
             McpConfigKind::Cursor
             | McpConfigKind::Pi
             | McpConfigKind::Omp
-            | McpConfigKind::PrimeAgent => McpConfigFormat::Json,
+            | McpConfigKind::PrimeAgent
+            | McpConfigKind::PluginManifestCleanup => McpConfigFormat::Json,
             McpConfigKind::OpenCode => McpConfigFormat::Jsonc,
             McpConfigKind::Nac => McpConfigFormat::Toml,
         }
@@ -1296,18 +1422,6 @@ fn object_entry_mut<'a>(
     Ok(value
         .as_object_mut()
         .expect("value was checked as a JSON object"))
-}
-
-fn codex_args(config_target: &ConfigTarget) -> Vec<String> {
-    let mut args = vec![
-        "mcp".to_string(),
-        "add".to_string(),
-        "moraine".to_string(),
-        "--".to_string(),
-        "moraine".to_string(),
-    ];
-    args.extend(mcp_run_args(config_target));
-    args
 }
 
 pub(super) fn hermes_args(config_target: &ConfigTarget) -> Vec<String> {
@@ -1578,6 +1692,8 @@ mod tests {
             launch_cwd: PathBuf::from("/workspace"),
             home: Some(home),
             xdg_config_home: Some(xdg.clone()),
+            codex_home: None,
+            claude_config_dir: None,
             kiro_home: None,
             nac_home: None,
             prime_agent_dir: None,
@@ -1603,6 +1719,8 @@ mod tests {
             launch_cwd: PathBuf::from("/workspace"),
             home: None,
             xdg_config_home: None,
+            codex_home: None,
+            claude_config_dir: None,
             kiro_home: None,
             nac_home: Some(nac_home.clone()),
             prime_agent_dir: None,
@@ -1638,6 +1756,8 @@ mod tests {
             launch_cwd: root.clone(),
             home: None,
             xdg_config_home: None,
+            codex_home: None,
+            claude_config_dir: None,
             kiro_home: None,
             nac_home: Some(nac_home),
             prime_agent_dir: None,
@@ -1669,6 +1789,8 @@ mod tests {
             launch_cwd: root.join("workspace"),
             home: None,
             xdg_config_home: None,
+            codex_home: None,
+            claude_config_dir: None,
             kiro_home: None,
             nac_home: Some(nac_home),
             prime_agent_dir: None,
@@ -1699,6 +1821,8 @@ mod tests {
             launch_cwd: PathBuf::from("/workspace/project"),
             home: None,
             xdg_config_home: None,
+            codex_home: None,
+            claude_config_dir: None,
             kiro_home: None,
             nac_home: None,
             prime_agent_dir: None,
@@ -1724,6 +1848,8 @@ mod tests {
             launch_cwd: PathBuf::from("/workspace/project"),
             home: Some(PathBuf::from("/home/example")),
             xdg_config_home: None,
+            codex_home: None,
+            claude_config_dir: None,
             kiro_home: None,
             nac_home: Some(PathBuf::from("nac-state")),
             prime_agent_dir: None,
@@ -1768,6 +1894,8 @@ mod tests {
             launch_cwd: launch,
             home: None,
             xdg_config_home: None,
+            codex_home: None,
+            claude_config_dir: None,
             kiro_home: None,
             nac_home: Some(PathBuf::from("relative-nac")),
             prime_agent_dir: None,
@@ -1797,6 +1925,8 @@ mod tests {
             launch_cwd: PathBuf::from("/workspace"),
             home: None,
             xdg_config_home: None,
+            codex_home: None,
+            claude_config_dir: None,
             kiro_home: None,
             nac_home: Some(nac_home.clone()),
             prime_agent_dir: None,
@@ -1842,6 +1972,8 @@ mod tests {
                 launch_cwd: PathBuf::from("/workspace"),
                 home: None,
                 xdg_config_home: None,
+                codex_home: None,
+                claude_config_dir: None,
                 kiro_home: None,
                 nac_home: Some(nac_home.clone()),
                 prime_agent_dir: None,
@@ -1869,6 +2001,8 @@ mod tests {
             launch_cwd: PathBuf::from("/workspace"),
             home: None,
             xdg_config_home: None,
+            codex_home: None,
+            claude_config_dir: None,
             kiro_home: None,
             nac_home: Some(nac_home),
             prime_agent_dir: None,

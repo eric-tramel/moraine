@@ -6,6 +6,7 @@ use std::collections::BTreeSet;
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, IsTerminal, Write};
+use std::net::IpAddr;
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -21,6 +22,8 @@ mod prime_agent;
 use harnesses::{ManagedFileWrite, McpConfigFormat, McpConfigWrite};
 
 const DEFAULT_CONFIG_TEMPLATE: &str = include_str!("../../../../config/moraine.toml");
+#[cfg(test)]
+const DEFAULT_MCP_HTTP_ENDPOINT: &str = "http://127.0.0.1:8080/mcp";
 const HOST_WIDE_ACCESS_WARNING: &str =
     "Selected harness integrations get host-wide Moraine session history access visible to your user.";
 
@@ -113,10 +116,17 @@ fn run_setup_with_paths(
             let mut harness_targets = selections.harness_targets();
             let can_run_harness =
                 config.status == SetupStatus::Ok || args.skip_config || args.dry_run;
+            let http_endpoint = if harness_targets.iter().copied().any(uses_http_endpoint) {
+                resolve_setup_http_endpoint(args, &target, &config)
+                    .map_err(|error| format!("{error:#}"))
+            } else {
+                Ok(String::new())
+            };
             let mut progress = SetupProgress::from_output(output);
             let mcp_context = McpSetupContext {
                 config_target: &target,
                 paths: path_context,
+                http_endpoint: &http_endpoint,
             };
 
             // NAC's combined mode writes its MCP table before persisting the source
@@ -439,6 +449,58 @@ fn inspect_config(path: &Path) -> ConfigState {
         }
         Err(exc) => ConfigState::Invalid(exc.to_string()),
     }
+}
+
+fn uses_http_endpoint(target: SetupMcpTarget) -> bool {
+    matches!(target, SetupMcpTarget::ClaudeCode | SetupMcpTarget::Codex)
+}
+
+fn resolve_setup_http_endpoint(
+    args: &SetupArgs,
+    target: &ConfigTarget,
+    config: &ConfigReport,
+) -> Result<String> {
+    let cfg = match moraine_config::load_config(&target.path) {
+        Ok(cfg) => cfg,
+        Err(_)
+            if args.dry_run
+                && target.source == ConfigTargetSource::HomeDefault
+                && config.action == "would_create" =>
+        {
+            moraine_config::AppConfig::default()
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "cannot derive the MCP HTTP endpoint from {}",
+                    target.path.display()
+                )
+            })
+        }
+    };
+    let bind = cfg.backend.bind.as_str();
+    if bind.trim() != bind {
+        bail!("backend.bind must not contain surrounding whitespace");
+    }
+    let literal = bind
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(bind);
+    let address = literal
+        .parse::<IpAddr>()
+        .with_context(|| "backend.bind must be a literal loopback IP for MCP HTTP setup")?;
+    if !address.is_loopback() {
+        bail!("backend.bind must be a loopback IP for MCP HTTP setup");
+    }
+    if cfg.monitor.port == 0 {
+        bail!("monitor.port must be nonzero for MCP HTTP setup");
+    }
+    let host = if address.is_ipv6() {
+        format!("[{address}]")
+    } else {
+        address.to_string()
+    };
+    Ok(format!("http://{host}:{}/mcp", cfg.monitor.port))
 }
 
 fn write_default_config(path: &Path) -> Result<()> {
@@ -1676,6 +1738,7 @@ impl SetupProgress {
 struct McpSetupContext<'a> {
     config_target: &'a ConfigTarget,
     paths: &'a harnesses::SetupPathContext,
+    http_endpoint: &'a std::result::Result<String, String>,
 }
 
 #[cfg(test)]
@@ -1689,11 +1752,13 @@ fn setup_mcp_target(
 ) -> Result<McpTargetReport> {
     let mut progress = SetupProgress::disabled();
     let paths = harnesses::SetupPathContext::from_env()?;
+    let http_endpoint = Ok(DEFAULT_MCP_HTTP_ENDPOINT.to_string());
     setup_mcp_target_with_progress(
         args,
         &McpSetupContext {
             config_target,
             paths: &paths,
+            http_endpoint: &http_endpoint,
         },
         target,
         interactive,
@@ -1712,7 +1777,20 @@ fn setup_mcp_target_with_progress(
     progress: &mut SetupProgress,
     runner: &mut dyn CommandRunner,
 ) -> Result<McpTargetReport> {
-    let plan = match McpPlan::for_target_with_paths(target, context.config_target, context.paths) {
+    let http_endpoint = if uses_http_endpoint(target) {
+        match context.http_endpoint {
+            Ok(endpoint) => Some(endpoint.as_str()),
+            Err(error) => return Ok(McpTargetReport::error(target, error)),
+        }
+    } else {
+        None
+    };
+    let plan = match McpPlan::for_target_with_paths(
+        target,
+        context.config_target,
+        context.paths,
+        http_endpoint,
+    ) {
         Ok(plan) => plan,
         Err(exc) => return Ok(McpTargetReport::error(target, &format!("{exc:#}"))),
     };
@@ -1778,8 +1856,17 @@ fn execute_mcp_plan_with_progress(
     let mut command_results = Vec::new();
     let mut warnings = Vec::new();
     let mut failed = None;
+    let mut config_files = Vec::new();
+    let mut config_writes_applied = false;
 
     for step in &plan.steps {
+        if step.apply_config_writes_before {
+            failed = apply_mcp_config_writes(&plan.config_writes, progress, &mut config_files);
+            config_writes_applied = true;
+            if failed.is_some() {
+                break;
+            }
+        }
         progress.command_start(step);
         let result = match runner.run(&step.command) {
             Ok(result) => result,
@@ -1811,29 +1898,13 @@ fn execute_mcp_plan_with_progress(
         }
     }
 
-    let mut config_files = Vec::new();
     let prime_skill_first = plan.target == SetupMcpTarget::PrimeAgent;
     if failed.is_none() && prime_skill_first {
         failed = apply_prime_managed_file_writes(&plan.managed_writes, progress, &mut config_files);
     }
 
-    if failed.is_none() {
-        for write in &plan.config_writes {
-            progress.config_start(write);
-            match apply_mcp_config_write(write) {
-                Ok(report) => {
-                    progress.config_success(write);
-                    config_files.push(report);
-                }
-                Err(exc) => {
-                    let error = format!("failed to update {}: {exc}", write.path().display());
-                    progress.config_error(write, &exc.to_string());
-                    config_files.push(McpConfigFileReport::error(write, &exc.to_string()));
-                    failed = Some(error);
-                    break;
-                }
-            }
-        }
+    if failed.is_none() && !config_writes_applied {
+        failed = apply_mcp_config_writes(&plan.config_writes, progress, &mut config_files);
     }
 
     if failed.is_none() && !prime_skill_first {
@@ -1905,8 +1976,13 @@ impl McpPlan {
     fn for_target(target: SetupMcpTarget, config_target: &ConfigTarget) -> Self {
         let paths = harnesses::SetupPathContext::from_env()
             .expect("setup path context should resolve the current directory");
-        Self::for_target_with_paths(target, config_target, &paths)
-            .expect("test MCP plan should be valid")
+        Self::for_target_with_paths(
+            target,
+            config_target,
+            &paths,
+            uses_http_endpoint(target).then_some(DEFAULT_MCP_HTTP_ENDPOINT),
+        )
+        .expect("test MCP plan should be valid")
     }
 
     #[cfg(test)]
@@ -1927,16 +2003,22 @@ impl McpPlan {
     ) -> Self {
         let mut paths = harnesses::SetupPathContext::with_home(home);
         paths.kiro_home = kiro_home;
-        Self::for_target_with_paths(target, config_target, &paths)
-            .expect("test MCP plan should be valid")
+        Self::for_target_with_paths(
+            target,
+            config_target,
+            &paths,
+            uses_http_endpoint(target).then_some(DEFAULT_MCP_HTTP_ENDPOINT),
+        )
+        .expect("test MCP plan should be valid")
     }
 
     fn for_target_with_paths(
         target: SetupMcpTarget,
         config_target: &ConfigTarget,
         paths: &harnesses::SetupPathContext,
+        http_endpoint: Option<&str>,
     ) -> Result<Self> {
-        harnesses::mcp_plan(target, config_target, paths)
+        harnesses::mcp_plan(target, config_target, paths, http_endpoint)
     }
 
     fn replace_registration(
@@ -2021,6 +2103,7 @@ struct McpPlanStep {
     command: CommandSpec,
     failure_policy: CommandFailurePolicy,
     success_stdout_contains: Option<&'static str>,
+    apply_config_writes_before: bool,
     progress_label: &'static str,
     success_label: &'static str,
     warning_label: &'static str,
@@ -2033,6 +2116,7 @@ impl McpPlanStep {
             command,
             failure_policy: CommandFailurePolicy::Required,
             success_stdout_contains: None,
+            apply_config_writes_before: false,
             progress_label: "Running setup command",
             success_label: "Command completed",
             warning_label: "Command completed with warning",
@@ -2045,6 +2129,7 @@ impl McpPlanStep {
             command,
             failure_policy: CommandFailurePolicy::Required,
             success_stdout_contains: Some(marker),
+            apply_config_writes_before: false,
             progress_label: "Running setup command",
             success_label: "Command completed",
             warning_label: "Command completed with warning",
@@ -2057,11 +2142,17 @@ impl McpPlanStep {
             command,
             failure_policy: CommandFailurePolicy::WarnAndContinue(message),
             success_stdout_contains: None,
+            apply_config_writes_before: false,
             progress_label: "Running optional setup command",
             success_label: "Optional command completed",
             warning_label: "Optional command skipped",
             error_label: "Optional command failed",
         }
+    }
+
+    fn with_config_writes_before(mut self) -> Self {
+        self.apply_config_writes_before = true;
+        self
     }
 
     fn with_progress(
@@ -2215,6 +2306,29 @@ fn apply_prime_managed_file_writes(
     }
 }
 
+fn apply_mcp_config_writes(
+    writes: &[McpConfigWrite],
+    progress: &mut SetupProgress,
+    config_files: &mut Vec<McpConfigFileReport>,
+) -> Option<String> {
+    for write in writes {
+        progress.config_start(write);
+        match apply_mcp_config_write(write) {
+            Ok(report) => {
+                progress.config_success(write);
+                config_files.push(report);
+            }
+            Err(error) => {
+                let message = format!("failed to update {}: {error}", write.path().display());
+                progress.config_error(write, &error.to_string());
+                config_files.push(McpConfigFileReport::error(write, &error.to_string()));
+                return Some(message);
+            }
+        }
+    }
+    None
+}
+
 fn apply_managed_file_writes(
     writes: &[ManagedFileWrite],
     progress: &mut SetupProgress,
@@ -2246,6 +2360,9 @@ fn apply_mcp_config_write(write: &McpConfigWrite) -> Result<McpConfigFileReport>
             Ok(McpConfigFileReport::unchanged(write))
         };
     }
+    if write.is_plugin_manifest_cleanup() {
+        return apply_plugin_manifest_cleanup(write);
+    }
     if matches!(write.format(), McpConfigFormat::Toml) {
         write.verify_nac_snapshot_current()?;
         if write.nac_is_unchanged() {
@@ -2263,6 +2380,96 @@ fn apply_mcp_config_write(write: &McpConfigWrite) -> Result<McpConfigFileReport>
     write.merge_into(&mut root)?;
     write_json_atomic(write.path(), &Value::Object(root))?;
     Ok(McpConfigFileReport::written(write))
+}
+
+fn apply_plugin_manifest_cleanup(write: &McpConfigWrite) -> Result<McpConfigFileReport> {
+    let cache_root = write
+        .plugin_cache_root()
+        .context("plugin manifest cleanup is missing its cache root")?;
+    let relative = write.path().strip_prefix(cache_root).with_context(|| {
+        format!(
+            "{} is outside plugin cache root {}",
+            write.path().display(),
+            cache_root.display()
+        )
+    })?;
+    if !cleanup_path_is_real_directory(cache_root)? {
+        return Ok(McpConfigFileReport::unchanged(write));
+    }
+    let Some(parent_relative) = relative.parent() else {
+        bail!("plugin manifest cleanup path has no parent");
+    };
+    let mut directory = cache_root.to_path_buf();
+    for component in parent_relative.components() {
+        let std::path::Component::Normal(component) = component else {
+            bail!("plugin manifest cleanup path contains an unsafe component");
+        };
+        directory.push(component);
+        if !cleanup_path_is_real_directory(&directory)? {
+            return Ok(McpConfigFileReport::unchanged(write));
+        }
+    }
+    if !cleanup_path_is_real_file(write.path())? {
+        return Ok(McpConfigFileReport::unchanged(write));
+    }
+
+    let canonical_root = cache_root
+        .canonicalize()
+        .with_context(|| format!("failed to resolve {}", cache_root.display()))?;
+    let canonical_parent = write
+        .path()
+        .parent()
+        .expect("cleanup manifest has a validated parent")
+        .canonicalize()
+        .with_context(|| format!("failed to resolve {}", write.path().display()))?;
+    if !canonical_parent.starts_with(&canonical_root) {
+        bail!(
+            "{} resolves outside plugin cache root {}",
+            write.path().display(),
+            cache_root.display()
+        );
+    }
+
+    let content = match fs::read_to_string(write.path()) {
+        Ok(content) => content,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            return Ok(McpConfigFileReport::unchanged(write))
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read {}", write.path().display()))
+        }
+    };
+    let mut root = serde_json::from_str::<Value>(&content)
+        .with_context(|| format!("{} is not valid JSON", write.path().display()))?
+        .as_object()
+        .cloned()
+        .with_context(|| format!("{} must contain a JSON object", write.path().display()))?;
+    if root.remove("mcpServers").is_none() {
+        return Ok(McpConfigFileReport::unchanged(write));
+    }
+    if !cleanup_path_is_real_file(write.path())? {
+        return Ok(McpConfigFileReport::unchanged(write));
+    }
+    write_json_atomic(write.path(), &Value::Object(root))?;
+    Ok(McpConfigFileReport::written(write))
+}
+
+fn cleanup_path_is_real_directory(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => Ok(true),
+        Ok(_) => bail!("{} is not a real directory", path.display()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| format!("failed to inspect {}", path.display())),
+    }
+}
+
+fn cleanup_path_is_real_file(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => Ok(true),
+        Ok(_) => bail!("{} is not a regular non-symlink file", path.display()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| format!("failed to inspect {}", path.display())),
+    }
 }
 
 fn apply_managed_file_write(write: &ManagedFileWrite) -> Result<McpConfigFileReport> {
@@ -2974,7 +3181,7 @@ mod tests {
     use crate::render::OutputMode;
     use std::collections::{BTreeMap, BTreeSet};
     #[cfg(unix)]
-    use std::os::unix::fs::{symlink, PermissionsExt};
+    use std::os::unix::fs::PermissionsExt;
     use toml_edit::value as toml_value;
 
     struct ScopedEnvironmentVariable {
@@ -3100,24 +3307,6 @@ mod tests {
             .and_then(Path::parent)
             .expect("repo root")
             .to_path_buf()
-    }
-
-    fn shared_plugin_mcp_config() -> Value {
-        let shared_mcp_path = repo_root()
-            .join("plugins")
-            .join("moraine")
-            .join(".mcp.json");
-        serde_json::from_str(
-            &fs::read_to_string(&shared_mcp_path).expect("read shared plugin mcp config"),
-        )
-        .expect("shared plugin mcp json")
-    }
-
-    fn shared_plugin_launcher() -> String {
-        shared_plugin_mcp_config()["mcpServers"]["moraine"]["args"][2]
-            .as_str()
-            .expect("shared inline launcher script")
-            .to_string()
     }
 
     fn plain_output() -> CliOutput {
@@ -3414,6 +3603,8 @@ mod tests {
             launch_cwd: root.join("launch"),
             home: None,
             xdg_config_home: None,
+            codex_home: None,
+            claude_config_dir: None,
             kiro_home: None,
             nac_home: Some(nac_home),
             prime_agent_dir: None,
@@ -3485,6 +3676,8 @@ mod tests {
             launch_cwd: root.join("launch"),
             home: None,
             xdg_config_home: None,
+            codex_home: None,
+            claude_config_dir: None,
             kiro_home: None,
             nac_home: Some(nac_home),
             prime_agent_dir: None,
@@ -3522,6 +3715,8 @@ mod tests {
             launch_cwd: root.join("launch"),
             home: None,
             xdg_config_home: None,
+            codex_home: None,
+            claude_config_dir: None,
             kiro_home: None,
             nac_home: Some(nac_home),
             prime_agent_dir: None,
@@ -3591,6 +3786,8 @@ mod tests {
             launch_cwd: root.join("launch"),
             home: None,
             xdg_config_home: None,
+            codex_home: None,
+            claude_config_dir: None,
             kiro_home: None,
             nac_home: Some(nac_home.clone()),
             prime_agent_dir: None,
@@ -4505,14 +4702,120 @@ host = "127.42.0.9"
     }
 
     #[test]
-    fn codex_default_config_installs_plugin() {
+    fn setup_http_endpoint_uses_defaults_and_brackets_ipv6() {
+        let missing = ConfigTarget {
+            path: temp_path("missing-http-config"),
+            source: ConfigTargetSource::HomeDefault,
+        };
+        let dry_run = SetupArgs {
+            yes: false,
+            dry_run: true,
+            skip_config: false,
+            skip_mcp: false,
+            repair_config: false,
+            mcp_targets: vec![SetupMcpTarget::Codex],
+        };
+        let planned = ConfigReport::planned(
+            &missing.path,
+            "would_create",
+            "default config would be written",
+        );
+        assert_eq!(
+            resolve_setup_http_endpoint(&dry_run, &missing, &planned).expect("default endpoint"),
+            DEFAULT_MCP_HTTP_ENDPOINT
+        );
+
+        let missing_custom = ConfigTarget {
+            path: temp_path("missing-custom-http-config"),
+            source: ConfigTargetSource::Cli,
+        };
+        let planned = ConfigReport::planned(
+            &missing_custom.path,
+            "would_create",
+            "default config would be written",
+        );
+        assert!(resolve_setup_http_endpoint(&dry_run, &missing_custom, &planned).is_err());
+
+        let invalid_dir = temp_path("invalid-http-config");
+        fs::create_dir_all(&invalid_dir).expect("create invalid config dir");
+        let invalid_path = invalid_dir.join("moraine.toml");
+        fs::write(&invalid_path, "not = [valid").expect("write invalid config");
+        let invalid = ConfigTarget {
+            path: invalid_path.clone(),
+            source: ConfigTargetSource::HomeDefault,
+        };
+        let planned = ConfigReport::planned(&invalid_path, "would_repair", "invalid config repair");
+        assert!(resolve_setup_http_endpoint(&dry_run, &invalid, &planned).is_err());
+        let _ = fs::remove_dir_all(invalid_dir);
+
+        let dir = temp_path("ipv6-http-config");
+        fs::create_dir_all(&dir).expect("create config dir");
+        let path = dir.join("moraine.toml");
+        fs::write(
+            &path,
+            "[backend]\nbind = \"::1\"\n\n[monitor]\nport = 9090\n",
+        )
+        .expect("write IPv6 config");
+        let target = ConfigTarget {
+            path: path.clone(),
+            source: ConfigTargetSource::Cli,
+        };
+        let report = ConfigReport::ok(&path, "unchanged", "ok");
+        assert_eq!(
+            resolve_setup_http_endpoint(&dry_run, &target, &report).expect("IPv6 endpoint"),
+            "http://[::1]:9090/mcp"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn setup_http_endpoint_rejects_non_loopback_and_zero_port() {
+        let dir = temp_path("unsafe-http-config");
+        fs::create_dir_all(&dir).expect("create config dir");
+        let path = dir.join("moraine.toml");
+        let target = ConfigTarget {
+            path: path.clone(),
+            source: ConfigTargetSource::Cli,
+        };
+        let args = SetupArgs {
+            yes: true,
+            dry_run: false,
+            skip_config: true,
+            skip_mcp: false,
+            repair_config: false,
+            mcp_targets: vec![SetupMcpTarget::ClaudeCode],
+        };
+        let report = ConfigReport::skipped(&path, "skipped by --skip-config");
+
+        fs::write(
+            &path,
+            "[backend]\nbind = \"0.0.0.0\"\nauth_token = \"test-only\"\n",
+        )
+        .expect("write wildcard config");
+        let error = resolve_setup_http_endpoint(&args, &target, &report)
+            .expect_err("wildcard bind rejected");
+        assert!(format!("{error:#}").contains("loopback"), "{error:#}");
+
+        fs::write(
+            &path,
+            "[backend]\nbind = \"127.0.0.1\"\n\n[monitor]\nport = 0\n",
+        )
+        .expect("write zero-port config");
+        let error =
+            resolve_setup_http_endpoint(&args, &target, &report).expect_err("zero port rejected");
+        assert!(format!("{error:#}").contains("nonzero"), "{error:#}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn codex_default_config_refreshes_plugin_and_registers_http() {
         let target = ConfigTarget {
             path: PathBuf::from("/tmp/config.toml"),
             source: ConfigTargetSource::HomeDefault,
         };
         let plan = McpPlan::for_target(SetupMcpTarget::Codex, &target);
         let commands = plan.commands();
-        assert_eq!(commands.len(), 3);
+        assert_eq!(commands.len(), 5);
         assert_eq!(
             commands[0].args,
             vec![
@@ -4528,19 +4831,27 @@ host = "127.42.0.9"
                 "plugins/moraine-dev",
             ]
         );
-        assert_eq!(commands[1].args, vec!["plugin", "add", "moraine@moraine"]);
-        assert_eq!(commands[2].args, vec!["mcp", "remove", "moraine"]);
+        assert_eq!(
+            commands[1].args,
+            vec!["plugin", "marketplace", "upgrade", "moraine"]
+        );
+        assert_eq!(commands[2].args, vec!["plugin", "add", "moraine@moraine"]);
+        assert_eq!(commands[3].args, vec!["mcp", "remove", "moraine"]);
+        assert_eq!(
+            commands[4].args,
+            vec!["mcp", "add", "moraine", "--url", DEFAULT_MCP_HTTP_ENDPOINT,]
+        );
     }
 
     #[test]
-    fn claude_default_config_installs_updates_and_cleans_manual_mcp() {
+    fn claude_default_config_refreshes_plugin_and_registers_http() {
         let target = ConfigTarget {
             path: PathBuf::from("/tmp/config.toml"),
             source: ConfigTargetSource::HomeDefault,
         };
         let plan = McpPlan::for_target(SetupMcpTarget::ClaudeCode, &target);
         let commands = plan.commands();
-        assert_eq!(commands.len(), 5);
+        assert_eq!(commands.len(), 6);
         assert_eq!(
             commands[0].args,
             vec![
@@ -4569,6 +4880,143 @@ host = "127.42.0.9"
             commands[4].args,
             vec!["mcp", "remove", "moraine", "--scope", "user"]
         );
+        assert_eq!(
+            commands[5].args,
+            vec![
+                "mcp",
+                "add",
+                "--transport",
+                "http",
+                "--scope",
+                "user",
+                "moraine",
+                DEFAULT_MCP_HTTP_ENDPOINT,
+            ]
+        );
+    }
+
+    #[test]
+    fn native_setup_removes_obsolete_plugin_mcp_registration() {
+        for (target, program, manifest_relative) in [
+            (
+                SetupMcpTarget::ClaudeCode,
+                "claude",
+                ".claude-plugin/plugin.json",
+            ),
+            (SetupMcpTarget::Codex, "codex", ".codex-plugin/plugin.json"),
+        ] {
+            let home = temp_path("obsolete-plugin-mcp");
+            let plugin_root = home.join(format!("{program}-config-override"));
+            let manifest = plugin_root
+                .join("plugins/cache/moraine/moraine/0.7.3")
+                .join(manifest_relative);
+            fs::create_dir_all(manifest.parent().expect("plugin manifest parent"))
+                .expect("create plugin cache");
+            fs::write(
+                &manifest,
+                r#"{"name":"moraine","mcpServers":"../.mcp.json","preserved":true}"#,
+            )
+            .expect("write stale plugin manifest");
+            let target_config = ConfigTarget {
+                path: home.join(".moraine/config.toml"),
+                source: ConfigTargetSource::HomeDefault,
+            };
+            let paths = harnesses::SetupPathContext::with_home(Some(home.clone()))
+                .with_plugin_roots(
+                    (target == SetupMcpTarget::Codex).then(|| plugin_root.clone()),
+                    (target == SetupMcpTarget::ClaudeCode).then(|| plugin_root.clone()),
+                );
+            let plan = McpPlan::for_target_with_paths(
+                target,
+                &target_config,
+                &paths,
+                Some(DEFAULT_MCP_HTTP_ENDPOINT),
+            )
+            .expect("build native setup plan");
+            let commands = plan.commands();
+            let command_count = commands.len();
+            let mut runner = FakeRunner::default().with_existing(program);
+            for (index, command) in commands.iter().enumerate() {
+                runner = runner.with_response(
+                    command.clone(),
+                    index + 1 != command_count,
+                    "native registration failed",
+                );
+            }
+
+            let report = execute_mcp_plan(plan, &mut runner).expect("execute native setup");
+            assert_eq!(report.status, SetupStatus::Error);
+            let updated: Value =
+                serde_json::from_slice(&fs::read(&manifest).expect("read plugin manifest"))
+                    .expect("parse plugin manifest");
+            assert!(updated.get("mcpServers").is_none());
+            assert_eq!(updated["preserved"], true);
+            let _ = fs::remove_dir_all(home);
+        }
+    }
+    #[test]
+    fn obsolete_plugin_cleanup_does_not_recreate_a_removed_manifest() {
+        let home = temp_path("removed-plugin-manifest");
+        let manifest =
+            home.join(".codex/plugins/cache/moraine/moraine/0.7.3/.codex-plugin/plugin.json");
+        fs::create_dir_all(manifest.parent().expect("plugin manifest parent"))
+            .expect("create plugin cache");
+        fs::write(&manifest, r#"{"mcpServers":"../.mcp.json"}"#).expect("write stale manifest");
+        let target = ConfigTarget {
+            path: home.join(".moraine/config.toml"),
+            source: ConfigTargetSource::HomeDefault,
+        };
+        let plan =
+            McpPlan::for_target_with_home(SetupMcpTarget::Codex, &target, Some(home.clone()));
+        assert_eq!(plan.config_writes.len(), 1);
+
+        fs::remove_file(&manifest).expect("simulate plugin refresh removing old manifest");
+        let report =
+            apply_mcp_config_write(&plan.config_writes[0]).expect("missing manifest is unchanged");
+        assert_eq!(report.action, "unchanged");
+        assert!(!manifest.exists());
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn obsolete_plugin_cleanup_refuses_a_swapped_symlink_parent() {
+        use std::os::unix::fs::symlink;
+
+        let home = temp_path("symlinked-plugin-manifest");
+        let manifest =
+            home.join(".codex/plugins/cache/moraine/moraine/0.7.3/.codex-plugin/plugin.json");
+        let manifest_parent = manifest.parent().expect("plugin manifest parent");
+        fs::create_dir_all(manifest_parent).expect("create plugin cache");
+        fs::write(&manifest, r#"{"mcpServers":"../.mcp.json"}"#).expect("write stale manifest");
+        let target = ConfigTarget {
+            path: home.join(".moraine/config.toml"),
+            source: ConfigTargetSource::HomeDefault,
+        };
+        let plan =
+            McpPlan::for_target_with_home(SetupMcpTarget::Codex, &target, Some(home.clone()));
+        assert_eq!(plan.config_writes.len(), 1);
+
+        fs::remove_dir_all(manifest_parent).expect("remove discovered manifest parent");
+        let external = temp_path("external-plugin-manifest");
+        fs::create_dir_all(&external).expect("create external directory");
+        let external_manifest = external.join("plugin.json");
+        fs::write(
+            &external_manifest,
+            r#"{"mcpServers":"do-not-touch","preserved":true}"#,
+        )
+        .expect("write external manifest");
+        symlink(&external, manifest_parent).expect("swap manifest parent for symlink");
+
+        let error = apply_mcp_config_write(&plan.config_writes[0])
+            .expect_err("symlinked plugin cache parent must be rejected");
+        assert!(error.to_string().contains("not a real directory"));
+        let external_value: Value =
+            serde_json::from_slice(&fs::read(&external_manifest).expect("read external manifest"))
+                .expect("parse external manifest");
+        assert_eq!(external_value["mcpServers"], "do-not-touch");
+        let _ = fs::remove_dir_all(home);
+        let _ = fs::remove_dir_all(external);
     }
 
     #[test]
@@ -4585,7 +5033,8 @@ host = "127.42.0.9"
             .with_response(commands[1].clone(), true, "")
             .with_response(commands[2].clone(), true, "")
             .with_response(commands[3].clone(), true, "")
-            .with_response(commands[4].clone(), true, "");
+            .with_response(commands[4].clone(), true, "")
+            .with_response(commands[5].clone(), true, "");
 
         let report = execute_mcp_plan(plan, &mut runner).expect("execute Claude plan");
 
@@ -4804,283 +5253,72 @@ host = "127.42.0.9"
     }
 
     #[test]
-    fn plugin_mcp_configs_are_client_specific() {
-        let repo_root = repo_root();
-
-        let shared_mcp = shared_plugin_mcp_config();
-        let shared_server = shared_mcp["mcpServers"]["moraine"]
-            .as_object()
-            .expect("shared moraine server object");
-        assert_eq!(
-            shared_server.get("command"),
-            Some(&serde_json::json!("/bin/sh"))
-        );
-        assert!(shared_server.get("cwd").is_none());
-        let shared_args = shared_server["args"].as_array().expect("shared args array");
-        assert_eq!(shared_args.first(), Some(&serde_json::json!("-eu")));
-        let shared_launcher = shared_args
-            .get(2)
-            .and_then(Value::as_str)
-            .expect("shared inline launcher script");
-        assert!(shared_launcher.contains("moraine plugin launch error: binary_untrusted"));
-        assert!(shared_launcher.contains("exec \"$moraine_bin\" run mcp"));
-        assert!(!shared_launcher.contains("scripts/launch.sh"));
-        let file_launcher = fs::read_to_string(
-            repo_root
-                .join("plugins")
-                .join("moraine")
-                .join("scripts")
-                .join("launch.sh"),
-        )
-        .expect("read file launcher script");
-        assert_eq!(shared_launcher, file_launcher);
-
-        let codex_manifest_path = repo_root
-            .join("plugins")
-            .join("moraine")
-            .join(".codex-plugin")
-            .join("plugin.json");
-        let codex_manifest: Value = serde_json::from_str(
-            &fs::read_to_string(&codex_manifest_path).expect("read codex plugin manifest"),
-        )
-        .expect("codex plugin manifest json");
-        assert_eq!(codex_manifest["mcpServers"], "./.mcp.json");
-
-        let claude_manifest_path = repo_root
-            .join("plugins")
-            .join("moraine")
-            .join(".claude-plugin")
-            .join("plugin.json");
-        let claude_manifest: Value = serde_json::from_str(
-            &fs::read_to_string(&claude_manifest_path).expect("read claude plugin manifest"),
-        )
-        .expect("claude plugin manifest json");
-        assert_eq!(claude_manifest["mcpServers"], "./.claude-mcp.json");
-
-        let claude_mcp_path = repo_root
-            .join("plugins")
-            .join("moraine")
-            .join(".claude-mcp.json");
-        let claude_mcp: Value = serde_json::from_str(
-            &fs::read_to_string(&claude_mcp_path).expect("read claude plugin mcp config"),
-        )
-        .expect("claude plugin mcp json");
-        assert_eq!(
-            claude_mcp["mcpServers"]["moraine"]["command"],
-            "${CLAUDE_PLUGIN_ROOT}/scripts/launch.sh"
-        );
-        assert_eq!(
-            claude_mcp["mcpServers"]["moraine"]["args"],
-            serde_json::json!([])
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn shared_plugin_launcher_rejects_relative_path_moraine() {
-        let dir = temp_path("relative-path-launcher");
-        let rel_bin = dir.join("rel-bin");
-        fs::create_dir_all(&rel_bin).expect("create relative bin dir");
-        let fake_moraine = rel_bin.join("moraine");
-        fs::write(&fake_moraine, "#!/bin/sh\nexit 99\n").expect("write fake moraine");
-        let mut permissions = fs::metadata(&fake_moraine)
-            .expect("fake metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&fake_moraine, permissions).expect("chmod fake moraine");
-
-        let output = Command::new("/bin/sh")
-            .arg("-eu")
-            .arg("-c")
-            .arg(shared_plugin_launcher())
-            .current_dir(&dir)
-            .env("PATH", "rel-bin")
-            .output()
-            .expect("run shared plugin launcher");
-
-        assert_eq!(output.status.code(), Some(126));
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(stderr.contains("binary_untrusted"));
-        assert!(stderr.contains("relative PATH entry"));
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn shared_plugin_launcher_execs_trusted_absolute_moraine() {
-        let dir = temp_path("trusted-launcher");
-        let project = dir.join("project");
-        let bin = dir.join("bin");
-        fs::create_dir_all(&project).expect("create project dir");
-        fs::create_dir_all(&bin).expect("create bin dir");
-        let fake_moraine = bin.join("moraine");
-        fs::write(
-            &fake_moraine,
-            "#!/bin/sh\nprintf 'fake-moraine:%s:%s\\n' \"$1\" \"$2\"\n",
-        )
-        .expect("write fake moraine");
-        let mut permissions = fs::metadata(&fake_moraine)
-            .expect("fake metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&fake_moraine, permissions).expect("chmod fake moraine");
-
-        let output = Command::new("/bin/sh")
-            .arg("-eu")
-            .arg("-c")
-            .arg(shared_plugin_launcher())
-            .current_dir(&project)
-            .env("PATH", &bin)
-            .output()
-            .expect("run shared plugin launcher");
-
-        assert!(output.status.success());
-        assert_eq!(
-            String::from_utf8_lossy(&output.stdout),
-            "fake-moraine:run:mcp\n"
-        );
-        assert!(output.stderr.is_empty());
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn shared_plugin_launcher_execs_uv_tool_moraine_from_home_workspace() {
-        let home = temp_path("uv-tool-home-launcher");
-        let bin = home.join(".local").join("bin");
-        let tool_bin = home
-            .join(".local")
-            .join("share")
-            .join("uv")
-            .join("tools")
-            .join("moraine-cli")
-            .join("bin");
-        fs::create_dir_all(&bin).expect("create uv tool bin dir");
-        fs::create_dir_all(&tool_bin).expect("create uv tool environment bin dir");
-        let installed_moraine = tool_bin.join("moraine");
-        fs::write(
-            &installed_moraine,
-            "#!/bin/sh\nprintf 'fake-moraine:%s:%s\\n' \"$1\" \"$2\"\n",
-        )
-        .expect("write fake moraine");
-        let mut permissions = fs::metadata(&installed_moraine)
-            .expect("fake metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&installed_moraine, permissions).expect("chmod fake moraine");
-        symlink(&installed_moraine, bin.join("moraine")).expect("link uv tool executable");
-
-        let output = Command::new("/bin/sh")
-            .arg("-eu")
-            .arg("-c")
-            .arg(shared_plugin_launcher())
-            .current_dir(&home)
-            .env("HOME", &home)
-            .env("PATH", &bin)
-            .output()
-            .expect("run shared plugin launcher");
-
-        assert!(output.status.success());
-        assert_eq!(
-            String::from_utf8_lossy(&output.stdout),
-            "fake-moraine:run:mcp\n"
-        );
-        assert!(output.stderr.is_empty());
-        let _ = fs::remove_dir_all(home);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn shared_plugin_launcher_rejects_user_bin_symlink_to_git_worktree() {
-        let home = temp_path("symlinked-project-launcher");
-        let bin = home.join(".local").join("bin");
-        let project_bin = home.join("project").join("target").join("debug");
-        fs::create_dir_all(&bin).expect("create user bin dir");
-        fs::create_dir_all(&project_bin).expect("create project bin dir");
-        fs::create_dir(home.join("project").join(".git")).expect("create Git marker");
-        let project_moraine = project_bin.join("moraine");
-        fs::write(&project_moraine, "#!/bin/sh\nexit 99\n").expect("write fake moraine");
-        let mut permissions = fs::metadata(&project_moraine)
-            .expect("fake metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&project_moraine, permissions).expect("chmod fake moraine");
-        symlink(&project_moraine, bin.join("moraine")).expect("link project executable");
-
-        let output = Command::new("/bin/sh")
-            .arg("-eu")
-            .arg("-c")
-            .arg(shared_plugin_launcher())
-            .current_dir(&home)
-            .env("HOME", &home)
-            .env("PATH", &bin)
-            .output()
-            .expect("run shared plugin launcher");
-
-        assert_eq!(output.status.code(), Some(126));
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(stderr.contains("binary_untrusted"));
-        assert!(stderr.contains("Git worktree"));
-        let _ = fs::remove_dir_all(home);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn shared_plugin_launcher_rejects_other_moraine_beneath_home_workspace() {
-        let home = temp_path("untrusted-home-launcher");
-        let bin = home.join("project-bin");
-        fs::create_dir_all(&bin).expect("create project bin dir");
-        let fake_moraine = bin.join("moraine");
-        fs::write(&fake_moraine, "#!/bin/sh\nexit 99\n").expect("write fake moraine");
-        let mut permissions = fs::metadata(&fake_moraine)
-            .expect("fake metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&fake_moraine, permissions).expect("chmod fake moraine");
-
-        let output = Command::new("/bin/sh")
-            .arg("-eu")
-            .arg("-c")
-            .arg(shared_plugin_launcher())
-            .current_dir(&home)
-            .env("HOME", &home)
-            .env("PATH", &bin)
-            .output()
-            .expect("run shared plugin launcher");
-
-        assert_eq!(output.status.code(), Some(126));
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(stderr.contains("binary_untrusted"));
-        assert!(stderr.contains("current project directory"));
-        let _ = fs::remove_dir_all(home);
+    fn plugins_leave_mcp_transport_registration_to_setup() {
+        let plugin_root = repo_root().join("plugins").join("moraine");
+        for manifest_path in [
+            plugin_root.join(".codex-plugin").join("plugin.json"),
+            plugin_root.join(".claude-plugin").join("plugin.json"),
+        ] {
+            let manifest: Value = serde_json::from_str(
+                &fs::read_to_string(&manifest_path).expect("read plugin manifest"),
+            )
+            .expect("plugin manifest JSON");
+            assert!(
+                manifest.get("mcpServers").is_none(),
+                "{} must not bundle an MCP launcher",
+                manifest_path.display()
+            );
+        }
+        for obsolete in [
+            plugin_root.join(".mcp.json"),
+            plugin_root.join(".claude-mcp.json"),
+            plugin_root.join("scripts").join("launch.sh"),
+        ] {
+            assert!(
+                !obsolete.exists(),
+                "{} must be retired after native URL migration",
+                obsolete.display()
+            );
+        }
     }
 
     #[test]
-    fn codex_custom_config_is_manual() {
+    fn codex_custom_config_uses_native_http_endpoint() {
         let target = ConfigTarget {
             path: PathBuf::from("/tmp/custom.toml"),
             source: ConfigTargetSource::Cli,
         };
         let plan = McpPlan::for_target(SetupMcpTarget::Codex, &target);
-        assert_eq!(plan.action, McpAction::ManualInstructions);
-        assert!(plan
-            .manual_snippet
-            .expect("manual snippet")
-            .contains("--config /tmp/custom.toml"));
+        assert_eq!(plan.action, McpAction::Execute);
+        assert_eq!(
+            plan.commands().last().expect("URL registration").args,
+            vec!["mcp", "add", "moraine", "--url", DEFAULT_MCP_HTTP_ENDPOINT,]
+        );
+        assert!(plan.manual_snippet.is_none());
     }
 
     #[test]
-    fn claude_custom_config_is_manual() {
+    fn claude_custom_config_uses_native_http_endpoint() {
         let target = ConfigTarget {
             path: PathBuf::from("/tmp/custom.toml"),
             source: ConfigTargetSource::Cli,
         };
         let plan = McpPlan::for_target(SetupMcpTarget::ClaudeCode, &target);
-        assert_eq!(plan.action, McpAction::ManualInstructions);
-        assert!(plan
-            .manual_snippet
-            .expect("manual snippet")
-            .contains("--config /tmp/custom.toml"));
+        assert_eq!(plan.action, McpAction::Execute);
+        assert_eq!(
+            plan.commands().last().expect("URL registration").args,
+            vec![
+                "mcp",
+                "add",
+                "--transport",
+                "http",
+                "--scope",
+                "user",
+                "moraine",
+                DEFAULT_MCP_HTTP_ENDPOINT,
+            ]
+        );
+        assert!(plan.manual_snippet.is_none());
     }
 
     #[test]
@@ -5445,6 +5683,8 @@ host = "127.42.0.9"
             launch_cwd: nac_home.clone(),
             home: None,
             xdg_config_home: None,
+            codex_home: None,
+            claude_config_dir: None,
             kiro_home: None,
             nac_home: Some(nac_home.clone()),
             prime_agent_dir: None,
@@ -5452,7 +5692,7 @@ host = "127.42.0.9"
             nac_snapshot: std::cell::OnceCell::new(),
             nac_expected_content: std::cell::OnceCell::new(),
         };
-        let plan = McpPlan::for_target_with_paths(SetupMcpTarget::Nac, &target, &paths)
+        let plan = McpPlan::for_target_with_paths(SetupMcpTarget::Nac, &target, &paths, None)
             .expect("MCP plan must not validate storage");
         let mut runner = FakeRunner::default();
         let report = execute_mcp_plan(plan, &mut runner).expect("apply MCP-only NAC merge");
@@ -5847,6 +6087,9 @@ host = "127.42.0.9"
 
     #[test]
     fn dry_run_without_explicit_targets_plans_all_default_harnesses() {
+        let home = temp_path("all-targets-dry-run");
+        let config_path = home.join(".moraine").join("moraine.toml");
+        write_default_config(&config_path).expect("write default config");
         let args = SetupArgs {
             yes: false,
             dry_run: true,
@@ -5860,7 +6103,7 @@ host = "127.42.0.9"
             &plain_output(),
             &args,
             ConfigTarget {
-                path: PathBuf::from("/tmp/config.toml"),
+                path: config_path,
                 source: ConfigTargetSource::HomeDefault,
             },
             false,
@@ -5881,6 +6124,7 @@ host = "127.42.0.9"
             .iter()
             .all(|target| target.status == SetupStatus::Planned));
         assert!(runner.ran.is_empty());
+        let _ = fs::remove_dir_all(home);
     }
 
     #[test]
@@ -6164,7 +6408,9 @@ watch_root = "~/.codex/sessions"
             .with_existing("codex")
             .with_response(commands[0].clone(), true, "")
             .with_response(commands[1].clone(), true, "")
-            .with_response(commands[2].clone(), true, "");
+            .with_response(commands[2].clone(), true, "")
+            .with_response(commands[3].clone(), true, "")
+            .with_response(commands[4].clone(), true, "");
         let report = execute_mcp_plan(plan, &mut runner).expect("execute mcp");
         assert_eq!(report.status, SetupStatus::Ok);
         assert_eq!(runner.ran, commands);
@@ -6182,7 +6428,9 @@ watch_root = "~/.codex/sessions"
             .with_existing("codex")
             .with_response(commands[0].clone(), true, "")
             .with_response(commands[1].clone(), true, "")
-            .with_response(commands[2].clone(), false, "server not found");
+            .with_response(commands[2].clone(), true, "")
+            .with_response(commands[3].clone(), false, "server not found")
+            .with_response(commands[4].clone(), true, "");
         let report = execute_mcp_plan(plan, &mut runner).expect("execute mcp");
         assert_eq!(report.status, SetupStatus::Ok);
         assert!(!report.warnings.is_empty());
@@ -6200,15 +6448,16 @@ watch_root = "~/.codex/sessions"
         let mut runner = FakeRunner::default()
             .with_existing("codex")
             .with_response(commands[0].clone(), true, "")
-            .with_response(commands[1].clone(), false, "plugin install failed");
+            .with_response(commands[1].clone(), true, "")
+            .with_response(commands[2].clone(), false, "plugin install failed");
         let report = execute_mcp_plan(plan, &mut runner).expect("execute mcp");
         assert_eq!(report.status, SetupStatus::Error);
         assert!(report
             .error
             .as_deref()
             .expect("error")
-            .contains(&commands[1].display()));
-        assert_eq!(runner.ran, commands[..2]);
+            .contains(&commands[2].display()));
+        assert_eq!(runner.ran, commands[..3]);
     }
 
     #[test]
