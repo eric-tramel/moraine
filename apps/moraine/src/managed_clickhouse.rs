@@ -170,7 +170,7 @@ fn detect_effective_memory_bytes() -> Result<u64> {
                 kib.checked_mul(1024)
             })
             .ok_or_else(|| anyhow!("failed parsing MemTotal from /proc/meminfo"))?;
-        return Ok(detect_cgroup_memory_limit().map_or(physical, |limit| physical.min(limit)));
+        Ok(detect_cgroup_memory_limit().map_or(physical, |limit| physical.min(limit)))
     }
 
     #[cfg(target_os = "macos")]
@@ -1705,9 +1705,18 @@ where
     let supervisor_log = clickhouse_supervisor_log_path(paths);
     let mut restarting_managed = false;
     if let Some(pid) = service_running(paths, Service::ClickHouse) {
+        let managed = managed_clickhouse_version(paths).is_some();
+        if !managed {
+            wait_for_clickhouse_with_progress(cfg, query_runtime, &mut on_progress).await?;
+            return Ok(StartOutcome {
+                service: Service::ClickHouse,
+                state: StartState::AlreadyRunning,
+                pid: Some(pid),
+                log_path: Some(supervisor_log.display().to_string()),
+            });
+        }
         let config_changed = materialize_clickhouse_config(cfg, paths)?;
-        let restart_required = config_changed && managed_clickhouse_version(paths).is_some();
-        if !restart_required {
+        if !config_changed {
             wait_for_clickhouse_with_progress(cfg, query_runtime, &mut on_progress).await?;
             apply_managed_resource_governance(cfg, query_runtime).await?;
             return Ok(StartOutcome {
@@ -3073,6 +3082,38 @@ mod tests {
         assert!(matches!(outcome.state, StartState::AlreadyServing));
         assert!(outcome.pid.is_none());
         assert!(!pid_path(&paths, Service::ClickHouse).exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tracked_external_endpoint_skips_managed_policy() {
+        let root = temp_dir("tracked-external-endpoint");
+        let ping = PingServer::start();
+        let cfg = test_config(&root, ping.url());
+        let paths = crate::paths::runtime_paths(&cfg);
+        ensure_runtime_dirs(&paths).expect("runtime dirs");
+        let mut sentinel = Command::new("sleep").arg("5").spawn().expect("sentinel");
+        write_pid(&pid_path(&paths, Service::ClickHouse), sentinel.id())
+            .expect("sentinel pid file");
+        let config_path = loaded_config_path(&root.join("config.toml"));
+
+        let outcome = start_clickhouse_with_progress(
+            &config_path,
+            &cfg,
+            &paths,
+            &QueryRuntime::new(),
+            |_| {},
+        )
+        .await
+        .expect("healthy tracked external endpoint");
+
+        assert!(matches!(outcome.state, StartState::AlreadyRunning));
+        assert_eq!(outcome.pid, Some(sentinel.id()));
+        assert!(!paths.clickhouse_config.exists());
+        assert!(!paths.clickhouse_users.exists());
+        sentinel.kill().expect("stop sentinel");
+        sentinel.wait().expect("reap sentinel");
         let _ = fs::remove_dir_all(root);
     }
 
