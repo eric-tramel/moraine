@@ -79,10 +79,10 @@ first_non_flag_arg() {
       continue
     fi
     case "$arg" in
-      --config|--output)
+      --config)
         skip_next=1
         ;;
-      --config=*|--output=*|--verbose|--help|-h|--version)
+      --config=*|--help|-h|--version)
         ;;
       -*)
         ;;
@@ -104,11 +104,11 @@ run_service_arg() {
       continue
     fi
     case "$arg" in
-      --config|--output)
+      --config)
         skip_next=1
         continue
         ;;
-      --config=*|--output=*|--verbose|--help|-h|--version)
+      --config=*|--help|-h|--version)
         continue
         ;;
       -*)

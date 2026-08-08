@@ -33,7 +33,7 @@ class Moraine(McpIntegration):
             data = json.loads(path.read_text())
         except FileNotFoundError as exc:
             raise RuntimeError(
-                "Moraine is not configured for Prime Agent; run `moraine setup --mcp-target prime-agent`."
+                "Moraine is not configured for Prime Agent; run `moraine setup integrations prime-agent --yes`."
             ) from exc
         except (OSError, ValueError, TypeError) as exc:
             raise RuntimeError(f"Unable to read Prime Agent Moraine settings from {path}") from exc

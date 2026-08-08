@@ -5,7 +5,6 @@ offline trace mining:
 
 ```bash
 moraine export events \
-  --format jsonl \
   --since 2026-06-01T00:00:00Z \
   --until 2026-06-15T00:00:00Z \
   --harness codex \
@@ -20,21 +19,19 @@ scope.
 
 ## Row Format
 
-`moraine export events` requires `--format jsonl`. Stdout contains JSONL data
-rows only: one JSON object per line, UTF-8 encoded. Completion metadata is never
-written to stdout, so output can be piped into tools such as `jq`, `head`, or
-offline mining jobs.
+`moraine export events` writes JSONL rows to stdout: one JSON object per line,
+UTF-8 encoded. Completion metadata is never written to stdout, so output can be
+piped into tools such as `jq`, `head`, or offline mining jobs.
 
-The global `--output` flag is for normal command rendering. Export commands
-reject explicit `--output plain`, `--output rich`, or `--output json`; use
-`--format jsonl` for export rows.
+The command's JSONL row format is fixed. Normal renderer options such as
+`--output plain`, `--output rich`, and `--output json` are not accepted.
 
 ## Schema
 
 Print the static, config-free public schema with:
 
 ```bash
-moraine schema analytics --json
+moraine schema analytics
 ```
 
 The v1 data schema is `moraine.analytics.events.v1`. Default event columns are:

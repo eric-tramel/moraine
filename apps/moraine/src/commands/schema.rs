@@ -1,8 +1,6 @@
-use anyhow::{bail, Result};
+use anyhow::Result;
 use serde::Serialize;
 use serde_json::json;
-
-use crate::cli::SchemaAnalyticsArgs;
 
 pub(super) const EVENTS_SCHEMA_VERSION: &str = "moraine.analytics.events.v1";
 pub(super) const EXPORT_METADATA_SCHEMA_VERSION: &str = "moraine.analytics.export_metadata.v1";
@@ -591,11 +589,7 @@ pub(super) fn all_non_sensitive_event_columns() -> Vec<&'static EventColumn> {
         .collect()
 }
 
-pub(crate) fn render_analytics(args: &SchemaAnalyticsArgs) -> Result<()> {
-    if !args.json {
-        bail!("moraine schema analytics currently requires --json");
-    }
-
+pub(crate) fn render_analytics() -> Result<()> {
     println!("{}", serde_json::to_string_pretty(&analytics_schema())?);
     Ok(())
 }

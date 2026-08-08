@@ -39,9 +39,10 @@ for name in moraine moraine-mcp; do
 done
 
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/moraine-prime-setup.XXXXXX")
+agent="$tmp/home/.prime/agent"
 cleanup() {
   if ((live)) && test -n "$prime_agent_cmd"; then
-    HOME="$tmp/home" PRIME_AGENT_CODING_AGENT_DIR="$tmp/prime-agent" \
+    HOME="$tmp/home" PRIME_AGENT_CODING_AGENT_DIR="$agent" \
       "$prime_agent_cmd" shutdown >/dev/null 2>&1 || true
   fi
   if test -n "$sandbox_id"; then
@@ -53,14 +54,31 @@ trap cleanup EXIT INT TERM
 mkdir -p "$tmp/home" "$tmp/bin"
 cp "$binary_dir/moraine" "$binary_dir/moraine-mcp" "$tmp/bin/"
 config="$tmp/moraine.toml"
-agent="$tmp/prime-agent"
 export HOME="$tmp/home"
 export DOCKER_CONFIG="$host_docker_config"
 export PRIME_AGENT_CODING_AGENT_DIR="$agent"
+setup_prime_agent() {
+  local report status
+  if report=$("$tmp/bin/moraine" --config "$config" setup integrations prime-agent --yes 2>&1); then
+    echo "offline integration setup unexpectedly passed its MCP health gate" >&2
+    return 1
+  else
+    status=$?
+  fi
+  test "$status" -eq 1 || {
+    echo "offline integration setup exited $status instead of 1" >&2
+    return 1
+  }
+  grep -Fq "MCP socket is absent" <<<"$report" || {
+    echo "offline integration setup did not report the absent MCP socket" >&2
+    return 1
+  }
+  printf '%s\n' "$report"
+}
 
-"$tmp/bin/moraine" --config "$config" setup --yes --mcp-target prime-agent
-# Reconcile setup-owned ingest sources without exposing any real harness homes.
-PATH="$tmp/bin:/usr/bin:/bin" "$tmp/bin/moraine" --config "$config" setup --yes >/dev/null
+
+"$tmp/bin/moraine" --config "$config" setup config --yes >/dev/null
+setup_prime_agent
 root_id=12345678-1234-4234-8234-123456789abc
 child_id=abcdefab-cdef-4abc-8def-abcdefabcdef
 mkdir -p "$agent/sessions" "$agent/session-artifacts/$root_id/sub-ce0de280"
@@ -85,10 +103,10 @@ config_data = tomllib.loads(config.read_text())
 sources = {source["name"]: source for source in config_data["ingest"]["sources"]}
 root_source = sources["prime-agent"]
 child_source = sources["prime-agent-subagents"]
-assert pathlib.Path(root_source["glob"].removesuffix("/*.jsonl")).resolve() == (agent / "sessions").resolve()
-assert pathlib.Path(root_source["watch_root"]).resolve() == (agent / "sessions").resolve()
-assert pathlib.Path(child_source["glob"].removesuffix("/**/sub-*/*.jsonl")).resolve() == (agent / "session-artifacts").resolve()
-assert pathlib.Path(child_source["watch_root"]).resolve() == (agent / "session-artifacts").resolve()
+assert pathlib.Path(root_source["glob"].removesuffix("/*.jsonl")).expanduser().resolve() == (agent / "sessions").resolve()
+assert pathlib.Path(root_source["watch_root"]).expanduser().resolve() == (agent / "sessions").resolve()
+assert pathlib.Path(child_source["glob"].removesuffix("/**/sub-*/*.jsonl")).expanduser().resolve() == (agent / "session-artifacts").resolve()
+assert pathlib.Path(child_source["watch_root"]).expanduser().resolve() == (agent / "session-artifacts").resolve()
 skill = agent / "skills" / "moraine"
 for rel in ("SKILL.md", "pyproject.toml", "src/moraine/__init__.py", ".moraine-setup.json"):
     assert (skill / rel).is_file(), rel
@@ -97,15 +115,15 @@ for path in (agent / "settings.json", skill / ".moraine-setup.json"):
 PY
 
 before=$(find "$agent" -type f -print0 | sort -z | xargs -0 shasum -a 256)
-"$tmp/bin/moraine" --config "$config" setup --yes --mcp-target prime-agent >/dev/null
+setup_prime_agent >/dev/null
 after=$(find "$agent" -type f -print0 | sort -z | xargs -0 shasum -a 256)
 test "$before" = "$after" || { echo "repeat setup changed managed files" >&2; exit 1; }
 dry_before=$(find "$agent" -type f -print0 | sort -z | xargs -0 shasum -a 256)
-"$tmp/bin/moraine" --config "$config" setup --yes --dry-run --mcp-target prime-agent >/dev/null
+"$tmp/bin/moraine" --config "$config" setup integrations prime-agent --dry-run >/dev/null
 dry_after=$(find "$agent" -type f -print0 | sort -z | xargs -0 shasum -a 256)
 test "$dry_before" = "$dry_after" || { echo "dry-run changed managed files" >&2; exit 1; }
 kernel_python="$tmp/custom python/bin/python"
-kernel_report=$(PRIME_AGENT_KERNEL_PYTHON="$kernel_python"   "$tmp/bin/moraine" --config "$config" setup --yes --dry-run --mcp-target prime-agent)
+kernel_report=$(PRIME_AGENT_KERNEL_PYTHON="$kernel_python"   "$tmp/bin/moraine" --config "$config" setup integrations prime-agent --dry-run)
 grep -Fq -- "--python '$kernel_python'" <<<"$kernel_report"
 grep -Fq "&& '$kernel_python' -c 'import mcp, moraine'" <<<"$kernel_report"
 test ! -e "$kernel_python" || { echo "custom kernel path was unexpectedly mutated" >&2; exit 1; }

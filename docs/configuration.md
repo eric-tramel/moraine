@@ -19,6 +19,18 @@ The top-level `moraine` command resolves config in this order:
 4. `MORAINE_DEFAULT_CONFIG`, when it points at an existing file
 5. `config/moraine.toml`, when running from a source checkout
 
+Inspect the small public allow-list without printing credentials or the full
+effective config:
+
+```bash
+moraine config get backend.start_on_up
+moraine config get clickhouse.url
+moraine config get clickhouse.database --output json
+```
+
+`moraine config get --help` lists the supported keys. Other keys, including
+authentication values, are rejected during argument parsing.
+
 Service-specific binaries accept the same `--config <path>` flag and add
 service-specific environment variables:
 
@@ -648,7 +660,7 @@ columns and host identifiers are never selected. Qualified NAC tool names such
 as `mcp__moraine__search_sessions` normalize to canonical Moraine tool names
 while their raw names remain in event provenance.
 
-`moraine setup --mcp-target nac` resolves the NAC config directory in this
+`moraine setup integrations nac --yes` resolves the NAC config directory in this
 order: `NAC_HOME`, `XDG_CONFIG_HOME/nac`, then `~/.config/nac`, and merges only
 the owned `[mcp_servers.moraine]` table. Model, storage, sandbox, and unrelated
 MCP settings are preserved.
@@ -977,7 +989,7 @@ The following fields control only the stdio compatibility path:
 | `central_connect_timeout_ms` | `250` | How long a stdio client waits to connect before falling back to embedded. |
 
 Directories routed to a non-default backend and
-`moraine run mcp --project-only` still use embedded stdio because direct HTTP
+`moraine run mcp -- --project-only` still use embedded stdio because direct HTTP
 requests have no launch-directory context. See
 [MCP in routed directories](#mcp-in-routed-directories) and
 [Agent MCP Search → Install](agent-mcp-search/install.md#project-scoped-retrieval-project-only).
@@ -1032,13 +1044,12 @@ start_on_up = true
 | `auth_token` | unset | Experimental startup prerequisite for a non-loopback effective bind. It does not authenticate HTTP requests. |
 | `start_on_up` | `true` | Deprecated compatibility key. Every `moraine up` starts one unified backend; an existing loopback `false` value is accepted but ignored. |
 
-`moraine up --backend`, `moraine up --monitor`, and `moraine up --mcp` remain
-deprecated, redundant compatibility forms. They never launch separate services.
-For upgrade safety, a non-loopback `backend.bind` also requires an affirmative
-existing launch setting (`backend.start_on_up = true`, or a legacy true alias);
-otherwise config loading fails rather than unexpectedly exposing the
-unauthenticated monitor API. Loopback configs normalize existing false values
-to true automatically.
+Every `moraine up` starts the unified backend; `--no-ingest` is the only
+startup-selection switch. For upgrade safety, a non-loopback `backend.bind`
+also requires an affirmative existing launch setting
+(`backend.start_on_up = true`, or a legacy true alias); otherwise config loading
+fails rather than unexpectedly exposing the unauthenticated monitor API.
+Loopback configs normalize existing false values to true automatically.
 
 ### Experimental HTTP bind guard
 

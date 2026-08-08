@@ -603,6 +603,18 @@ mod tests {
         }
     }
 
+    fn up_args(no_ingest: bool) -> UpArgs {
+        UpArgs {
+            render: crate::cli::RenderArgs {
+                output: crate::cli::OutputArgs {
+                    output: crate::cli::OutputFormat::Auto,
+                },
+                verbose: false,
+            },
+            no_ingest,
+        }
+    }
+
     #[test]
     fn startup_progress_is_stderr_tty_only_and_json_safe() {
         let rich = ProgressStyle::from_capabilities(&test_output(OutputMode::Rich, true), true);
@@ -724,34 +736,12 @@ mod tests {
     }
 
     #[test]
-    fn selected_up_services_always_includes_backend_and_deduplicates_aliases() {
+    fn selected_up_services_always_includes_backend() {
         assert_eq!(
-            selected_up_services(&UpArgs {
-                no_ingest: false,
-                backend: false,
-                monitor: false,
-                mcp: false,
-            }),
+            selected_up_services(&up_args(false)),
             vec![Service::Ingest, Service::Backend]
         );
-
-        for (backend, monitor, mcp) in [
-            (true, false, false),
-            (false, true, false),
-            (false, false, true),
-            (true, true, true),
-        ] {
-            assert_eq!(
-                selected_up_services(&UpArgs {
-                    no_ingest: true,
-                    backend,
-                    monitor,
-                    mcp,
-                }),
-                vec![Service::Backend],
-                "backend={backend} monitor={monitor} mcp={mcp}"
-            );
-        }
+        assert_eq!(selected_up_services(&up_args(true)), vec![Service::Backend]);
     }
 
     #[test]

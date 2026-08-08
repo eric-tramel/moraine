@@ -36,15 +36,7 @@ database = "moraine"
     let output = Command::new(env!("CARGO_BIN_EXE_moraine"))
         .arg("--config")
         .arg(&config)
-        .args([
-            "export",
-            "events",
-            "--format",
-            "jsonl",
-            "--all",
-            "--columns",
-            "payload_json",
-        ])
+        .args(["export", "events", "--all", "--columns", "payload_json"])
         .output()
         .expect("run moraine");
     let _ = fs::remove_file(config);
@@ -174,8 +166,6 @@ timeout_seconds = 1.0
         .args([
             "export",
             "events",
-            "--format",
-            "jsonl",
             "--all",
             "--columns",
             "event_uid,event_ts",
@@ -274,15 +264,7 @@ timeout_seconds = 1.0
     let mut child = Command::new(env!("CARGO_BIN_EXE_moraine"))
         .arg("--config")
         .arg(&config)
-        .args([
-            "export",
-            "events",
-            "--format",
-            "jsonl",
-            "--all",
-            "--columns",
-            "event_uid",
-        ])
+        .args(["export", "events", "--all", "--columns", "event_uid"])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()

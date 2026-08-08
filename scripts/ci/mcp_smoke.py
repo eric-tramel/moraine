@@ -681,11 +681,11 @@ def run_smoke(
     event_types_filter: Optional[list[str]] = None,
 ) -> None:
     absent_session_ids = absent_session_ids or []
-    argv = [moraine, "run", "mcp", "--config", config]
+    argv = [moraine, "--config", config, "run", "mcp"]
     popen_kwargs: Dict[str, Any] = {}
     launch_dir = project_dir or working_dir
     if project_dir is not None:
-        argv.append("--project-only")
+        argv.extend(["--", "--project-only"])
     if launch_dir is not None:
         # Mimic a shell launching from the project directory: cwd is the
         # physical path and PWD carries the logical spelling, which may
@@ -1202,7 +1202,7 @@ def main() -> int:
     parser.add_argument(
         "--project-dir",
         help=(
-            "run `moraine run mcp --project-only` from this directory and "
+            "run `moraine run mcp -- --project-only` from this directory and "
             "assert the initialize response advertises the scope"
         ),
     )

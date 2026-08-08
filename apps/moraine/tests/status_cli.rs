@@ -70,17 +70,17 @@ managed_clickhouse_dir = "{}"
 
 fn run_status(config: &Path) -> Output {
     Command::new(env!("CARGO_BIN_EXE_moraine"))
-        .args(["--output", "json", "--config"])
+        .arg("--config")
         .arg(config)
-        .arg("status")
+        .args(["status", "--output", "json"])
         .output()
         .expect("run moraine status")
 }
 fn run_plain_status(config: &Path) -> Output {
     Command::new(env!("CARGO_BIN_EXE_moraine"))
-        .args(["--output", "plain", "--config"])
+        .arg("--config")
         .arg(config)
-        .arg("status")
+        .args(["status", "--output", "plain"])
         .output()
         .expect("run plain moraine status")
 }

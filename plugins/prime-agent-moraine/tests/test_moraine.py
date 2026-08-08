@@ -55,7 +55,7 @@ class MoraineSkillTests(unittest.TestCase):
         (self.agent / "settings.json").write_text(json.dumps(value))
 
     def test_settings_validation_is_actionable(self):
-        with self.assertRaisesRegex(RuntimeError, "moraine setup --mcp-target prime-agent"):
+        with self.assertRaisesRegex(RuntimeError, "moraine setup integrations prime-agent --yes"):
             self.module.Moraine._settings()
         self.write_settings({"mcpServers": {"moraine": {"enabled": False}}})
         with self.assertRaisesRegex(RuntimeError, "disabled"):

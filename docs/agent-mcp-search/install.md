@@ -64,8 +64,8 @@ moraine up
 
 `moraine setup` starts with all supported harnesses selected for ingest plus
 plugin or MCP setup. In the interactive selector, turn off any harnesses you do
-not want before applying. Use `moraine setup --dry-run` to preview the default
-setup without writing files. Use the manual sections below for project-scoped
+not want before applying. Use `moraine setup integrations --all --dry-run` to
+preview every harness integration without writing files. Use the manual sections below for project-scoped
 servers, `--project-only`, or custom environment wiring.
 
 For Codex and Claude Code, setup refreshes the Moraine plugin and removes any
@@ -199,11 +199,11 @@ What this means for you:
 
 ## Project-scoped retrieval (`--project-only`)
 
-Add `--project-only` to restrict retrieval to sessions that originated from
-the directory the server is launched in:
+Add `--project-only` after Moraine's `--` service-argument separator to restrict
+retrieval to sessions that originated from the directory where the server starts:
 
 ```bash
-claude mcp add --transport stdio --scope project moraine -- moraine run mcp --project-only
+claude mcp add --transport stdio --scope project moraine -- moraine run mcp -- --project-only
 ```
 
 With the flag set, `search_sessions`, `list_sessions`, `open`, and
@@ -253,7 +253,7 @@ Use a stdio command instead only when you need project scope,
 `--project-only`, or compatibility environment handling:
 
 ```bash
-codex mcp add moraine -- moraine run mcp --project-only
+codex mcp add moraine -- moraine run mcp -- --project-only
 ```
 
 See [Codex MCP docs](https://developers.openai.com/codex/mcp) and the
@@ -271,7 +271,7 @@ claude mcp list
 Use the retained stdio transport for project-scoped retrieval:
 
 ```bash
-claude mcp add --transport stdio --scope project moraine -- moraine run mcp --project-only
+claude mcp add --transport stdio --scope project moraine -- moraine run mcp -- --project-only
 ```
 
 Project scope writes or updates `.mcp.json` in the current project. Claude Code
@@ -290,7 +290,7 @@ setup/doctor commands. It still uses the `moraine` CLI on `PATH` and the running
 local stack.
 
 ```bash
-moraine setup --mcp-target hermes
+moraine setup integrations hermes
 hermes moraine doctor
 ```
 
@@ -299,7 +299,7 @@ entry that launches `moraine run mcp`, then verifies it with
 `hermes mcp test moraine` unless `--no-test` is passed. `moraine setup` skips
 that live test while installing the plugin; run `hermes moraine doctor` for
 profile-local diagnostics. If you run multiple Hermes profiles, run
-`moraine setup --mcp-target hermes` in each profile that should be able to search
+`moraine setup integrations hermes` in each profile that should be able to search
 Moraine history.
 
 Manual plugin installation remains available when you are not using
@@ -326,7 +326,7 @@ MCP server and installs a dedicated global steering file with Moraine search and
 realtime guidance:
 
 ```bash
-moraine setup --mcp-target kiro-cli
+moraine setup integrations kiro-cli
 ```
 
 Setup writes `$KIRO_HOME/steering/moraine.md` when `KIRO_HOME` is set, or
@@ -379,7 +379,7 @@ kimi mcp test moraine
 For user-scoped Qwen setup, run:
 
 ```bash
-moraine setup --mcp-target qwen-code
+moraine setup integrations qwen-code
 ```
 
 Moraine invokes Qwen's native CLI to add or update only the user-scoped
@@ -402,7 +402,7 @@ managed by `moraine setup`.
 NAC reads MCP server definitions from `config.toml`. For global use:
 
 ```bash
-moraine setup --mcp-target nac
+moraine setup integrations nac
 ```
 
 Setup chooses the config directory in this order:
@@ -451,7 +451,7 @@ path in this source: Moraine and NAC may have different launch directories.
 Review the preview before applying custom paths:
 
 ```bash
-moraine setup --dry-run --mcp-target nac
+moraine setup integrations nac --dry-run
 ```
 
 Setup-owned writes are atomic and idempotent. Re-running the targeted command
@@ -470,7 +470,7 @@ release, which does not recognize the `nac_sqlite` format.
 ## OpenCode
 
 OpenCode reads MCP servers from the `mcp` object in its config. For global use,
-`moraine setup --mcp-target opencode` creates or updates
+`moraine setup integrations opencode` creates or updates
 `~/.config/opencode/opencode.json`. OpenCode's docs describe local MCP servers
 with `type = "local"` and a `command` array:
 [OpenCode MCP servers](https://opencode.ai/docs/mcp-servers) and
@@ -494,7 +494,7 @@ Equivalent manual config:
 ## Cursor
 
 Cursor reads MCP server definitions from `mcp.json`. For global use,
-`moraine setup --mcp-target cursor` creates or updates `~/.cursor/mcp.json`.
+`moraine setup integrations cursor` creates or updates `~/.cursor/mcp.json`.
 Cursor's docs describe project config at `.cursor/mcp.json`, global config at
 `~/.cursor/mcp.json`, and CLI inspection through `agent mcp`:
 [Cursor MCP guide](https://cursor.com/docs/mcp.md) and
@@ -532,7 +532,7 @@ Cursor should invoke the installed `moraine` command directly.
 
 Pi uses an extension to bridge MCP servers into Pi tools. Install the MCP
 extension, then add a Moraine stdio server to Pi's MCP config.
-`moraine setup --mcp-target pi-coding-agent` runs the extension install and
+`moraine setup integrations pi-coding-agent` runs the extension install and
 creates or updates global `~/.pi/agent/mcp.json`. The extension docs describe
 global and project `mcp.json` files plus stdio server fields:
 [Pi MCP extension](https://pi.dev/packages/pi-mcp-extension).
@@ -564,7 +564,7 @@ Pi to inspect server status.
 ## OMP (Oh My Pi)
 
 OMP has native MCP support and keeps its own agent state.
-`moraine setup --mcp-target omp` creates or updates
+`moraine setup integrations omp` creates or updates
 `~/.omp/agent/mcp.json`; no MCP extension is required. Existing servers and
 unrelated settings in that file are preserved. OMP setup is independent from
 Pi: it detects `omp` or `~/.omp/agent`, owns only the `omp` ingest source, and
@@ -577,7 +577,7 @@ Pi's global MCP config rather than OMP's, while current OMP releases load
 To preview the OMP config change without writing files, run:
 
 ```bash
-moraine setup --mcp-target omp --dry-run
+moraine setup integrations omp --dry-run
 ```
 
 For manual setup, use the same JSON shape shown above at OMP's global config
@@ -593,7 +593,7 @@ Prime Agent v0.7.0 is the verified compatibility contract. Stop Prime Agent,
 then install its Python-backed Moraine skill and stdio registration:
 
 ```bash
-moraine setup --mcp-target prime-agent --yes
+moraine setup integrations prime-agent --yes
 ```
 
 Setup manages `settings.json` and `skills/moraine` under
@@ -619,7 +619,7 @@ user, so enable it only in a trusted harness environment.
 Preview without writing:
 
 ```bash
-moraine setup --mcp-target prime-agent --dry-run
+moraine setup integrations prime-agent --dry-run
 ```
 
 If setup reports a partial prior installation, keep Prime Agent stopped and rerun

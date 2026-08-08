@@ -14,6 +14,26 @@ pub(crate) enum Service {
     Mcp,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum)]
+pub(crate) enum LogService {
+    #[value(name = "clickhouse")]
+    ClickHouse,
+    #[value(name = "ingest")]
+    Ingest,
+    #[value(name = "backend")]
+    Backend,
+}
+
+impl From<LogService> for Service {
+    fn from(service: LogService) -> Self {
+        match service {
+            LogService::ClickHouse => Self::ClickHouse,
+            LogService::Ingest => Self::Ingest,
+            LogService::Backend => Self::Backend,
+        }
+    }
+}
+
 impl Service {
     pub(crate) fn name(self) -> &'static str {
         match self {

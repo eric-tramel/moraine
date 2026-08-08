@@ -35,20 +35,29 @@ config and install or update agent harness integrations:
 moraine setup
 ```
 
-In non-interactive scripts, accept the default config and all supported agent
-harness integrations:
+For non-interactive config creation, select the config mode explicitly:
 
 ```bash
-moraine setup --yes
+moraine setup config --yes
 ```
 
-Pass `--skip-mcp` when you only want config creation or repair.
-
-Preview the default config and all supported harness integrations without
-writing files or touching host agent config:
+To back up and replace an invalid config non-interactively, opt into repair:
 
 ```bash
-moraine setup --dry-run
+moraine setup config --repair --yes
+```
+
+To configure every supported harness integration non-interactively, make the
+broad integration scope explicit:
+
+```bash
+moraine setup integrations --all --yes
+```
+
+Preview those integration changes without writing files or running external commands:
+
+```bash
+moraine setup integrations --all --dry-run
 ```
 
 The Claude Code and Codex plugins, plus global MCP registrations, can expose
@@ -145,13 +154,13 @@ rerunning setup after installing a new harness CLI. Direct targets do not change
 ingest source selections:
 
 ```bash
-moraine setup --yes --mcp-target claude-code --mcp-target codex --mcp-target hermes --mcp-target kiro-cli --mcp-target kimi-cli --mcp-target qwen-code --mcp-target nac --mcp-target opencode --mcp-target cursor --mcp-target pi-coding-agent --mcp-target omp --mcp-target prime-agent
+moraine setup integrations claude-code codex hermes kiro-cli kimi-cli qwen-code nac opencode cursor pi-coding-agent omp prime-agent --yes
 ```
 
 Preview targeted MCP/plugin changes without touching host agent config:
 
 ```bash
-moraine setup --dry-run --mcp-target claude-code --mcp-target codex --mcp-target hermes --mcp-target kiro-cli --mcp-target kimi-cli --mcp-target qwen-code --mcp-target nac --mcp-target opencode --mcp-target cursor --mcp-target pi-coding-agent --mcp-target omp --mcp-target prime-agent
+moraine setup integrations claude-code codex hermes kiro-cli kimi-cli qwen-code nac opencode cursor pi-coding-agent omp prime-agent --dry-run
 ```
 
 The Claude Code, Codex, and Hermes plugins bundle Moraine search, realtime, and
@@ -193,8 +202,10 @@ For manual cleanup, project-scoped setup, and other custom setup, see
 | Command | Purpose |
 | --- | --- |
 | `moraine up` | Start ClickHouse, ingest, and the unified MCP/HTTP/static backend. |
-| `moraine up --backend` / `--monitor` / `--mcp` | Deprecated, redundant compatibility flags; bare `moraine up` starts the same backend. |
-| `moraine setup` | Create or repair config and guide MCP/plugin registration. |
+| `moraine setup` | Guide config, ingest-source, and harness integration setup. |
+| `moraine setup config --yes` | Create config non-interactively. |
+| `moraine setup config --repair --yes` | Back up and replace an invalid config non-interactively. |
+| `moraine setup integrations codex --yes` | Install or update a selected harness integration. |
 | `moraine status` | Print service and ingest health. |
 | `moraine logs` | Show recent service logs. |
 | `moraine logs ingest --lines 500` | Show recent ingest logs. |

@@ -13,7 +13,7 @@ use super::schema::{
     all_non_sensitive_event_columns, default_event_columns, event_column, EventColumn,
     EVENTS_SCHEMA_VERSION, EXPORT_METADATA_SCHEMA_VERSION,
 };
-use crate::cli::{ExportEventsArgs, ExportRowFormat};
+use crate::cli::ExportEventsArgs;
 
 const EXPORT_KIND_EVENTS: &str = "events";
 const DEFAULT_BACKEND: &str = "default";
@@ -119,7 +119,6 @@ struct CompletionMetadata<'a> {
 
 fn prepare_export(cfg: &AppConfig, args: ExportEventsArgs) -> Result<PreparedExport> {
     validate_limit(args.limit)?;
-    validate_format(args.format)?;
     let columns = select_columns(args.columns.as_deref(), args.include_sensitive)?;
     let sensitive_columns_requested = columns
         .iter()
@@ -144,12 +143,6 @@ fn prepare_export(cfg: &AppConfig, args: ExportEventsArgs) -> Result<PreparedExp
     })
 }
 
-fn validate_format(format: ExportRowFormat) -> Result<()> {
-    match format {
-        ExportRowFormat::Jsonl => Ok(()),
-    }
-}
-
 fn validate_limit(limit: Option<usize>) -> Result<()> {
     if limit == Some(0) {
         bail!("--limit must be a positive integer");
@@ -171,7 +164,7 @@ fn select_columns(raw: Option<&str>, include_sensitive: bool) -> Result<Vec<&'st
                 }
                 let column = event_column(trimmed).ok_or_else(|| {
                     anyhow!(
-                        "unsupported export column '{}'; run `moraine schema analytics --json` for the public column list",
+                        "unsupported export column '{}'; run `moraine schema analytics` for the public column list",
                         trimmed
                     )
                 })?;
@@ -746,12 +739,10 @@ fn write_completion_metadata_line<W: Write>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::ExportRowFormat;
     use serde_json::json;
 
     fn base_args() -> ExportEventsArgs {
         ExportEventsArgs {
-            format: ExportRowFormat::Jsonl,
             columns: None,
             include_sensitive: false,
             limit: None,

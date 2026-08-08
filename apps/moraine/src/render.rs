@@ -8,7 +8,7 @@ use ratatui::text::Line;
 use ratatui::widgets::{Block, BorderType, Borders, Cell, Paragraph, Row, Table, Widget, Wrap};
 use std::io::IsTerminal;
 
-use crate::cli::{Cli, OutputFormat};
+use crate::cli::OutputFormat;
 use crate::mcp_health::McpHealthSnapshot;
 use crate::process::{StartOutcome, StartState};
 use crate::service::Service;
@@ -167,8 +167,8 @@ pub(crate) struct CliOutput {
 }
 
 impl CliOutput {
-    pub(crate) fn from_cli(cli: &Cli) -> Self {
-        let mode = match cli.output {
+    pub(crate) fn from_options(output: OutputFormat, verbose: bool) -> Self {
+        let mode = match output {
             OutputFormat::Auto => {
                 if std::io::stdout().is_terminal() {
                     OutputMode::Rich
@@ -193,7 +193,7 @@ impl CliOutput {
 
         Self {
             mode,
-            verbose: cli.verbose,
+            verbose,
             unicode,
             width,
         }
@@ -888,13 +888,10 @@ pub(crate) fn render_down(output: &CliOutput, snapshot: &DownSnapshot) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::Cli;
-    use clap::Parser;
 
     #[test]
-    fn output_mode_respects_json_flag() {
-        let cli = Cli::parse_from(["moraine", "--output", "json", "status"]);
-        let output = CliOutput::from_cli(&cli);
+    fn output_mode_respects_json_option() {
+        let output = CliOutput::from_options(OutputFormat::Json, false);
         assert_eq!(output.mode, OutputMode::Json);
     }
 

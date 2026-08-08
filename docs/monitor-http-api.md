@@ -258,7 +258,7 @@ backend's private Unix-socket MCP service.
 
 MCP routes do not live under `/api/v1`, and HTTP clients cannot select a named
 backend or launch-directory project scope through this endpoint. Use
-`moraine run mcp --project-only` for scoped retrieval.
+`moraine run mcp -- --project-only` for scoped retrieval.
 
 The endpoint is mounted only for an explicit loopback `backend.bind`. A
 configured auth token may permit non-loopback monitor startup, but `/mcp`

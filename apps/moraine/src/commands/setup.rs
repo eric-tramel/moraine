@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::cli::{SetupArgs, SetupMcpTarget};
+use crate::cli::{SetupCommand, SetupMcpTarget};
 use crate::mcp_health::{probe_mcp_backend, McpHealthSnapshot};
 use crate::paths::load_cfg;
 use crate::render::CliOutput;
@@ -30,14 +30,25 @@ const HOST_WIDE_ACCESS_WARNING: &str =
     "Selected harness integrations get host-wide Moraine session history access visible to your user.";
 const SETUP_MCP_HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
 
+#[derive(Debug)]
+struct SetupArgs {
+    yes: bool,
+    dry_run: bool,
+    skip_config: bool,
+    skip_mcp: bool,
+    repair_config: bool,
+    mcp_targets: Vec<SetupMcpTarget>,
+}
+
 pub(super) async fn handle(
     output: &CliOutput,
     raw_config: Option<PathBuf>,
-    args: SetupArgs,
+    command: Option<SetupCommand>,
 ) -> Result<ExitCode> {
+    let interactive = can_prompt(output);
+    let args = setup_execution_args(command, interactive)?;
     let target = resolve_setup_config_target(raw_config)?;
     let config_path = target.path.clone();
-    let interactive = can_prompt(output);
     let mut runner = RealCommandRunner;
     let mut report = run_setup(output, &args, target, interactive, &mut runner)?;
     record_setup_mcp_health(&mut report, &args, &config_path).await;
@@ -77,6 +88,59 @@ async fn record_setup_mcp_health(report: &mut SetupReport, args: &SetupArgs, con
     report.record_mcp_health(health);
 }
 
+fn setup_execution_args(command: Option<SetupCommand>, interactive: bool) -> Result<SetupArgs> {
+    match command {
+        None => {
+            if !interactive {
+                bail!(
+                    "guided setup requires an interactive terminal; use `moraine setup config` or `moraine setup integrations`"
+                );
+            }
+            Ok(SetupArgs {
+                yes: false,
+                dry_run: false,
+                skip_config: false,
+                skip_mcp: false,
+                repair_config: false,
+                mcp_targets: Vec::new(),
+            })
+        }
+        Some(SetupCommand::Config(config)) => {
+            if !interactive && !config.yes && !config.dry_run {
+                bail!("non-interactive config setup requires --yes or --dry-run");
+            }
+            Ok(SetupArgs {
+                yes: config.yes,
+                dry_run: config.dry_run,
+                skip_config: false,
+                skip_mcp: true,
+                repair_config: config.repair,
+                mcp_targets: Vec::new(),
+            })
+        }
+        Some(SetupCommand::Integrations(integrations)) => {
+            if !interactive && !integrations.yes && !integrations.dry_run {
+                bail!("non-interactive integration setup requires --yes or --dry-run");
+            }
+            if integrations.all && !integrations.yes && !integrations.dry_run {
+                bail!("setup integrations --all requires --yes or --dry-run");
+            }
+            Ok(SetupArgs {
+                yes: integrations.yes,
+                dry_run: integrations.dry_run,
+                skip_config: true,
+                skip_mcp: false,
+                repair_config: false,
+                mcp_targets: if integrations.all {
+                    harnesses::setup_targets()
+                } else {
+                    integrations.targets
+                },
+            })
+        }
+    }
+}
+
 fn can_prompt(output: &CliOutput) -> bool {
     !output.is_json() && std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
 }
@@ -101,11 +165,11 @@ fn run_setup_with_paths(
     path_context: &harnesses::SetupPathContext,
 ) -> Result<SetupReport> {
     if output.is_json() && !args.yes && !args.dry_run {
-        bail!("`moraine --output json setup` requires --yes or --dry-run");
+        bail!("JSON setup output requires --yes or --dry-run");
     }
 
     let mut config = if args.skip_config {
-        ConfigReport::skipped(&target.path, "skipped by --skip-config")
+        ConfigReport::skipped(&target.path, "not part of targeted integration setup")
     } else {
         setup_config(args, &target, interactive)?
     };
@@ -427,7 +491,7 @@ fn setup_config(
                 return Ok(ConfigReport::error(
                     &target.path,
                     "invalid",
-                    "config is invalid; rerun with --repair-config to back it up and write the default template",
+                    "config is invalid; rerun `moraine setup config --repair --yes` to back it up and write the default template",
                 ));
             }
 
@@ -1287,7 +1351,6 @@ fn setup_target_selections(
             confirmed_harness: false,
         });
     }
-
     if args.yes || args.dry_run {
         return Ok(SetupSelectionSet {
             targets: default_setup_target_selections(),
@@ -2990,7 +3053,7 @@ fn render_report(output: &CliOutput, report: &SetupReport) -> Result<()> {
         output.section(
             "Agent Integrations",
             &[format!(
-                "{} none selected  run with --mcp-target <target> or rerun interactively",
+                "{} none selected  run `moraine setup integrations <target>` or rerun guided setup",
                 status_mark(SetupStatus::Skipped, output.unicode)
             )],
         );
@@ -3244,6 +3307,7 @@ impl SetupMcpTarget {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::{SetupConfigArgs, SetupIntegrationsArgs};
     use crate::render::OutputMode;
     use std::collections::{BTreeMap, BTreeSet};
     #[cfg(unix)]
@@ -3330,6 +3394,92 @@ mod tests {
             std::process::id(),
             timestamp_suffix()
         ))
+    }
+
+    #[test]
+    fn setup_modes_require_explicit_noninteractive_scope_and_confirmation() {
+        let bare = setup_execution_args(None, false).expect_err("guided mode needs a terminal");
+        assert!(bare.to_string().contains("interactive terminal"));
+
+        let config = setup_execution_args(
+            Some(SetupCommand::Config(SetupConfigArgs {
+                yes: false,
+                dry_run: false,
+                repair: false,
+            })),
+            false,
+        )
+        .expect_err("config mutation needs confirmation");
+        assert!(config.to_string().contains("--yes or --dry-run"));
+
+        let integrations = setup_execution_args(
+            Some(SetupCommand::Integrations(SetupIntegrationsArgs {
+                targets: vec![SetupMcpTarget::Codex],
+                all: false,
+                yes: false,
+                dry_run: false,
+            })),
+            false,
+        )
+        .expect_err("integration mutation needs confirmation");
+        assert!(integrations.to_string().contains("--yes or --dry-run"));
+    }
+
+    #[test]
+    fn setup_modes_isolate_config_and_harness_work() {
+        let config = setup_execution_args(
+            Some(SetupCommand::Config(SetupConfigArgs {
+                yes: true,
+                dry_run: false,
+                repair: true,
+            })),
+            false,
+        )
+        .expect("config mode");
+        assert!(!config.skip_config);
+        assert!(config.skip_mcp);
+        assert!(config.repair_config);
+
+        let explicit = setup_execution_args(
+            Some(SetupCommand::Integrations(SetupIntegrationsArgs {
+                targets: vec![SetupMcpTarget::Codex],
+                all: false,
+                yes: true,
+                dry_run: false,
+            })),
+            false,
+        )
+        .expect("explicit integration mode");
+        assert!(explicit.skip_config);
+        assert!(!explicit.skip_mcp);
+        let selections = setup_target_selections(&explicit, false, &FakeRunner::default())
+            .expect("harness-only selections");
+        assert!(!selections.apply_ingest);
+        assert!(selections
+            .targets
+            .iter()
+            .all(|selection| selection.mode == SetupSelectionMode::HarnessOnly));
+
+        let all = setup_execution_args(
+            Some(SetupCommand::Integrations(SetupIntegrationsArgs {
+                targets: Vec::new(),
+                all: true,
+                yes: false,
+                dry_run: true,
+            })),
+            false,
+        )
+        .expect("all-integration dry-run");
+        assert!(all.skip_config);
+        assert_eq!(all.mcp_targets, harnesses::setup_targets());
+        let selections = setup_target_selections(&all, false, &FakeRunner::default())
+            .expect("all harness-only selections");
+        assert!(!selections.apply_ingest);
+        assert_eq!(selections.harness_targets(), harnesses::setup_targets());
+        assert!(selections
+            .targets
+            .iter()
+            .all(|selection| selection.mode == SetupSelectionMode::HarnessOnly));
     }
 
     fn setup_config_for_test(path: &Path, dry_run: bool, repair_config: bool) -> ConfigReport {
@@ -3493,43 +3643,6 @@ mod tests {
     #[test]
     fn setup_selector_warning_discloses_host_wide_history_access() {
         assert!(HOST_WIDE_ACCESS_WARNING.contains("host-wide Moraine session history access"));
-    }
-
-    #[test]
-    fn default_target_selections_enable_ingest_and_harnesses() {
-        let selections = default_setup_target_selections();
-        assert_eq!(
-            selections
-                .iter()
-                .map(|selection| selection.target)
-                .collect::<Vec<_>>(),
-            harnesses::setup_targets()
-        );
-        assert!(selections
-            .iter()
-            .all(|selection| selection.mode == SetupSelectionMode::IngestAndHarness));
-    }
-
-    #[test]
-    fn yes_without_explicit_targets_selects_all_default_harnesses() {
-        let args = SetupArgs {
-            yes: true,
-            dry_run: false,
-            skip_config: false,
-            skip_mcp: false,
-            repair_config: false,
-            mcp_targets: Vec::new(),
-        };
-        let selections =
-            setup_target_selections(&args, false, &FakeRunner::default()).expect("selections");
-
-        assert!(selections.apply_ingest);
-        assert!(selections.confirmed_harness);
-        assert_eq!(selections.harness_targets(), harnesses::setup_targets(),);
-        assert!(selections
-            .targets
-            .iter()
-            .all(|selection| selection.mode == SetupSelectionMode::IngestAndHarness));
     }
 
     #[test]
@@ -6152,48 +6265,7 @@ host = "127.42.0.9"
     }
 
     #[test]
-    fn dry_run_without_explicit_targets_plans_all_default_harnesses() {
-        let home = temp_path("all-targets-dry-run");
-        let config_path = home.join(".moraine").join("moraine.toml");
-        write_default_config(&config_path).expect("write default config");
-        let args = SetupArgs {
-            yes: false,
-            dry_run: true,
-            skip_config: true,
-            skip_mcp: false,
-            repair_config: false,
-            mcp_targets: Vec::new(),
-        };
-        let mut runner = FakeRunner::default();
-        let report = run_setup(
-            &plain_output(),
-            &args,
-            ConfigTarget {
-                path: config_path,
-                source: ConfigTargetSource::HomeDefault,
-            },
-            false,
-            &mut runner,
-        )
-        .expect("setup report");
 
-        assert_eq!(
-            report
-                .mcp_targets
-                .iter()
-                .map(|target| target.target)
-                .collect::<Vec<_>>(),
-            harnesses::setup_targets()
-        );
-        assert!(report
-            .mcp_targets
-            .iter()
-            .all(|target| target.status == SetupStatus::Planned));
-        assert!(runner.ran.is_empty());
-        let _ = fs::remove_dir_all(home);
-    }
-
-    #[test]
     fn dry_run_previews_ingest_config_updates_without_writing_existing_config() {
         let dir = temp_path("dry-run-ingest-preview");
         fs::create_dir_all(&dir).expect("create dir");

@@ -97,7 +97,7 @@ user. For project-scoped setup, duplicate MCP cleanup, and other clients, see
 ## Agent Harness Guidance
 
 The Claude Code, Codex, and Hermes plugins already bundle Moraine search
-guidance, and `moraine setup --mcp-target kiro-cli` installs it under
+guidance, and `moraine setup integrations kiro-cli --yes` installs it under
 `$KIRO_HOME/steering` when set, or `~/.kiro/steering` otherwise. If you use
 manual MCP registration or another harness, add the following guidance to its
 global instructions, such

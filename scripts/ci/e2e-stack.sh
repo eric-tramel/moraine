@@ -2730,7 +2730,7 @@ PY
 
   echo "[e2e] checking full-stack status prefers the daemon v1 API"
   local daemon_status_path="$tmp_root/daemon-status.json"
-  "$moraine_bin" --output json --config "$config_path" status > "$daemon_status_path"
+  "$moraine_bin" --config "$config_path" status --output json > "$daemon_status_path"
   "$python_bin" - "$daemon_status_path" "$backend_pid" "$monitor_port" <<'PY'
 import json
 from pathlib import Path
@@ -2880,7 +2880,7 @@ PY
 
   echo "[e2e] checking final JSON status after abrupt backend loss"
   local final_status_path="$tmp_root/final-status.json"
-  "$moraine_bin" --output json --config "$config_path" status > "$final_status_path"
+  "$moraine_bin" --config "$config_path" status --output json > "$final_status_path"
   "$python_bin" - "$final_status_path" "$ingest_pid" "$clickhouse_pid" <<'PY'
 import json
 from pathlib import Path
@@ -2945,8 +2945,8 @@ PY
   echo "[e2e] stopping remaining services and checking all-down status"
   local all_down_transition_path="$tmp_root/all-down-transition.json"
   local all_down_status_path="$tmp_root/all-down-status.json"
-  "$moraine_bin" --output json --config "$config_path" down > "$all_down_transition_path"
-  "$moraine_bin" --output json --config "$config_path" status > "$all_down_status_path"
+  "$moraine_bin" --config "$config_path" down --output json > "$all_down_transition_path"
+  "$moraine_bin" --config "$config_path" status --output json > "$all_down_status_path"
   "$python_bin" - "$all_down_status_path" <<'PY'
 import json
 from pathlib import Path

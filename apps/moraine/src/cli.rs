@@ -1,8 +1,8 @@
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use std::path::PathBuf;
 
-use crate::service::Service;
+use crate::service::{LogService, Service};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub(crate) enum OutputFormat {
@@ -12,57 +12,96 @@ pub(crate) enum OutputFormat {
     Json,
 }
 
+#[derive(Debug, Args)]
+pub(crate) struct OutputArgs {
+    /// Select automatic terminal output, rich text, plain text, or JSON.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Auto)]
+    pub(crate) output: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct RenderArgs {
+    #[command(flatten)]
+    pub(crate) output: OutputArgs,
+    /// Include diagnostic details.
+    #[arg(long)]
+    pub(crate) verbose: bool,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct TreeOutputArgs {
+    /// Select automatic terminal output, rich text, plain text, or JSON.
+    #[arg(long, global = true, value_enum, default_value_t = OutputFormat::Auto)]
+    pub(crate) output: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct TreeRenderArgs {
+    #[command(flatten)]
+    pub(crate) output: TreeOutputArgs,
+    /// Include diagnostic details.
+    #[arg(long, global = true)]
+    pub(crate) verbose: bool,
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "moraine",
-    about = "Unified runtime control plane for Moraine services",
-    version = moraine_config::BUILD_VERSION
+    about = "Run and inspect local Moraine services",
+    version = moraine_config::BUILD_VERSION,
+    after_long_help = "Examples:\n  moraine setup\n  moraine up\n  moraine status --output json\n  moraine logs ingest --lines 500"
 )]
 pub(crate) struct Cli {
+    /// Use this Moraine configuration file.
     #[arg(long, global = true, value_name = "PATH")]
     pub(crate) config: Option<PathBuf>,
-    #[arg(long, global = true, value_enum, default_value_t = OutputFormat::Auto)]
-    pub(crate) output: OutputFormat,
-    #[arg(long, global = true, default_value_t = false)]
-    pub(crate) verbose: bool,
     #[command(subcommand)]
     pub(crate) command: CliCommand,
 }
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum CliCommand {
-    Up(UpArgs),
-    Down,
-    Status,
-    Logs(LogsArgs),
-    Export(Box<ExportArgs>),
-    Schema(SchemaArgs),
-    Db(DbArgs),
-    Clickhouse(ClickhouseArgs),
-    Config(ConfigArgs),
+    /// Configure Moraine and agent integrations.
     Setup(SetupArgs),
+    /// Start the local ClickHouse, ingest, and unified backend services.
+    Up(UpArgs),
+    /// Stop managed Moraine services.
+    Down(OutputArgs),
+    /// Show service, database, and ingest health.
+    Status(RenderArgs),
+    /// Show recent managed-service logs.
+    Logs(LogsArgs),
+    /// Export normalized analytics data.
+    Export(Box<ExportArgs>),
+    /// Describe public data schemas.
+    Schema(SchemaArgs),
+    /// Inspect or migrate the Moraine database.
+    Db(DbArgs),
+    /// Manage the bundled ClickHouse installation.
+    Clickhouse(ClickhouseArgs),
+    /// Inspect resolved public configuration values.
+    Config(ConfigArgs),
+    /// Run one Moraine service in the foreground.
     Run(RunArgs),
 }
 
 #[derive(Debug, Args)]
 pub(crate) struct UpArgs {
+    #[command(flatten)]
+    pub(crate) render: RenderArgs,
+    /// Start the backend without the ingest watcher.
     #[arg(long)]
     pub(crate) no_ingest: bool,
-    /// Deprecated compatibility flag; the backend now always starts.
-    #[arg(long)]
-    pub(crate) backend: bool,
-    /// Deprecated compatibility flag; the backend now always starts.
-    #[arg(long)]
-    pub(crate) monitor: bool,
-    /// Deprecated compatibility flag; the backend now always starts.
-    #[arg(long)]
-    pub(crate) mcp: bool,
 }
 
 #[derive(Debug, Args)]
 pub(crate) struct LogsArgs {
+    #[command(flatten)]
+    pub(crate) output: OutputArgs,
+    /// Managed service whose logs should be shown; omit to show all services.
     #[arg(value_enum)]
-    pub(crate) service: Option<Service>,
+    pub(crate) service: Option<LogService>,
+    /// Maximum lines to show from each log.
     #[arg(long, default_value_t = 200)]
     pub(crate) lines: usize,
 }
@@ -75,56 +114,69 @@ pub(crate) struct ExportArgs {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum ExportCommand {
+    /// Stream normalized event rows as JSONL.
     Events(ExportEventsArgs),
 }
 
 #[derive(Debug, Args)]
 pub(crate) struct ExportEventsArgs {
-    #[arg(long, value_enum, required = true)]
-    pub(crate) format: ExportRowFormat,
-    #[arg(long)]
+    /// Comma-separated public column names, or `all`.
+    #[arg(long, value_name = "NAME,...")]
     pub(crate) columns: Option<String>,
-    #[arg(long, default_value_t = false)]
+    /// Permit explicitly selected sensitive columns.
+    #[arg(long)]
     pub(crate) include_sensitive: bool,
+    /// Maximum number of rows to emit.
     #[arg(long)]
     pub(crate) limit: Option<usize>,
-    #[arg(long, default_value_t = false)]
+    /// Export without a filter.
+    #[arg(long)]
     pub(crate) all: bool,
-    #[arg(long)]
+    /// Include events at or after this RFC3339 timestamp.
+    #[arg(long, value_name = "RFC3339")]
     pub(crate) since: Option<String>,
-    #[arg(long)]
+    /// Include events before this RFC3339 timestamp.
+    #[arg(long, value_name = "RFC3339")]
     pub(crate) until: Option<String>,
+    /// Match this session ID exactly; repeat to match any listed ID.
     #[arg(long)]
     pub(crate) session_id: Vec<String>,
+    /// Match this harness exactly; repeat to match any listed harness.
     #[arg(long)]
     pub(crate) harness: Vec<String>,
+    /// Match this configured source name; repeat to match any listed source.
     #[arg(long)]
     pub(crate) source_name: Vec<String>,
+    /// Match this project ID exactly; repeat to match any listed project.
     #[arg(long)]
     pub(crate) project_id: Vec<String>,
+    /// Match this working directory or one of its descendants.
     #[arg(long)]
     pub(crate) cwd_prefix: Vec<String>,
+    /// Match this worktree root exactly; repeat to match any listed root.
     #[arg(long)]
     pub(crate) worktree_root: Vec<String>,
+    /// Match this repository-relative path exactly.
     #[arg(long)]
     pub(crate) repo_rel_path: Vec<String>,
+    /// Match this normalized event kind exactly.
     #[arg(long)]
     pub(crate) event_kind: Vec<String>,
+    /// Match this normalized payload type exactly.
     #[arg(long)]
     pub(crate) payload_type: Vec<String>,
+    /// Match this normalized actor kind exactly.
     #[arg(long)]
     pub(crate) actor_kind: Vec<String>,
+    /// Match this model name exactly.
     #[arg(long)]
     pub(crate) model_name: Vec<String>,
+    /// Match this tool name exactly.
     #[arg(long)]
     pub(crate) tool_name: Vec<String>,
-    #[arg(long, default_value_t = false)]
+    /// Include only failed tool events.
+    #[arg(long)]
     pub(crate) tool_error_only: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub(crate) enum ExportRowFormat {
-    Jsonl,
 }
 
 #[derive(Debug, Args)]
@@ -135,24 +187,23 @@ pub(crate) struct SchemaArgs {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum SchemaCommand {
-    Analytics(SchemaAnalyticsArgs),
-}
-
-#[derive(Debug, Args)]
-pub(crate) struct SchemaAnalyticsArgs {
-    #[arg(long)]
-    pub(crate) json: bool,
+    /// Print the analytics export schema as JSON.
+    Analytics,
 }
 
 #[derive(Debug, Args)]
 pub(crate) struct DbArgs {
+    #[command(flatten)]
+    pub(crate) output: TreeOutputArgs,
     #[command(subcommand)]
     pub(crate) command: DbCommand,
 }
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum DbCommand {
+    /// Apply pending database migrations.
     Migrate,
+    /// Check ClickHouse connectivity and schema health.
     Doctor,
 }
 
@@ -164,17 +215,24 @@ pub(crate) struct ClickhouseArgs {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum ClickhouseCommand {
+    /// Install the bundled ClickHouse binary.
     Install(ClickhouseInstallArgs),
-    Status,
-    Uninstall,
+    /// Show bundled ClickHouse installation and process state.
+    Status(OutputArgs),
+    /// Remove the bundled ClickHouse binary.
+    Uninstall(OutputArgs),
     #[command(hide = true)]
     Supervise,
 }
 
 #[derive(Debug, Args)]
 pub(crate) struct ClickhouseInstallArgs {
+    #[command(flatten)]
+    pub(crate) output: OutputArgs,
+    /// Replace an existing managed binary.
     #[arg(long)]
     pub(crate) force: bool,
+    /// Install this ClickHouse release instead of the configured default.
     #[arg(long)]
     pub(crate) version: Option<String>,
 }
@@ -187,35 +245,91 @@ pub(crate) struct ConfigArgs {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum ConfigCommand {
+    /// Print one safe resolved configuration value.
     Get(ConfigGetArgs),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum ConfigKey {
+    #[value(name = "backend.start_on_up")]
+    BackendStartOnUp,
+    #[value(name = "clickhouse.url")]
+    ClickhouseUrl,
+    #[value(name = "clickhouse.database")]
+    ClickhouseDatabase,
+}
+
+impl ConfigKey {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::BackendStartOnUp => "backend.start_on_up",
+            Self::ClickhouseUrl => "clickhouse.url",
+            Self::ClickhouseDatabase => "clickhouse.database",
+        }
+    }
 }
 
 #[derive(Debug, Args)]
 pub(crate) struct ConfigGetArgs {
-    #[arg(value_name = "KEY")]
-    pub(crate) key: String,
+    #[command(flatten)]
+    pub(crate) output: OutputArgs,
+    /// Safe public configuration key to print.
+    #[arg(value_enum, value_name = "KEY")]
+    pub(crate) key: ConfigKey,
 }
 
 #[derive(Debug, Args)]
+#[command(
+    after_long_help = "Examples:\n  moraine setup\n  moraine setup config --yes\n  moraine setup integrations codex --yes\n  moraine setup integrations --all --dry-run"
+)]
 pub(crate) struct SetupArgs {
-    /// Accept non-interactive defaults, including all supported MCP/plugin targets.
+    #[command(flatten)]
+    pub(crate) render: TreeRenderArgs,
+    #[command(subcommand)]
+    pub(crate) command: Option<SetupCommand>,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum SetupCommand {
+    /// Create, validate, or repair the Moraine config file.
+    Config(SetupConfigArgs),
+    /// Install agent harness plugins and MCP registrations.
+    Integrations(SetupIntegrationsArgs),
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct SetupConfigArgs {
+    /// Confirm non-interactive config changes.
     #[arg(long)]
     pub(crate) yes: bool,
-    /// Show planned changes without writing files or running external commands.
+    /// Show planned config changes without writing files.
     #[arg(long)]
     pub(crate) dry_run: bool,
-    /// Skip config file creation, validation, and repair.
-    #[arg(long, conflicts_with = "repair_config")]
-    pub(crate) skip_config: bool,
-    /// Skip MCP/plugin registration prompts and actions.
-    #[arg(long, conflicts_with = "mcp_targets")]
-    pub(crate) skip_mcp: bool,
-    /// Repair an invalid config by backing it up and writing the default template.
+    /// Back up and replace an invalid config with the default template.
     #[arg(long)]
-    pub(crate) repair_config: bool,
-    /// MCP/plugin target to configure. Repeat to select multiple targets.
-    #[arg(long = "mcp-target", value_enum, value_name = "TARGET")]
-    pub(crate) mcp_targets: Vec<SetupMcpTarget>,
+    pub(crate) repair: bool,
+}
+
+#[derive(Debug, Args)]
+#[command(group(
+    ArgGroup::new("selection")
+        .required(true)
+        .multiple(false)
+        .args(["targets", "all"])
+))]
+pub(crate) struct SetupIntegrationsArgs {
+    /// Harness integration to configure. Pass multiple target names as needed.
+    #[arg(value_enum, value_name = "TARGET", num_args = 1..)]
+    pub(crate) targets: Vec<SetupMcpTarget>,
+    /// Configure every supported harness integration.
+    #[arg(long)]
+    pub(crate) all: bool,
+    /// Confirm non-interactive integration changes.
+    #[arg(long)]
+    pub(crate) yes: bool,
+    /// Show planned integration changes without writing files or running commands.
+    #[arg(long)]
+    pub(crate) dry_run: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, ValueEnum)]
@@ -239,20 +353,52 @@ pub(crate) enum SetupMcpTarget {
 
 #[derive(Debug, Args)]
 pub(crate) struct RunArgs {
+    /// Service to run in the foreground.
     #[arg(value_enum)]
     pub(crate) service: Service,
-    #[arg(
-        trailing_var_arg = true,
-        allow_hyphen_values = true,
-        num_args = 0..
-    )]
+    /// Arguments forwarded to the service after `--`.
+    #[arg(last = true, num_args = 0..)]
     pub(crate) args: Vec<String>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::CommandFactory;
+    use clap::{error::ErrorKind, CommandFactory};
+
+    #[test]
+    fn clap_definition_is_internally_consistent() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn visible_commands_and_arguments_are_documented() {
+        fn assert_documented(command: &clap::Command, path: &str) {
+            for argument in command
+                .get_arguments()
+                .filter(|argument| !argument.is_hide_set())
+            {
+                assert!(
+                    argument.get_help().is_some() || argument.get_long_help().is_some(),
+                    "missing help for {path} argument {}",
+                    argument.get_id()
+                );
+            }
+            for subcommand in command
+                .get_subcommands()
+                .filter(|subcommand| !subcommand.is_hide_set())
+            {
+                let subcommand_path = format!("{path} {}", subcommand.get_name());
+                assert!(
+                    subcommand.get_about().is_some() || subcommand.get_long_about().is_some(),
+                    "missing help for {subcommand_path}"
+                );
+                assert_documented(subcommand, &subcommand_path);
+            }
+        }
+
+        assert_documented(&Cli::command(), "moraine");
+    }
 
     #[test]
     fn version_reports_the_build_commit() {
@@ -264,6 +410,22 @@ mod tests {
     }
 
     #[test]
+    fn root_help_prioritizes_and_describes_common_commands() {
+        let help = Cli::command().render_long_help().to_string();
+        for description in [
+            "Configure Moraine and agent integrations",
+            "Start the local ClickHouse, ingest, and unified backend services",
+            "Stop managed Moraine services",
+            "Show service, database, and ingest health",
+            "Show recent managed-service logs",
+        ] {
+            assert!(help.contains(description), "missing help: {description}");
+        }
+        assert!(help.find("setup").unwrap() < help.find("export").unwrap());
+        assert!(help.contains("moraine status --output json"));
+    }
+
+    #[test]
     fn clap_parses_clickhouse_install_flags() {
         let cli = Cli::parse_from([
             "moraine",
@@ -272,6 +434,8 @@ mod tests {
             "--version",
             "v25.12.5.44-stable",
             "--force",
+            "--output",
+            "json",
         ]);
         match cli.command {
             CliCommand::Clickhouse(ClickhouseArgs {
@@ -279,13 +443,14 @@ mod tests {
             }) => {
                 assert!(install.force);
                 assert_eq!(install.version.as_deref(), Some("v25.12.5.44-stable"));
+                assert_eq!(install.output.output, OutputFormat::Json);
             }
             _ => panic!("expected clickhouse install command"),
         }
     }
 
     #[test]
-    fn clap_parses_internal_clickhouse_supervisor() {
+    fn clap_parses_internal_clickhouse_supervisor_without_render_flags() {
         let cli = Cli::parse_from(["moraine", "clickhouse", "supervise"]);
         assert!(matches!(
             cli.command,
@@ -293,27 +458,44 @@ mod tests {
                 command: ClickhouseCommand::Supervise,
             })
         ));
+        assert!(
+            Cli::try_parse_from(["moraine", "clickhouse", "supervise", "--output", "json"])
+                .is_err()
+        );
     }
 
     #[test]
-    fn clap_parses_config_get_key() {
+    fn clap_lists_and_parses_safe_config_keys() {
         let cli = Cli::parse_from(["moraine", "config", "get", "clickhouse.url"]);
         match cli.command {
             CliCommand::Config(ConfigArgs {
                 command: ConfigCommand::Get(get),
-            }) => assert_eq!(get.key, "clickhouse.url"),
+            }) => assert_eq!(get.key, ConfigKey::ClickhouseUrl),
             _ => panic!("expected config get command"),
+        }
+
+        let help = Cli::command()
+            .find_subcommand_mut("config")
+            .unwrap()
+            .find_subcommand_mut("get")
+            .unwrap()
+            .render_help()
+            .to_string();
+        for key in [
+            "backend.start_on_up",
+            "clickhouse.url",
+            "clickhouse.database",
+        ] {
+            assert!(help.contains(key), "missing config key {key}");
         }
     }
 
     #[test]
-    fn clap_parses_export_events_flags() {
+    fn clap_parses_export_events_without_a_format_switch() {
         let cli = Cli::parse_from([
             "moraine",
             "export",
             "events",
-            "--format",
-            "jsonl",
             "--since",
             "2026-06-01T00:00:00Z",
             "--until",
@@ -333,7 +515,6 @@ mod tests {
         match cli.command {
             CliCommand::Export(args) => match args.command {
                 ExportCommand::Events(events) => {
-                    assert_eq!(events.format, ExportRowFormat::Jsonl);
                     assert_eq!(events.since.as_deref(), Some("2026-06-01T00:00:00Z"));
                     assert_eq!(events.until.as_deref(), Some("2026-06-15T00:00:00Z"));
                     assert_eq!(events.harness, vec!["codex", "hermes"]);
@@ -344,98 +525,186 @@ mod tests {
             },
             _ => panic!("expected export events command"),
         }
+        assert!(
+            Cli::try_parse_from(["moraine", "export", "events", "--all", "--format", "jsonl"])
+                .is_err()
+        );
     }
 
     #[test]
-    fn clap_rejects_export_events_without_format() {
-        let err = Cli::try_parse_from(["moraine", "export", "events", "--all"])
-            .expect_err("export row format is required");
-        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
-    }
-
-    #[test]
-    fn clap_parses_schema_analytics_json() {
-        let cli = Cli::parse_from(["moraine", "schema", "analytics", "--json"]);
-        match cli.command {
+    fn clap_parses_schema_analytics_without_a_json_switch() {
+        assert!(matches!(
+            Cli::parse_from(["moraine", "schema", "analytics"]).command,
             CliCommand::Schema(SchemaArgs {
-                command: SchemaCommand::Analytics(analytics),
-            }) => assert!(analytics.json),
-            _ => panic!("expected schema analytics command"),
-        }
+                command: SchemaCommand::Analytics,
+            })
+        ));
+        assert!(Cli::try_parse_from(["moraine", "schema", "analytics", "--json"]).is_err());
     }
 
     #[test]
-    fn clap_parses_setup_targets() {
+    fn clap_parses_explicit_setup_integrations() {
         let cli = Cli::parse_from([
             "moraine",
             "setup",
-            "--yes",
-            "--dry-run",
-            "--mcp-target",
+            "integrations",
             "codex",
-            "--mcp-target",
             "opencode",
-            "--mcp-target",
-            "cursor",
-            "--mcp-target",
-            "pi-coding-agent",
-            "--mcp-target",
-            "omp",
-            "--mcp-target",
             "prime-agent",
-            "--mcp-target",
-            "claude-code",
-            "--mcp-target",
-            "hermes",
-            "--mcp-target",
-            "qwen-code",
-            "--mcp-target",
-            "kiro-cli",
-            "--mcp-target",
-            "nac",
+            "--yes",
         ]);
         match cli.command {
-            CliCommand::Setup(setup) => {
-                assert!(setup.yes);
-                assert!(setup.dry_run);
+            CliCommand::Setup(SetupArgs {
+                command: Some(SetupCommand::Integrations(args)),
+                ..
+            }) => {
+                assert!(args.yes);
+                assert!(!args.all);
                 assert_eq!(
-                    setup.mcp_targets,
+                    args.targets,
                     vec![
                         SetupMcpTarget::Codex,
                         SetupMcpTarget::OpenCode,
-                        SetupMcpTarget::Cursor,
-                        SetupMcpTarget::PiCodingAgent,
-                        SetupMcpTarget::Omp,
                         SetupMcpTarget::PrimeAgent,
-                        SetupMcpTarget::ClaudeCode,
-                        SetupMcpTarget::Hermes,
-                        SetupMcpTarget::QwenCode,
-                        SetupMcpTarget::KiroCli,
-                        SetupMcpTarget::Nac,
                     ]
                 );
             }
-            _ => panic!("expected setup command"),
+            _ => panic!("expected setup integrations command"),
         }
     }
 
     #[test]
-    fn clap_rejects_setup_skip_mcp_with_target() {
-        let err = Cli::try_parse_from(["moraine", "setup", "--skip-mcp", "--mcp-target", "codex"])
-            .expect_err("conflicting setup mcp flags should fail");
-        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    fn clap_requires_exactly_one_setup_integration_selection() {
+        let missing = Cli::try_parse_from(["moraine", "setup", "integrations", "--yes"])
+            .expect_err("selection is required");
+        assert_eq!(missing.kind(), ErrorKind::MissingRequiredArgument);
+
+        let conflict = Cli::try_parse_from([
+            "moraine",
+            "setup",
+            "integrations",
+            "codex",
+            "--all",
+            "--dry-run",
+        ])
+        .expect_err("targets and all conflict");
+        assert_eq!(conflict.kind(), ErrorKind::ArgumentConflict);
+
+        let cli = Cli::parse_from([
+            "moraine",
+            "setup",
+            "integrations",
+            "--all",
+            "--dry-run",
+            "--output",
+            "json",
+        ]);
+        assert!(matches!(
+            cli.command,
+            CliCommand::Setup(SetupArgs {
+                render: TreeRenderArgs {
+                    output: TreeOutputArgs {
+                        output: OutputFormat::Json,
+                    },
+                    ..
+                },
+                command: Some(SetupCommand::Integrations(SetupIntegrationsArgs {
+                    all: true,
+                    dry_run: true,
+                    ..
+                })),
+            })
+        ));
     }
 
     #[test]
-    fn clap_parses_backend_and_compatibility_up_flags() {
-        let cli = Cli::parse_from(["moraine", "up", "--backend", "--monitor", "--mcp"]);
-        match cli.command {
-            CliCommand::Up(args) => {
-                assert!(args.backend);
-                assert!(args.monitor);
-                assert!(args.mcp);
-            }
-            _ => panic!("expected up command"),
+    fn renderer_flags_are_scoped_to_consuming_commands() {
+        let accepted: &[&[&str]] = &[
+            &["moraine", "up", "--output", "json", "--verbose"],
+            &["moraine", "down", "--output", "json"],
+            &["moraine", "status", "--output", "json", "--verbose"],
+            &["moraine", "logs", "--output", "json"],
+            &["moraine", "db", "--output", "json", "doctor"],
+            &["moraine", "db", "doctor", "--output", "json"],
+            &["moraine", "clickhouse", "install", "--output", "json"],
+            &["moraine", "clickhouse", "status", "--output", "json"],
+            &["moraine", "clickhouse", "uninstall", "--output", "json"],
+            &[
+                "moraine",
+                "config",
+                "get",
+                "backend.start_on_up",
+                "--output",
+                "json",
+            ],
+            &[
+                "moraine",
+                "setup",
+                "--output",
+                "json",
+                "--verbose",
+                "config",
+                "--dry-run",
+            ],
+            &[
+                "moraine",
+                "setup",
+                "config",
+                "--dry-run",
+                "--output",
+                "json",
+                "--verbose",
+            ],
+        ];
+        for argv in accepted {
+            assert!(
+                Cli::try_parse_from(*argv).is_ok(),
+                "expected renderer arguments to parse: {argv:?}"
+            );
+        }
+
+        let rejected: &[&[&str]] = &[
+            &["moraine", "--output", "json", "status"],
+            &["moraine", "--verbose", "status"],
+            &["moraine", "down", "--verbose"],
+            &["moraine", "logs", "--verbose"],
+            &["moraine", "export", "events", "--output", "json"],
+            &["moraine", "export", "events", "--verbose"],
+            &["moraine", "schema", "analytics", "--output", "json"],
+            &["moraine", "schema", "analytics", "--verbose"],
+            &["moraine", "db", "doctor", "--verbose"],
+            &["moraine", "clickhouse", "--output", "json", "status"],
+            &["moraine", "clickhouse", "status", "--verbose"],
+            &[
+                "moraine",
+                "config",
+                "--output",
+                "json",
+                "get",
+                "backend.start_on_up",
+            ],
+            &[
+                "moraine",
+                "config",
+                "get",
+                "backend.start_on_up",
+                "--verbose",
+            ],
+            &["moraine", "run", "mcp", "--output", "json"],
+            &["moraine", "run", "mcp", "--verbose"],
+        ];
+        for argv in rejected {
+            assert!(
+                Cli::try_parse_from(*argv).is_err(),
+                "expected renderer arguments to be rejected: {argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn clap_rejects_removed_startup_selectors() {
+        for flag in ["--backend", "--monitor", "--mcp"] {
+            assert!(Cli::try_parse_from(["moraine", "up", flag]).is_err());
         }
     }
 
@@ -443,8 +712,6 @@ mod tests {
     fn clap_parses_run_passthrough_args() {
         let cli = Cli::parse_from([
             "moraine",
-            "--output",
-            "plain",
             "run",
             "mcp",
             "--",
