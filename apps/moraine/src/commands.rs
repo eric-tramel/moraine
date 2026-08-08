@@ -184,7 +184,7 @@ pub(crate) async fn dispatch(
                 }
             }
         }
-        CliCommand::Setup(args) => setup::handle(&output, cli.config.clone(), args),
+        CliCommand::Setup(args) => setup::handle(&output, cli.config.clone(), args).await,
         CliCommand::Run(run) => run_service(cli.config.clone(), run).await,
     }
 }

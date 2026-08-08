@@ -2,7 +2,14 @@
   <profiles>
     <default>
       <use_concurrency_control>1</use_concurrency_control>
-      <max_memory_usage>0</max_memory_usage>
+      <max_memory_usage>__MAX_QUERY_MEMORY_BYTES__</max_memory_usage>
+      <max_memory_usage_for_user>__MAX_USER_QUERY_MEMORY_BYTES__</max_memory_usage_for_user>
+      <max_bytes_before_external_group_by>__DEFAULT_SPILL_BYTES__</max_bytes_before_external_group_by>
+      <max_bytes_before_external_sort>__DEFAULT_SPILL_BYTES__</max_bytes_before_external_sort>
+      <max_bytes_ratio_before_external_group_by>0</max_bytes_ratio_before_external_group_by>
+      <max_bytes_ratio_before_external_sort>0</max_bytes_ratio_before_external_sort>
+      <max_temporary_data_on_disk_size_for_query>2147483648</max_temporary_data_on_disk_size_for_query>
+      <max_temporary_data_on_disk_size_for_user>4294967296</max_temporary_data_on_disk_size_for_user>
       <load_balancing>random</load_balancing>
     </default>
   </profiles>

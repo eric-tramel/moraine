@@ -1,4 +1,5 @@
 use reqwest::{Client, StatusCode, Url};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::future::Future;
@@ -9,7 +10,7 @@ use std::sync::{
 };
 use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::sync::{mpsc, watch, Semaphore};
+use tokio::sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -19,7 +20,6 @@ pub const QUERY_CLEANUP_GRACE: Duration = Duration::from_secs(5);
 const ADMIN_CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
 const ADMIN_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
 const CLEANUP_RETRY: Duration = Duration::from_millis(50);
-const ADMIN_CONCURRENCY: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum QueryWorkload {
@@ -46,6 +46,118 @@ impl QueryWorkload {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum QueryResourceProfile {
+    Interactive,
+    Background,
+    Migration,
+    Administrative,
+}
+
+impl QueryResourceProfile {
+    const ALL: [Self; 4] = [
+        Self::Interactive,
+        Self::Background,
+        Self::Migration,
+        Self::Administrative,
+    ];
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Interactive => 0,
+            Self::Background => 1,
+            Self::Migration => 2,
+            Self::Administrative => 3,
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Interactive => "interactive",
+            Self::Background => "background",
+            Self::Migration => "migration",
+            Self::Administrative => "administrative",
+        }
+    }
+
+    const fn max_running(self) -> usize {
+        match self {
+            Self::Interactive => 4,
+            Self::Background => 2,
+            Self::Migration => 1,
+            Self::Administrative => 2,
+        }
+    }
+
+    const fn max_queued(self) -> usize {
+        match self {
+            Self::Interactive => 16,
+            Self::Background => 8,
+            Self::Migration => 1,
+            Self::Administrative => 8,
+        }
+    }
+
+    pub(crate) const fn workload_name(self) -> &'static str {
+        match self {
+            Self::Interactive => "moraine_interactive",
+            Self::Background => "moraine_background",
+            Self::Migration => "moraine_migration",
+            Self::Administrative => "moraine_administrative",
+        }
+    }
+
+    pub(crate) const fn memory_bytes(self) -> u64 {
+        match self {
+            Self::Interactive | Self::Background => 268_435_456,
+            Self::Migration => 1_073_741_824,
+            Self::Administrative => 134_217_728,
+        }
+    }
+
+    pub(crate) const fn spill_bytes(self) -> u64 {
+        self.memory_bytes() / 4
+    }
+
+    pub(crate) const fn temporary_disk_bytes(self) -> u64 {
+        match self {
+            Self::Interactive | Self::Background => 536_870_912,
+            Self::Migration => 2_147_483_648,
+            Self::Administrative => 134_217_728,
+        }
+    }
+}
+
+impl From<QueryWorkload> for QueryResourceProfile {
+    fn from(workload: QueryWorkload) -> Self {
+        match workload {
+            QueryWorkload::Mcp | QueryWorkload::Monitor | QueryWorkload::Export => {
+                Self::Interactive
+            }
+            QueryWorkload::Background => Self::Background,
+            QueryWorkload::Migration => Self::Migration,
+            QueryWorkload::Internal | QueryWorkload::Administrative => Self::Administrative,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueryProfilePressure {
+    pub running: u64,
+    pub queued: u64,
+    pub rejected: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueryPressureSnapshot {
+    pub scope: String,
+    pub interactive: QueryProfilePressure,
+    pub background: QueryProfilePressure,
+    pub migration: QueryProfilePressure,
+    pub administrative: QueryProfilePressure,
+    pub resource_limit_events: u64,
+}
+
 impl fmt::Display for QueryWorkload {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
@@ -60,6 +172,7 @@ pub enum QueryCause {
     Shutdown,
     Abandoned,
     Deadline,
+    Busy,
     Backend,
     ResourceExhausted,
 }
@@ -86,11 +199,74 @@ struct QueryRuntimeInner {
     changed: watch::Sender<u64>,
     close_started: Mutex<Option<Instant>>,
     close_lock: tokio::sync::Mutex<()>,
+    close: CancellationToken,
+    admission: [Arc<ProfileAdmission>; 4],
+    resource_limit_events: AtomicU64,
 }
 
 struct QueryRuntimeState {
     active: HashMap<Uuid, Arc<OwnerState>>,
     closing: bool,
+}
+
+struct ProfileAdmission {
+    running_slots: Arc<Semaphore>,
+    total_slots: Arc<Semaphore>,
+    running: Arc<AtomicU64>,
+    queued: Arc<AtomicU64>,
+    rejected: AtomicU64,
+}
+
+impl ProfileAdmission {
+    fn new(profile: QueryResourceProfile) -> Arc<Self> {
+        Arc::new(Self {
+            running_slots: Arc::new(Semaphore::new(profile.max_running())),
+            total_slots: Arc::new(Semaphore::new(profile.max_running() + profile.max_queued())),
+            running: Arc::new(AtomicU64::new(0)),
+            queued: Arc::new(AtomicU64::new(0)),
+            rejected: AtomicU64::new(0),
+        })
+    }
+
+    fn pressure(&self) -> QueryProfilePressure {
+        QueryProfilePressure {
+            running: self.running.load(Ordering::Relaxed),
+            queued: self.queued.load(Ordering::Relaxed),
+            rejected: self.rejected.load(Ordering::Relaxed),
+        }
+    }
+
+    fn close(&self) {
+        self.running_slots.close();
+        self.total_slots.close();
+    }
+}
+
+struct AdmissionGauge {
+    value: Arc<AtomicU64>,
+}
+
+impl AdmissionGauge {
+    fn new(value: Arc<AtomicU64>) -> Self {
+        value.fetch_add(1, Ordering::Relaxed);
+        Self { value }
+    }
+}
+
+impl Drop for AdmissionGauge {
+    fn drop(&mut self) {
+        let _ = self
+            .value
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                Some(value.saturating_sub(1))
+            });
+    }
+}
+
+pub(crate) struct StatementAdmission {
+    _total_slot: OwnedSemaphorePermit,
+    _running_slot: OwnedSemaphorePermit,
+    _running_gauge: AdmissionGauge,
 }
 
 enum SupervisorMessage {
@@ -121,6 +297,9 @@ impl QueryRuntime {
                 changed,
                 close_started: Mutex::new(None),
                 close_lock: tokio::sync::Mutex::new(()),
+                close: CancellationToken::new(),
+                admission: QueryResourceProfile::ALL.map(ProfileAdmission::new),
+                resource_limit_events: AtomicU64::new(0),
             }),
         }
     }
@@ -166,6 +345,81 @@ impl QueryRuntime {
             .len()
     }
 
+    pub fn pressure_snapshot(&self) -> QueryPressureSnapshot {
+        let pressure =
+            |profile: QueryResourceProfile| self.inner.admission[profile.index()].pressure();
+        QueryPressureSnapshot {
+            scope: "process".to_string(),
+            interactive: pressure(QueryResourceProfile::Interactive),
+            background: pressure(QueryResourceProfile::Background),
+            migration: pressure(QueryResourceProfile::Migration),
+            administrative: pressure(QueryResourceProfile::Administrative),
+            resource_limit_events: self.inner.resource_limit_events.load(Ordering::Relaxed),
+        }
+    }
+
+    pub(crate) fn record_resource_limit_event(&self) {
+        self.inner
+            .resource_limit_events
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    pub(crate) fn record_rejection(&self, profile: QueryResourceProfile) {
+        self.inner.admission[profile.index()]
+            .rejected
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) async fn admit_statement(
+        &self,
+        owner: &QueryOwner,
+    ) -> Result<StatementAdmission, ClickHouseError> {
+        owner.ensure_runtime(self)?;
+        let profile = QueryResourceProfile::from(owner.workload());
+        let admission = &self.inner.admission[profile.index()];
+        let total_slot = match admission.total_slots.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) if self.is_closing() => {
+                return Err(ClickHouseError::cancelled("query runtime is closing"));
+            }
+            Err(_) => {
+                admission.rejected.fetch_add(1, Ordering::Relaxed);
+                return Err(ClickHouseError::busy(format!(
+                    "{} query admission queue is full",
+                    profile.as_str()
+                )));
+            }
+        };
+
+        let running_slot = match admission.running_slots.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                let queued = AdmissionGauge::new(admission.queued.clone());
+                let acquire = admission.running_slots.clone().acquire_owned();
+                tokio::pin!(acquire);
+                let result = tokio::select! {
+                    permit = &mut acquire => permit.map_err(|_| {
+                        ClickHouseError::cancelled("query runtime admission is closed")
+                    }),
+                    _ = owner.state.token.cancelled() => Err(error_for_cause(
+                        owner.cause().unwrap_or(QueryCause::Abandoned),
+                        "query admission was cancelled",
+                    )),
+                    _ = self.inner.close.cancelled() => Err(ClickHouseError::cancelled(
+                        "query runtime closed during admission",
+                    )),
+                };
+                drop(queued);
+                result?
+            }
+        };
+        let running_gauge = AdmissionGauge::new(admission.running.clone());
+        Ok(StatementAdmission {
+            _total_slot: total_slot,
+            _running_slot: running_slot,
+            _running_gauge: running_gauge,
+        })
+    }
+
     fn same_domain(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
     }
@@ -195,6 +449,12 @@ impl QueryRuntime {
                 .lock()
                 .expect("query runtime state poisoned");
             state.closing = true;
+            self.inner.close.cancel();
+            for (index, admission) in self.inner.admission.iter().enumerate() {
+                if index != QueryResourceProfile::Administrative.index() {
+                    admission.close();
+                }
+            }
             state.active.values().cloned().collect()
         };
         for owner in owners {
@@ -264,6 +524,63 @@ impl QueryRuntimeInner {
             self.changed.send_modify(|version| {
                 *version = version.wrapping_add(1);
             });
+        }
+    }
+
+    async fn admit_administrative(
+        &self,
+        wall: Instant,
+    ) -> Result<StatementAdmission, ClickHouseError> {
+        let profile = QueryResourceProfile::Administrative;
+        let admission = &self.admission[profile.index()];
+        let total_slot = match admission.total_slots.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                admission.rejected.fetch_add(1, Ordering::Relaxed);
+                return Err(ClickHouseError::busy(
+                    "administrative query admission queue is full",
+                ));
+            }
+        };
+        let running_slot = match admission.running_slots.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                let queued = AdmissionGauge::new(admission.queued.clone());
+                let permit =
+                    tokio::time::timeout_at(wall, admission.running_slots.clone().acquire_owned())
+                        .await
+                        .map_err(|_| {
+                            ClickHouseError::cancelled("administrative query admission timed out")
+                        })?
+                        .map_err(|_| {
+                            ClickHouseError::cancelled("administrative query admission is closed")
+                        })?;
+                drop(queued);
+                permit
+            }
+        };
+        let running_gauge = AdmissionGauge::new(admission.running.clone());
+        Ok(StatementAdmission {
+            _total_slot: total_slot,
+            _running_slot: running_slot,
+            _running_gauge: running_gauge,
+        })
+    }
+
+    fn classify_administrative_code(&self, code: Option<u32>) -> ClickHouseErrorCategory {
+        match code {
+            Some(202 | 745) => {
+                self.admission[QueryResourceProfile::Administrative.index()]
+                    .rejected
+                    .fetch_add(1, Ordering::Relaxed);
+                ClickHouseErrorCategory::Busy
+            }
+            Some(158 | 241 | 243 | 307 | 396) => {
+                self.resource_limit_events.fetch_add(1, Ordering::Relaxed);
+                ClickHouseErrorCategory::ResourceExhausted
+            }
+            Some(159 | 160 | 209) => ClickHouseErrorCategory::DeadlineExceeded,
+            _ => ClickHouseErrorCategory::Backend,
         }
     }
 }
@@ -451,6 +768,7 @@ impl QueryOwner {
         &self,
         runtime: &QueryRuntime,
         backend: Arc<AdminBackend>,
+        admission: StatementAdmission,
     ) -> Result<StatementTicket, ClickHouseError> {
         self.ensure_runtime(runtime)?;
         let sequence = self
@@ -484,6 +802,7 @@ impl QueryOwner {
             owner: self.state.clone(),
             child_id,
             armed: true,
+            _admission: Some(admission),
         })
     }
 }
@@ -525,6 +844,7 @@ pub(crate) struct StatementTicket {
     owner: Arc<OwnerState>,
     child_id: String,
     armed: bool,
+    _admission: Option<StatementAdmission>,
 }
 
 impl StatementTicket {
@@ -550,6 +870,13 @@ impl StatementTicket {
             self.armed = false;
             self.owner.child_succeeded(&self.child_id);
         }
+    }
+
+    pub(crate) fn succeed_reusing_admission(&mut self) -> StatementAdmission {
+        self.succeed();
+        self._admission
+            .take()
+            .expect("statement admission can only be reused once")
     }
 
     pub(crate) fn fail(&mut self, cause: QueryCause) {
@@ -651,6 +978,7 @@ impl OwnerState {
 pub enum ClickHouseErrorCategory {
     Cancelled,
     DeadlineExceeded,
+    Busy,
     ResourceExhausted,
     Backend,
     OwnershipViolation,
@@ -689,6 +1017,9 @@ impl ClickHouseError {
     }
     pub(crate) fn deadline(context: impl Into<String>) -> Self {
         Self::new(ClickHouseErrorCategory::DeadlineExceeded, context)
+    }
+    pub(crate) fn busy(context: impl Into<String>) -> Self {
+        Self::new(ClickHouseErrorCategory::Busy, context)
     }
     pub(crate) fn resource(context: impl Into<String>) -> Self {
         Self::new(ClickHouseErrorCategory::ResourceExhausted, context)
@@ -781,6 +1112,7 @@ fn sanitize_exception_detail(detail: &str) -> Option<String> {
 pub(crate) fn error_for_cause(cause: QueryCause, context: impl Into<String>) -> ClickHouseError {
     match cause {
         QueryCause::Deadline => ClickHouseError::deadline(context),
+        QueryCause::Busy => ClickHouseError::busy(context),
         QueryCause::ResourceExhausted => ClickHouseError::resource(context),
         QueryCause::Backend => ClickHouseError::backend(context),
         QueryCause::Explicit
@@ -796,9 +1128,10 @@ pub(crate) struct AdminBackend {
     username: String,
     password: String,
     client: Client,
-    semaphore: Semaphore,
     sequence: AtomicU64,
     owner_id: Uuid,
+    managed_workloads_available: AtomicBool,
+    runtime: Weak<QueryRuntimeInner>,
 }
 
 impl AdminBackend {
@@ -807,6 +1140,7 @@ impl AdminBackend {
         username: String,
         password: String,
         default_headers: reqwest::header::HeaderMap,
+        runtime: &QueryRuntime,
     ) -> Result<Arc<Self>, ClickHouseError> {
         let client = Client::builder()
             .connect_timeout(ADMIN_CONNECT_TIMEOUT)
@@ -824,59 +1158,147 @@ impl AdminBackend {
             username,
             password,
             client,
-            semaphore: Semaphore::new(ADMIN_CONCURRENCY),
             sequence: AtomicU64::new(0),
             owner_id: Uuid::new_v4(),
+            managed_workloads_available: AtomicBool::new(false),
+            runtime: Arc::downgrade(&runtime.inner),
         }))
     }
 
-    async fn execute(&self, query: &str, wall: Instant) -> Result<String, ClickHouseError> {
-        let permit = tokio::time::timeout_at(wall, self.semaphore.acquire())
+    pub(crate) fn set_managed_workloads_available(&self, available: bool) {
+        self.managed_workloads_available
+            .store(available, Ordering::Relaxed);
+    }
+
+    pub(crate) async fn execute(
+        &self,
+        query: &str,
+        wall: Instant,
+    ) -> Result<String, ClickHouseError> {
+        self.execute_inner(query, wall, true, true, None).await
+    }
+
+    pub(crate) async fn execute_unprofiled(
+        &self,
+        query: &str,
+        timeout: Duration,
+    ) -> Result<String, ClickHouseError> {
+        self.execute_inner(query, Instant::now() + timeout, false, true, None)
             .await
-            .map_err(|_| ClickHouseError::cancelled("ClickHouse cleanup semaphore timed out"))?
-            .map_err(|_| ClickHouseError::cancelled("ClickHouse cleanup semaphore closed"))?;
+    }
+
+    pub(crate) async fn probe_unprofiled(
+        &self,
+        query: &str,
+        timeout: Duration,
+        query_id: &str,
+    ) -> Result<String, ClickHouseError> {
+        self.execute_inner(
+            query,
+            Instant::now() + timeout,
+            false,
+            false,
+            Some(query_id),
+        )
+        .await
+    }
+
+    async fn execute_inner(
+        &self,
+        query: &str,
+        wall: Instant,
+        cleanup: bool,
+        accounted: bool,
+        query_id: Option<&str>,
+    ) -> Result<String, ClickHouseError> {
+        let operation = if cleanup {
+            "ClickHouse cleanup"
+        } else {
+            "ClickHouse administrative request"
+        };
+        let runtime = self
+            .runtime
+            .upgrade()
+            .ok_or_else(|| ClickHouseError::cancelled("query runtime is unavailable"))?;
+        let admission = if accounted {
+            Some(runtime.admit_administrative(wall).await?)
+        } else {
+            None
+        };
         let now = Instant::now();
         if now >= wall {
-            return Err(ClickHouseError::cancelled(
-                "ClickHouse cleanup wall expired",
-            ));
+            return Err(ClickHouseError::cancelled(format!(
+                "{operation} wall expired"
+            )));
         }
-        let timeout = (wall - now).min(ADMIN_REQUEST_TIMEOUT);
-        let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
-        let query_id = format!(
-            "moraine-administrative-{}-{sequence}",
-            self.owner_id.simple()
-        );
+        let remaining = wall - now;
+        let request_timeout = if cleanup {
+            remaining.min(ADMIN_REQUEST_TIMEOUT)
+        } else {
+            remaining
+        };
+        let generated_query_id;
+        let query_id = if let Some(query_id) = query_id {
+            query_id
+        } else {
+            let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
+            generated_query_id = format!(
+                "moraine-administrative-{}-{sequence}",
+                self.owner_id.simple()
+            );
+            &generated_query_id
+        };
         let mut url = self.url.clone();
         {
             let mut pairs = url.query_pairs_mut();
             pairs.append_pair("query", query);
-            pairs.append_pair("query_id", &query_id);
+            pairs.append_pair("query_id", query_id);
             pairs.append_pair("replace_running_query", "0");
+            if cleanup && self.managed_workloads_available.load(Ordering::Relaxed) {
+                let profile = QueryResourceProfile::Administrative;
+                pairs.append_pair("workload", profile.workload_name());
+                pairs.append_pair("max_memory_usage", &profile.memory_bytes().to_string());
+                pairs.append_pair(
+                    "max_bytes_before_external_group_by",
+                    &profile.spill_bytes().to_string(),
+                );
+                pairs.append_pair(
+                    "max_bytes_before_external_sort",
+                    &profile.spill_bytes().to_string(),
+                );
+                pairs.append_pair("max_bytes_ratio_before_external_group_by", "0");
+                pairs.append_pair("max_bytes_ratio_before_external_sort", "0");
+                pairs.append_pair(
+                    "max_temporary_data_on_disk_size_for_query",
+                    &profile.temporary_disk_bytes().to_string(),
+                );
+            }
         }
         let mut request = self
             .client
             .post(url)
-            .timeout(timeout)
+            .timeout(request_timeout)
             .header(reqwest::header::CONTENT_LENGTH, 0)
             .body(Vec::new());
         if !self.username.is_empty() {
             request = request.basic_auth(&self.username, Some(&self.password));
         }
-        let response = request.send().await.map_err(|error| {
-            ClickHouseError::transport("ClickHouse cleanup request failed", error)
-        })?;
+        let response = request
+            .send()
+            .await
+            .map_err(|error| ClickHouseError::transport(format!("{operation} failed"), error))?;
         let status = response.status();
         let body = response.text().await.map_err(|error| {
-            ClickHouseError::transport("failed to read ClickHouse cleanup response", error)
+            ClickHouseError::transport(format!("failed to read {operation} response"), error)
         })?;
-        drop(permit);
+        drop(admission);
         if !status.is_success() {
+            let code = extract_exception_code(&body);
             return Err(ClickHouseError::response(
-                ClickHouseErrorCategory::Backend,
-                "ClickHouse cleanup request was rejected",
+                runtime.classify_administrative_code(code),
+                format!("{operation} was rejected"),
                 status,
-                extract_exception_code(&body),
+                code,
                 Some(&body),
             ));
         }
@@ -1156,5 +1578,163 @@ mod tests {
         tokio::time::timeout(Duration::from_millis(250), runtime.close_and_drain())
             .await
             .expect("completed deadline owner must not hold shutdown open");
+    }
+    #[test]
+    fn workloads_map_to_fixed_resource_profiles() {
+        for workload in [
+            QueryWorkload::Mcp,
+            QueryWorkload::Monitor,
+            QueryWorkload::Export,
+        ] {
+            assert_eq!(
+                QueryResourceProfile::from(workload),
+                QueryResourceProfile::Interactive
+            );
+        }
+        assert_eq!(
+            QueryResourceProfile::from(QueryWorkload::Background),
+            QueryResourceProfile::Background
+        );
+        assert_eq!(
+            QueryResourceProfile::from(QueryWorkload::Migration),
+            QueryResourceProfile::Migration
+        );
+        for workload in [QueryWorkload::Internal, QueryWorkload::Administrative] {
+            assert_eq!(
+                QueryResourceProfile::from(workload),
+                QueryResourceProfile::Administrative
+            );
+        }
+        for profile in QueryResourceProfile::ALL {
+            assert!(profile.max_running() > 0);
+            assert!(profile.max_queued() > 0);
+            assert!(profile.spill_bytes() < profile.memory_bytes());
+            assert!(profile.temporary_disk_bytes() > 0);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn interactive_admission_is_bounded_and_cancellation_aware() {
+        let runtime = QueryRuntime::new();
+        let mut running_owners = Vec::new();
+        let mut running_permits = Vec::new();
+        for _ in 0..QueryResourceProfile::Interactive.max_running() {
+            let owner = QueryOwner::new(&runtime, QueryWorkload::Mcp).expect("running owner");
+            running_permits.push(
+                runtime
+                    .admit_statement(&owner)
+                    .await
+                    .expect("running admission"),
+            );
+            running_owners.push(owner);
+        }
+
+        let mut queued_owners = Vec::new();
+        let mut queued_tasks = Vec::new();
+        for _ in 0..QueryResourceProfile::Interactive.max_queued() {
+            let owner = QueryOwner::new(&runtime, QueryWorkload::Mcp).expect("queued owner");
+            let task_owner = owner.clone();
+            let task_runtime = runtime.clone();
+            queued_tasks.push(tokio::spawn(async move {
+                task_runtime.admit_statement(&task_owner).await
+            }));
+            queued_owners.push(owner);
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if runtime.pressure_snapshot().interactive.queued
+                    == QueryResourceProfile::Interactive.max_queued() as u64
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all waiters become visible");
+
+        let rejected_owner = QueryOwner::new(&runtime, QueryWorkload::Mcp).expect("rejected owner");
+        let rejected = match runtime.admit_statement(&rejected_owner).await {
+            Ok(_) => panic!("bounded queue must reject excess work"),
+            Err(error) => error,
+        };
+        assert_eq!(rejected.category(), ClickHouseErrorCategory::Busy);
+        let pressure = runtime.pressure_snapshot();
+        assert_eq!(
+            pressure.interactive.running,
+            QueryResourceProfile::Interactive.max_running() as u64
+        );
+        assert_eq!(
+            pressure.interactive.queued,
+            QueryResourceProfile::Interactive.max_queued() as u64
+        );
+        assert_eq!(pressure.interactive.rejected, 1);
+
+        for owner in &queued_owners {
+            owner.cancel(QueryCause::Explicit);
+        }
+        for task in queued_tasks {
+            let error = match task.await.expect("queued admission task") {
+                Ok(_) => panic!("cancelled waiter must not be admitted"),
+                Err(error) => error,
+            };
+            assert_eq!(error.category(), ClickHouseErrorCategory::Cancelled);
+        }
+        drop(running_permits);
+        for owner in running_owners {
+            owner.cancel(QueryCause::Explicit);
+        }
+        rejected_owner.cancel(QueryCause::Explicit);
+        runtime.close_and_drain().await;
+        let pressure = runtime.pressure_snapshot();
+        assert_eq!(pressure.interactive.running, 0);
+        assert_eq!(pressure.interactive.queued, 0);
+    }
+
+    #[tokio::test]
+    async fn administrative_transport_uses_reported_capacity_and_error_counters() {
+        let runtime = QueryRuntime::new();
+        let wall = Instant::now() + Duration::from_secs(1);
+        let first = runtime
+            .inner
+            .admit_administrative(wall)
+            .await
+            .expect("first administrative admission");
+        let second = runtime
+            .inner
+            .admit_administrative(wall)
+            .await
+            .expect("second administrative admission");
+        let inner = Arc::clone(&runtime.inner);
+        let queued = tokio::spawn(async move { inner.admit_administrative(wall).await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while runtime.pressure_snapshot().administrative.queued != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("administrative waiter becomes visible");
+        assert_eq!(runtime.pressure_snapshot().administrative.running, 2);
+
+        drop(first);
+        let third = queued
+            .await
+            .expect("queued task")
+            .expect("queued administrative admission");
+        assert_eq!(runtime.pressure_snapshot().administrative.queued, 0);
+        assert_eq!(runtime.pressure_snapshot().administrative.running, 2);
+        drop((second, third));
+
+        assert_eq!(
+            runtime.inner.classify_administrative_code(Some(745)),
+            ClickHouseErrorCategory::Busy
+        );
+        assert_eq!(
+            runtime.inner.classify_administrative_code(Some(241)),
+            ClickHouseErrorCategory::ResourceExhausted
+        );
+        let pressure = runtime.pressure_snapshot();
+        assert_eq!(pressure.administrative.rejected, 1);
+        assert_eq!(pressure.resource_limit_events, 1);
     }
 }

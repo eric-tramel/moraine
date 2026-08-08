@@ -186,6 +186,7 @@ not_found
 unsupported_event_type
 cancelled
 deadline_exceeded
+busy
 resource_exhausted
 backend_failure
 internal_error
@@ -205,8 +206,8 @@ Error behavior:
   response.
 - An explicitly supplied caller deadline returns `deadline_exceeded`. Current
   MCP requests do not supply one, and Moraine does not add a default deadline.
-- A full admission queue or a ClickHouse resource limit returns
-  `resource_exhausted`.
+- A full admission queue returns `busy`; a ClickHouse memory, disk, row, or
+  byte limit returns `resource_exhausted`.
 - ClickHouse transport, HTTP, and database failures return `backend_failure`.
 - Moraine implementation failures return `internal_error` with a concise
   message.

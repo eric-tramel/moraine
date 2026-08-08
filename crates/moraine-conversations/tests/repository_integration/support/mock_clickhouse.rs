@@ -134,6 +134,9 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
         if query.contains("FROM system.processes") {
             return (StatusCode::OK, json_each_row(json!([])));
         }
+        if query.contains("FROM system.workloads") {
+            return (StatusCode::OK, "0".to_string());
+        }
         state
             .queries
             .lock()

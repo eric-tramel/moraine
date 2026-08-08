@@ -1,6 +1,6 @@
 use std::fs;
 #[cfg(unix)]
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 #[cfg(unix)]
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -151,6 +151,121 @@ fn backend_row(status: &Value) -> &Value {
         .iter()
         .find(|service| service["service"] == "backend")
         .expect("backend service row")
+}
+
+#[cfg(unix)]
+fn spawn_mcp_endpoint(socket_path: &Path) -> thread::JoinHandle<Vec<Value>> {
+    use std::os::unix::net::UnixListener;
+
+    let listener = UnixListener::bind(socket_path).expect("bind MCP endpoint");
+    listener
+        .set_nonblocking(true)
+        .expect("set MCP endpoint nonblocking");
+    thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut accepted = Vec::new();
+        while accepted.len() < 2 && Instant::now() < deadline {
+            match listener.accept() {
+                Ok((stream, _)) => accepted.push(stream),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("accept MCP connection: {error}"),
+            }
+        }
+        assert_eq!(accepted.len(), 2, "liveness and health connections");
+        drop(accepted.remove(0));
+        let mut stream = accepted.remove(0);
+        stream
+            .set_nonblocking(false)
+            .expect("set MCP fixture blocking mode");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .expect("set MCP read timeout");
+        let mut reader = BufReader::new(stream.try_clone().expect("clone MCP stream"));
+        let mut requests = Vec::new();
+
+        let mut initialize_line = String::new();
+        reader
+            .read_line(&mut initialize_line)
+            .expect("read initialize request");
+        requests.push(
+            serde_json::from_str::<Value>(&initialize_line).expect("decode initialize request"),
+        );
+        let initialize_response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {"tools": {"listChanged": false}},
+                "serverInfo": {"name": "moraine-mcp", "version": "fixture-version"}
+            }
+        });
+        serde_json::to_writer(&mut stream, &initialize_response)
+            .expect("encode initialize response");
+        stream.write_all(b"\n").expect("write initialize response");
+        stream.flush().expect("flush initialize response");
+
+        for expected_method in ["notifications/initialized", "ping"] {
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("read MCP request");
+            let request: Value = serde_json::from_str(&line).expect("decode MCP request");
+            assert_eq!(request["method"], expected_method);
+            requests.push(request);
+        }
+        let ping_response = serde_json::json!({"jsonrpc": "2.0", "id": 2, "result": {}});
+        serde_json::to_writer(&mut stream, &ping_response).expect("encode ping response");
+        stream.write_all(b"\n").expect("write ping response");
+        stream.flush().expect("flush ping response");
+        requests
+    })
+}
+
+#[cfg(unix)]
+#[test]
+fn status_reports_mcp_initialize_and_ping_health() {
+    for plain in [false, true] {
+        let root = temp_dir();
+        let worker = spawn_mcp_endpoint(&root.join("backend.sock"));
+        let config = write_config(&root, 0);
+        let output = if plain {
+            run_plain_status(&config)
+        } else {
+            run_status(&config)
+        };
+        assert!(
+            output.status.success(),
+            "status failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if plain {
+            let rendered = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                rendered.contains("MCP initialize + ping healthy"),
+                "{rendered}"
+            );
+            assert!(
+                rendered.contains("protocol: 2025-03-26  |  server: fixture-version"),
+                "{rendered}"
+            );
+        } else {
+            let status: Value = serde_json::from_slice(&output.stdout).expect("status JSON output");
+            assert_eq!(status["mcp_health"]["healthy"], true, "{status}");
+            assert_eq!(status["mcp_health"]["protocol_version"], "2025-03-26");
+            assert_eq!(status["mcp_health"]["server_version"], "fixture-version");
+            assert_eq!(status["mcp_health"]["error"], Value::Null);
+        }
+
+        let requests = worker.join().expect("MCP endpoint worker");
+        assert_eq!(requests[0]["method"], "initialize");
+        assert_eq!(
+            requests[0]["params"]["clientInfo"]["name"],
+            "moraine-cli-health"
+        );
+        assert_eq!(requests[1]["method"], "notifications/initialized");
+        assert_eq!(requests[2]["method"], "ping");
+        let _ = fs::remove_dir_all(root);
+    }
 }
 
 #[test]

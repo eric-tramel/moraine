@@ -1,5 +1,5 @@
 use anyhow::Result;
-use moraine_clickhouse::DoctorReport;
+use moraine_clickhouse::{DoctorReport, QueryPressureSnapshot};
 use moraine_conversations::{IngestAlertCode, IngestConditionState, IngestStatus};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Rect};
@@ -9,6 +9,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Cell, Paragraph, Row, Table, 
 use std::io::IsTerminal;
 
 use crate::cli::{Cli, OutputFormat};
+use crate::mcp_health::McpHealthSnapshot;
 use crate::process::{StartOutcome, StartState};
 use crate::service::Service;
 
@@ -92,6 +93,8 @@ pub(crate) enum HeartbeatSnapshot {
 pub(crate) struct StatusSnapshot {
     pub(crate) services: Vec<ServiceRuntimeStatus>,
     pub(crate) monitor_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) mcp_health: Option<McpHealthSnapshot>,
     pub(crate) data_source: StatusDataSource,
     pub(crate) managed_clickhouse_installed: bool,
     pub(crate) managed_clickhouse_path: String,
@@ -105,6 +108,8 @@ pub(crate) struct StatusSnapshot {
     pub(crate) heartbeat: HeartbeatSnapshot,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) ingest_status: Option<IngestStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) query_pressure: Option<QueryPressureSnapshot>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -478,6 +483,25 @@ pub(crate) fn render_status(output: &CliOutput, snapshot: &StatusSnapshot) -> Re
         output.table("Services", &["", "state", "endpoint"], &service_rows);
     }
 
+    if let Some(health) = &snapshot.mcp_health {
+        let mut mcp_lines = vec![format!(
+            "{} MCP initialize + ping {}",
+            stoplight(health.healthy),
+            health_label(health.healthy)
+        )];
+        if let (Some(protocol), Some(server)) = (&health.protocol_version, &health.server_version) {
+            mcp_lines.push(format!("protocol: {protocol}  |  server: {server}"));
+        }
+        if let Some(error) = &health.error {
+            mcp_lines.push(format!("diagnostic: {error}"));
+            mcp_lines.push(
+                "remediation: run `moraine up`; if the check still fails, inspect `moraine logs backend`"
+                    .to_string(),
+            );
+        }
+        output.section("MCP", &mcp_lines);
+    }
+
     // -- Database Health (concise) --
     let db_healthy = snapshot.doctor.clickhouse_healthy && snapshot.doctor.database_exists;
     let mut doctor_lines = vec![format!(
@@ -630,6 +654,25 @@ pub(crate) fn render_status(output: &CliOutput, snapshot: &StatusSnapshot) -> Re
     }
     if !ingest_lines.is_empty() {
         output.section("Ingest", &ingest_lines);
+    }
+    if let Some(pressure) = &snapshot.query_pressure {
+        let profile = |name: &str, value: &moraine_clickhouse::QueryProfilePressure| {
+            format!(
+                "{name}: {} running  |  {} queued  |  {} rejected",
+                value.running, value.queued, value.rejected
+            )
+        };
+        output.section(
+            "Query Pressure",
+            &[
+                format!("scope: {}", pressure.scope),
+                profile("interactive", &pressure.interactive),
+                profile("background", &pressure.background),
+                profile("migration", &pressure.migration),
+                profile("administrative", &pressure.administrative),
+                format!("resource-limit events: {}", pressure.resource_limit_events),
+            ],
+        );
     }
 
     // -- ClickHouse runtime details (verbose only) --
