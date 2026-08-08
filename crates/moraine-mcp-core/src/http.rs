@@ -514,7 +514,7 @@ mod tests {
         assert_eq!(payload["result"]["isError"], true);
         assert_eq!(
             payload["result"]["structuredContent"]["error"]["code"],
-            "resource_exhausted"
+            "busy"
         );
         assert_eq!(
             payload["result"]["structuredContent"]["error"]["details"]["reason"],
