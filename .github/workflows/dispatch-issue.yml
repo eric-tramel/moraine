@@ -1,0 +1,70 @@
+name: Dispatch issue to OMP
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  dispatch:
+    if: >-
+      github.event.repository.id == 1158239756 &&
+      github.event.comment.user.id == 1223539 &&
+      github.event.comment.body == '/dispatch' &&
+      github.event.issue.state == 'open' &&
+      !github.event.issue.pull_request
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: dispatch-${{ github.event.repository.id }}-${{ github.event.issue.number }}
+      cancel-in-progress: false
+    steps:
+      - name: Join dispatch tailnet
+        # tailscale/github-action v4
+        uses: tailscale/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          audience: ${{ secrets.TS_AUDIENCE }}
+          tags: tag:github-dispatch
+          version: 1.102.2
+          ping: moraine-dev-1
+
+      - name: Dispatch issue
+        env:
+          DISPATCH_HOST: moraine-dev-1
+          DISPATCH_PORT: '2222'
+          DISPATCH_SSH_KEY: ${{ secrets.MORAINE_DISPATCH_SSH_KEY }}
+          DISPATCH_KNOWN_HOSTS: ${{ secrets.MORAINE_DISPATCH_KNOWN_HOSTS }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+
+          key_file="$RUNNER_TEMP/moraine-dispatch-key"
+          known_hosts_file="$RUNNER_TEMP/moraine-dispatch-known-hosts"
+          printf '%s\n' "$DISPATCH_SSH_KEY" > "$key_file"
+          printf '%s\n' "$DISPATCH_KNOWN_HOSTS" > "$known_hosts_file"
+
+          jq -ce --arg base_sha "$GITHUB_SHA" '
+            {
+              schema: 1,
+              kind: "github_issue",
+              repository_id: .repository.id,
+              issue_number: .issue.number,
+              comment_id: .comment.id,
+              base_sha: $base_sha
+            }
+          ' "$GITHUB_EVENT_PATH" |
+            ssh \
+              -o BatchMode=yes \
+              -o ClearAllForwardings=yes \
+              -o ConnectTimeout=15 \
+              -o IdentitiesOnly=yes \
+              -o StrictHostKeyChecking=yes \
+              -o "UserKnownHostsFile=$known_hosts_file" \
+              -i "$key_file" \
+              -p "$DISPATCH_PORT" \
+              "moraine-dispatch@$DISPATCH_HOST"
