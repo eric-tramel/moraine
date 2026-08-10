@@ -4,6 +4,9 @@ use crate::domain::{
     SessionAnalyticsQuery, StoreDiagnostics, StoreHealth, TablePreview, TablePreviewQuery,
     TableSummaries, WebSearchEvent,
 };
+use crate::domain::{
+    CanonicalContinuation, CanonicalReadOutcome, CanonicalSessionPage, CanonicalTurnPage,
+};
 
 #[async_trait]
 impl ConversationRepository for ClickHouseConversationRepository {
@@ -76,6 +79,16 @@ impl ConversationRepository for ClickHouseConversationRepository {
         self.get_mcp_session_impl(session_id).await
     }
 
+    async fn canonical_open_session_page(
+        &self,
+        session_id: &str,
+        limit: u16,
+        after: Option<CanonicalContinuation>,
+    ) -> RepoResult<Option<CanonicalReadOutcome<CanonicalSessionPage>>> {
+        self.canonical_open_session_page_impl(session_id, limit, after)
+            .await
+    }
+
     async fn list_mcp_sessions(
         &self,
         filter: McpSessionListFilter,
@@ -111,6 +124,17 @@ impl ConversationRepository for ClickHouseConversationRepository {
         turn_seq: u32,
     ) -> RepoResult<Option<McpTurnOpen>> {
         self.get_mcp_turn_impl(session_id, turn_seq, false).await
+    }
+
+    async fn canonical_open_turn_page(
+        &self,
+        session_id: &str,
+        turn_seq: u32,
+        limit: u16,
+        after: Option<CanonicalContinuation>,
+    ) -> RepoResult<Option<CanonicalReadOutcome<CanonicalTurnPage>>> {
+        self.canonical_open_turn_page_impl(session_id, turn_seq, limit, after)
+            .await
     }
 
     async fn open_event(&self, req: OpenEventRequest) -> RepoResult<OpenContext> {

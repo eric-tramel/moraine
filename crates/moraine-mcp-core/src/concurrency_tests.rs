@@ -339,6 +339,7 @@ fn test_state_with_admission(
         )),
         QueryRuntime::new(),
     )
+    .expect("create concurrency test state")
 }
 
 fn start_connection_with_state(

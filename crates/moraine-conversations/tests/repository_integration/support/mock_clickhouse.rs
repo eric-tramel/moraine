@@ -13,7 +13,7 @@ use moraine_conversations::{ClickHouseConversationRepository, RepoConfig, Sessio
 use serde_json::json;
 use tokio::sync::Notify;
 
-use super::canonical_open_fixtures::{hydrated_rows, navigation_rows};
+use super::canonical_open_fixtures::{hydrated_rows, navigation_rows, version_rows};
 use super::responses::{json_each_row, trace_event_row, turn_summary_row};
 use super::OwnedRepository;
 
@@ -225,7 +225,7 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
             return (StatusCode::OK, json_each_row(json!(rows)));
         }
 
-        if query.contains("FROM `moraine`.`mcp_event_navigation` AS n FINAL")
+        if query.contains("FROM `moraine`.`mcp_event_navigation_seek` AS n FINAL")
             && query.contains("toUInt8(is_metadata_bearing) AS is_metadata_bearing")
         {
             let session_id = query
@@ -239,12 +239,18 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
             );
         }
 
-        if query.contains("FROM `moraine`.`events` FINAL")
+        if query.contains("FROM `moraine`.`mcp_event_version_seek`")
+            && query.contains("WHERE event_uid IN")
+        {
+            return (StatusCode::OK, json_each_row(json!(version_rows())));
+        }
+
+        if query.contains("FROM `moraine`.`events`")
             && query.contains("token_usage_native_units")
-            && query.contains("event_uid IN")
+            && query.contains("(event_uid, event_version) IN")
         {
             let session_id = query
-                .split("WHERE session_id = '")
+                .split("session_id = '")
                 .nth(1)
                 .and_then(|rest| rest.split('\'').next())
                 .unwrap_or("");

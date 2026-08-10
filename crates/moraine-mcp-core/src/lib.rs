@@ -19,6 +19,7 @@ use moraine_conversations::{
 pub use moraine_conversations::{ConversationRepository, SessionOriginScope};
 #[cfg(unix)]
 pub use private_proxy::{negotiate_private_route, PrivateProxyConnection, PrivateRouteNegotiation};
+use ring::rand::{SecureRandom, SystemRandom};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
@@ -278,9 +279,125 @@ struct CancelledParams {
     request_id: Value,
 }
 
+#[cfg(test)]
+static TEST_OPEN_CURSOR_KEY: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+
+fn random_open_cursor_key() -> Result<[u8; 32]> {
+    let mut key = [0_u8; 32];
+    SystemRandom::new()
+        .fill(&mut key)
+        .map_err(|_| anyhow!("failed to generate MCP cursor key"))?;
+    Ok(key)
+}
+
+fn read_open_cursor_key(path: &std::path::Path) -> Result<[u8; 32]> {
+    use std::io::Read as _;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options
+        .open(path)
+        .with_context(|| format!("failed to open MCP cursor key {}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to inspect MCP cursor key {}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(anyhow!(
+            "MCP cursor key {} must be a regular file",
+            path.display()
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let parent = path
+            .parent()
+            .ok_or_else(|| anyhow!("MCP cursor key has no parent directory"))?;
+        let owner = std::fs::metadata(parent)
+            .with_context(|| format!("failed to inspect runtime directory {}", parent.display()))?
+            .uid();
+        if metadata.uid() != owner {
+            return Err(anyhow!(
+                "MCP cursor key {} must be owned by the runtime directory owner",
+                path.display()
+            ));
+        }
+        if metadata.mode() & 0o077 != 0 {
+            return Err(anyhow!(
+                "MCP cursor key {} must not be accessible by group or other users",
+                path.display()
+            ));
+        }
+    }
+    let mut bytes = Vec::with_capacity(33);
+    std::io::Read::take(file, 33)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read MCP cursor key {}", path.display()))?;
+    bytes.try_into().map_err(|bytes: Vec<u8>| {
+        anyhow!(
+            "MCP cursor key {} must contain exactly 32 bytes, found {}",
+            path.display(),
+            bytes.len()
+        )
+    })
+}
+
+fn load_or_create_open_cursor_key(root_dir: &str) -> Result<[u8; 32]> {
+    let root = std::path::Path::new(root_dir);
+    std::fs::create_dir_all(root)
+        .with_context(|| format!("failed to create runtime directory {}", root.display()))?;
+    let path = root.join("mcp-open-cursor.key");
+    match read_open_cursor_key(&path) {
+        Ok(key) => return Ok(key),
+        Err(_) if !path.exists() => {}
+        Err(error) => return Err(error),
+    }
+
+    let key = random_open_cursor_key()?;
+    let mut suffix = [0_u8; 8];
+    SystemRandom::new()
+        .fill(&mut suffix)
+        .map_err(|_| anyhow!("failed to generate MCP cursor key filename"))?;
+    let temp = root.join(format!(
+        ".mcp-open-cursor.key.{:016x}.tmp",
+        u64::from_le_bytes(suffix)
+    ));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&temp)
+        .with_context(|| format!("failed to create MCP cursor key {}", temp.display()))?;
+    std::io::Write::write_all(&mut file, &key)
+        .with_context(|| format!("failed to write MCP cursor key {}", temp.display()))?;
+    file.sync_all()
+        .with_context(|| format!("failed to sync MCP cursor key {}", temp.display()))?;
+    drop(file);
+
+    let linked = std::fs::hard_link(&temp, &path);
+    let _ = std::fs::remove_file(&temp);
+    match linked {
+        Ok(()) => Ok(key),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            read_open_cursor_key(&path)
+        }
+        Err(error) => Err(error)
+            .with_context(|| format!("failed to install MCP cursor key {}", path.display())),
+    }
+}
+
 #[derive(Clone)]
 struct AppState {
     cfg: Arc<AppConfig>,
+    open_cursor_key: [u8; 32],
     repo: Arc<dyn ConversationRepository>,
     launch_dir: Option<PathBuf>,
     prewarm_started: Arc<AtomicBool>,
@@ -1108,27 +1225,34 @@ impl AppState {
         launch_dir: Option<PathBuf>,
         request_admission: Arc<RequestAdmission>,
         query_runtime: QueryRuntime,
-    ) -> Arc<AppState> {
-        Arc::new(AppState {
+    ) -> Result<Arc<AppState>> {
+        #[cfg(test)]
+        let open_cursor_key = *TEST_OPEN_CURSOR_KEY
+            .get_or_init(|| random_open_cursor_key().expect("generate test cursor key"));
+        #[cfg(not(test))]
+        let open_cursor_key = load_or_create_open_cursor_key(&cfg.runtime.root_dir)?;
+        Ok(Arc::new(AppState {
             cfg,
+            open_cursor_key,
             repo,
             launch_dir,
             prewarm_started,
             request_admission,
             query_runtime,
-        })
+        }))
     }
 
     #[cfg(test)]
     fn embedded(cfg: AppConfig, repo: Arc<dyn ConversationRepository>) -> Arc<AppState> {
         Self::embedded_with_runtime(cfg, repo, QueryRuntime::new())
+            .expect("create embedded MCP state")
     }
 
     fn embedded_with_runtime(
         cfg: AppConfig,
         repo: Arc<dyn ConversationRepository>,
         query_runtime: QueryRuntime,
-    ) -> Arc<AppState> {
+    ) -> Result<Arc<AppState>> {
         let request_admission = build_request_admission(&cfg);
         Self::with_repository(
             cfg.into(),
@@ -1604,7 +1728,7 @@ pub async fn run_stdio_with_repository(
     repository: Arc<dyn ConversationRepository>,
     query_runtime: QueryRuntime,
 ) -> Result<()> {
-    let state = AppState::embedded_with_runtime(cfg, repository, query_runtime);
+    let state = AppState::embedded_with_runtime(cfg, repository, query_runtime)?;
     serve_connection(
         state,
         BufReader::new(tokio::io::stdin()),
@@ -1665,14 +1789,14 @@ impl McpDaemonState {
             .get_or_try_init(|| async {
                 let backend = self.router.default_repository().await?;
                 let prewarm_started = self.prewarm_gates.for_backend(backend.backend_name())?;
-                Ok(AppState::with_repository(
+                AppState::with_repository(
                     self.cfg.clone(),
                     backend.repository().clone(),
                     prewarm_started,
                     None,
                     self.request_admission.clone(),
                     self.router.query_runtime(),
-                ))
+                )
             })
             .await
             .cloned()
@@ -2103,7 +2227,7 @@ async fn serve_socket_connection(state: SocketState, stream: tokio::net::UnixStr
         launch_dir,
         state.daemon.request_admission.clone(),
         state.daemon.router.query_runtime(),
-    );
+    )?;
     if negotiated {
         tokio::select! {
             result = private_proxy::write_ack(&mut write_half) => result?,
@@ -2282,6 +2406,48 @@ mod tests {
 
     fn test_state() -> Arc<AppState> {
         AppState::embedded(AppConfig::default(), repository_with_scope(None))
+    }
+
+    #[test]
+    fn cursor_key_persists_across_state_reloads() {
+        let mut suffix = [0_u8; 8];
+        SystemRandom::new()
+            .fill(&mut suffix)
+            .expect("generate test directory suffix");
+        let root = std::env::temp_dir().join(format!(
+            "moraine-mcp-cursor-key-{:016x}",
+            u64::from_le_bytes(suffix)
+        ));
+        let root_text = root.to_str().expect("UTF-8 temporary path");
+        let first = load_or_create_open_cursor_key(root_text).expect("create cursor key");
+        let second = load_or_create_open_cursor_key(root_text).expect("reload cursor key");
+        assert_eq!(second, first);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{symlink, PermissionsExt};
+            let key_path = root.join("mcp-open-cursor.key");
+            let mut permissions = std::fs::metadata(&key_path)
+                .expect("cursor key metadata")
+                .permissions();
+            assert_eq!(permissions.mode() & 0o777, 0o600);
+            permissions.set_mode(0o644);
+            std::fs::set_permissions(&key_path, permissions).expect("weaken cursor key mode");
+            let error =
+                load_or_create_open_cursor_key(root_text).expect_err("reject permissive key");
+            assert!(error.to_string().contains("group or other"));
+
+            let mut permissions = std::fs::metadata(&key_path)
+                .expect("cursor key metadata")
+                .permissions();
+            permissions.set_mode(0o600);
+            std::fs::set_permissions(&key_path, permissions).expect("restore cursor key mode");
+            std::fs::remove_file(&key_path).expect("remove cursor key");
+            let known_key = root.join("known-key");
+            std::fs::write(&known_key, [7_u8; 32]).expect("write known key");
+            symlink(&known_key, &key_path).expect("create cursor key symlink");
+            load_or_create_open_cursor_key(root_text).expect_err("reject cursor key symlink");
+        }
+        std::fs::remove_dir_all(root).expect("remove cursor key test directory");
     }
 
     #[test]

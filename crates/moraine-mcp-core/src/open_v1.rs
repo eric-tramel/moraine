@@ -1,14 +1,14 @@
 use crate::contract::{
-    decode_open_cursor, encode_open_cursor, CanonicalOpenV1Args, ContractError, McpEntityKind,
-    McpEventId, McpId, McpSessionId, McpTurnId, OpenCursor, OpenCursorAfter, OpenV1Args,
-    Performance, ToolEnvelope, ToolError, ToolErrorCode, ToolErrorEnvelope, OPEN_MIN_LIMIT,
-    OPEN_TOOL,
+    classify_open_cursor, encode_open_cursor_v2, CanonicalOpenV1Args, ContractError, McpEntityKind,
+    McpEventId, McpId, McpSessionId, McpTurnId, OpenCursorClassified, OpenCursorV2, OpenV1Args,
+    Performance, ToolEnvelope, ToolError, ToolErrorCode, ToolErrorEnvelope, OPEN_CURSOR_V2_VERSION,
+    OPEN_MIN_LIMIT, OPEN_TOOL,
 };
 use crate::{handled_tool_error_result, request_started_at, tool_success_result, AppState};
 use anyhow::{Context, Result};
 use moraine_conversations::{
-    McpEventOpen, McpEventRef, McpEventSummary, McpSessionOpen, McpTurnCompact, McpTurnOpen,
-    McpTurnRef, SessionMetadata, TraceEvent,
+    CanonicalContinuation, CanonicalReadOutcome, McpEventOpen, McpEventRef, McpEventSummary,
+    McpSessionOpen, McpTurnCompact, McpTurnOpen, McpTurnRef, SessionMetadata, TraceEvent,
 };
 use serde_json::{json, Map, Value};
 use std::time::Instant;
@@ -17,7 +17,6 @@ const SUMMARY_PREVIEW_CHARS: usize = 240;
 const ENCRYPTED_REASONING_SUMMARY: &str = "[encrypted reasoning omitted]";
 const SUMMARY_MAX_TOOLS: usize = 25;
 const SUMMARY_TOOL_NAME_CHARS: usize = 120;
-const OPEN_CURSOR_VERSION: u8 = 1;
 
 #[derive(Debug)]
 struct ResolvedOpen {
@@ -31,8 +30,7 @@ enum OpenMode {
     Summary,
     Page {
         limit: u16,
-        after: Option<OpenCursorAfter>,
-        expected_snapshot: Option<(u8, u64)>,
+        continuation: Option<CanonicalContinuation>,
     },
 }
 
@@ -72,67 +70,164 @@ impl AppState {
             }
         };
 
-        let resolved = match resolve_open(canonical, self.cfg.mcp.max_results) {
-            Ok(resolved) => resolved,
-            Err(err) => {
-                return contract_error_tool_response(raw_request, err, started_at);
-            }
-        };
+        let mut resolved =
+            match resolve_open(canonical, self.cfg.mcp.max_results, &self.open_cursor_key) {
+                Ok(resolved) => resolved,
+                Err(err) => {
+                    return contract_error_tool_response(raw_request, err, started_at);
+                }
+            };
         let request = resolved.request.clone();
 
         match &resolved.id {
-            McpId::Session(id) => match self.repo.get_mcp_session(id.raw_session_id()).await {
-                Ok(Some(session)) => {
-                    if let Err(error) = validate_snapshot(&resolved.mode, session.snapshot.as_ref())
-                    {
-                        return contract_error_tool_response(request, error, started_at);
-                    }
-                    let page = match session_page(&resolved, &session) {
-                        Ok(page) => page,
-                        Err(error) => {
-                            return contract_error_tool_response(request, error, started_at);
-                        }
-                    };
-                    match open_session_data(&session, page.as_ref()) {
-                        Ok((data, warnings)) => {
-                            success_tool_response(request, data, warnings, started_at)
-                        }
-                        Err(err) => internal_error_tool_response(
+            McpId::Session(id) => {
+                if matches!(resolved.mode, OpenMode::Summary) {
+                    return match self.repo.get_mcp_session(id.raw_session_id()).await {
+                        Ok(Some(session)) => match open_session_data(&session, None, None, None) {
+                            Ok((data, warnings)) => {
+                                success_tool_response(request, data, warnings, started_at)
+                            }
+                            Err(err) => internal_error_tool_response(
+                                request,
+                                format!("failed to shape session open response: {err:#}"),
+                                started_at,
+                            ),
+                        },
+                        Ok(None) => not_found_tool_response(
                             request,
-                            format!("failed to shape session open response: {err:#}"),
+                            McpEntityKind::Session,
+                            &resolved.id.to_string(),
                             started_at,
                         ),
-                    }
+                        Err(err) => repo_error_tool_response(request, err, started_at),
+                    };
                 }
-                Ok(None) => not_found_tool_response(
-                    request,
-                    McpEntityKind::Session,
-                    &resolved.id.to_string(),
-                    started_at,
-                ),
-                Err(err) => repo_error_tool_response(request, err, started_at),
-            },
-            McpId::Turn(id) => {
-                let (session_id, turn_seq) = id.decode();
-                let turn_result = if matches!(resolved.mode, OpenMode::Page { .. }) {
-                    self.repo.get_mcp_turn(session_id, turn_seq).await
-                } else {
-                    self.repo.get_mcp_turn_summary(session_id, turn_seq).await
+                let OpenMode::Page {
+                    limit,
+                    continuation,
+                    ..
+                } = &mut resolved.mode
+                else {
+                    unreachable!("summary returned above");
                 };
-                match turn_result {
-                    Ok(Some(turn)) => {
-                        if let Err(error) =
-                            validate_snapshot(&resolved.mode, turn.snapshot.as_ref())
-                        {
-                            return contract_error_tool_response(request, error, started_at);
-                        }
-                        let page = match turn_page(&resolved, &turn) {
-                            Ok(page) => page,
+                let limit = *limit;
+                let continuation = continuation.take();
+                match self
+                    .repo
+                    .canonical_open_session_page(id.raw_session_id(), limit, continuation)
+                    .await
+                {
+                    Ok(Some(CanonicalReadOutcome::Page(page))) => {
+                        let next_cursor = match mint_cursor(
+                            &resolved.id,
+                            limit,
+                            page.continuation,
+                            &self.open_cursor_key,
+                        ) {
+                            Ok(cursor) => cursor,
                             Err(error) => {
                                 return contract_error_tool_response(request, error, started_at);
                             }
                         };
-                        match open_turn_data(&turn, page.as_ref()) {
+                        let selection = PageSelection {
+                            start: 0,
+                            end: page.session.turns.len(),
+                            next_cursor,
+                        };
+                        match open_session_data(
+                            &page.session,
+                            Some(&selection),
+                            page.first_turn_seq,
+                            page.last_turn_seq,
+                        ) {
+                            Ok((data, warnings)) => {
+                                success_tool_response(request, data, warnings, started_at)
+                            }
+                            Err(err) => internal_error_tool_response(
+                                request,
+                                format!("failed to shape session open response: {err:#}"),
+                                started_at,
+                            ),
+                        }
+                    }
+                    Ok(Some(CanonicalReadOutcome::Reopen)) => contract_error_tool_response(
+                        request,
+                        invalid_cursor(
+                            "cursor snapshot is stale; reopen the target to restart expansion",
+                        ),
+                        started_at,
+                    ),
+                    Ok(None) => not_found_tool_response(
+                        request,
+                        McpEntityKind::Session,
+                        &resolved.id.to_string(),
+                        started_at,
+                    ),
+                    Err(err) => repo_error_tool_response(request, err, started_at),
+                }
+            }
+            McpId::Turn(id) => {
+                let (session_id, turn_seq) = id.decode();
+                if matches!(resolved.mode, OpenMode::Summary) {
+                    return match self.repo.get_mcp_turn_summary(session_id, turn_seq).await {
+                        Ok(Some(turn)) => match open_turn_data(&turn, None) {
+                            Ok((data, warnings)) => {
+                                success_tool_response(request, data, warnings, started_at)
+                            }
+                            Err(err) => internal_error_tool_response(
+                                request,
+                                format!("failed to shape turn open response: {err:#}"),
+                                started_at,
+                            ),
+                        },
+                        Ok(None) => not_found_tool_response(
+                            request,
+                            McpEntityKind::Turn,
+                            &resolved.id.to_string(),
+                            started_at,
+                        ),
+                        Err(err) => repo_error_tool_response(request, err, started_at),
+                    };
+                }
+                let OpenMode::Page {
+                    limit,
+                    continuation,
+                } = &mut resolved.mode
+                else {
+                    unreachable!("summary returned above");
+                };
+                let limit = *limit;
+                let ordinal_offset = continuation
+                    .as_ref()
+                    .map_or(0, |cursor| cursor.after.event_ordinal as usize);
+                let continuation = continuation.take();
+                match self
+                    .repo
+                    .canonical_open_turn_page(session_id, turn_seq, limit, continuation)
+                    .await
+                {
+                    Ok(Some(CanonicalReadOutcome::Page(page))) => {
+                        let next_cursor = match mint_cursor(
+                            &resolved.id,
+                            limit,
+                            page.continuation,
+                            &self.open_cursor_key,
+                        ) {
+                            Ok(cursor) => cursor,
+                            Err(error) => {
+                                return contract_error_tool_response(request, error, started_at);
+                            }
+                        };
+                        let selection = PageSelection {
+                            start: 0,
+                            end: page.turn.events.len(),
+                            next_cursor,
+                        };
+                        match open_turn_data_with_offset(
+                            &page.turn,
+                            Some(&selection),
+                            ordinal_offset,
+                        ) {
                             Ok((data, warnings)) => {
                                 success_tool_response(request, data, warnings, started_at)
                             }
@@ -143,6 +238,13 @@ impl AppState {
                             ),
                         }
                     }
+                    Ok(Some(CanonicalReadOutcome::Reopen)) => contract_error_tool_response(
+                        request,
+                        invalid_cursor(
+                            "cursor snapshot is stale; reopen the target to restart expansion",
+                        ),
+                        started_at,
+                    ),
                     Ok(None) => not_found_tool_response(
                         request,
                         McpEntityKind::Turn,
@@ -178,6 +280,7 @@ impl AppState {
 fn resolve_open(
     args: CanonicalOpenV1Args,
     max_results: u16,
+    key: &[u8; 32],
 ) -> crate::contract::ContractResult<ResolvedOpen> {
     match args {
         CanonicalOpenV1Args::Initial { id, limit } => {
@@ -189,19 +292,20 @@ fn resolve_open(
                 id,
                 mode: limit.map_or(OpenMode::Summary, |limit| OpenMode::Page {
                     limit,
-                    after: None,
-                    expected_snapshot: None,
+                    continuation: None,
                 }),
                 request,
             })
         }
         CanonicalOpenV1Args::Continue { cursor } => {
-            let decoded = decode_open_cursor(&cursor)?;
-            if decoded.version != OPEN_CURSOR_VERSION {
-                return Err(invalid_cursor(
-                    "cursor version is not supported; reopen the target",
-                ));
-            }
+            let decoded = match classify_open_cursor(&cursor, key)? {
+                OpenCursorClassified::V1Legacy => {
+                    return Err(invalid_cursor(
+                        "cursor snapshot is stale; reopen the target to restart expansion",
+                    ));
+                }
+                OpenCursorClassified::V2(cursor) => cursor,
+            };
             let max_limit = max_results.max(OPEN_MIN_LIMIT);
             if !(OPEN_MIN_LIMIT..=max_limit).contains(&decoded.limit) {
                 return Err(invalid_cursor(
@@ -212,11 +316,7 @@ fn resolve_open(
                 .target_id
                 .parse()
                 .map_err(|_| invalid_cursor("cursor target is invalid; reopen the target"))?;
-            if !matches!(
-                (&id, &decoded.after),
-                (McpId::Session(_), OpenCursorAfter::Turn { .. })
-                    | (McpId::Turn(_), OpenCursorAfter::Event { .. })
-            ) {
+            if matches!(id, McpId::Event(_)) {
                 return Err(invalid_cursor(
                     "cursor target kind is invalid; reopen the target",
                 ));
@@ -225,8 +325,7 @@ fn resolve_open(
                 id,
                 mode: OpenMode::Page {
                     limit: decoded.limit,
-                    after: Some(decoded.after),
-                    expected_snapshot: Some((decoded.snapshot_slot, decoded.snapshot_generation)),
+                    continuation: Some(decoded.continuation),
                 },
                 request: json!({ "cursor": cursor }),
             })
@@ -234,130 +333,28 @@ fn resolve_open(
     }
 }
 
+fn mint_cursor(
+    target: &McpId,
+    limit: u16,
+    continuation: Option<CanonicalContinuation>,
+    key: &[u8; 32],
+) -> crate::contract::ContractResult<Option<String>> {
+    continuation
+        .map(|continuation| {
+            let cursor = OpenCursorV2 {
+                version: OPEN_CURSOR_V2_VERSION,
+                target_id: target.to_string(),
+                limit,
+                continuation,
+            };
+            encode_open_cursor_v2(&cursor, key)
+        })
+        .transpose()
+}
+
 fn invalid_cursor(message: impl Into<String>) -> ContractError {
     ContractError::new(ToolErrorCode::InvalidRequest, message)
         .with_details(json!({ "field": "cursor" }))
-}
-
-fn snapshot_tuple(
-    snapshot: Option<&moraine_conversations::McpOpenSnapshot>,
-) -> crate::contract::ContractResult<(u8, u64)> {
-    snapshot
-        .map(|snapshot| (snapshot.slot, snapshot.generation))
-        .ok_or_else(|| invalid_cursor("pagination snapshot is unavailable; reopen the target"))
-}
-
-fn validate_snapshot(
-    mode: &OpenMode,
-    actual: Option<&moraine_conversations::McpOpenSnapshot>,
-) -> crate::contract::ContractResult<()> {
-    let OpenMode::Page {
-        expected_snapshot: Some(expected),
-        ..
-    } = mode
-    else {
-        return Ok(());
-    };
-    if *expected != snapshot_tuple(actual)? {
-        return Err(invalid_cursor(
-            "cursor snapshot is stale; reopen the target to restart expansion",
-        ));
-    }
-    Ok(())
-}
-
-fn session_page(
-    resolved: &ResolvedOpen,
-    session: &McpSessionOpen,
-) -> crate::contract::ContractResult<Option<PageSelection>> {
-    let OpenMode::Page { limit, after, .. } = &resolved.mode else {
-        return Ok(None);
-    };
-    let start = match after.as_ref() {
-        None => 0,
-        Some(OpenCursorAfter::Turn { turn_seq }) => session
-            .turns
-            .iter()
-            .position(|turn| turn.metadata.turn_seq == *turn_seq)
-            .map(|index| index + 1)
-            .ok_or_else(|| invalid_cursor("cursor position no longer exists; reopen the target"))?,
-        Some(_) => return Err(invalid_cursor("cursor does not match a session page")),
-    };
-    let end = start
-        .saturating_add(usize::from(*limit))
-        .min(session.turns.len());
-    let next_cursor = if end < session.turns.len() {
-        let anchor = session.turns.get(end - 1).ok_or_else(|| {
-            invalid_cursor("cursor page is empty before the end; reopen the target")
-        })?;
-        let (slot, generation) = snapshot_tuple(session.snapshot.as_ref())?;
-        Some(encode_open_cursor(&OpenCursor {
-            version: OPEN_CURSOR_VERSION,
-            target_id: resolved.id.to_string(),
-            limit: *limit,
-            snapshot_slot: slot,
-            snapshot_generation: generation,
-            after: OpenCursorAfter::Turn {
-                turn_seq: anchor.metadata.turn_seq,
-            },
-        })?)
-    } else {
-        None
-    };
-    Ok(Some(PageSelection {
-        start,
-        end,
-        next_cursor,
-    }))
-}
-
-fn turn_page(
-    resolved: &ResolvedOpen,
-    turn: &McpTurnOpen,
-) -> crate::contract::ContractResult<Option<PageSelection>> {
-    let OpenMode::Page { limit, after, .. } = &resolved.mode else {
-        return Ok(None);
-    };
-    let start = match after.as_ref() {
-        None => 0,
-        Some(OpenCursorAfter::Event {
-            event_order,
-            event_uid,
-        }) => turn
-            .events
-            .iter()
-            .position(|event| event.event_order == *event_order && event.event_uid == *event_uid)
-            .map(|index| index + 1)
-            .ok_or_else(|| invalid_cursor("cursor position no longer exists; reopen the target"))?,
-        Some(_) => return Err(invalid_cursor("cursor does not match a turn page")),
-    };
-    let end = start
-        .saturating_add(usize::from(*limit))
-        .min(turn.events.len());
-    let next_cursor = if end < turn.events.len() {
-        let anchor = turn.events.get(end - 1).ok_or_else(|| {
-            invalid_cursor("cursor page is empty before the end; reopen the target")
-        })?;
-        let (slot, generation) = snapshot_tuple(turn.snapshot.as_ref())?;
-        Some(encode_open_cursor(&OpenCursor {
-            version: OPEN_CURSOR_VERSION,
-            target_id: resolved.id.to_string(),
-            limit: *limit,
-            snapshot_slot: slot,
-            snapshot_generation: generation,
-            after: OpenCursorAfter::Event {
-                event_order: anchor.event_order,
-                event_uid: anchor.event_uid.clone(),
-            },
-        })?)
-    } else {
-        None
-    };
-    Ok(Some(PageSelection {
-        start,
-        end,
-        next_cursor,
-    }))
 }
 
 fn request_from_arguments(arguments: &Value) -> Value {
@@ -547,6 +544,8 @@ fn open_result_text(payload: &Value) -> String {
 fn open_session_data(
     session: &McpSessionOpen,
     page: Option<&PageSelection>,
+    first_turn_seq: Option<u32>,
+    last_turn_seq: Option<u32>,
 ) -> Result<(Value, Vec<String>)> {
     let session_id = encode_session_id(&session.metadata.session_id)?;
     let terminal_event_id = encode_optional_event_id(session.terminal_event_uid.as_deref())?;
@@ -555,16 +554,22 @@ fn open_session_data(
         .iter()
         .map(open_session_turn_summary)
         .collect::<Result<Vec<_>>>()?;
-    let first_turn_id = session
-        .turns
-        .first()
-        .map(|turn| encode_turn_id(&turn.metadata.session_id, turn.metadata.turn_seq))
-        .transpose()?;
-    let last_turn_id = session
-        .turns
-        .last()
-        .map(|turn| encode_turn_id(&turn.metadata.session_id, turn.metadata.turn_seq))
-        .transpose()?;
+    let first_turn_id = match first_turn_seq {
+        Some(turn_seq) => Some(encode_turn_id(&session.metadata.session_id, turn_seq)?),
+        None => session
+            .turns
+            .first()
+            .map(|turn| encode_turn_id(&turn.metadata.session_id, turn.metadata.turn_seq))
+            .transpose()?,
+    };
+    let last_turn_id = match last_turn_seq {
+        Some(turn_seq) => Some(encode_turn_id(&session.metadata.session_id, turn_seq)?),
+        None => session
+            .turns
+            .last()
+            .map(|turn| encode_turn_id(&turn.metadata.session_id, turn.metadata.turn_seq))
+            .transpose()?,
+    };
 
     let data = json!({
         "kind": "session",
@@ -636,6 +641,14 @@ fn open_turn_data(
     turn: &McpTurnOpen,
     page: Option<&PageSelection>,
 ) -> Result<(Value, Vec<String>)> {
+    open_turn_data_with_offset(turn, page, 0)
+}
+
+fn open_turn_data_with_offset(
+    turn: &McpTurnOpen,
+    page: Option<&PageSelection>,
+    ordinal_offset: usize,
+) -> Result<(Value, Vec<String>)> {
     let turn_id = encode_turn_id(&turn.metadata.session_id, turn.metadata.turn_seq)?;
     let session_id = encode_session_id(&turn.metadata.session_id)?;
     let terminal_event_id = encode_optional_event_id(turn.terminal_event_uid.as_deref())?;
@@ -653,7 +666,11 @@ fn open_turn_data(
         .iter()
         .enumerate()
         .map(|(index, event)| {
-            open_turn_event_summary(event, start + index + 1, turn.terminal_event_uid.as_deref())
+            open_turn_event_summary(
+                event,
+                ordinal_offset + start + index + 1,
+                turn.terminal_event_uid.as_deref(),
+            )
         })
         .collect::<Result<Vec<_>>>()?;
     let warnings = Vec::new();
@@ -1059,6 +1076,8 @@ fn non_empty(value: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::contract::{encode_open_cursor, OpenCursor, OpenCursorAfter};
+    const OPEN_CURSOR_VERSION: u8 = 1;
     use moraine_config::AppConfig;
     use moraine_conversations::{
         ConversationMode, InMemoryConversationRepository, InMemoryConversationResponses,
@@ -1114,7 +1133,8 @@ mod tests {
             end: 1,
             next_cursor: None,
         };
-        let (data, warnings) = open_session_data(&session, Some(&page)).expect("session data");
+        let (data, warnings) =
+            open_session_data(&session, Some(&page), None, None).expect("session data");
         assert!(warnings.is_empty());
         assert_eq!(data["kind"], "session");
         assert_eq!(
@@ -1433,6 +1453,46 @@ mod tests {
             .as_str()
             .expect("message")
             .contains("stale"));
+    }
+
+    #[tokio::test]
+    async fn continuation_rejects_tampered_v2_cursor() {
+        let repository = Arc::new(InMemoryConversationRepository::with_responses(
+            RepoConfig::default(),
+            InMemoryConversationResponses {
+                get_mcp_turn: Some(Ok(Some(large_turn(3, 7)))),
+                ..InMemoryConversationResponses::default()
+            },
+        ));
+        let state = AppState::embedded(AppConfig::default(), repository);
+        let turn_id = encode_turn_id("session-a", 1).expect("turn id");
+        let first_page = state
+            .open_v1(json!({ "id": turn_id, "limit": 1 }))
+            .await
+            .expect("first page");
+        let mut cursor = first_page["structuredContent"]["data"]["next_cursor"]
+            .as_str()
+            .expect("next cursor")
+            .as_bytes()
+            .to_vec();
+        let index = cursor.len() / 2;
+        cursor[index] = if cursor[index] == b'A' { b'B' } else { b'A' };
+        let cursor = String::from_utf8(cursor).expect("cursor remains UTF-8");
+
+        let result = state
+            .open_v1(json!({ "cursor": cursor }))
+            .await
+            .expect("tampered cursor response");
+
+        assert_eq!(result["isError"], json!(true));
+        assert_eq!(
+            result["structuredContent"]["error"]["code"],
+            json!("invalid_request")
+        );
+        assert!(result["structuredContent"]["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("malformed"));
     }
 
     #[tokio::test]

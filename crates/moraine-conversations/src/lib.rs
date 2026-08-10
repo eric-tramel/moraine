@@ -10,10 +10,12 @@ mod session_label;
 pub use backend_router::{BackendRepository, BackendRepositoryRouter};
 pub use clickhouse_repo::ClickHouseConversationRepository;
 pub use domain::{
-    is_user_facing_content_event, Conversation, ConversationDetailOptions, ConversationListFilter,
-    ConversationListSort, ConversationMode, ConversationSearchHit, ConversationSearchQuery,
-    ConversationSearchResults, ConversationSearchStats, ConversationSummary, FileAttentionQuery,
-    FileAttentionTouch, McpEventOpen, McpEventRef, McpEventSummary, McpEventType, McpOpenSnapshot,
+    is_user_facing_content_event, CanonicalContinuation, CanonicalReadAnchor, CanonicalReadOutcome,
+    CanonicalSessionPage, CanonicalSessionSignals, CanonicalTurnPage, Conversation,
+    ConversationDetailOptions, ConversationListFilter, ConversationListSort, ConversationMode,
+    ConversationSearchHit, ConversationSearchQuery, ConversationSearchResults,
+    ConversationSearchStats, ConversationSummary, FileAttentionQuery, FileAttentionTouch,
+    McpEventOpen, McpEventRef, McpEventSummary, McpEventType, McpOpenSnapshot,
     McpSessionListFilter, McpSessionListItem, McpSessionOpen, McpTurnCompact, McpTurnOpen,
     McpTurnRef, OpenContext, OpenEvent, OpenEventRequest, Page, PageRequest, RepoConfig,
     SearchEventHit, SearchEventKind, SearchEventsQuery, SearchEventsResult, SearchEventsStats,

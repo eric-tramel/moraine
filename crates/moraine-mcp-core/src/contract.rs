@@ -1,7 +1,14 @@
 use chrono::DateTime;
+use flate2::{read::ZlibDecoder, write::ZlibEncoder, Compression};
+use moraine_conversations::CanonicalContinuation;
+use ring::{
+    aead::{self, Aad, LessSafeKey, Nonce, UnboundKey},
+    rand::{SecureRandom, SystemRandom},
+};
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{json, Value};
 use std::fmt;
+use std::io::{Read, Write};
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
@@ -10,6 +17,9 @@ const TURN_ID_PREFIX: &str = "turn:";
 const EVENT_ID_PREFIX: &str = "event:";
 const BASE64_URL_ALPHABET: &[u8; 64] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+const OPEN_CURSOR_NONCE_BYTES: usize = 12;
+const OPEN_CURSOR_TAG_BYTES: usize = 16;
+const OPEN_CURSOR_DECOMPRESSED_MAX_BYTES: u64 = 64 * 1024;
 
 pub const SEARCH_SESSIONS_TOOL: &str = "search_sessions";
 pub const OPEN_TOOL: &str = "open";
@@ -24,7 +34,7 @@ pub const SEARCH_SESSIONS_MIN_N_HITS: u16 = 1;
 pub const SEARCH_SESSIONS_MAX_N_HITS: u16 = 50;
 pub const SEARCH_SESSIONS_MAX_QUERY_CHARS: usize = 4096;
 pub const OPEN_MIN_LIMIT: u16 = 1;
-pub const OPEN_CURSOR_MAX_CHARS: usize = 4096;
+pub const OPEN_CURSOR_MAX_CHARS: usize = 16 * 1024;
 pub const LIST_SESSIONS_DEFAULT_LIMIT: u16 = 20;
 pub const LIST_SESSIONS_MIN_LIMIT: u16 = 1;
 pub const FILE_ATTENTION_TOOL: &str = "file_attention";
@@ -843,6 +853,129 @@ pub fn decode_open_cursor(token: &str) -> ContractResult<OpenCursor> {
     })?;
     serde_json::from_slice(&bytes)
         .map_err(|_| invalid_request_with_field("cursor", "cursor is malformed; reopen the target"))
+}
+
+pub(crate) const OPEN_CURSOR_V2_VERSION: u8 = 2;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct OpenCursorV2 {
+    pub version: u8,
+    pub target_id: String,
+    pub limit: u16,
+    pub continuation: CanonicalContinuation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OpenCursorClassified {
+    V1Legacy,
+    V2(Box<OpenCursorV2>),
+}
+
+#[derive(Deserialize)]
+struct CursorVersionPeek {
+    version: u8,
+}
+
+fn open_cursor_cipher(key_bytes: &[u8; 32]) -> Result<LessSafeKey, ()> {
+    let key = UnboundKey::new(&aead::CHACHA20_POLY1305, key_bytes).map_err(|_| ())?;
+    Ok(LessSafeKey::new(key))
+}
+
+pub(crate) fn encode_open_cursor_v2(
+    cursor: &OpenCursorV2,
+    key: &[u8; 32],
+) -> ContractResult<String> {
+    let json = serde_json::to_vec(cursor).map_err(|error| {
+        invalid_request_with_field("cursor", format!("failed to encode cursor: {error}"))
+    })?;
+    if json.len() as u64 > OPEN_CURSOR_DECOMPRESSED_MAX_BYTES {
+        return Err(invalid_request_with_field(
+            "cursor",
+            "cursor payload is too large",
+        ));
+    }
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+    encoder
+        .write_all(&json)
+        .map_err(|_| invalid_request_with_field("cursor", "failed to encode cursor"))?;
+    let mut encrypted = encoder
+        .finish()
+        .map_err(|_| invalid_request_with_field("cursor", "failed to encode cursor"))?;
+    let mut nonce_bytes = [0_u8; OPEN_CURSOR_NONCE_BYTES];
+    SystemRandom::new()
+        .fill(&mut nonce_bytes)
+        .map_err(|_| invalid_request_with_field("cursor", "failed to secure cursor"))?;
+    open_cursor_cipher(key)
+        .and_then(|cipher| {
+            cipher
+                .seal_in_place_append_tag(
+                    Nonce::assume_unique_for_key(nonce_bytes),
+                    Aad::empty(),
+                    &mut encrypted,
+                )
+                .map_err(|_| ())
+        })
+        .map_err(|_| invalid_request_with_field("cursor", "failed to secure cursor"))?;
+    let mut bytes = Vec::with_capacity(OPEN_CURSOR_NONCE_BYTES + encrypted.len());
+    bytes.extend_from_slice(&nonce_bytes);
+    bytes.extend_from_slice(&encrypted);
+    let token = encode_base64_url_no_pad(&bytes);
+    if token.len() > OPEN_CURSOR_MAX_CHARS {
+        return Err(invalid_request_with_field(
+            "cursor",
+            format!("cursor must be at most {OPEN_CURSOR_MAX_CHARS} characters"),
+        ));
+    }
+    Ok(token)
+}
+
+pub(crate) fn classify_open_cursor(
+    token: &str,
+    key: &[u8; 32],
+) -> ContractResult<OpenCursorClassified> {
+    if token.len() > OPEN_CURSOR_MAX_CHARS {
+        return Err(invalid_request_with_field(
+            "cursor",
+            format!("cursor must be at most {OPEN_CURSOR_MAX_CHARS} characters"),
+        ));
+    }
+    let malformed =
+        || invalid_request_with_field("cursor", "cursor is malformed; reopen the target");
+    let bytes = decode_base64_url_no_pad(token).map_err(|_| malformed())?;
+    if serde_json::from_slice::<CursorVersionPeek>(&bytes).is_ok_and(|peek| peek.version == 1) {
+        return Ok(OpenCursorClassified::V1Legacy);
+    }
+    if bytes.len() < OPEN_CURSOR_NONCE_BYTES + OPEN_CURSOR_TAG_BYTES {
+        return Err(malformed());
+    }
+    let (nonce_bytes, encrypted) = bytes.split_at(OPEN_CURSOR_NONCE_BYTES);
+    let nonce = <[u8; OPEN_CURSOR_NONCE_BYTES]>::try_from(nonce_bytes).map_err(|_| malformed())?;
+    let mut encrypted = encrypted.to_vec();
+    let plaintext = open_cursor_cipher(key)
+        .and_then(|cipher| {
+            cipher
+                .open_in_place(
+                    Nonce::assume_unique_for_key(nonce),
+                    Aad::empty(),
+                    &mut encrypted,
+                )
+                .map_err(|_| ())
+        })
+        .map_err(|_| malformed())?;
+    let decoder = ZlibDecoder::new(&*plaintext);
+    let mut json = Vec::new();
+    decoder
+        .take(OPEN_CURSOR_DECOMPRESSED_MAX_BYTES.saturating_add(1))
+        .read_to_end(&mut json)
+        .map_err(|_| malformed())?;
+    if json.len() as u64 > OPEN_CURSOR_DECOMPRESSED_MAX_BYTES {
+        return Err(malformed());
+    }
+    let cursor: OpenCursorV2 = serde_json::from_slice(&json).map_err(|_| malformed())?;
+    if cursor.version != OPEN_CURSOR_V2_VERSION {
+        return Err(malformed());
+    }
+    Ok(OpenCursorClassified::V2(Box::new(cursor)))
 }
 
 /// How far `file_attention` widens its search.

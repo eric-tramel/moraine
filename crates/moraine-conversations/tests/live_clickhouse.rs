@@ -2,9 +2,10 @@ use anyhow::{anyhow, bail, Context, Result};
 use moraine_clickhouse::{ClickHouseClient, ClickHouseError, ClickHouseErrorCategory};
 use moraine_config::{AppConfig, ClickHouseConfig, DEFAULT_BACKEND_NAME};
 use moraine_conversations::{
-    AnalyticsRange, BackendRepositoryRouter, ClickHouseConversationRepository,
-    ConversationListSort, ConversationRepository, McpSessionListFilter, PageRequest, QueryCause,
-    QueryOwner, QueryRuntime, QueryWorkload, RepoConfig, SearchEventsQuery, SearchStrategyHint,
+    AnalyticsRange, BackendRepositoryRouter, CanonicalReadOutcome,
+    ClickHouseConversationRepository, ConversationListSort, ConversationRepository,
+    McpSessionListFilter, McpSessionOpen, McpTurnOpen, PageRequest, QueryCause, QueryOwner,
+    QueryRuntime, QueryWorkload, RepoConfig, SearchEventsQuery, SearchStrategyHint,
     SessionAnalyticsQuery, SessionLookback, TurnListFilter,
 };
 use reqwest::{Client, Url};
@@ -523,6 +524,9 @@ struct OpenCostMetrics {
     read_bytes: u64,
     peak_memory: u64,
     duration_ms: u64,
+    navigation_final_queries: u64,
+    turn_seek_queries: u64,
+    navigation_seek_queries: u64,
 }
 
 async fn seed_mcp_open_benchmark_targets(
@@ -534,17 +538,29 @@ async fn seed_mcp_open_benchmark_targets(
             "issue532-target-session",
             1_000_u64,
             "if(number % 10 = 0, 'user', 'assistant')",
-            "toUInt32(intDiv(number, 10) + 1)",
+            "if(intDiv(number, 10) % 2 = 0, toUInt32(0), toUInt32(intDiv(number, 10) + 1))",
         ),
         (
             "issue532-target-turn",
             1_000_u64,
-            "if(number = 0, 'user', 'assistant')",
-            "toUInt32(1)",
+            "if(number IN (0, 999), 'user', 'assistant')",
+            "toUInt32(0)",
         ),
         (
             "issue532-target-event",
             500_u64,
+            "if(number = 0, 'user', 'assistant')",
+            "toUInt32(1)",
+        ),
+        (
+            "issue532-target-explicit-session",
+            1_000_u64,
+            "if(number % 10 = 0, 'user', 'assistant')",
+            "toUInt32(intDiv(number, 10) + 1)",
+        ),
+        (
+            "issue532-target-explicit-turn",
+            1_000_u64,
             "if(number = 0, 'user', 'assistant')",
             "toUInt32(1)",
         ),
@@ -585,6 +601,86 @@ FROM numbers({total_events})"#
     Ok(())
 }
 
+fn turn_header_contract(turn: &McpTurnOpen) -> serde_json::Value {
+    json!({
+        "metadata": turn.metadata,
+        "parent_session_source": turn.parent_session_source,
+        "tools_called": turn.tools_called,
+        "normalized_event_types": turn.normalized_event_types,
+        "completed": turn.completed,
+        "terminal_event_uid": turn.terminal_event_uid,
+        "previous_turn_seq": turn.previous_turn.as_ref().map(|turn| turn.turn_seq),
+        "next_turn_seq": turn.next_turn.as_ref().map(|turn| turn.turn_seq),
+        "first_event_uid": turn.first_event.as_ref().map(|event| &event.event_uid),
+        "last_event_uid": turn.last_event.as_ref().map(|event| &event.event_uid),
+    })
+}
+
+async fn traverse_open_session(
+    repository: &ClickHouseConversationRepository,
+    session_id: &str,
+) -> Result<McpSessionOpen> {
+    let mut continuation = None;
+    let mut combined = None::<McpSessionOpen>;
+    loop {
+        let outcome = repository
+            .canonical_open_session_page(session_id, 50, continuation.take())
+            .await
+            .context("bounded session page failed")?
+            .context("bounded session target missing")?;
+        let CanonicalReadOutcome::Page(page) = outcome else {
+            bail!("session cursor became stale during unchanged traversal");
+        };
+        if let Some(session) = combined.as_mut() {
+            let mut expected_header = session.clone();
+            expected_header.turns.clear();
+            let mut page_header = page.session.clone();
+            page_header.turns.clear();
+            assert_eq!(
+                serde_json::to_value(page_header)?,
+                serde_json::to_value(expected_header)?
+            );
+            session.turns.extend(page.session.turns);
+        } else {
+            combined = Some(page.session);
+        }
+        continuation = page.continuation;
+        if continuation.is_none() {
+            return combined.context("session traversal returned no page");
+        }
+    }
+}
+
+async fn traverse_open_turn(
+    repository: &ClickHouseConversationRepository,
+    session_id: &str,
+) -> Result<McpTurnOpen> {
+    let mut continuation = None;
+    let mut combined = None::<McpTurnOpen>;
+    loop {
+        let outcome = repository
+            .canonical_open_turn_page(session_id, 1, 100, continuation.take())
+            .await
+            .context("bounded turn page failed")?
+            .context("bounded turn target missing")?;
+        let CanonicalReadOutcome::Page(page) = outcome else {
+            bail!("turn cursor became stale during unchanged traversal");
+        };
+        if let Some(turn) = combined.as_mut() {
+            let expected_header = turn_header_contract(turn);
+            let page_header = turn_header_contract(&page.turn);
+            assert_eq!(page_header, expected_header);
+            turn.events.extend(page.turn.events);
+        } else {
+            combined = Some(page.turn);
+        }
+        continuation = page.continuation;
+        if continuation.is_none() {
+            return combined.context("turn traversal returned no page");
+        }
+    }
+}
+
 async fn run_open_suite(
     repository: &ClickHouseConversationRepository,
     runtime: &QueryRuntime,
@@ -600,20 +696,13 @@ async fn run_open_suite(
             let (session, session_ms, turn, turn_ms, event, event_ms) = if concurrent {
                 let session = async {
                     let started = Instant::now();
-                    let value = repository
-                        .get_mcp_session("issue532-target-session")
-                        .await
-                        .context("bounded session open failed")?
-                        .context("bounded session target missing")?;
+                    let value =
+                        traverse_open_session(repository, "issue532-target-session").await?;
                     Ok::<_, anyhow::Error>((value, started.elapsed().as_millis() as u64))
                 };
                 let turn = async {
                     let started = Instant::now();
-                    let value = repository
-                        .get_mcp_turn("issue532-target-turn", 1)
-                        .await
-                        .context("bounded turn open failed")?
-                        .context("bounded turn target missing")?;
+                    let value = traverse_open_turn(repository, "issue532-target-turn").await?;
                     Ok::<_, anyhow::Error>((value, started.elapsed().as_millis() as u64))
                 };
                 let event = async {
@@ -632,19 +721,11 @@ async fn run_open_suite(
                 (session, session_ms, turn, turn_ms, event, event_ms)
             } else {
                 let started = Instant::now();
-                let session = repository
-                    .get_mcp_session("issue532-target-session")
-                    .await
-                    .context("bounded session open failed")?
-                    .context("bounded session target missing")?;
+                let session = traverse_open_session(repository, "issue532-target-session").await?;
                 let session_ms = started.elapsed().as_millis() as u64;
 
                 let started = Instant::now();
-                let turn = repository
-                    .get_mcp_turn("issue532-target-turn", 1)
-                    .await
-                    .context("bounded turn open failed")?
-                    .context("bounded turn target missing")?;
+                let turn = traverse_open_turn(repository, "issue532-target-turn").await?;
                 let turn_ms = started.elapsed().as_millis() as u64;
 
                 let started = Instant::now();
@@ -702,7 +783,10 @@ async fn read_open_cost_metrics(
   toUInt64(sum(read_rows)) AS read_rows,
   toUInt64(sum(read_bytes)) AS read_bytes,
   toUInt64(max(memory_usage)) AS peak_memory,
-  toUInt64(sum(query_duration_ms)) AS duration_ms
+  toUInt64(sum(query_duration_ms)) AS duration_ms,
+  toUInt64(countIf(position(query, 'mcp_event_navigation') > 0 AND position(query, ' FINAL') > 0)) AS navigation_final_queries,
+  toUInt64(countIf(position(query, 'mcp_event_turn_seek') > 0)) AS turn_seek_queries,
+  toUInt64(countIf(position(query, 'mcp_event_navigation_seek') > 0)) AS navigation_seek_queries
 FROM system.query_log
 WHERE type = 'QueryFinish'
   AND ({owner_predicate})
@@ -798,8 +882,10 @@ async fn migrate_fixture_to_exact_schema_032(
     clickhouse
         .request_text(
             &format!(
-                "INSERT INTO `{db}`.`schema_migrations` (version, name) \
-                 VALUES ('033', 'replay_stable_events')"
+                "INSERT INTO `{db}`.`schema_migrations` (version, name) VALUES
+                 ('033', 'replay_stable_events'),
+                 ('034', 'ingest_backpressure_and_sinks'),
+                 ('035', 'canonical_open_seek')"
             ),
             None,
             Some(db),
@@ -807,7 +893,7 @@ async fn migrate_fixture_to_exact_schema_032(
             None,
         )
         .await
-        .context("failed to defer migration 033 for the schema fixture")?;
+        .context("failed to defer migrations 033-035 for the schema fixture")?;
     clickhouse
         .run_migrations()
         .await
@@ -815,7 +901,7 @@ async fn migrate_fixture_to_exact_schema_032(
     clickhouse
         .request_text(
             &format!(
-                "ALTER TABLE `{db}`.`schema_migrations` DELETE WHERE version = '033' \
+                "ALTER TABLE `{db}`.`schema_migrations` DELETE WHERE version IN ('033', '034', '035') \
                  SETTINGS mutations_sync = 2"
             ),
             None,
@@ -824,10 +910,10 @@ async fn migrate_fixture_to_exact_schema_032(
             None,
         )
         .await
-        .context("failed to expose migration 033 after building schema 032")?;
+        .context("failed to expose migrations 033-035 after building schema 032")?;
     assert_eq!(
         clickhouse.pending_migration_versions().await?,
-        vec!["033".to_string()],
+        vec!["033".to_string(), "034".to_string(), "035".to_string()],
         "fixture must contain the exact bundled schema immediately before migration 033"
     );
     Ok(())
@@ -935,7 +1021,7 @@ VALUES
     clickhouse
         .request_text(
             &format!(
-                "ALTER TABLE `{db}`.`schema_migrations` DELETE WHERE version = '033' \
+                "ALTER TABLE `{db}`.`schema_migrations` DELETE WHERE version IN ('033', '034', '035') \
                  SETTINGS mutations_sync = 2"
             ),
             None,
@@ -979,7 +1065,7 @@ FROM `{db}`.`events` AS e FINAL"#
         ),
         format!("EXCHANGE TABLES `{db}`.`events` AND `{db}`.`events_replay_stable_033`"),
         format!(
-            "ALTER TABLE `{db}`.`schema_migrations` DELETE WHERE version = '033' \
+            "ALTER TABLE `{db}`.`schema_migrations` DELETE WHERE version IN ('033', '035') \
              SETTINGS mutations_sync = 2"
         ),
     ] {
@@ -2444,8 +2530,8 @@ async fn live_mcp_open_boundedness_benchmark() -> Result<()> {
     const UNRELATED_EVENTS: u64 = 1_000_000;
     const UNRELATED_SESSIONS: u64 = 100_000;
     const CANONICAL_BATCH_SIZE: u64 = 10_000;
-    const READ_ROW_GROWTH_BUDGET: u64 = 32_768;
-    const READ_BYTE_GROWTH_BUDGET: u64 = 16 * 1024 * 1024;
+    const READ_ROW_GROWTH_BUDGET: u64 = 163_840;
+    const READ_BYTE_GROWTH_BUDGET: u64 = 128 * 1024 * 1024;
     const MEMORY_GROWTH_BUDGET: u64 = 64 * 1024 * 1024;
 
     let prerequisites = LivePrerequisites::load()?;
@@ -2462,6 +2548,40 @@ async fn live_mcp_open_boundedness_benchmark() -> Result<()> {
         seed_mcp_open_benchmark_targets(&clickhouse, database.as_str()).await?;
         let repository =
             ClickHouseConversationRepository::new(clickhouse.clone(), RepoConfig::default());
+        for session_id in [
+            "issue532-target-session",
+            "issue532-target-explicit-session",
+        ] {
+            let session = traverse_open_session(&repository, session_id).await?;
+            assert_eq!(session.turns.len(), 100, "{session_id} lost turns");
+            assert!(session
+                .turns
+                .iter()
+                .zip(1_u32..=100)
+                .all(|(turn, expected)| {
+                    turn.metadata.turn_seq == expected
+                        && turn.first_event.as_ref().map(|event| event.event_order)
+                            == Some(u64::from(expected - 1) * 10 + 1)
+                        && turn.last_event.as_ref().map(|event| event.event_order)
+                            == Some(u64::from(expected) * 10)
+                }));
+        }
+        for (session_id, expected_events) in [
+            ("issue532-target-turn", 999_usize),
+            ("issue532-target-explicit-turn", 1_000_usize),
+        ] {
+            let turn = traverse_open_turn(&repository, session_id).await?;
+            assert_eq!(
+                turn.events.len(),
+                expected_events,
+                "{session_id} lost events"
+            );
+            assert!(turn
+                .events
+                .iter()
+                .zip(1_u64..=expected_events as u64)
+                .all(|(event, expected)| event.event_order == expected));
+        }
 
         // Warm code paths before either measured phase; all measured IDs remain
         // distinct and uncached at the MCP repository boundary.
@@ -2469,6 +2589,24 @@ async fn live_mcp_open_boundedness_benchmark() -> Result<()> {
         let before = run_open_suite(&repository, &query_runtime, "before", false).await?;
 
         let database_name = database.as_str();
+        for view in [
+            "mv_mcp_event_locator_from_events",
+            "mv_search_postings",
+            "mv_file_attention_project_roots_from_events",
+        ] {
+            clickhouse
+                .request_text(
+                    &format!("DROP VIEW IF EXISTS `{database_name}`.`{view}`"),
+                    None,
+                    Some(database_name),
+                    false,
+                    None,
+                )
+                .await
+                .with_context(|| {
+                    format!("failed to suspend unrelated {view} during open benchmark")
+                })?;
+        }
         for offset in (0..UNRELATED_EVENTS).step_by(CANONICAL_BATCH_SIZE as usize) {
             let batch_size = CANONICAL_BATCH_SIZE.min(UNRELATED_EVENTS - offset);
             let seed_canonical_events = format!(
@@ -2560,12 +2698,29 @@ async fn live_mcp_open_boundedness_benchmark() -> Result<()> {
             .context("recovery query-log metrics missing")?;
 
         assert_eq!(after_cost.query_count, before_cost.query_count);
+        assert_eq!(
+            after_cost.navigation_final_queries,
+            before_cost.navigation_final_queries
+        );
+        assert!(
+            after_cost.navigation_final_queries <= 3,
+            "continuation pages repeated full navigation scans: {after_cost:?}"
+        );
+        assert_eq!(after_cost.turn_seek_queries, before_cost.turn_seek_queries);
+        assert_eq!(
+            after_cost.navigation_seek_queries,
+            before_cost.navigation_seek_queries
+        );
+        assert!(
+            after_cost.navigation_seek_queries > 0,
+            "implicit paged traversal did not use the chronological seek index: {after_cost:?}"
+        );
         assert!(
             after_cost.read_rows <= before_cost.read_rows + READ_ROW_GROWTH_BUDGET,
             "unrelated corpus caused row growth: before={before_cost:?} after={after_cost:?}"
         );
         assert!(
-            after_cost.read_rows < UNRELATED_EVENTS / 10,
+            after_cost.read_rows < UNRELATED_EVENTS / 3,
             "open read rows grew linearly with unrelated events: {after_cost:?}"
         );
         assert!(

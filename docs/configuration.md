@@ -1100,6 +1100,10 @@ clickhouse_version = "v25.12.5.44-stable"
 ```
 
 Relative `logs_dir` and `pids_dir` values are resolved under `root_dir`.
+The MCP service keeps `mcp-open-cursor.key` in `root_dir` with owner-only
+permissions so continuation cursors remain valid across service restarts.
+Preserve this file as runtime state; replacing or deleting it invalidates
+outstanding cursors.
 `service_bin_dir` must contain `moraine-ingest` and `moraine-mcp`, unless
 `MORAINE_SERVICE_BIN_DIR` is set or source-tree mode is enabled. Release
 packages also retain `moraine-monitor` as a deprecated executable alias that

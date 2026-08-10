@@ -113,6 +113,30 @@ pub(crate) fn navigation_rows(session_id: &str) -> Vec<Value> {
         })
         .collect()
 }
+pub(crate) fn version_rows() -> Vec<Value> {
+    [
+        "sess-open",
+        "sess-incomplete",
+        "sess-event",
+        "sess-out-of-scope",
+    ]
+    .into_iter()
+    .flat_map(navigation_rows)
+    .map(|nav| {
+        json!({
+            "event_uid": nav["event_uid"],
+            "event_version": nav["event_version"],
+            "session_id": nav["session_id"],
+            "sort_time": nav["sort_time"],
+            "source_file": nav["source_file"],
+            "source_generation": nav["source_generation"],
+            "source_offset": nav["source_offset"],
+            "source_line_no": nav["source_line_no"],
+            "emission_index": nav["emission_index"],
+        })
+    })
+    .collect()
+}
 
 pub(crate) fn hydrated_rows(session_id: &str) -> Vec<Value> {
     navigation_rows(session_id)

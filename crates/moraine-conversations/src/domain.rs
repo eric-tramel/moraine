@@ -380,6 +380,59 @@ pub struct McpOpenSnapshot {
     pub generation: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CanonicalReadAnchor {
+    pub sort_time_ms: i64,
+    pub source_file: String,
+    pub source_generation: u32,
+    pub source_offset: u64,
+    pub source_line_no: u64,
+    pub emission_index: u32,
+    pub event_uid: String,
+    pub event_version: u64,
+    pub event_order: u64,
+    pub prefix_user_message_count: u64,
+    pub event_ordinal: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CanonicalSessionSignals {
+    pub unique_versions: u64,
+    pub fingerprint_a: u64,
+    pub fingerprint_b: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CanonicalContinuation {
+    pub signals: CanonicalSessionSignals,
+    pub after: CanonicalReadAnchor,
+    pub after_turn_seq: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_carry: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CanonicalSessionPage {
+    pub session: McpSessionOpen,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_turn_seq: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_turn_seq: Option<u32>,
+    pub continuation: Option<CanonicalContinuation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CanonicalTurnPage {
+    pub turn: McpTurnOpen,
+    pub continuation: Option<CanonicalContinuation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum CanonicalReadOutcome<T> {
+    Page(T),
+    Reopen,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpSessionOpen {
     pub metadata: SessionMetadata,
