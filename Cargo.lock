@@ -1185,6 +1185,7 @@ dependencies = [
  "clap",
  "dialoguer",
  "jsonc-parser",
+ "libc",
  "moraine-clickhouse",
  "moraine-config",
  "moraine-conversations",

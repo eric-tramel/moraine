@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import os
+import signal
 import subprocess
+import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -100,6 +104,53 @@ def stop(proc: subprocess.Popen[str]) -> None:
         proc.wait(timeout=5)
 
 
+def wait_for_child_pid(proc: subprocess.Popen[str]) -> int:
+    children_path = Path(f"/proc/{proc.pid}/task/{proc.pid}/children")
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            raise AssertionError(
+                f"canonical MCP wrapper exited before spawning its child: {proc.returncode}"
+            )
+        try:
+            children = children_path.read_text(encoding="utf-8").split()
+        except FileNotFoundError:
+            children = []
+        if children:
+            return int(children[0])
+        time.sleep(0.02)
+    raise AssertionError("canonical MCP wrapper did not spawn a child within 5 seconds")
+
+
+def process_is_live(pid: int) -> bool:
+    try:
+        state = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").split()[2]
+    except FileNotFoundError:
+        return False
+    return state != "Z"
+
+
+def assert_wrapper_cleans_up_child(
+    moraine: str, config: str, working_dir: str, *, force: bool
+) -> None:
+    proc = launch(moraine, config, working_dir)
+    child_pid = wait_for_child_pid(proc)
+    if force:
+        os.kill(proc.pid, signal.SIGKILL)
+    else:
+        proc.terminate()
+    proc.wait(timeout=10)
+
+    deadline = time.monotonic() + 5
+    while process_is_live(child_pid) and time.monotonic() < deadline:
+        time.sleep(0.02)
+    if process_is_live(child_pid):
+        mode = "SIGKILL" if force else "SIGTERM"
+        raise AssertionError(
+            f"MCP child {child_pid} survived wrapper shutdown via {mode}"
+        )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--moraine", required=True)
@@ -150,6 +201,14 @@ def main() -> int:
     finally:
         for client in clients:
             stop(client)
+
+    if sys.platform.startswith("linux"):
+        assert_wrapper_cleans_up_child(
+            args.moraine, args.config, args.working_dir, force=False
+        )
+        assert_wrapper_cleans_up_child(
+            args.moraine, args.config, args.working_dir, force=True
+        )
 
     print("concurrent canonical stdio MCP clients passed")
     return 0
