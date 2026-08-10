@@ -6,16 +6,37 @@ on:
 
 permissions:
   contents: read
-  id-token: write
 
 jobs:
-  dispatch:
+  gate:
     if: >-
       github.event.repository.id == 1158239756 &&
       github.event.comment.user.id == 1223539 &&
       github.event.comment.body == '/dispatch' &&
       github.event.issue.state == 'open' &&
       !github.event.issue.pull_request
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      dispatch: ${{ steps.exact_command.outputs.dispatch }}
+    steps:
+      - name: Require exact dispatch command
+        id: exact_command
+        shell: bash
+        run: |
+          set -euo pipefail
+          if jq -e '.comment.body == "/dispatch"' "$GITHUB_EVENT_PATH" >/dev/null; then
+            printf 'dispatch=true\n' >> "$GITHUB_OUTPUT"
+          else
+            printf 'dispatch=false\n' >> "$GITHUB_OUTPUT"
+          fi
+
+  dispatch:
+    needs: gate
+    if: needs.gate.outputs.dispatch == 'true'
+    permissions:
+      contents: read
+      id-token: write
     runs-on: ubuntu-latest
     timeout-minutes: 10
     concurrency:
@@ -31,6 +52,7 @@ jobs:
           tags: tag:github-dispatch
           version: 1.102.2
           ping: moraine-dev-1
+          use-cache: false
 
       - name: Dispatch issue
         env:
