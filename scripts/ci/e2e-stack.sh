@@ -2401,6 +2401,15 @@ print(log_path.stat().st_size if log_path.is_file() else 0)
 PY
 )"
 
+  echo "[e2e] checking concurrent canonical stdio MCP clients"
+  "$python_bin" "$repo_root/scripts/ci/mcp_stdio_concurrency_smoke.py" \
+    --moraine "$moraine_bin" \
+    --config "$config_path" \
+    --working-dir "$codex_project_dir" \
+    --legacy-pid-file "$pids_dir/mcp.pid" \
+    --query "$codex_keyword" \
+    --expect-session-id "$codex_session_id"
+
   echo "[e2e] checking first fresh stdio MCP process (codex cache miss)"
   "$python_bin" "$repo_root/scripts/ci/mcp_smoke.py" \
     --moraine "$moraine_bin" \

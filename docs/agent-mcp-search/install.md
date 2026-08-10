@@ -193,9 +193,10 @@ What this means for you:
 - **The URL serves the default backend.** Named-backend routing and
   `--project-only` rely on launch-directory context and therefore remain on the
   stdio path.
-- **Stdio compatibility remains.** `moraine run mcp` still proxies through the
-  private Unix socket and falls back to an embedded server when the backend is
-  unreachable.
+- **Stdio compatibility remains.** Each `moraine run mcp` invocation is a
+  transient client: concurrent harness sessions may each proxy through the
+  private Unix socket, and no singleton `mcp.pid` is created. A client falls
+  back to an embedded server when the backend is unreachable.
 
 ## Project-scoped retrieval (`--project-only`)
 

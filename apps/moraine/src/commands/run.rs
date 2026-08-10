@@ -4,7 +4,7 @@ use std::process::{Command, ExitCode};
 
 use crate::cli::RunArgs;
 use crate::managed_clickhouse::run_foreground_clickhouse;
-use crate::paths::{load_cfg, runtime_paths};
+use crate::paths::{load_cfg, runtime_paths, RuntimePaths};
 use crate::process::{
     lock_storage_writer_launch, pid_path, remove_pid_if_matches, require_service_binary,
     service_args_with_defaults, write_pid_exclusive, StorageGateGuard,
@@ -35,21 +35,26 @@ pub(super) async fn handle(global_config: Option<PathBuf>, run: RunArgs) -> Resu
     if let Some((key, value)) = config_path.child_origin_environment() {
         command.env(key, value);
     }
-    run_registered_foreground_child(
+    let pid_file = foreground_pid_path(&paths, run.service);
+    run_foreground_child(
         command,
-        &pid_path(&paths, run.service),
+        pid_file.as_deref(),
         run.service.name(),
         writer_gate,
     )
 }
 
-fn run_registered_foreground_child(
+fn foreground_pid_path(paths: &RuntimePaths, service: Service) -> Option<PathBuf> {
+    (service != Service::Mcp).then(|| pid_path(paths, service))
+}
+
+fn run_foreground_child(
     mut command: Command,
-    pid_file: &Path,
+    pid_file: Option<&Path>,
     service_name: &str,
-    writer_gate: Option<StorageGateGuard>,
+    mut writer_gate: Option<StorageGateGuard>,
 ) -> Result<ExitCode> {
-    if let Some(parent) = pid_file.parent() {
+    if let Some(parent) = pid_file.and_then(Path::parent) {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create PID directory {}", parent.display()))?;
     }
@@ -58,17 +63,22 @@ fn run_registered_foreground_child(
         .map_err(anyhow::Error::from)
         .with_context(|| format!("failed to run {service_name}"))?;
     let child_pid = child.id();
-    if let Err(error) = write_pid_exclusive(pid_file, child_pid) {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(error);
+    if let Some(pid_file) = pid_file {
+        if let Err(error) = write_pid_exclusive(pid_file, child_pid) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+        drop(writer_gate.take());
     }
-    drop(writer_gate);
     let result = child
         .wait()
         .map_err(anyhow::Error::from)
         .with_context(|| format!("failed to wait for {service_name}"));
-    remove_pid_if_matches(pid_file, child_pid);
+    drop(writer_gate);
+    if let Some(pid_file) = pid_file {
+        remove_pid_if_matches(pid_file, child_pid);
+    }
     let status = result?;
     Ok(ExitCode::from(status.code().unwrap_or(1) as u8))
 }
@@ -153,11 +163,72 @@ mod tests {
             .env("PID_FILE", &pid_file)
             .args(["-c", "sleep 0.1; test \"$(cat \"$PID_FILE\")\" = \"$$\""]);
 
-        let code = run_registered_foreground_child(command, &pid_file, "ingest", None)
+        let code = run_foreground_child(command, Some(&pid_file), "ingest", None)
             .expect("run registered foreground child");
 
         assert_eq!(code, ExitCode::SUCCESS);
         assert!(!pid_file.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mcp_foreground_clients_do_not_own_a_singleton_pid() {
+        let cfg = moraine_config::AppConfig::default();
+        let paths = runtime_paths(&cfg);
+
+        assert!(foreground_pid_path(&paths, Service::Mcp).is_none());
+        assert_eq!(
+            foreground_pid_path(&paths, Service::Ingest),
+            Some(pid_path(&paths, Service::Ingest))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pidless_mcp_client_holds_storage_gate_for_its_lifetime() {
+        let root = std::env::temp_dir().join(format!("moraine-mcp-gate-{}", std::process::id()));
+        let mut cfg = moraine_config::AppConfig::default();
+        cfg.runtime.pids_dir = root.join("run").to_string_lossy().to_string();
+        let paths = runtime_paths(&cfg);
+        let marker = root.join("client-ready");
+        std::fs::create_dir_all(&root).expect("create test root");
+
+        let writer_gate = crate::process::lock_storage_writer_launch(&paths, Service::Mcp)
+            .expect("acquire MCP launch gate")
+            .expect("MCP is a possible storage writer");
+        let client_marker = marker.clone();
+        let client = std::thread::spawn(move || {
+            let mut command = Command::new("/bin/sh");
+            command
+                .env("READY", client_marker)
+                .args(["-c", "touch \"$READY\"; sleep 0.2"]);
+            run_foreground_child(command, None, "mcp", Some(writer_gate))
+                .expect("run pidless MCP client")
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while !marker.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(marker.exists(), "MCP client did not start");
+
+        let migration_paths = paths.clone();
+        let (migration_tx, migration_rx) = std::sync::mpsc::channel();
+        let migration = std::thread::spawn(move || {
+            let gate = crate::process::lock_storage_migration(&migration_paths)
+                .expect("acquire migration gate");
+            migration_tx.send(()).expect("report migration gate");
+            drop(gate);
+        });
+        assert!(migration_rx
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .is_err());
+
+        assert_eq!(client.join().expect("join MCP client"), ExitCode::SUCCESS);
+        migration_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("migration must proceed after MCP exits");
+        migration.join().expect("join migration contender");
         let _ = std::fs::remove_dir_all(root);
     }
 }
