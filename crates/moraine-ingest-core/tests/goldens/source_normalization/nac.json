@@ -701,6 +701,8 @@
           "linked_external_id": "nac_fixture_session-local",
           "metadata_json": "{}",
           "session_id": "nac_fixture_session-local:worker:worker-a",
+          "source_file": "/fixtures/nac/store.db",
+          "source_generation": 1,
           "source_name": "golden-nac"
         }
       ],

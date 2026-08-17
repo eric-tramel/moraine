@@ -6,6 +6,7 @@ use super::*;
 
 fn sample_search_doc() -> SearchDocExtraCacheEntry {
     SearchDocExtraCacheEntry {
+        publication_token: "revision-1".to_string(),
         session_id: "session-1".to_string(),
         event_time: "2026-04-27T12:00:00.000Z".to_string(),
         source_name: "source".to_string(),
@@ -39,6 +40,7 @@ fn sample_search_row(
 ) -> SearchRow {
     SearchRow {
         event_uid: event_uid.to_string(),
+        source_host: String::new(),
         session_id: session_id.to_string(),
         event_time: "2026-04-27T12:00:00.000Z".to_string(),
         source_name: "source".to_string(),
@@ -63,6 +65,7 @@ fn sample_mcp_search_row(event_uid: &str, raw_score: f64, event_unix_ms: i64) ->
     SearchMcpEventRow {
         event_version: 1,
         event_uid: event_uid.to_string(),
+        source_host: String::new(),
         session_id: "session-1".to_string(),
         source_name: "source".to_string(),
         harness: "harness".to_string(),
@@ -198,6 +201,77 @@ fn mcp_search_sql_excludes_internal_tool_calls() {
     assert!(sql.contains("splitByString('__', lowerUTF8(trimBoth(p.name)))"));
     assert!(sql.contains("arrayElement"));
     assert!(sql.contains("= 'moraine'"));
+    assert!(sql.contains("FROM `moraine`.`v_live_search_postings` AS p"));
+    assert!(sql.contains("WHERE p.term IN q_terms"));
+}
+
+#[test]
+fn live_search_queries_authorize_postings_and_hydration() {
+    let client = ClickHouseClient::new(moraine_config::ClickHouseConfig::default())
+        .expect("build ClickHouse client");
+    let repo = ClickHouseConversationRepository::new(client, RepoConfig::default());
+    let terms = vec!["needle".to_string()];
+    let idf = HashMap::from([("needle".to_string(), 1.0)]);
+
+    let ranking_sql = repo
+        .build_search_events_sql(&terms, &idf, 10.0, true, None, true, None, None, 1, 0.0, 20)
+        .expect("build live search ranking SQL");
+    let hydration_sql = repo
+        .build_search_events_hydrate_sql(&["event-a".to_string()])
+        .expect("build live search hydration SQL");
+
+    assert!(ranking_sql.contains("FROM `moraine`.`v_live_search_postings` AS p"));
+    assert!(ranking_sql.contains("ALL INNER JOIN `moraine`.`v_live_mcp_event_locator` AS l"));
+    assert!(hydration_sql.contains("v_live_events"));
+    assert!(hydration_sql.contains("GROUP BY e.event_uid"));
+}
+
+#[test]
+fn conversation_candidates_score_only_live_postings() {
+    let client = ClickHouseClient::new(moraine_config::ClickHouseConfig::default())
+        .expect("build ClickHouse client");
+    let repo = ClickHouseConversationRepository::new(client, RepoConfig::default());
+    let terms = vec!["needle".to_string()];
+    let idf = HashMap::from([("needle".to_string(), 1.0)]);
+
+    let sql = repo
+        .build_search_conversations_sql(
+            &terms, &idf, 10.0, true, false, 1, 0.0, 20, None, None, None,
+        )
+        .expect("build conversation search SQL");
+
+    assert!(sql.contains("FROM `moraine`.`v_live_search_postings` AS p"));
+    assert!(sql.contains("GROUP BY p.doc_id"));
+    assert!(sql.contains("sum(e.event_score) AS score"));
+}
+
+#[test]
+fn conversation_document_filters_use_live_locator_before_scoring() {
+    let client = ClickHouseClient::new(moraine_config::ClickHouseConfig::default())
+        .expect("build ClickHouse client");
+    let repo = ClickHouseConversationRepository::new(client, RepoConfig::default());
+    let terms = vec!["needle".to_string()];
+    let idf = HashMap::from([("needle".to_string(), 1.0)]);
+
+    let sql = repo
+        .build_search_conversations_sql(
+            &terms,
+            &idf,
+            10.0,
+            false,
+            true,
+            1,
+            0.0,
+            20,
+            Some(1_000),
+            Some(2_000),
+            None,
+        )
+        .expect("build filtered conversation search SQL");
+
+    assert!(sql.contains("ANY INNER JOIN `moraine`.`v_live_mcp_event_locator` AS d"));
+    assert!(sql.contains("toUnixTimestamp64Milli(d.ingested_at) >= 1000"));
+    assert!(sql.contains("toUnixTimestamp64Milli(d.ingested_at) < 2000"));
 }
 
 #[test]
@@ -299,7 +373,7 @@ fn conversation_search_uses_one_bounded_canonical_postings_pass() {
         .expect("build conversation search SQL");
 
     assert_eq!(
-        sql.matches("FROM `moraine`.`search_postings` AS p FINAL")
+        sql.matches("FROM `moraine`.`v_live_search_postings` AS p")
             .count(),
         1
     );

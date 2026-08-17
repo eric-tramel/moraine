@@ -26,6 +26,7 @@ Modes:
   analytics-schema  Run live_schema_semantics_and_teardown exactly.
   analytics-parity  Run live_monitor_repository_semantic_parity exactly.
   query-ownership   Run live_query_ownership_and_cancellation exactly (~40 seconds).
+  source-publication Run source-generation publication cutover semantics exactly.
 
 Each invocation creates and owns a fresh sandbox, enables destructive tests
 only for the in-container Cargo process, retains a diagnostic log, and tears
@@ -44,6 +45,9 @@ case "$1" in
         ;;
     query-ownership)
         test_function="live_query_ownership_and_cancellation"
+        ;;
+    source-publication)
+        test_function="source_publication::live_source_generation_publication_is_atomic"
         ;;
     -h|--help)
         usage

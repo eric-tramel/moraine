@@ -176,6 +176,7 @@ pub(super) struct OpenTargetRow {
 #[derive(Debug, Clone, Deserialize)]
 pub(super) struct SearchRow {
     pub(super) event_uid: String,
+    pub(super) source_host: String,
     pub(super) session_id: String,
     #[serde(default)]
     pub(super) event_time: String,
@@ -205,6 +206,8 @@ pub(super) struct SearchMcpCandidateRow {
     #[serde(default)]
     pub(super) event_uid: String,
     #[serde(default)]
+    pub(super) source_host: String,
+    #[serde(default)]
     pub(super) session_id: String,
     pub(super) event_version: u64,
     pub(super) raw_score: f64,
@@ -221,6 +224,8 @@ pub(super) struct SearchMcpCandidateRow {
 pub(super) struct SearchMcpEventRow {
     pub(super) event_version: u64,
     pub(super) event_uid: String,
+    #[serde(default)]
+    pub(super) source_host: String,
     pub(super) session_id: String,
     pub(super) source_name: String,
     pub(super) harness: String,

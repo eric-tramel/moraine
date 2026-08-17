@@ -672,10 +672,12 @@ path depends on NAC's launch directory, and a per-launch `nac --store-path`
 override is invisible to setup, so use the manual snippet it prints instead of
 silently following the wrong database.
 
-Replacing a NAC database at the same path starts a new source generation and
-reconciles the old rows after the replacement snapshot is durable. WAL-only
-changes are picked up through `store.db-wal` and `store.db-shm`; unrelated
-SQLite files and backups are ignored.
+Replacing a NAC database at the same path starts a new source generation.
+Canonical reads keep serving the previous published generation while the
+replacement is scanned, then switch generations only after its final checkpoint
+is durably committed. A failed or interrupted scan leaves the previous
+generation visible for retry. WAL-only changes are picked up through
+`store.db-wal` and `store.db-shm`; unrelated SQLite files and backups are ignored.
 
 OpenCode:
 

@@ -215,7 +215,7 @@ FORMAT JSONEachRow",
         session_id: &str,
     ) -> RepoResult<Option<SessionMetadata>> {
         Self::validate_session_id(session_id)?;
-        if !self.session_in_scope(session_id).await? {
+        if !self.session_in_scope(None, session_id).await? {
             return Ok(None);
         }
         self.load_session_metadata(session_id).await

@@ -15,6 +15,7 @@
 use crate::dispatch::process_file;
 use crate::heartbeat::host_name;
 use crate::model::{Checkpoint, RowBatch};
+use crate::publication_identity::PublicationIdentity;
 use crate::redaction::{RedactionAudit, SecretRedactor};
 use crate::sink::{spawn_sink_task, SinkAuthorConfig, SinkRole};
 use crate::watch::enumerate_tracked_files;
@@ -475,6 +476,7 @@ enum BackendHandle {
     Active {
         tx: mpsc::Sender<SinkMessage>,
         cell: Arc<BackendSinkCell>,
+        replay_notify: Arc<Notify>,
     },
     Disabled {
         cell: Arc<BackendSinkCell>,
@@ -497,6 +499,7 @@ impl RedactionContext {
 struct TeeRouterContext {
     config: Arc<AppConfig>,
     query_runtime: QueryRuntime,
+    publication_identity: PublicationIdentity,
     sources: Arc<Vec<IngestSource>>,
     resolver: SharedRouteResolver,
     registry: StatusRegistry,
@@ -518,17 +521,20 @@ pub(crate) fn spawn_tee_router(
     resolver: SharedRouteResolver,
     registry: StatusRegistry,
     redaction: RedactionContext,
+    publication_identity: PublicationIdentity,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let context = TeeRouterContext {
             config,
             query_runtime,
+            publication_identity,
             sources: Arc::new(sources),
             resolver,
             registry,
             redaction,
         };
         let mut handles = HashMap::<String, BackendHandle>::new();
+        let mut source_targets = discover_startup_backend_targets(&context).await;
 
         // Backends named by home-config routes start eagerly so handshake
         // failures surface at startup. Repo `.moraine.toml` routes are
@@ -542,40 +548,146 @@ pub(crate) fn spawn_tee_router(
             .map(|route| route.backend.clone())
             .filter(|name| name != DEFAULT_BACKEND_NAME)
             .collect();
-        eager.extend(discover_startup_backend_targets(&context).await);
+        eager.extend(source_targets.values().flatten().cloned());
         for name in eager {
             ensure_backend(&name, &context, &mut handles);
         }
 
         while let Some(message) = rx.recv().await {
-            let mut batch = match message {
-                SinkMessage::Batch(batch) => batch,
-                SinkMessage::BackendBatch { .. } | SinkMessage::FlushBarrier(_) => {
+            match message {
+                SinkMessage::Batch(mut batch) => {
+                    redact_default_batch_if_enabled(
+                        &context.config,
+                        &context.redaction,
+                        &mut batch,
+                    );
+                    let targets = {
+                        let mut resolver = context
+                            .resolver
+                            .lock()
+                            .expect("route resolver mutex poisoned");
+                        collect_targets(&batch, &mut resolver)
+                    };
+                    for key in batch_source_checkpoint_keys(&batch) {
+                        source_targets
+                            .entry(key)
+                            .or_default()
+                            .extend(targets.iter().cloned());
+                    }
+                    if batch
+                        .checkpoint
+                        .as_ref()
+                        .is_some_and(|checkpoint| checkpoint.status == "replaying")
+                    {
+                        for name in &targets {
+                            if let Some(handle) = ensure_backend(name, &context, &mut handles) {
+                                request_backend_catch_up(handle);
+                            }
+                        }
+                    }
+                    for name in &targets {
+                        if let Some(handle) = ensure_backend(name, &context, &mut handles) {
+                            forward_to_backend(handle, &batch);
+                        }
+                    }
+                    if default_tx.send(SinkMessage::Batch(batch)).await.is_err() {
+                        break;
+                    }
+                }
+                SinkMessage::BeginReplay { transition, ack } => {
+                    request_source_catch_up(&transition, &source_targets, &handles);
+                    if default_tx
+                        .send(SinkMessage::BeginReplay { transition, ack })
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                SinkMessage::FinalizeReplay { transition, ack } => {
+                    request_source_catch_up(&transition, &source_targets, &handles);
+                    if default_tx
+                        .send(SinkMessage::FinalizeReplay { transition, ack })
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                SinkMessage::BlockReplay { transition, ack } => {
+                    request_source_catch_up(&transition, &source_targets, &handles);
+                    if default_tx
+                        .send(SinkMessage::BlockReplay { transition, ack })
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                SinkMessage::MirrorCaughtUp { .. }
+                | SinkMessage::BackendBatch { .. }
+                | SinkMessage::FlushBarrier(_) => {
                     error!("processor channel received a backend-only sink message");
-                    continue;
                 }
-            };
-            redact_default_batch_if_enabled(&context.config, &context.redaction, &mut batch);
-
-            let targets = {
-                let mut resolver = context
-                    .resolver
-                    .lock()
-                    .expect("route resolver mutex poisoned");
-                collect_targets(&batch, &mut resolver)
-            };
-
-            for name in &targets {
-                if let Some(handle) = ensure_backend(name, &context, &mut handles) {
-                    forward_to_backend(handle, &batch);
-                }
-            }
-
-            if default_tx.send(SinkMessage::Batch(batch)).await.is_err() {
-                break;
             }
         }
     })
+}
+
+fn request_backend_catch_up(handle: &BackendHandle) {
+    if let BackendHandle::Active {
+        cell,
+        replay_notify,
+        ..
+    } = handle
+    {
+        cell.begin_catch_up();
+        replay_notify.notify_one();
+    }
+}
+
+fn request_source_catch_up(
+    transition: &crate::CheckpointTransition,
+    source_targets: &HashMap<String, BTreeSet<String>>,
+    handles: &HashMap<String, BackendHandle>,
+) {
+    let key = crate::checkpoint::checkpoint_key(
+        &transition.source.source_name,
+        &transition.source.source_file,
+    );
+    if let Some(targets) = source_targets.get(&key) {
+        for name in targets {
+            if let Some(handle) = handles.get(name) {
+                request_backend_catch_up(handle);
+            }
+        }
+    }
+}
+
+fn batch_source_checkpoint_keys(batch: &RowBatch) -> BTreeSet<String> {
+    let mut keys = BTreeSet::new();
+    for row in batch
+        .raw_rows
+        .iter()
+        .chain(&batch.event_rows)
+        .chain(&batch.link_rows)
+        .chain(&batch.error_rows)
+    {
+        let Some(source_name) = row.get("source_name").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(source_file) = row.get("source_file").and_then(Value::as_str) else {
+            continue;
+        };
+        keys.insert(crate::checkpoint::checkpoint_key(source_name, source_file));
+    }
+    if let Some(checkpoint) = &batch.checkpoint {
+        keys.insert(crate::checkpoint::checkpoint_key(
+            &checkpoint.source_name,
+            &checkpoint.source_file,
+        ));
+    }
+    keys
 }
 
 fn redact_default_batch_if_enabled(
@@ -591,8 +703,10 @@ fn redact_default_batch_if_enabled(
     redaction.audit.record(&report);
 }
 
-async fn discover_startup_backend_targets(context: &TeeRouterContext) -> BTreeSet<String> {
-    let mut targets = BTreeSet::new();
+async fn discover_startup_backend_targets(
+    context: &TeeRouterContext,
+) -> HashMap<String, BTreeSet<String>> {
+    let mut targets = HashMap::new();
     if !context
         .config
         .backends
@@ -617,7 +731,11 @@ async fn discover_startup_backend_targets(context: &TeeRouterContext) -> BTreeSe
 
         for path in files {
             match discover_file_backend_targets(context, source, path, metrics.clone()).await {
-                Ok(file_targets) => targets.extend(file_targets),
+                Ok(file_targets) => {
+                    for (source_key, backends) in file_targets {
+                        targets.entry(source_key).or_default().extend(backends);
+                    }
+                }
                 Err(exc) => warn!(
                     source = %source.name,
                     "startup backend discovery failed: {exc}"
@@ -633,7 +751,7 @@ async fn discover_file_backend_targets(
     source: &IngestSource,
     path: String,
     metrics: Arc<Metrics>,
-) -> Result<BTreeSet<String>, anyhow::Error> {
+) -> Result<HashMap<String, BTreeSet<String>>, anyhow::Error> {
     let checkpoints = Arc::new(RwLock::new(HashMap::<String, Checkpoint>::new()));
     let poll_state = crate::sqlite_poll::VolatilePollMap::new();
     let (tx, mut rx) = mpsc::channel::<SinkMessage>(16);
@@ -654,26 +772,42 @@ async fn discover_file_backend_targets(
     );
     tokio::pin!(process);
 
-    let mut targets = BTreeSet::new();
+    let mut targets = HashMap::<String, BTreeSet<String>>::new();
     let process_result = loop {
         tokio::select! {
             result = &mut process => break result,
             Some(SinkMessage::Batch(batch)) = rx.recv() => {
-                let mut resolver = context
-                    .resolver
-                    .lock()
-                    .expect("route resolver mutex poisoned");
-                targets.extend(collect_targets(&batch, &mut resolver));
+                let batch_targets = {
+                    let mut resolver = context
+                        .resolver
+                        .lock()
+                        .expect("route resolver mutex poisoned");
+                    collect_targets(&batch, &mut resolver)
+                };
+                if let Some(checkpoint) = &batch.checkpoint {
+                    let key = crate::checkpoint::checkpoint_key(
+                        &checkpoint.source_name,
+                        &checkpoint.source_file,
+                    );
+                    targets.entry(key).or_default().extend(batch_targets);
+                }
             }
         }
     };
 
     while let Ok(SinkMessage::Batch(batch)) = rx.try_recv() {
-        let mut resolver = context
-            .resolver
-            .lock()
-            .expect("route resolver mutex poisoned");
-        targets.extend(collect_targets(&batch, &mut resolver));
+        let batch_targets = {
+            let mut resolver = context
+                .resolver
+                .lock()
+                .expect("route resolver mutex poisoned");
+            collect_targets(&batch, &mut resolver)
+        };
+        if let Some(checkpoint) = &batch.checkpoint {
+            let key =
+                crate::checkpoint::checkpoint_key(&checkpoint.source_name, &checkpoint.source_file);
+            targets.entry(key).or_default().extend(batch_targets);
+        }
     }
 
     process_result?;
@@ -714,6 +848,7 @@ fn ensure_backend<'a>(
 
         let backend_cfg = context.config.backends.get(name)?.clone();
         let (tx, backend_rx) = mpsc::channel::<SinkMessage>(queue_capacity);
+        let replay_notify = Arc::new(Notify::new());
 
         info!(backend = name, "starting mirror sink for backend");
         spawn_backend_supervisor(
@@ -721,16 +856,24 @@ fn ensure_backend<'a>(
             cell.clone(),
             tx.clone(),
             backend_rx,
+            replay_notify.clone(),
             context.clone(),
         );
 
-        handles.insert(name.to_string(), BackendHandle::Active { tx, cell });
+        handles.insert(
+            name.to_string(),
+            BackendHandle::Active {
+                tx,
+                cell,
+                replay_notify,
+            },
+        );
     }
     handles.get(name)
 }
 
 fn forward_to_backend(handle: &BackendHandle, batch: &RowBatch) {
-    let BackendHandle::Active { tx, cell } = handle else {
+    let BackendHandle::Active { tx, cell, .. } = handle else {
         if let BackendHandle::Disabled { cell } = handle {
             debug_assert_eq!(
                 cell.status(),
@@ -778,6 +921,7 @@ fn spawn_backend_supervisor(
     cell: Arc<BackendSinkCell>,
     replay_tx: mpsc::Sender<SinkMessage>,
     backend_rx: mpsc::Receiver<SinkMessage>,
+    replay_notify: Arc<Notify>,
     context: TeeRouterContext,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -848,7 +992,6 @@ fn spawn_backend_supervisor(
         let checkpoints = Arc::new(RwLock::new(durable));
 
         let metrics = Arc::new(Metrics::default());
-        let replay_notify = Arc::new(Notify::new());
         spawn_sink_task(
             context.config.as_ref().clone(),
             client,
@@ -856,6 +999,7 @@ fn spawn_backend_supervisor(
             metrics.clone(),
             backend_rx,
             true,
+            context.publication_identity.clone(),
             SinkAuthorConfig::fully_supported(context.config.identity.author.clone()),
             SinkRole::Backend {
                 cell: cell.clone(),
@@ -912,18 +1056,27 @@ fn spawn_backend_supervisor(
                 return;
             }
 
-            if cell.try_mark_caught_up(epoch) {
-                info!(
-                    backend = %name,
-                    "backend replay reached a durable fixed point; live mirroring enabled"
-                );
-                continue;
+            match crate::publication::send_mirror_caught_up(&replay_tx).await {
+                Ok(()) if cell.try_mark_caught_up(epoch) => {
+                    info!(
+                        backend = %name,
+                        "backend replay reached a durable fixed point; publication enabled"
+                    );
+                }
+                Ok(()) => {
+                    // A routed batch was dropped while publication was being
+                    // acknowledged. Keep checkpoint authority disabled and
+                    // run another pass from the durable floor.
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => {
+                    cell.mark_flush_failure();
+                    warn!(
+                        backend = %name,
+                        "backend publication barrier failed; catch-up will retry: {error:#}"
+                    );
+                }
             }
-
-            // A routed batch was dropped while this pass was running, or the
-            // sink experienced another outage. Re-read from the now-durable
-            // checkpoint map; replay-stable event IDs make the overlap safe.
-            tokio::task::yield_now().await;
         }
     })
 }
@@ -1117,6 +1270,7 @@ mod tests {
         let context = TeeRouterContext {
             config,
             query_runtime: QueryRuntime::new(),
+            publication_identity: test_publication_identity(),
             sources: Arc::new(vec![IngestSource {
                 name: "claude".to_string(),
                 harness: "claude-code".to_string(),
@@ -1132,10 +1286,11 @@ mod tests {
 
         let targets = discover_startup_backend_targets(&context).await;
 
+        let key = crate::checkpoint::checkpoint_key("claude", &path.to_string_lossy());
         assert_eq!(
-            targets,
-            BTreeSet::from(["team-ch".to_string()]),
-            "startup discovery starts repo-routed backends so replay can backfill retained files"
+            targets.get(&key),
+            Some(&BTreeSet::from(["team-ch".to_string()])),
+            "startup discovery retains source routing so replacement replay triggers backend catch-up"
         );
 
         let _ = fs::remove_file(path);
@@ -1288,6 +1443,20 @@ mod tests {
     }
 
     #[test]
+    fn checkpointless_batch_retains_source_routing_for_replay_catch_up() {
+        let mut batch = RowBatch::default();
+        batch.push_raw_row(json!({
+            "source_name": "claude",
+            "source_file": "/sessions/a.jsonl",
+        }));
+
+        assert_eq!(
+            batch_source_checkpoint_keys(&batch),
+            BTreeSet::from([checkpoint_key("claude", "/sessions/a.jsonl")])
+        );
+    }
+
+    #[test]
     fn collect_targets_finds_backends_across_row_kinds() {
         let mut resolver = resolver_with_lookup(team_config(), |_| None);
         let batch = mixed_session_batch();
@@ -1379,6 +1548,7 @@ mod tests {
         let handle = BackendHandle::Active {
             tx,
             cell: cell.clone(),
+            replay_notify: Arc::new(Notify::new()),
         };
 
         let batch = mixed_session_batch();
@@ -1417,6 +1587,7 @@ mod tests {
         let handle = BackendHandle::Active {
             tx,
             cell: cell.clone(),
+            replay_notify: Arc::new(Notify::new()),
         };
         let batch = mixed_session_batch();
 
@@ -1497,6 +1668,12 @@ mod tests {
                     SinkMessage::FlushBarrier(barrier) => {
                         let _ = barrier.send(());
                     }
+                    SinkMessage::BeginReplay { .. }
+                    | SinkMessage::FinalizeReplay { .. }
+                    | SinkMessage::BlockReplay { .. }
+                    | SinkMessage::MirrorCaughtUp { .. } => {
+                        panic!("backend delta test received a publication barrier")
+                    }
                 }
             }
         });
@@ -1562,6 +1739,7 @@ mod tests {
         let handle = BackendHandle::Active {
             tx,
             cell: cell.clone(),
+            replay_notify: Arc::new(Notify::new()),
         };
 
         forward_to_backend(&handle, &mixed_session_batch());
@@ -1655,6 +1833,10 @@ mod tests {
         Arc::new(RedactionAudit::default())
     }
 
+    fn test_publication_identity() -> PublicationIdentity {
+        PublicationIdentity::for_test("11111111-1111-4111-8111-111111111111")
+    }
+
     fn test_router_context(
         config: Arc<AppConfig>,
         resolver: SharedRouteResolver,
@@ -1662,6 +1844,7 @@ mod tests {
         TeeRouterContext {
             config,
             query_runtime: QueryRuntime::new(),
+            publication_identity: test_publication_identity(),
             sources: Arc::new(Vec::new()),
             resolver,
             registry: Arc::new(Mutex::new(BTreeMap::new())),
@@ -1728,6 +1911,7 @@ mod tests {
             cell.clone(),
             tx,
             rx,
+            Arc::new(Notify::new()),
             test_router_context(config, resolver),
         );
 
@@ -1912,6 +2096,7 @@ mod tests {
             cell.clone(),
             tx,
             rx,
+            Arc::new(Notify::new()),
             test_router_context(config, resolver),
         );
 

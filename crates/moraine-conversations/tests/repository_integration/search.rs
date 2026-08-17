@@ -113,7 +113,7 @@ async fn search_session_metadata_applies_time_mode_filters_and_caps_limit() {
     let metadata_search_query = queries
         .iter()
         .find(|q| {
-            q.contains("FROM (SELECT * FROM `moraine`.`events` FINAL) AS e")
+            q.contains("FROM `moraine`.`events` AS e FINAL")
                 && q.contains("WHERE e.event_kind = 'session_meta'")
                 && q.contains("AS meta_event_uid")
         })
@@ -206,7 +206,7 @@ async fn search_conversations_returns_ranked_session_hits_and_expected_sql_shape
     );
     let ranking_queries = queries
         .iter()
-        .filter(|query| query.contains("FROM `moraine`.`search_postings` AS p FINAL"))
+        .filter(|query| query.contains("FROM `moraine`.`v_live_search_postings` AS p FINAL"))
         .collect::<Vec<_>>();
     assert_eq!(
         ranking_queries.len(),
@@ -376,7 +376,7 @@ async fn search_conversations_without_time_window_uses_postings_only_fast_path()
         .find(|q| q.contains("GROUP BY e.session_id"))
         .expect("aggregated conversation query should be captured");
 
-    assert!(agg_query.contains("PREWHERE"));
+    assert!(agg_query.contains("WHERE p.term IN ["));
     assert!(agg_query.contains("bitCount(groupBitOr(e.term_mask))"));
     assert!(!agg_query.contains("JOIN `moraine`.`search_documents` AS d"));
 }
@@ -466,7 +466,10 @@ async fn search_events_documents_subquery_avoids_self_aliased_aggregates() {
     // qualify inner column references via an `AS t` table alias.
     let documents_subqueries: Vec<&String> = queries
         .iter()
-        .filter(|q| q.contains("GROUP BY p.doc_id") || q.contains("FROM (SELECT\n  t.event_uid"))
+        .filter(|q| {
+            q.contains("GROUP BY p.source_host, p.doc_id")
+                || q.contains("FROM (SELECT\n  t.event_uid")
+        })
         .collect();
     assert!(
         !documents_subqueries.is_empty(),
@@ -675,7 +678,8 @@ async fn search_mcp_events_uses_one_candidate_and_one_bounded_detail_query() {
     let queries = state.queries.lock().expect("queries lock");
     assert_eq!(queries.len(), 2, "cold search must issue exactly two reads");
     assert!(queries[0].contains("toUInt8(0) AS row_kind"));
-    assert!(queries[0].contains("ORDER BY raw_score DESC, event_unix_ms DESC, event_uid ASC"));
+    assert!(queries[0]
+        .contains("ORDER BY raw_score DESC, event_unix_ms DESC, source_host ASC, event_uid ASC"));
     assert_eq!(
         queries[0].matches("search_corpus_stats").count(),
         1,
@@ -685,7 +689,8 @@ async fn search_mcp_events_uses_one_candidate_and_one_bounded_detail_query() {
     assert!(queries[0].contains("term_postings AS ("));
     assert!(queries[0].contains("greatest(toFloat64(corpus_docs), toFloat64(p.df))"));
     assert!(queries[1].contains("FROM `moraine`.`events` AS e"));
-    assert!(queries[1].contains("e.event_uid IN event_uids"));
+    assert!(queries[1]
+        .contains("WHERE (e.source_host, e.event_uid, e.event_version) IN candidate_keys"));
     assert!(queries[1].contains("argMax(leftUTF8(e.text_content"));
     assert!(
         queries.iter().all(|query| query

@@ -358,7 +358,7 @@ async fn file_attention_all_scope_keeps_the_configured_server_floor_only() {
     let queries = state.queries.lock().expect("queries lock").clone();
     let attention_queries = queries
         .iter()
-        .filter(|query| query.contains("FROM `moraine`.`events` FINAL"))
+        .filter(|query| query.contains("FROM `moraine`.`events` AS e FINAL"))
         .collect::<Vec<_>>();
     assert_eq!(attention_queries.len(), 2);
     for query in attention_queries {
@@ -406,7 +406,7 @@ async fn file_attention_project_scope_stays_closed_on_schema_skew() {
     )];
     let (repo, state) = build_scripted_repo(responses).await;
 
-    let touches = repo
+    let error = repo
         .file_attention(FileAttentionQuery {
             rel: "crates/foo.rs".to_string(),
             normalized_project_id: Some("project-a".to_string()),
@@ -422,9 +422,9 @@ async fn file_attention_project_scope_stays_closed_on_schema_skew() {
             max_rows: 10,
         })
         .await
-        .expect("project-scoped schema-skew query stays closed");
+        .expect_err("strict publication revalidation must fail closed after schema skew");
 
-    assert!(touches.is_empty());
+    assert!(matches!(error, RepoError::Backend(_)));
     assert_eq!(state.queries.lock().expect("queries lock").len(), 1);
 }
 

@@ -48,6 +48,12 @@ const DEFAULT_JSONL_SOURCE_LINE_BYTE_LIMIT: usize = 8 * 1024 * 1024;
 const ERROR_KIND_SOURCE_LINE_TOO_LARGE: &str = "jsonl_source_line_too_large";
 const ERROR_KIND_NORMALIZED_ROW_TOO_LARGE: &str = "jsonl_normalized_row_too_large";
 
+fn file_policy_fingerprint(config: &AppConfig, work: &WorkItem) -> String {
+    let exclusions = serde_json::to_string(&config.ingest.exclude_project_dirs)
+        .expect("project exclusion globs are serializable");
+    format!("file-publication-v1:{}:{exclusions}", work.format.as_str())
+}
+
 #[derive(Debug, Default, Deserialize, Serialize)]
 struct KiroCheckpointCursor {
     #[serde(default)]
@@ -509,8 +515,7 @@ async fn send_chunk_if_batch_exceeds_limits(
     sink_tx: &mpsc::Sender<SinkMessage>,
     work: &WorkItem,
     source_file: &str,
-    source_inode: u64,
-    source_generation: u32,
+    checkpoint: &Checkpoint,
     offset: u64,
     line_no: u64,
     context: &'static str,
@@ -523,12 +528,11 @@ async fn send_chunk_if_batch_exceeds_limits(
     chunk.checkpoint = Some(Checkpoint {
         source_name: work.source_name.clone(),
         source_file: source_file.to_string(),
-        source_inode,
-        source_generation,
+        source_inode: checkpoint.source_inode,
+        source_generation: checkpoint.source_generation,
         last_offset: offset,
         last_line_no: line_no,
-        status: "active".to_string(),
-        ..Default::default()
+        ..checkpoint.clone()
     });
 
     sink_tx
@@ -1010,6 +1014,67 @@ pub(crate) async fn run_work_item(
     }
 }
 
+async fn publish_empty_replacement(
+    sink_tx: &mpsc::Sender<SinkMessage>,
+    checkpoint: &mut Checkpoint,
+    first_ingest: bool,
+    generation_changed: bool,
+    inode: u64,
+    file_size: u64,
+    policy_fingerprint: &str,
+) -> Result<()> {
+    if first_ingest {
+        return Ok(());
+    }
+    if checkpoint.status != crate::publication::CheckpointLifecycle::Replaying.as_str()
+        && !generation_changed
+    {
+        let already_empty = checkpoint.policy_fingerprint == policy_fingerprint
+            && checkpoint.last_offset >= file_size
+            && checkpoint.last_line_no == 0;
+        if already_empty {
+            return Ok(());
+        }
+        checkpoint.source_generation =
+            crate::publication::checked_next_generation(checkpoint.source_generation)?;
+        checkpoint.last_offset = 0;
+        checkpoint.last_line_no = 0;
+    }
+    if checkpoint.status != crate::publication::CheckpointLifecycle::Replaying.as_str() {
+        let transition = crate::CheckpointTransition::begin_replay(
+            checkpoint,
+            inode,
+            file_size,
+            policy_fingerprint,
+        );
+        let replay_checkpoint = transition.checkpoint.clone();
+        let ack = crate::publication::send_begin_replay(sink_tx, transition).await?;
+        *checkpoint = replay_checkpoint;
+        checkpoint.checkpoint_revision = ack.checkpoint_revision;
+        checkpoint.operation_id = ack.operation_id;
+    }
+    let scan_inode = checkpoint.scan_inode;
+    let scan_boundary = checkpoint.scan_boundary;
+    let final_checkpoint = Checkpoint {
+        source_inode: inode,
+        last_offset: file_size.max(scan_boundary),
+        last_line_no: 0,
+        status: crate::publication::CheckpointLifecycle::Active
+            .as_str()
+            .to_string(),
+        policy_fingerprint: policy_fingerprint.to_string(),
+        ..checkpoint.clone()
+    };
+    let transition = crate::CheckpointTransition::finalize_replay(
+        &final_checkpoint,
+        scan_inode,
+        scan_boundary,
+        policy_fingerprint,
+    );
+    crate::publication::send_finalize_replay(sink_tx, transition).await?;
+    Ok(())
+}
+
 pub(crate) async fn process_file(
     config: &AppConfig,
     work: &WorkItem,
@@ -1095,7 +1160,8 @@ pub(crate) async fn process_file(
     let mut generation_changed = false;
     if checkpoint.source_inode != inode || file_size < checkpoint.last_offset {
         checkpoint.source_inode = inode;
-        checkpoint.source_generation = checkpoint.source_generation.saturating_add(1).max(1);
+        checkpoint.source_generation =
+            crate::publication::checked_next_generation(checkpoint.source_generation)?;
         checkpoint.last_offset = 0;
         checkpoint.last_line_no = 0;
         checkpoint.status = "active".to_string();
@@ -1119,28 +1185,32 @@ pub(crate) async fn process_file(
     let kiro_sidecar_valid = kiro_metadata
         .as_ref()
         .is_some_and(|metadata| metadata.record().is_some());
-    let transcript_fingerprint = kiro_metadata
-        .as_ref()
-        .map_or(0, KiroSessionMetadata::transcript_fingerprint);
-    let sidecar_requires_transcript_replay = kiro_sidecar_valid
-        && !first_ingest
-        && checkpoint.last_offset > 0
-        && (!kiro_cursor.kiro_sidecar_valid
-            || kiro_cursor.transcript_fingerprint != transcript_fingerprint);
+    let sidecar_requires_transcript_replay =
+        kiro_sidecar_valid && !first_ingest && checkpoint.last_offset > 0 && sidecar_changed;
     if sidecar_requires_transcript_replay {
+        if !generation_changed {
+            checkpoint.source_generation =
+                crate::publication::checked_next_generation(checkpoint.source_generation)?;
+            generation_changed = true;
+        }
         checkpoint.last_offset = 0;
         checkpoint.last_line_no = 0;
+    }
+    let policy_fingerprint = file_policy_fingerprint(config, work);
+    if !first_ingest
+        && !generation_changed
+        && !checkpoint.policy_fingerprint.is_empty()
+        && checkpoint.policy_fingerprint != policy_fingerprint
+    {
+        checkpoint.source_generation =
+            crate::publication::checked_next_generation(checkpoint.source_generation)?;
+        checkpoint.last_offset = 0;
+        checkpoint.last_line_no = 0;
+        generation_changed = true;
     }
     let sidecar_needs_processing =
         kiro_metadata.is_some() && (first_ingest || generation_changed || sidecar_changed);
 
-    if file_size == checkpoint.last_offset
-        && !first_ingest
-        && !generation_changed
-        && !sidecar_needs_processing
-    {
-        return Ok(());
-    }
     if !config.ingest.exclude_project_dirs.is_empty() {
         let sidecar_cwd = kiro_metadata
             .as_ref()
@@ -1160,8 +1230,18 @@ pub(crate) async fn process_file(
                 source_name = %work.source_name,
                 harness = %work.harness,
                 source_file,
-                "skipping Kiro session because project exclusions are configured and the session cwd is unavailable"
+                "excluding Kiro session because project exclusions are configured and the session cwd is unavailable"
             );
+            publish_empty_replacement(
+                &sink_tx,
+                &mut checkpoint,
+                first_ingest,
+                generation_changed,
+                inode,
+                file_size,
+                &policy_fingerprint,
+            )
+            .await?;
             return Ok(());
         }
         if config.is_project_dir_excluded(&cwd) {
@@ -1170,10 +1250,28 @@ pub(crate) async fn process_file(
                 harness = %work.harness,
                 source_file,
                 project_dir = %cwd,
-                "skipping session from excluded project directory"
+                "excluding session from configured project directory"
             );
+            publish_empty_replacement(
+                &sink_tx,
+                &mut checkpoint,
+                first_ingest,
+                generation_changed,
+                inode,
+                file_size,
+                &policy_fingerprint,
+            )
+            .await?;
             return Ok(());
         }
+    }
+    if file_size == checkpoint.last_offset
+        && !first_ingest
+        && !generation_changed
+        && !sidecar_needs_processing
+        && checkpoint.status != "replaying"
+    {
+        return Ok(());
     }
     let cowork_companion = load_cowork_companion_record(work);
 
@@ -1184,6 +1282,20 @@ pub(crate) async fn process_file(
 
     let mut reader = BufReader::new(file);
     let mut offset = checkpoint.last_offset;
+    if generation_changed {
+        let transition = crate::CheckpointTransition::begin_replay(
+            &checkpoint,
+            inode,
+            file_size,
+            policy_fingerprint.clone(),
+        );
+        let replay_checkpoint = transition.checkpoint.clone();
+        let ack = crate::publication::send_begin_replay(&sink_tx, transition).await?;
+        checkpoint = replay_checkpoint;
+        checkpoint.checkpoint_revision = ack.checkpoint_revision;
+        checkpoint.operation_id = ack.operation_id;
+    }
+    let replay_in_progress = checkpoint.status == "replaying";
     let mut line_no = checkpoint.last_line_no;
     let initial_hints = if checkpoint.last_offset > 0
         || matches!(work.harness.as_str(), "pi-coding-agent" | "prime-agent")
@@ -1361,8 +1473,7 @@ pub(crate) async fn process_file(
                 &sink_tx,
                 work,
                 source_file,
-                inode,
-                checkpoint.source_generation,
+                &checkpoint,
                 offset,
                 line_no,
                 "oversized-line chunk",
@@ -1477,8 +1588,7 @@ pub(crate) async fn process_file(
                     &sink_tx,
                     work,
                     source_file,
-                    inode,
-                    checkpoint.source_generation,
+                    &checkpoint,
                     offset,
                     line_no,
                     "oversized-normalized-row chunk",
@@ -1518,8 +1628,7 @@ pub(crate) async fn process_file(
             &sink_tx,
             work,
             source_file,
-            inode,
-            checkpoint.source_generation,
+            &checkpoint,
             offset,
             line_no,
             "chunk",
@@ -1544,20 +1653,45 @@ pub(crate) async fn process_file(
         status: "active".to_string(),
         cursor_json: kiro_cursor_json.unwrap_or_else(|| checkpoint.cursor_json.clone()),
         source_fingerprint: sidecar_fingerprint,
-        ..Default::default()
+        policy_fingerprint: policy_fingerprint.clone(),
+        ..checkpoint.clone()
     };
-
-    if first_ingest
+    let should_persist = first_ingest
         || batch.row_count() > 0
         || generation_changed
+        || replay_in_progress
         || sidecar_needs_processing
-        || offset != checkpoint.last_offset
-    {
-        batch.checkpoint = Some(final_checkpoint);
-        sink_tx
-            .send(SinkMessage::Batch(batch))
-            .await
-            .context("sink channel closed while sending final batch")?;
+        || offset != checkpoint.last_offset;
+    if should_persist {
+        if replay_in_progress {
+            if batch.row_count() > 0 {
+                sink_tx
+                    .send(SinkMessage::Batch(batch))
+                    .await
+                    .context("sink channel closed while sending final replay rows")?;
+            }
+            let final_meta = std::fs::metadata(source_file)
+                .with_context(|| format!("source disappeared during replay: {source_file}"))?;
+            let final_inode = source_inode_for_file(source_file, &final_meta);
+            anyhow::ensure!(
+                final_inode == checkpoint.scan_inode
+                    && final_meta.len() >= checkpoint.scan_boundary,
+                "source changed during replay validation for {source_file}"
+            );
+            let transition = crate::CheckpointTransition::finalize_replay(
+                &final_checkpoint,
+                checkpoint.scan_inode,
+                checkpoint.scan_boundary,
+                policy_fingerprint,
+            );
+            crate::publication::send_finalize_replay(&sink_tx, transition).await?;
+        } else {
+            batch.checkpoint = Some(final_checkpoint);
+            sink_tx
+                .send(SinkMessage::Batch(batch))
+                .await
+                .context("sink channel closed while sending final batch")?;
+        }
     }
 
     if metrics.queue_depth.load(Ordering::Relaxed) == 0 {
@@ -2582,6 +2716,61 @@ mod tests {
         out
     }
 
+    async fn drive_replay<F>(
+        process: F,
+        rx: &mut mpsc::Receiver<SinkMessage>,
+    ) -> Vec<crate::model::RowBatch>
+    where
+        F: std::future::Future<Output = anyhow::Result<()>>,
+    {
+        tokio::pin!(process);
+        let mut batches = Vec::new();
+        loop {
+            tokio::select! {
+                result = &mut process => {
+                    result.expect("replay should succeed");
+                    break;
+                }
+                message = rx.recv() => match message.expect("replay sink remains open") {
+                    SinkMessage::Batch(batch) => batches.push(batch),
+                    SinkMessage::BeginReplay { transition, ack }
+                    | SinkMessage::BlockReplay { transition, ack } => {
+                        let _ = ack.send(Ok(crate::publication::ReplayBarrierAck {
+                            checkpoint_revision: 1,
+                            operation_id: transition.operation_id,
+                        }));
+                    }
+                    SinkMessage::FinalizeReplay { transition, ack } => {
+                        if let Some(batch) = batches.last_mut() {
+                            batch.checkpoint = Some(transition.checkpoint.clone());
+                        }
+                        let _ = ack.send(Ok(
+                            crate::publication::FinalizeReplayOutcome::Published(
+                                crate::publication::PublicationAck {
+                                    checkpoint_revision: 2,
+                                    publication_revision: 1,
+                                    already_published: false,
+                                },
+                            ),
+                        ));
+                    }
+                    SinkMessage::MirrorCaughtUp { ack } => {
+                        let _ = ack.send(Ok(()));
+                    }
+                    SinkMessage::BackendBatch { .. } | SinkMessage::FlushBarrier(_) => {
+                        panic!("file processor test received a backend-only sink message")
+                    }
+                }
+            }
+        }
+        while let Ok(message) = rx.try_recv() {
+            if let SinkMessage::Batch(batch) = message {
+                batches.push(batch);
+            }
+        }
+        batches
+    }
+
     fn kiro_sidecar(session_id: &str, title: &str, input_tokens: u64, credits: f64) -> Value {
         json!({
             "session_id": session_id,
@@ -2688,17 +2877,18 @@ mod tests {
                 .expect("serialize Kiro sidecar"),
         )
         .expect("write Kiro sidecar");
-        process_file(
-            &config,
-            &work,
-            checkpoints.clone(),
-            &VolatilePollMap::new(),
-            sink_tx.clone(),
-            &metrics,
+        let second = drive_replay(
+            process_file(
+                &config,
+                &work,
+                checkpoints.clone(),
+                &VolatilePollMap::new(),
+                sink_tx.clone(),
+                &metrics,
+            ),
+            &mut sink_rx,
         )
-        .await
-        .expect("refresh Kiro session after sidecar appears");
-        let second = drain_batches(&mut sink_rx).await;
+        .await;
         assert_eq!(second.len(), 1);
         assert_eq!(
             second[0].raw_rows.len(),
@@ -2736,20 +2926,25 @@ mod tests {
                 .expect("serialize updated Kiro sidecar"),
         )
         .expect("update Kiro sidecar");
-        process_file(
-            &config,
-            &work,
-            checkpoints.clone(),
-            &VolatilePollMap::new(),
-            sink_tx.clone(),
-            &metrics,
+        let third = drive_replay(
+            process_file(
+                &config,
+                &work,
+                checkpoints.clone(),
+                &VolatilePollMap::new(),
+                sink_tx.clone(),
+                &metrics,
+            ),
+            &mut sink_rx,
         )
-        .await
-        .expect("refresh valid Kiro sidecar");
-        let third = drain_batches(&mut sink_rx).await;
+        .await;
         assert_eq!(third.len(), 1);
-        assert_eq!(third[0].raw_rows.len(), 1, "valid sidecar update only");
-        assert_eq!(third[0].event_rows.len(), 1);
+        assert_eq!(
+            third[0].raw_rows.len(),
+            3,
+            "metadata plus transcript replay"
+        );
+        assert_eq!(third[0].event_rows.len(), 3);
         assert_eq!(
             third[0].event_rows[0]
                 .pointer("/token_usage_native_units/credits")
@@ -2771,17 +2966,18 @@ mod tests {
             serde_json::to_vec_pretty(&changed_hints).expect("serialize changed Kiro hints"),
         )
         .expect("update Kiro transcript hints");
-        process_file(
-            &config,
-            &work,
-            checkpoints,
-            &VolatilePollMap::new(),
-            sink_tx,
-            &metrics,
+        let fourth = drive_replay(
+            process_file(
+                &config,
+                &work,
+                checkpoints,
+                &VolatilePollMap::new(),
+                sink_tx,
+                &metrics,
+            ),
+            &mut sink_rx,
         )
-        .await
-        .expect("replay Kiro transcript after metadata hints change");
-        let fourth = drain_batches(&mut sink_rx).await;
+        .await;
         assert_eq!(fourth.len(), 1);
         assert_eq!(fourth[0].raw_rows.len(), 3, "metadata plus replay");
         assert_eq!(fourth[0].event_rows.len(), 3);
@@ -2863,19 +3059,24 @@ mod tests {
         )
         .expect("update Kiro sidecar alongside transcript");
         fs::write(&path, format!("{prompt}\n{assistant}\n")).expect("append Kiro assistant");
-        process_file(
-            &config,
-            &work,
-            checkpoints,
-            &VolatilePollMap::new(),
-            sink_tx,
-            &metrics,
+        let second = drive_replay(
+            process_file(
+                &config,
+                &work,
+                checkpoints,
+                &VolatilePollMap::new(),
+                sink_tx,
+                &metrics,
+            ),
+            &mut sink_rx,
         )
-        .await
-        .expect("ingest appended Kiro assistant");
-        let second = drain_batches(&mut sink_rx).await;
+        .await;
         assert_eq!(second.len(), 1);
-        assert_eq!(second[0].raw_rows.len(), 2, "metadata plus appended row");
+        assert_eq!(
+            second[0].raw_rows.len(),
+            3,
+            "metadata plus transcript replay"
+        );
         let assistant_event_ts = second[0]
             .event_rows
             .iter()

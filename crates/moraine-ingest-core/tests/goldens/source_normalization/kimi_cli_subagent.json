@@ -108,6 +108,8 @@
           "linked_external_id": "kimi-cli:11111111-2222-4333-8444-555555555555",
           "metadata_json": "{}",
           "session_id": "kimi-cli:agent-abcdef01",
+          "source_file": "/fixtures/kimi-cli/project-273/11111111-2222-4333-8444-555555555555/subagents/agent-abcdef01/wire.jsonl",
+          "source_generation": 1,
           "source_name": "golden-kimi-cli-subagent"
         }
       ],

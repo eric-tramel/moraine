@@ -2,6 +2,8 @@ use crate::checkpoint::merge_checkpoint;
 use crate::heartbeat::host_name;
 use crate::model::{Checkpoint, RowBatch};
 use crate::normalize::finalize_batch_event_identities;
+use crate::publication::{AppendManifest, CheckpointLifecycle, PublicationActor};
+use crate::publication_identity::PublicationIdentity;
 use crate::redaction::{RedactionAudit, SecretRedactor};
 use crate::sources::shared::truncate_chars;
 use crate::tee::{
@@ -13,7 +15,6 @@ use crate::{
     WATCHER_BACKEND_POLL,
 };
 use anyhow::Context;
-use chrono::{DateTime, Utc};
 use moraine_clickhouse::{
     is_oversized_json_each_row_insert_error, ClickHouseClient, QueryOwner, QueryWorkload,
 };
@@ -23,6 +24,23 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+
+fn stamp_source_host(batch: &mut RowBatch, source_host: &str) {
+    for row in batch
+        .raw_rows
+        .iter_mut()
+        .chain(&mut batch.event_rows)
+        .chain(&mut batch.link_rows)
+        .chain(&mut batch.error_rows)
+    {
+        if let Some(object) = row.as_object_mut() {
+            object.insert(
+                "source_host".to_string(),
+                Value::String(source_host.to_string()),
+            );
+        }
+    }
+}
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -145,6 +163,8 @@ impl IngestAckObserver {
 #[derive(Default)]
 struct PendingAckBatch {
     event_identity_digests: Vec<String>,
+    append_manifest: Option<AppendManifest>,
+    visibility_samples: Vec<(Instant, usize)>,
 }
 
 impl PendingAckBatch {
@@ -153,8 +173,16 @@ impl PendingAckBatch {
             .extend(event_rows.iter().filter_map(event_identity_digest));
     }
 
+    fn observe_pending_rows(&mut self, row_count: usize) {
+        if row_count > 0 {
+            self.visibility_samples.push((Instant::now(), row_count));
+        }
+    }
+
     fn clear(&mut self) {
         self.event_identity_digests.clear();
+        self.append_manifest = None;
+        self.visibility_samples.clear();
     }
 }
 
@@ -302,36 +330,56 @@ fn duration_from_config_seconds(seconds: f64, minimum_seconds: f64, field_name: 
     })
 }
 
-fn append_to_visible_percentile(sorted_latencies_ms: &[u64], quantile: f64) -> u64 {
+fn append_to_visible_percentile(
+    sorted_latencies_ms: &[(u64, usize)],
+    total_rows: usize,
+    quantile: f64,
+) -> u64 {
     debug_assert!(!sorted_latencies_ms.is_empty());
-    let rank = ((sorted_latencies_ms.len() as f64) * quantile).ceil() as usize;
-    sorted_latencies_ms[rank.saturating_sub(1).min(sorted_latencies_ms.len() - 1)]
+    let rank = ((total_rows as f64) * quantile).ceil() as usize;
+    let mut cumulative = 0usize;
+    for (latency_ms, rows) in sorted_latencies_ms {
+        cumulative = cumulative.saturating_add(*rows);
+        if cumulative >= rank.max(1) {
+            return *latency_ms;
+        }
+    }
+    sorted_latencies_ms
+        .last()
+        .map_or(0, |(latency, _)| *latency)
 }
 
 fn compute_append_to_visible_stats(
-    raw_rows: &[Value],
-    visible_at: DateTime<Utc>,
+    samples: &[(Instant, usize)],
+    visible_at: Instant,
 ) -> Option<(u32, u32)> {
-    let mut latencies_ms: Vec<u64> = raw_rows
-        .iter()
-        .filter_map(|row| row.get("record_ts").and_then(Value::as_str))
-        .filter_map(|record_ts| DateTime::parse_from_rfc3339(record_ts).ok())
-        .map(|record_ts| {
-            visible_at
-                .signed_duration_since(record_ts.with_timezone(&Utc))
-                .num_milliseconds()
-                .max(0) as u64
-        })
-        .collect();
-
-    if latencies_ms.is_empty() {
+    let total_rows = samples.iter().map(|(_, rows)| *rows).sum::<usize>();
+    if total_rows == 0 {
         return None;
     }
-
-    latencies_ms.sort_unstable();
-    let p50 = append_to_visible_percentile(&latencies_ms, 0.50);
-    let p95 = append_to_visible_percentile(&latencies_ms, 0.95);
+    let mut latencies_ms = samples
+        .iter()
+        .map(|(observed_at, rows)| {
+            (
+                visible_at
+                    .checked_duration_since(*observed_at)
+                    .unwrap_or_default()
+                    .as_millis() as u64,
+                *rows,
+            )
+        })
+        .collect::<Vec<_>>();
+    latencies_ms.sort_unstable_by_key(|(latency, _)| *latency);
+    let p50 = append_to_visible_percentile(&latencies_ms, total_rows, 0.50);
+    let p95 = append_to_visible_percentile(&latencies_ms, total_rows, 0.95);
     Some((saturating_u64_to_u32(p50), saturating_u64_to_u32(p95)))
+}
+
+fn publication_host_for_role(role: &SinkRole) -> String {
+    match role {
+        SinkRole::Backend { .. } => host_name(),
+        SinkRole::Default { .. } => String::new(),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -342,6 +390,7 @@ pub(crate) fn spawn_sink_task(
     metrics: Arc<Metrics>,
     mut rx: mpsc::Receiver<SinkMessage>,
     checkpoint_cursor_columns: bool,
+    publication_identity: PublicationIdentity,
     author: SinkAuthorConfig,
     role: SinkRole,
 ) -> JoinHandle<()> {
@@ -360,15 +409,40 @@ pub(crate) fn spawn_sink_task(
         let mut identity_maps = HashMap::<IdentityMapKey, HashMap<String, String>>::new();
         let mut rejected_scopes = HashSet::<IdentityMapKey>::new();
 
-        // Mirror sinks share one ingest_checkpoints table per team backend,
-        // so their rows are scoped per host (migration 018; guaranteed
-        // present by the schema handshake). The default backend stays
-        // single-writer and keeps writing host-less rows, which also keeps
-        // it working before `moraine db migrate` adds the column locally.
-        let checkpoint_host = match &role {
-            SinkRole::Backend { .. } => host_name(),
-            SinkRole::Default { .. } => String::new(),
-        };
+        // Shared backend rows and checkpoints use the existing machine-host
+        // scope. The local/default store remains hostless.
+        let checkpoint_host = publication_host_for_role(&role);
+        let publication_actor = PublicationActor::new(
+            clickhouse.clone(),
+            checkpoint_host.clone(),
+            publication_identity.publisher_id().to_string(),
+        );
+        let startup_result: anyhow::Result<()> =
+            match QueryOwner::new(&clickhouse.runtime(), QueryWorkload::Background) {
+                Ok(owner) => {
+                    owner
+                        .scope(async {
+                            publication_actor.block_orphaned_append_on_startup().await?;
+                            publication_actor.diagnose_shared_legacy_ambiguity().await?;
+                            let durable_checkpoints = checkpoints
+                                .read()
+                                .await
+                                .values()
+                                .cloned()
+                                .collect::<Vec<_>>();
+                            publication_actor
+                                .repair_ready_publications(durable_checkpoints)
+                                .await?;
+                            Ok(())
+                        })
+                        .await
+                }
+                Err(error) => Err(error.into()),
+            };
+        if let Err(error) = startup_result {
+            tracing::error!("failed to initialize source publication state: {error:#}");
+            return;
+        }
 
         let flush_interval = duration_from_config_seconds(
             config.ingest.flush_interval_seconds,
@@ -390,6 +464,54 @@ pub(crate) fn spawn_sink_task(
         let mut heartbeat_tick = tokio::time::interval(heartbeat_interval);
         let mut throttling_flush_retries = false;
 
+        macro_rules! flush_publication_barrier {
+            () => {{
+                let flush_ok = if has_pending_data(
+                    &raw_rows,
+                    &event_rows,
+                    &link_rows,
+                    &error_rows,
+                    &checkpoint_updates,
+                    &pending_ack,
+                ) {
+                    flush_pending_with_ack(
+                        &clickhouse,
+                        &checkpoints,
+                        Some(&publication_actor),
+                        &metrics,
+                        &mut raw_rows,
+                        &mut event_rows,
+                        &mut link_rows,
+                        &mut error_rows,
+                        &mut checkpoint_updates,
+                        checkpoint_cursor_columns,
+                        &checkpoint_host,
+                        &ack_observer,
+                        &mut pending_ack,
+                    )
+                    .await
+                } else {
+                    true
+                };
+                note_flush_outcome(&role, flush_ok, true);
+                if flush_ok {
+                    pending_batch_bytes = 0;
+                }
+                flush_ok
+            }};
+        }
+
+        macro_rules! publication_operation {
+            ($operation:expr) => {{
+                match QueryOwner::new(&clickhouse.runtime(), QueryWorkload::Background) {
+                    Ok(owner) => owner
+                        .scope($operation)
+                        .await
+                        .map_err(|error| format!("{error:#}")),
+                    Err(error) => Err(format!("{error:#}")),
+                }
+            }};
+        }
         loop {
             if throttling_flush_retries
                 && has_pending_data(
@@ -398,11 +520,13 @@ pub(crate) fn spawn_sink_task(
                     &link_rows,
                     &error_rows,
                     &checkpoint_updates,
+                    &pending_ack,
                 )
             {
                 let flush_ok = flush_pending_with_ack(
                     &clickhouse,
                     &checkpoints,
+                    Some(&publication_actor),
                     &metrics,
                     &mut raw_rows,
                     &mut event_rows,
@@ -462,7 +586,11 @@ pub(crate) fn spawn_sink_task(
                                         IdentityLane::BackendLive,
                                     )
                                 }
-                                SinkMessage::FlushBarrier(_) => unreachable!(),
+                                SinkMessage::BeginReplay { .. }
+                                | SinkMessage::FinalizeReplay { .. }
+                                | SinkMessage::BlockReplay { .. }
+                                | SinkMessage::MirrorCaughtUp { .. }
+                                | SinkMessage::FlushBarrier(_) => unreachable!(),
                             };
                             // Mirror sinks only buffer the sessions routed to
                             // them; the default sink takes batches whole.
@@ -484,6 +612,7 @@ pub(crate) fn spawn_sink_task(
                                 }
                                 SinkRole::Default { .. } => batch,
                             };
+                            stamp_source_host(&mut batch, &checkpoint_host);
                             author.apply_to_batch(&mut batch);
                             let identity_scope = batch_identity_scope(&batch);
                             let identity_key = identity_scope.clone().map(|scope| IdentityMapKey {
@@ -544,6 +673,7 @@ pub(crate) fn spawn_sink_task(
                                     rejected_scopes.remove(key);
                                 }
                             }
+                            pending_ack.observe_pending_rows(batch.raw_rows.len());
                             pending_batch_bytes =
                                 pending_batch_bytes.saturating_add(batch.approx_bytes());
                             raw_rows.extend(batch.raw_rows);
@@ -570,6 +700,7 @@ pub(crate) fn spawn_sink_task(
                                 let flush_ok = flush_pending_with_ack(
                                     &clickhouse,
                                     &checkpoints,
+                                    Some(&publication_actor),
                                     &metrics,
                                     &mut raw_rows,
                                     &mut event_rows,
@@ -595,6 +726,113 @@ pub(crate) fn spawn_sink_task(
                                 }
                             }
                         }
+                        Some(SinkMessage::BeginReplay {
+                            mut transition,
+                            ack,
+                        }) => {
+                            let result = if flush_publication_barrier!() {
+                                publication_operation!(
+                                    publication_actor.persist_transition(&mut transition)
+                                )
+                            } else {
+                                Err("failed to flush rows before replay-start checkpoint".to_string())
+                            };
+                            if result.is_ok() {
+                                let mut current = checkpoints.write().await;
+                                merge_checkpoint(&mut current, transition.checkpoint.clone());
+                            }
+                            let _ = ack.send(result);
+                        }
+                        Some(SinkMessage::FinalizeReplay {
+                            mut transition,
+                            ack,
+                        }) => {
+                            let result = if flush_publication_barrier!() {
+                                if matches!(&role, SinkRole::Backend { .. }) {
+                                    publication_operation!(
+                                        publication_actor
+                                            .persist_staged_mirror_final(&mut transition)
+                                    )
+                                    .map(|_| crate::FinalizeReplayOutcome::StagedForMirror)
+                                } else {
+                                    transition.set_backend_caught_up(true);
+                                    publication_operation!(
+                                        publication_actor.publish_final(&mut transition)
+                                    )
+                                    .map(crate::FinalizeReplayOutcome::Published)
+                                }
+                            } else {
+                                Err("failed to flush final replay rows before publication".to_string())
+                            };
+                            if result.is_ok() {
+                                let mut current = checkpoints.write().await;
+                                merge_checkpoint(&mut current, transition.checkpoint.clone());
+                            }
+                            let _ = ack.send(result);
+                        }
+                        Some(SinkMessage::BlockReplay {
+                            mut transition,
+                            ack,
+                        }) => {
+                            let result = if flush_publication_barrier!() {
+                                publication_operation!(
+                                    publication_actor.persist_transition(&mut transition)
+                                )
+                            } else {
+                                Err("failed to flush rows before blocked replay checkpoint".to_string())
+                            };
+                            if result.is_ok() {
+                                let mut current = checkpoints.write().await;
+                                merge_checkpoint(&mut current, transition.checkpoint.clone());
+                            }
+                            let _ = ack.send(result);
+                        }
+                        Some(SinkMessage::MirrorCaughtUp { ack }) => {
+                            let result = if flush_publication_barrier!() {
+                                // The durable transition map, not only this
+                                // process's staging cache, is authoritative.
+                                // A restart may lose the cache after the final
+                                // scan but before the fixed-point catch-up.
+                                let mut staged = checkpoints
+                                    .read()
+                                    .await
+                                    .values()
+                                    .filter(|checkpoint| {
+                                        checkpoint.source_generation > 1
+                                            && checkpoint.status
+                                                == CheckpointLifecycle::Active.as_str()
+                                            && checkpoint.block_reason.is_empty()
+                                            && checkpoint.final_scan_complete
+                                            && !checkpoint.backend_caught_up
+                                    })
+                                    .cloned()
+                                    .map(crate::CheckpointTransition::from_checkpoint)
+                                    .collect::<Vec<_>>();
+                                let published = publication_operation!(async {
+                                    for transition in &mut staged {
+                                        transition.set_backend_caught_up(true);
+                                        publication_actor.publish_final(transition).await?;
+                                    }
+                                    Ok::<_, anyhow::Error>(staged)
+                                });
+                                match published {
+                                    Ok(staged) => {
+                                        let mut current = checkpoints.write().await;
+                                        for transition in staged {
+                                            merge_checkpoint(
+                                                &mut current,
+                                                transition.checkpoint,
+                                            );
+                                        }
+                                        Ok(())
+                                    }
+                                    Err(error) => Err(error),
+                                }
+                            } else {
+                                Err("failed to flush mirror rows before publication".to_string())
+                            };
+                            let _ = ack.send(result);
+                        }
                         Some(SinkMessage::FlushBarrier(barrier)) => {
                             if has_pending_data(
                                 &raw_rows,
@@ -602,10 +840,12 @@ pub(crate) fn spawn_sink_task(
                                 &link_rows,
                                 &error_rows,
                                 &checkpoint_updates,
+                                &pending_ack,
                             ) {
                                 let flush_ok = flush_pending_with_ack(
                                     &clickhouse,
                                     &checkpoints,
+                                    Some(&publication_actor),
                                     &metrics,
                                     &mut raw_rows,
                                     &mut event_rows,
@@ -640,10 +880,11 @@ pub(crate) fn spawn_sink_task(
                     }
                 }
                 _ = flush_tick.tick() => {
-                    if has_pending_data(&raw_rows, &event_rows, &link_rows, &error_rows, &checkpoint_updates) {
+                    if has_pending_data(&raw_rows, &event_rows, &link_rows, &error_rows, &checkpoint_updates, &pending_ack) {
                         let flush_ok = flush_pending_with_ack(
                             &clickhouse,
                             &checkpoints,
+                            Some(&publication_actor),
                             &metrics,
                             &mut raw_rows,
                             &mut event_rows,
@@ -681,10 +922,12 @@ pub(crate) fn spawn_sink_task(
             &link_rows,
             &error_rows,
             &checkpoint_updates,
+            &pending_ack,
         ) {
             let flush_ok = flush_pending_with_ack(
                 &clickhouse,
                 &checkpoints,
+                Some(&publication_actor),
                 &metrics,
                 &mut raw_rows,
                 &mut event_rows,
@@ -713,12 +956,14 @@ fn has_pending_data(
     link_rows: &[Value],
     error_rows: &[Value],
     checkpoint_updates: &HashMap<String, Checkpoint>,
+    pending_ack: &PendingAckBatch,
 ) -> bool {
     !(raw_rows.is_empty()
         && event_rows.is_empty()
         && link_rows.is_empty()
         && error_rows.is_empty()
-        && checkpoint_updates.is_empty())
+        && checkpoint_updates.is_empty()
+        && pending_ack.append_manifest.is_none())
 }
 
 fn quarantine_oversized_rows(
@@ -1154,6 +1399,7 @@ async fn flush_pending(
     flush_pending_with_ack(
         clickhouse,
         checkpoints,
+        None,
         metrics,
         raw_rows,
         event_rows,
@@ -1172,6 +1418,7 @@ async fn flush_pending(
 async fn flush_pending_with_ack(
     clickhouse: &ClickHouseClient,
     checkpoints: &Arc<RwLock<HashMap<String, Checkpoint>>>,
+    publication_actor: Option<&PublicationActor>,
     metrics: &Arc<Metrics>,
     raw_rows: &mut Vec<Value>,
     event_rows: &mut Vec<Value>,
@@ -1183,6 +1430,61 @@ async fn flush_pending_with_ack(
     ack_observer: &IngestAckObserver,
     pending_ack: &mut PendingAckBatch,
 ) -> bool {
+    let append_fence = if let Some(actor) = publication_actor {
+        let preparation = match QueryOwner::new(&clickhouse.runtime(), QueryWorkload::Background) {
+            Ok(owner) => owner
+                .scope(async {
+                    let manifest = if let Some(manifest) = &pending_ack.append_manifest {
+                        manifest.clone()
+                    } else {
+                        let mut manifest = AppendManifest::from_pending(
+                            checkpoint_host,
+                            raw_rows,
+                            event_rows,
+                            link_rows,
+                            &[],
+                            error_rows,
+                            checkpoint_updates.values().cloned(),
+                        );
+                        actor.prove_insert_only(&mut manifest).await?;
+                        pending_ack.append_manifest = Some(manifest.clone());
+                        manifest
+                    };
+                    actor
+                        .begin_append(&manifest)
+                        .await
+                        .map(|fence| (fence, manifest))
+                })
+                .await
+                .map(|(fence, manifest)| fence.map(|fence| (fence, manifest))),
+            Err(error) => Err(error.into()),
+        };
+        match preparation {
+            Ok(Some(((batch_id, cache_epoch), manifest))) => {
+                let Some(target_epoch) = cache_epoch.checked_add(1) else {
+                    warn!("append cache epoch exhausted at {cache_epoch}");
+                    return false;
+                };
+                for checkpoint in checkpoint_updates.values_mut() {
+                    checkpoint.append_batch_id = batch_id.clone();
+                    checkpoint.cache_epoch = target_epoch;
+                }
+                Some((batch_id, manifest))
+            }
+            Ok(None) => None,
+            Err(error) => {
+                metrics.flush_failures.fetch_add(1, Ordering::Relaxed);
+                *metrics
+                    .last_error
+                    .lock()
+                    .expect("metrics last_error mutex poisoned") = error.to_string();
+                warn!("failed to prepare append publication: {error:#}");
+                return false;
+            }
+        }
+    } else {
+        None
+    };
     let started = Instant::now();
     metrics.sink_pending_rows.store(
         (raw_rows.len() + event_rows.len() + link_rows.len() + error_rows.len()) as u64,
@@ -1270,22 +1572,12 @@ async fn flush_pending_with_ack(
                 .scope(async {
                     if !raw_rows.is_empty() {
                         clickhouse
-                            .insert_json_rows("raw_events", raw_rows)
+                            .insert_json_rows_sync("raw_events", raw_rows)
                             .await
                             .map_err(|error| SinkFlushFailure::new(SinkStage::RawEvents, error))?;
                         metrics
                             .raw_rows_written
                             .fetch_add(raw_rows.len() as u64, Ordering::Relaxed);
-                        if let Some((p50_ms, p95_ms)) =
-                            compute_append_to_visible_stats(raw_rows, Utc::now())
-                        {
-                            metrics
-                                .append_to_visible_p50_ms
-                                .store(p50_ms as u64, Ordering::Relaxed);
-                            metrics
-                                .append_to_visible_p95_ms
-                                .store(p95_ms as u64, Ordering::Relaxed);
-                        }
                         raw_rows.clear();
                     }
 
@@ -1305,7 +1597,7 @@ async fn flush_pending_with_ack(
 
                     if !link_rows.is_empty() {
                         clickhouse
-                            .insert_json_rows("event_links", link_rows)
+                            .insert_json_rows_sync("event_links", link_rows)
                             .await
                             .map_err(|error| SinkFlushFailure::new(SinkStage::EventLinks, error))?;
                         link_rows.clear();
@@ -1313,7 +1605,7 @@ async fn flush_pending_with_ack(
 
                     if !error_rows.is_empty() {
                         clickhouse
-                            .insert_json_rows("ingest_errors", error_rows)
+                            .insert_json_rows_sync("ingest_errors", error_rows)
                             .await
                             .map_err(|error| {
                                 SinkFlushFailure::new(SinkStage::IngestErrors, error)
@@ -1337,7 +1629,53 @@ async fn flush_pending_with_ack(
                         .map_err(|error| {
                             SinkFlushFailure::new(SinkStage::IngestCheckpoints, error)
                         })?;
+                        if let Some(actor) = publication_actor {
+                            for checkpoint in checkpoint_updates.values().cloned() {
+                                let mut transition =
+                                    crate::CheckpointTransition::from_checkpoint(checkpoint);
+                                actor.persist_transition(&mut transition).await.map_err(
+                                    |error| {
+                                        SinkFlushFailure::new(SinkStage::IngestCheckpoints, error)
+                                    },
+                                )?;
+                                if transition.lifecycle == CheckpointLifecycle::Active
+                                    && transition.checkpoint.source_generation == 1
+                                {
+                                    actor
+                                        .publish_initial_if_absent(&mut transition)
+                                        .await
+                                        .map_err(|error| {
+                                            SinkFlushFailure::new(
+                                                SinkStage::IngestCheckpoints,
+                                                error,
+                                            )
+                                        })?;
+                                }
+                            }
+                        }
                         checkpoint_updates.clear();
+                    }
+
+                    if let (Some(actor), Some((batch_id, manifest))) =
+                        (publication_actor, append_fence.as_ref())
+                    {
+                        actor
+                            .commit_append(batch_id, Some(&manifest.source_keys))
+                            .await
+                            .map_err(|error| {
+                                SinkFlushFailure::new(SinkStage::IngestCheckpoints, error)
+                            })?;
+                    }
+                    if let Some((p50_ms, p95_ms)) = compute_append_to_visible_stats(
+                        &pending_ack.visibility_samples,
+                        Instant::now(),
+                    ) {
+                        metrics
+                            .append_to_visible_p50_ms
+                            .store(p50_ms as u64, Ordering::Relaxed);
+                        metrics
+                            .append_to_visible_p95_ms
+                            .store(p95_ms as u64, Ordering::Relaxed);
                     }
 
                     metrics
@@ -1411,6 +1749,16 @@ async fn flush_pending_with_ack(
                                     failure.stage.table()
                                 )
                                     })?;
+                                    if let (Some(actor), Some((batch_id, manifest))) =
+                                        (publication_actor, append_fence.as_ref())
+                                    {
+                                        actor
+                                            .commit_append(batch_id, Some(&manifest.source_keys))
+                                            .await
+                                            .context(
+                                                "failed to resolve append fence after non-retryable sink failure",
+                                            )?;
+                                    }
                                     Ok::<(), anyhow::Error>(())
                                 })
                                 .await
@@ -1465,13 +1813,13 @@ mod tests {
     use super::*;
     use crate::checkpoint::checkpoint_key;
     use crate::model::RowBatch;
+    use crate::CheckpointTransition;
     use axum::{
         extract::{Query, State},
         http::StatusCode,
         routing::post,
         Router,
     };
-    use chrono::{DateTime, Utc};
     use serde_json::json;
     use tokio::time::timeout;
 
@@ -1482,6 +1830,7 @@ mod tests {
         fail_once_by_table: Arc<Mutex<HashMap<String, usize>>>,
         fail_always_by_table: Arc<Mutex<HashMap<String, String>>>,
         query_ids: Arc<Mutex<Vec<String>>>,
+        queries: Arc<Mutex<Vec<String>>>,
     }
 
     impl MockClickHouseState {
@@ -1526,10 +1875,32 @@ mod tests {
                 .unwrap_or_default()
         }
 
+        fn seed_rows(&self, table: &str, rows: Vec<Value>) {
+            self.rows_by_table
+                .lock()
+                .expect("mock rows mutex poisoned")
+                .insert(table.to_string(), rows);
+        }
+
+        fn max_u64(&self, table: &str, field: &str) -> u64 {
+            self.rows(table)
+                .into_iter()
+                .filter_map(|row| row.get(field).and_then(Value::as_u64))
+                .max()
+                .unwrap_or(0)
+        }
+
         fn query_ids(&self) -> Vec<String> {
             self.query_ids
                 .lock()
                 .expect("mock query ids mutex poisoned")
+                .clone()
+        }
+
+        fn queries(&self) -> Vec<String> {
+            self.queries
+                .lock()
+                .expect("mock queries mutex poisoned")
                 .clone()
         }
     }
@@ -1549,6 +1920,16 @@ mod tests {
             Some("ingest_heartbeats")
         } else if query.contains("`events`") {
             Some("events")
+        } else if query.contains("`ingest_checkpoint_transitions`") {
+            Some("ingest_checkpoint_transitions")
+        } else if query.contains("`source_generation_publication_readiness`") {
+            Some("source_generation_publication_readiness")
+        } else if query.contains("`published_source_generations`") {
+            Some("published_source_generations")
+        } else if query.contains("`publication_diagnostic_events`") {
+            Some("publication_diagnostic_events")
+        } else if query.contains("`ingest_append_control`") {
+            Some("ingest_append_control")
         } else {
             None
         }
@@ -1559,7 +1940,15 @@ mod tests {
         Query(params): Query<HashMap<String, String>>,
         body: String,
     ) -> (StatusCode, String) {
-        let query = params.get("query").cloned().unwrap_or_default();
+        let query = params
+            .get("query")
+            .map(String::as_str)
+            .unwrap_or(body.as_str());
+        state
+            .queries
+            .lock()
+            .expect("mock queries mutex poisoned")
+            .push(query.to_string());
         if query.contains("FROM system.workloads") {
             return (StatusCode::OK, "0".to_string());
         }
@@ -1573,7 +1962,91 @@ mod tests {
                     .expect("sink request must carry a query id")
                     .clone(),
             );
-        let Some(table) = inserted_table_name(&query) else {
+        if query.contains("v_current_ingest_append_control") {
+            let rows = state
+                .rows("ingest_append_control")
+                .into_iter()
+                .max_by_key(|row| {
+                    row.get("control_revision")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0)
+                })
+                .into_iter()
+                .collect::<Vec<_>>();
+            return (StatusCode::OK, json!({"data": rows}).to_string());
+        }
+        if query.contains("v_current_ingest_checkpoint_transitions AS checkpoint") {
+            return (
+                StatusCode::OK,
+                json!({"data": state.rows("append_checkpoint_proofs")}).to_string(),
+            );
+        }
+        if query.contains("v_current_published_source_generations") {
+            let rows = state
+                .rows("published_source_generations")
+                .into_iter()
+                .max_by_key(|row| {
+                    row.get("publication_revision")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0)
+                })
+                .into_iter()
+                .collect::<Vec<_>>();
+            return (StatusCode::OK, json!({"data": rows}).to_string());
+        }
+        if query.contains("AS checkpoint_revision") && query.contains("transitions.operation_id") {
+            let revision = state
+                .rows("ingest_checkpoint_transitions")
+                .into_iter()
+                .filter(|row| {
+                    row.get("operation_id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|operation_id| {
+                            query.contains(&format!("transitions.operation_id = '{operation_id}'"))
+                        })
+                })
+                .filter_map(|row| row.get("checkpoint_revision").and_then(Value::as_u64))
+                .max()
+                .unwrap_or(0);
+            return (
+                StatusCode::OK,
+                json!({"data": [{"checkpoint_revision": revision}]}).to_string(),
+            );
+        }
+        if query.contains("max(transitions.checkpoint_revision)") {
+            let revision = state.max_u64("ingest_checkpoint_transitions", "checkpoint_revision");
+            return (
+                StatusCode::OK,
+                json!({"data": [{"revision": revision}]}).to_string(),
+            );
+        }
+        if query.contains("max(heads.publication_revision)") {
+            let revision = state.max_u64("published_source_generations", "publication_revision");
+            return (
+                StatusCode::OK,
+                json!({"data": [{"revision": revision}]}).to_string(),
+            );
+        }
+        if query.contains("max(readiness.readiness_revision)") {
+            let revision = state.max_u64(
+                "source_generation_publication_readiness",
+                "readiness_revision",
+            );
+            return (
+                StatusCode::OK,
+                json!({"data": [{"revision": revision}]}).to_string(),
+            );
+        }
+        if query.contains("existing_count") {
+            return (
+                StatusCode::OK,
+                json!({"data": [{"existing_count": 0}]}).to_string(),
+            );
+        }
+        if query.contains("SELECT") && !query.contains("INSERT INTO") {
+            return (StatusCode::OK, json!({"data": []}).to_string());
+        }
+        let Some(table) = inserted_table_name(query) else {
             return (
                 StatusCode::BAD_REQUEST,
                 format!("unexpected query payload: {query}"),
@@ -1673,6 +2146,136 @@ mod tests {
         }
     }
 
+    fn seed_interrupted_append(
+        state: &MockClickHouseState,
+        identity: &PublicationIdentity,
+        checkpoint: &Checkpoint,
+        cache_epoch: u64,
+    ) -> (AppendManifest, String) {
+        let manifest = AppendManifest::from_pending(
+            "",
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            std::iter::once(checkpoint.clone()),
+        );
+        let batch_id = manifest.batch_id();
+        state.seed_rows(
+            "ingest_append_control",
+            vec![json!({
+                "host": "",
+                "control_revision": 1,
+                "cache_epoch": cache_epoch,
+                "state": "preparing",
+                "batch_id": batch_id,
+                "publisher_id": identity.publisher_id(),
+                "manifest_json": serde_json::to_string(&manifest).expect("serialize manifest"),
+                "insert_only": 0,
+            })],
+        );
+        (manifest, batch_id)
+    }
+
+    async fn wait_for_append_control_rows(state: &MockClickHouseState, expected: usize) {
+        timeout(Duration::from_secs(2), async {
+            while state.rows("ingest_append_control").len() < expected {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("append-control startup recovery should complete");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn startup_recovery_commits_only_a_fully_checkpointed_append() {
+        let state = MockClickHouseState::default();
+        let identity = test_publication_identity();
+        let checkpoint = sample_checkpoint();
+        let (_manifest, batch_id) = seed_interrupted_append(&state, &identity, &checkpoint, 7);
+        state.seed_rows(
+            "append_checkpoint_proofs",
+            vec![json!({
+                "source_host": "",
+                "source_name": checkpoint.source_name,
+                "source_file": checkpoint.source_file,
+                "checkpoint_revision": 4,
+                "source_generation": checkpoint.source_generation,
+                "published_source_generation": checkpoint.source_generation,
+                "last_offset": checkpoint.last_offset,
+                "last_line": checkpoint.last_line_no,
+                "lifecycle": "active",
+                "block_reason": "",
+                "append_batch_id": batch_id,
+                "cache_epoch": 8,
+            })],
+        );
+        let (clickhouse, state) = spawn_mock_clickhouse_with_state(state).await;
+        let mut config = moraine_config::AppConfig::default();
+        config.ingest.heartbeat_interval_seconds = 60.0;
+        let (_tx, rx) = mpsc::channel(1);
+        let handle = spawn_sink_task(
+            config,
+            clickhouse,
+            Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(Metrics::default()),
+            rx,
+            true,
+            identity,
+            SinkAuthorConfig::fully_supported(String::new()),
+            default_role(),
+        );
+
+        wait_for_append_control_rows(&state, 2).await;
+        let latest = state
+            .rows("ingest_append_control")
+            .into_iter()
+            .max_by_key(|row| row["control_revision"].as_u64().unwrap_or(0))
+            .expect("recovered append control");
+        assert_eq!(latest["state"], "idle");
+        assert_eq!(latest["cache_epoch"], 8);
+        handle.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn startup_recovery_keeps_a_missing_checkpoint_append_fenced() {
+        let state = MockClickHouseState::default();
+        let identity = test_publication_identity();
+        let checkpoint = sample_checkpoint();
+        let (_manifest, batch_id) = seed_interrupted_append(&state, &identity, &checkpoint, 7);
+        let (clickhouse, state) = spawn_mock_clickhouse_with_state(state).await;
+        let mut config = moraine_config::AppConfig::default();
+        config.ingest.heartbeat_interval_seconds = 60.0;
+        let (_tx, rx) = mpsc::channel(1);
+        let handle = spawn_sink_task(
+            config,
+            clickhouse,
+            Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(Metrics::default()),
+            rx,
+            true,
+            identity,
+            SinkAuthorConfig::fully_supported(String::new()),
+            default_role(),
+        );
+
+        wait_for_append_control_rows(&state, 2).await;
+        let latest = state
+            .rows("ingest_append_control")
+            .into_iter()
+            .max_by_key(|row| row["control_revision"].as_u64().unwrap_or(0))
+            .expect("reopened append control");
+        assert_eq!(latest["state"], "preparing");
+        assert_eq!(latest["batch_id"], batch_id);
+        assert_eq!(latest["cache_epoch"], 7);
+        let manifest: AppendManifest =
+            serde_json::from_str(latest["manifest_json"].as_str().expect("manifest JSON"))
+                .expect("recovery manifest");
+        assert!(manifest.recovery_pending);
+        handle.abort();
+    }
+
     fn single_row_batch(id: u64) -> SinkMessage {
         let mut batch = RowBatch::default();
         batch.raw_rows.push(json!({ "id": id }));
@@ -1688,6 +2291,10 @@ mod tests {
 
     fn test_redaction_audit() -> Arc<RedactionAudit> {
         Arc::new(RedactionAudit::default())
+    }
+
+    fn test_publication_identity() -> PublicationIdentity {
+        PublicationIdentity::for_test("11111111-1111-4111-8111-111111111111")
     }
 
     fn default_role() -> SinkRole {
@@ -1742,6 +2349,38 @@ mod tests {
 
     fn fixed_monotonic_timestamp() -> Option<u64> {
         Some(42_000_000)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn startup_initializes_append_control_for_shared_publication_host() {
+        let (clickhouse, state) = spawn_mock_clickhouse("").await;
+        let runtime = clickhouse.runtime();
+        let actor = PublicationActor::new(
+            clickhouse,
+            "host-a".to_string(),
+            "host-a:publisher-a".to_string(),
+        );
+        let owner =
+            QueryOwner::new(&runtime, QueryWorkload::Background).expect("create startup owner");
+
+        assert!(!owner
+            .scope(actor.block_orphaned_append_on_startup())
+            .await
+            .expect("initialize append control"));
+        let rows = state.rows("ingest_append_control");
+        let initialized = rows.last().expect("append control initialized");
+        assert_eq!(
+            initialized.get("host").and_then(Value::as_str),
+            Some("host-a")
+        );
+        assert_eq!(
+            initialized.get("publisher_id").and_then(Value::as_str),
+            Some("host-a:publisher-a")
+        );
+        assert_eq!(
+            initialized.get("state").and_then(Value::as_str),
+            Some("idle")
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1916,6 +2555,7 @@ mod tests {
             !flush_pending_with_ack(
                 &clickhouse,
                 &checkpoints,
+                None,
                 &metrics,
                 &mut raw_rows,
                 &mut event_rows,
@@ -1936,6 +2576,7 @@ mod tests {
             flush_pending_with_ack(
                 &clickhouse,
                 &checkpoints,
+                None,
                 &metrics,
                 &mut raw_rows,
                 &mut event_rows,
@@ -2013,15 +2654,16 @@ mod tests {
 
     #[tokio::test]
     async fn failed_flush_throttles_sink_consumption() {
+        let (clickhouse, _state) =
+            spawn_mock_clickhouse_with_state(MockClickHouseState::with_permanent_failure(
+                "raw_events",
+                "intentional raw-event outage",
+            ))
+            .await;
         let mut config = moraine_config::AppConfig::default();
-        config.clickhouse.url = "http://127.0.0.1:1".to_string();
-        config.clickhouse.timeout_seconds = 1.0;
         config.ingest.batch_size = 1;
         config.ingest.flush_interval_seconds = 0.05;
         config.ingest.heartbeat_interval_seconds = 60.0;
-
-        let clickhouse = ClickHouseClient::new(config.clickhouse.clone())
-            .expect("clickhouse client should initialize");
         let checkpoints = Arc::new(RwLock::new(HashMap::new()));
         let metrics = Arc::new(Metrics::default());
         let (tx, rx) = mpsc::channel(1);
@@ -2033,6 +2675,7 @@ mod tests {
             metrics,
             rx,
             true,
+            test_publication_identity(),
             SinkAuthorConfig::fully_supported(String::new()),
             default_role(),
         );
@@ -2071,6 +2714,7 @@ mod tests {
             metrics,
             rx,
             true,
+            test_publication_identity(),
             SinkAuthorConfig::fully_supported(String::new()),
             default_role(),
         );
@@ -2129,9 +2773,10 @@ mod tests {
             config,
             clickhouse,
             checkpoints.clone(),
-            metrics,
+            metrics.clone(),
             rx,
             true,
+            test_publication_identity(),
             SinkAuthorConfig::fully_supported(String::new()),
             default_role(),
         );
@@ -2150,9 +2795,21 @@ mod tests {
 
         let deadline = Instant::now() + Duration::from_secs(1);
         while mock_state.call_count("ingest_checkpoints") == 0 && Instant::now() < deadline {
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert!(mock_state.call_count("ingest_checkpoints") > 0);
+        assert!(
+            mock_state.call_count("ingest_checkpoints") > 0,
+            "sink_finished={}, last_error={:?}, queries before checkpoint insert: {:?}",
+            handle.is_finished(),
+            metrics
+                .last_error
+                .lock()
+                .expect("metrics last_error mutex poisoned"),
+            mock_state
+                .queries
+                .lock()
+                .expect("mock queries mutex poisoned")
+        );
         assert!(
             timeout(Duration::from_millis(50), &mut barrier_rx)
                 .await
@@ -2182,6 +2839,119 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn backend_replay_publishes_only_after_fixed_point_barrier() {
+        let (clickhouse, mock_state) =
+            spawn_mock_clickhouse_with_state(MockClickHouseState::default()).await;
+        let mut config = moraine_config::AppConfig::default();
+        config.ingest.batch_size = usize::MAX;
+        config.ingest.flush_interval_seconds = 60.0;
+        config.ingest.heartbeat_interval_seconds = 60.0;
+        let state_dir = std::env::temp_dir().join(format!(
+            "moraine-publication-sink-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        config.ingest.state_dir = state_dir.to_string_lossy().into_owned();
+        let mut checkpoint = sample_checkpoint();
+        checkpoint.source_generation = 2;
+        checkpoint.status = CheckpointLifecycle::Replaying.as_str().to_string();
+        checkpoint.scan_inode = checkpoint.source_inode;
+        checkpoint.scan_boundary = checkpoint.last_offset;
+        checkpoint.policy_fingerprint = "policy-fingerprint".to_string();
+        let key = checkpoint_key(&checkpoint.source_name, &checkpoint.source_file);
+        let checkpoints = Arc::new(RwLock::new(HashMap::from([(key, checkpoint.clone())])));
+        let (tx, rx) = mpsc::channel(8);
+        let handle = spawn_sink_task(
+            config,
+            clickhouse,
+            checkpoints,
+            Arc::new(Metrics::default()),
+            rx,
+            true,
+            test_publication_identity(),
+            SinkAuthorConfig::fully_supported(String::new()),
+            backend_role(
+                Arc::new(BackendSinkCell::new("team-ch")),
+                Arc::new(Notify::new()),
+            ),
+        );
+
+        let transition = CheckpointTransition::finalize_replay(
+            &checkpoint,
+            checkpoint.source_inode,
+            checkpoint.last_offset,
+            "policy-fingerprint",
+        );
+        let staged = crate::publication::send_finalize_replay(&tx, transition).await;
+        if let Err(error) = staged.as_ref() {
+            drop(tx);
+            let sink_result = timeout(Duration::from_secs(2), handle).await;
+            panic!(
+                "stage mirror replay: {error:#}; sink: {sink_result:?}; queries: {:?}",
+                mock_state.queries()
+            );
+        }
+        assert_eq!(
+            staged.expect("checked staged outcome"),
+            crate::FinalizeReplayOutcome::StagedForMirror
+        );
+        assert!(
+            mock_state.rows("published_source_generations").is_empty(),
+            "a staged mirror replay must keep the previous generation published"
+        );
+        let staged_readiness = mock_state.rows("source_generation_publication_readiness");
+        assert_eq!(staged_readiness.len(), 1);
+        assert_eq!(
+            staged_readiness[0]
+                .get("backend_caught_up")
+                .and_then(Value::as_u64),
+            Some(0)
+        );
+
+        crate::publication::send_mirror_caught_up(&tx)
+            .await
+            .expect("publish staged replay after fixed-point barrier");
+        let published = mock_state.rows("published_source_generations");
+        assert_eq!(published.len(), 1);
+        assert_eq!(
+            published[0]
+                .get("source_generation")
+                .and_then(Value::as_u64),
+            Some(2)
+        );
+        let compatibility_checkpoints = mock_state.rows("ingest_checkpoints");
+        assert_eq!(compatibility_checkpoints.len(), 1);
+        assert_eq!(
+            compatibility_checkpoints[0]
+                .get("source_generation")
+                .and_then(Value::as_u64),
+            Some(2),
+            "publication must advance the durable compatibility checkpoint"
+        );
+        assert_eq!(
+            compatibility_checkpoints[0]
+                .get("host")
+                .and_then(Value::as_str),
+            Some(host_name().as_str()),
+            "shared backend compatibility checkpoints remain host-scoped"
+        );
+        let readiness = mock_state.rows("source_generation_publication_readiness");
+        assert_eq!(readiness.len(), 2);
+        assert_eq!(
+            readiness[1]
+                .get("backend_caught_up")
+                .and_then(Value::as_u64),
+            Some(1)
+        );
+
+        drop(tx);
+        timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("sink exits")
+            .expect("sink task does not panic");
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn flush_barrier_reports_rejected_batch_and_withholds_its_checkpoint() {
         let (clickhouse, mock_state) = spawn_mock_clickhouse("").await;
         let mut config = moraine_config::AppConfig::default();
@@ -2199,6 +2969,7 @@ mod tests {
             metrics,
             rx,
             true,
+            test_publication_identity(),
             SinkAuthorConfig::fully_supported(String::new()),
             default_role(),
         );
@@ -2249,6 +3020,7 @@ mod tests {
             Arc::new(Metrics::default()),
             rx,
             true,
+            test_publication_identity(),
             SinkAuthorConfig::fully_supported(String::new()),
             default_role(),
         );
@@ -2313,6 +3085,7 @@ mod tests {
             metrics,
             rx,
             true,
+            test_publication_identity(),
             SinkAuthorConfig::fully_supported(String::new()),
             backend_role(cell, Arc::new(Notify::new())),
         );
@@ -2403,6 +3176,7 @@ mod tests {
             Arc::new(Metrics::default()),
             rx,
             true,
+            test_publication_identity(),
             SinkAuthorConfig::fully_supported(String::new()),
             backend_role(cell, Arc::new(Notify::new())),
         );
@@ -2513,6 +3287,7 @@ mod tests {
             metrics,
             rx,
             true,
+            test_publication_identity(),
             SinkAuthorConfig::fully_supported(String::new()),
             backend_role(cell, Arc::new(Notify::new())),
         );
@@ -2569,6 +3344,7 @@ mod tests {
             Arc::new(Metrics::default()),
             rx,
             true,
+            test_publication_identity(),
             SinkAuthorConfig::fully_supported(String::new()),
             backend_role(restarted_cell, Arc::new(Notify::new())),
         );
@@ -2617,6 +3393,7 @@ mod tests {
             Arc::new(Metrics::default()),
             rx,
             true,
+            test_publication_identity(),
             SinkAuthorConfig::fully_supported(String::new()),
             backend_role(cell.clone(), replay_notify.clone()),
         );
@@ -2708,6 +3485,7 @@ mod tests {
             Arc::new(Metrics::default()),
             rx,
             true,
+            test_publication_identity(),
             SinkAuthorConfig::fully_supported(String::new()),
             backend_role(cell.clone(), replay_notify.clone()),
         );
@@ -2761,28 +3539,42 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn flush_pending_retries_only_unfinished_tables() {
+    async fn flush_pending_retries_only_unfinished_tables_under_original_fence() {
         let (clickhouse, mock_state) = spawn_mock_clickhouse("events").await;
         let checkpoints = Arc::new(RwLock::new(HashMap::new()));
         let metrics = Arc::new(Metrics::default());
+        let publication_identity = test_publication_identity();
+        let publication_actor = PublicationActor::new(
+            clickhouse.clone(),
+            String::new(),
+            publication_identity.publisher_id().to_string(),
+        );
+        let ack_observer = IngestAckObserver::new(false);
+        let mut pending_ack = PendingAckBatch::default();
 
         let mut raw_rows = vec![json!({
+            "source_name": "source-a",
+            "source_file": "/tmp/source-a.jsonl",
+            "source_generation": 1,
             "record_ts": "2026-02-17T00:00:01.000Z",
             "event_uid": "evt-1"
         })];
-        let mut event_rows = vec![json!({"event_uid": "evt-1"})];
+        let mut event_rows = vec![json!({
+            "source_name": "source-a",
+            "source_file": "/tmp/source-a.jsonl",
+            "source_generation": 1,
+            "event_uid": "evt-1"
+        })];
         let mut link_rows = Vec::<Value>::new();
         let mut error_rows = Vec::<Value>::new();
-        let mut checkpoint_updates = HashMap::new();
         let checkpoint = sample_checkpoint();
-        checkpoint_updates.insert(
-            checkpoint_key(&checkpoint.source_name, &checkpoint.source_file),
-            checkpoint.clone(),
-        );
+        let checkpoint_key_value = checkpoint_key(&checkpoint.source_name, &checkpoint.source_file);
+        let mut checkpoint_updates = HashMap::from([(checkpoint_key_value.clone(), checkpoint)]);
 
-        let first_attempt = flush_pending(
+        let first_attempt = flush_pending_with_ack(
             &clickhouse,
             &checkpoints,
+            Some(&publication_actor),
             &metrics,
             &mut raw_rows,
             &mut event_rows,
@@ -2791,28 +3583,24 @@ mod tests {
             &mut checkpoint_updates,
             true,
             "",
+            &ack_observer,
+            &mut pending_ack,
         )
         .await;
         assert!(!first_attempt, "first flush should fail at events stage");
-
         assert!(raw_rows.is_empty(), "raw rows should not be retried");
-        assert_eq!(
-            event_rows.len(),
-            1,
-            "event rows remain pending after failure"
-        );
-        assert_eq!(
-            checkpoint_updates.len(),
-            1,
-            "checkpoint update must remain pending until checkpoint flush succeeds"
-        );
-        assert_eq!(metrics.raw_rows_written.load(Ordering::Relaxed), 1);
-        assert_eq!(metrics.event_rows_written.load(Ordering::Relaxed), 0);
-        assert_eq!(metrics.flush_failures.load(Ordering::Relaxed), 1);
+        assert_eq!(event_rows.len(), 1, "event rows remain pending");
+        assert_eq!(checkpoint_updates.len(), 1, "checkpoint remains pending");
+        let retained_batch_id = pending_ack
+            .append_manifest
+            .as_ref()
+            .expect("original append manifest retained")
+            .batch_id();
 
-        let second_attempt = flush_pending(
+        let second_attempt = flush_pending_with_ack(
             &clickhouse,
             &checkpoints,
+            Some(&publication_actor),
             &metrics,
             &mut raw_rows,
             &mut event_rows,
@@ -2821,28 +3609,42 @@ mod tests {
             &mut checkpoint_updates,
             true,
             "",
+            &ack_observer,
+            &mut pending_ack,
         )
         .await;
         assert!(
             second_attempt,
-            "second flush should complete remaining stages"
+            "retry should complete under original fence: {}",
+            metrics
+                .last_error
+                .lock()
+                .expect("metrics last_error mutex poisoned")
         );
-
         assert!(event_rows.is_empty());
         assert!(checkpoint_updates.is_empty());
         assert_eq!(metrics.raw_rows_written.load(Ordering::Relaxed), 1);
         assert_eq!(metrics.event_rows_written.load(Ordering::Relaxed), 1);
         assert_eq!(metrics.flush_failures.load(Ordering::Relaxed), 1);
-
         assert_eq!(mock_state.call_count("raw_events"), 1);
         assert_eq!(mock_state.call_count("events"), 2);
         assert_eq!(mock_state.call_count("ingest_checkpoints"), 1);
 
-        let state = checkpoints.read().await;
-        let checkpoint_key_value = checkpoint_key(&checkpoint.source_name, &checkpoint.source_file);
+        let append_controls = mock_state.rows("ingest_append_control");
+        assert!(append_controls.iter().all(|row| {
+            row.get("batch_id").and_then(Value::as_str) == Some(retained_batch_id.as_str())
+        }));
+        assert_eq!(
+            append_controls
+                .last()
+                .and_then(|row| row.get("state"))
+                .and_then(Value::as_str),
+            Some("idle"),
+            "retried staged flush must quiesce its original fence"
+        );
         assert!(
-            state.contains_key(&checkpoint_key_value),
-            "checkpoint cache should advance after checkpoint stage succeeds"
+            checkpoints.read().await.contains_key(&checkpoint_key_value),
+            "checkpoint cache should advance after retry"
         );
     }
 
@@ -2856,6 +3658,14 @@ mod tests {
             .await;
         let checkpoints = Arc::new(RwLock::new(HashMap::new()));
         let metrics = Arc::new(Metrics::default());
+        let publication_identity = test_publication_identity();
+        let publication_actor = PublicationActor::new(
+            clickhouse.clone(),
+            String::new(),
+            publication_identity.publisher_id().to_string(),
+        );
+        let ack_observer = IngestAckObserver::new(false);
+        let mut pending_ack = PendingAckBatch::default();
 
         let checkpoint = sample_checkpoint();
         let checkpoint_key_value = checkpoint_key(&checkpoint.source_name, &checkpoint.source_file);
@@ -2880,9 +3690,10 @@ mod tests {
         let mut error_rows = Vec::<Value>::new();
 
         assert!(
-            flush_pending(
+            flush_pending_with_ack(
                 &clickhouse,
                 &checkpoints,
+                Some(&publication_actor),
                 &metrics,
                 &mut raw_rows,
                 &mut event_rows,
@@ -2891,6 +3702,8 @@ mod tests {
                 &mut checkpoint_updates,
                 true,
                 "",
+                &ack_observer,
+                &mut pending_ack,
             )
             .await,
             "non-retryable oversized JSONEachRow failures should clear the stuck batch"
@@ -2910,6 +3723,15 @@ mod tests {
             mock_state.call_count("ingest_checkpoints"),
             1,
             "the skipped batch checkpoint should commit after the compact error row"
+        );
+        let append_controls = mock_state.rows("ingest_append_control");
+        assert_eq!(
+            append_controls
+                .last()
+                .and_then(|row| row.get("state"))
+                .and_then(Value::as_str),
+            Some("idle"),
+            "dropping a non-retryable batch must quiesce its prepared append fence"
         );
 
         let persisted_errors = mock_state.rows("ingest_errors");
@@ -3357,6 +4179,7 @@ mod tests {
             metrics,
             rx,
             true,
+            test_publication_identity(),
             SinkAuthorConfig::fully_supported(String::new()),
             SinkRole::Backend {
                 cell: Arc::new(BackendSinkCell::new("team-ch")),
@@ -3513,50 +4336,35 @@ mod tests {
     }
 
     #[test]
-    fn compute_append_to_visible_stats_uses_real_record_timestamps() {
-        let visible_at = DateTime::parse_from_rfc3339("2026-02-17T00:00:10.000Z")
-            .expect("valid timestamp")
-            .with_timezone(&Utc);
-        let raw_rows = vec![
-            json!({"record_ts": "2026-02-17T00:00:00.000Z"}),
-            json!({"record_ts": "2026-02-17T00:00:05.000Z"}),
-            json!({"record_ts": "2026-02-17T00:00:09.000Z"}),
+    fn compute_append_to_visible_stats_uses_ingest_observation_times() {
+        let visible_at = Instant::now();
+        let samples = vec![
+            (visible_at - Duration::from_secs(10), 1),
+            (visible_at - Duration::from_secs(5), 1),
+            (visible_at - Duration::from_secs(1), 1),
         ];
 
-        let (p50, p95) = compute_append_to_visible_stats(&raw_rows, visible_at)
-            .expect("expected percentile stats");
+        let (p50, p95) =
+            compute_append_to_visible_stats(&samples, visible_at).expect("percentile stats");
 
         assert_eq!(p50, 5_000);
         assert_eq!(p95, 10_000);
     }
 
     #[test]
-    fn compute_append_to_visible_stats_returns_none_for_unparseable_rows() {
-        let visible_at = DateTime::parse_from_rfc3339("2026-02-17T00:00:10.000Z")
-            .expect("valid timestamp")
-            .with_timezone(&Utc);
-        let raw_rows = vec![
-            json!({"record_ts": "not-a-timestamp"}),
-            json!({"record_ts": ""}),
-            json!({}),
+    fn compute_append_to_visible_stats_weights_batch_row_counts() {
+        let visible_at = Instant::now();
+        let samples = vec![
+            (visible_at - Duration::from_secs(10), 1),
+            (visible_at - Duration::from_secs(1), 19),
         ];
 
-        let stats = compute_append_to_visible_stats(&raw_rows, visible_at);
-        assert!(stats.is_none());
-    }
+        let (p50, p95) =
+            compute_append_to_visible_stats(&samples, visible_at).expect("percentile stats");
 
-    #[test]
-    fn compute_append_to_visible_stats_clamps_future_timestamps_to_zero() {
-        let visible_at = DateTime::parse_from_rfc3339("2026-02-17T00:00:10.000Z")
-            .expect("valid timestamp")
-            .with_timezone(&Utc);
-        let raw_rows = vec![json!({"record_ts": "2026-02-17T00:00:20.000Z"})];
-
-        let (p50, p95) = compute_append_to_visible_stats(&raw_rows, visible_at)
-            .expect("expected percentile stats");
-
-        assert_eq!(p50, 0);
-        assert_eq!(p95, 0);
+        assert_eq!(p50, 1_000);
+        assert_eq!(p95, 1_000);
+        assert!(compute_append_to_visible_stats(&[], visible_at).is_none());
     }
 
     #[test]

@@ -362,6 +362,7 @@ async fn list_mcp_sessions_applies_session_origin_scope() {
     assert!(list_query.contains("WHERE cwd != ''"));
     assert!(list_query.contains("origin_cwd = '/work/project'"));
     assert!(list_query.contains("startsWith(origin_cwd, '/work/project/')"));
+    assert!(list_query.contains("HAVING count() = 1 AND countIf("));
     let window_sessions = list_query
         .split_once("event_rollups AS (")
         .map(|(window, _)| window)
@@ -440,15 +441,15 @@ async fn scoped_point_lookups_hide_out_of_scope_sessions() {
     assert!(event.is_none(), "out-of-scope event must be hidden");
 
     let queries = state.queries.lock().expect("queries lock").clone();
-    let legacy_gate_count = queries
+    let scope_gate_count = queries
         .iter()
         .filter(|query| {
-            query.starts_with("SELECT session_id FROM (")
+            query.starts_with("SELECT toUInt64(count() = 1")
                 && query.contains("argMin(cwd, tuple(event_ts, event_uid))")
         })
         .count();
     assert_eq!(
-        legacy_gate_count, 4,
+        scope_gate_count, 4,
         "each canonical point lookup must enforce the configured origin scope"
     );
     assert!(queries.iter().all(|query| {
@@ -484,7 +485,7 @@ async fn scoped_point_lookups_serve_in_scope_sessions() {
     let gate_queries: Vec<&String> = queries
         .iter()
         .filter(|q| {
-            q.starts_with("SELECT session_id FROM (") && q.contains("session_id = 'sess-open'")
+            q.starts_with("SELECT toUInt64(count() = 1") && q.contains("session_id = 'sess-open'")
         })
         .collect();
     assert_eq!(
@@ -590,7 +591,12 @@ async fn get_mcp_session_includes_turn_summaries_and_latest_completion() {
         .get_mcp_session("sess-open")
         .await
         .expect("mcp session open succeeds")
-        .expect("mcp session exists");
+        .unwrap_or_else(|| {
+            panic!(
+                "mcp session missing; queries={:#?}",
+                state.queries.lock().expect("queries lock")
+            )
+        });
 
     assert_eq!(session.metadata.session_id, "sess-open");
     assert_eq!(session.metadata.mode, ConversationMode::ToolCalling);
@@ -660,7 +666,7 @@ async fn get_mcp_session_includes_turn_summaries_and_latest_completion() {
     let open_navigation_query = queries
         .iter()
         .find(|query| {
-            query.contains("FROM `moraine`.`mcp_event_navigation_seek` AS n FINAL")
+            query.contains("FROM `moraine`.`v_live_mcp_event_navigation_seek` AS n")
                 && query.contains("WHERE n.session_id = 'sess-open'")
         })
         .expect("session open must read canonical navigation rows");
@@ -698,17 +704,18 @@ async fn get_mcp_session_uses_only_bounded_projection_queries() {
     assert_eq!(session.metadata.session_id, "sess-open");
 
     let queries = state.queries.lock().expect("queries lock").clone();
-    assert_eq!(queries.len(), 3);
-    assert!(queries[0].contains("FROM `moraine`.`mcp_event_navigation_seek` AS n FINAL"));
-    assert!(queries[0].contains("WHERE n.session_id = 'sess-open'"));
-    assert!(queries[1].contains("FROM `moraine`.`mcp_event_version_seek`"));
-    assert!(queries[1].contains("WHERE event_uid IN"));
-    assert!(queries[2].contains("FROM `moraine`.`events`"));
-    assert!(!queries[2].contains(" FINAL"));
-    assert!(queries[2].contains("PREWHERE session_id = 'sess-open'"));
-    assert!(queries[2].contains("event_ts >= fromUnixTimestamp64Milli("));
-    assert!(queries[2].contains("event_uid IN ["));
-    assert!(queries[2].contains("(event_uid, event_version) IN ("));
+    assert_eq!(queries.len(), 4);
+    assert!(queries[0].starts_with("SELECT toUInt64(count() = 1"));
+    assert!(queries[1].contains("FROM `moraine`.`v_live_mcp_event_navigation_seek` AS n"));
+    assert!(queries[1].contains("WHERE n.session_id = 'sess-open'"));
+    assert!(queries[2].contains("FROM `moraine`.`v_live_mcp_event_version_seek`"));
+    assert!(queries[2].contains("session_id = 'sess-open' AND event_uid IN"));
+    assert!(queries[3].contains("FROM `moraine`.`events`"));
+    assert!(queries[3].contains("v_published_source_generation_history"));
+    assert!(queries[3].contains("WHERE session_id = 'sess-open'"));
+    assert!(queries[3].contains("event_ts >= fromUnixTimestamp64Milli("));
+    assert!(queries[3].contains("event_uid IN ["));
+    assert!(queries[3].contains("(event_uid, event_version) IN ("));
     assert!(queries
         .iter()
         .all(|query| { !query.contains("mcp_open_") && !query.contains("v_conversation_trace") }));
@@ -811,7 +818,7 @@ async fn get_mcp_turn_summary_skips_projected_event_json_and_keeps_handles() {
 
     let queries = state.queries.lock().expect("queries lock").clone();
     assert!(queries.iter().any(|query| {
-        query.contains("FROM `moraine`.`mcp_event_navigation_seek` AS n FINAL")
+        query.contains("FROM `moraine`.`v_live_mcp_event_navigation_seek` AS n")
             && query.contains("n.session_id = 'sess-incomplete'")
     }));
     assert!(queries
@@ -860,9 +867,10 @@ async fn get_mcp_event_returns_full_content_and_navigation_refs() {
     assert_eq!(event.next_turn.as_ref().map(|turn| turn.turn_seq), Some(2));
 
     let queries = state.queries.lock().expect("queries lock").clone();
-    assert_eq!(queries.len(), 4);
+    assert_eq!(queries.len(), 5);
     assert!(queries.iter().all(|query| {
-        query.contains("mcp_event_locator")
+        query.starts_with("SELECT toUInt64(count() = 1")
+            || query.contains("mcp_event_locator")
             || query.contains("mcp_event_navigation_seek")
             || query.contains("mcp_event_version_seek")
             || query.contains("FROM `moraine`.`events`")
@@ -870,7 +878,7 @@ async fn get_mcp_event_returns_full_content_and_navigation_refs() {
     assert!(queries
         .iter()
         .filter(|query| query.contains("FROM `moraine`.`events`"))
-        .all(|query| !query.contains(" FINAL")));
+        .all(|query| query.contains("v_published_source_generation_history")));
     assert!(queries
         .iter()
         .all(|query| !query.contains("v_conversation_trace")));
@@ -1054,7 +1062,7 @@ async fn list_session_events_rejects_cursor_with_mismatched_direction() {
 async fn web_feed_covers_variants_precedence_limit_order_and_canonical_source() {
     let response = ScriptedResponse::rows(
         &[
-            "FROM (SELECT * FROM `moraine`.`events` FINAL) AS e",
+            "FROM `moraine`.`events` AS e FINAL",
             "e.payload_type = 'web_search_call'",
             "e.payload_type = 'tool_use' AND e.tool_name IN ('WebSearch', 'WebFetch')",
             "e.payload_type = 'search_results_received'",
@@ -1123,14 +1131,11 @@ async fn web_feed_covers_variants_precedence_limit_order_and_canonical_source() 
 async fn web_feed_propagates_backend_and_json_each_row_decode_errors() {
     let scenarios = [
         ScriptedResponse::failure(
-            &["FROM (SELECT * FROM `moraine`.`events` FINAL) AS e"],
+            &["FROM `moraine`.`events` AS e FINAL"],
             "web feed backend failed",
         ),
         ScriptedResponse::raw(
-            &[
-                "FROM (SELECT * FROM `moraine`.`events` FINAL) AS e",
-                "FORMAT JSONEachRow",
-            ],
+            &["FROM `moraine`.`events` AS e FINAL", "FORMAT JSONEachRow"],
             "not-json\n",
         ),
     ];
