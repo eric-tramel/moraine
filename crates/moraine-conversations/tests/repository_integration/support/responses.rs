@@ -280,7 +280,7 @@ pub(crate) fn analytics_responses(
             &[
                 "toInt64(toUnixTimestamp(now())) AS database_now_unix",
                 window_literal,
-                "FROM (SELECT * FROM `moraine`.`events` FINAL) AS e",
+                "FROM `moraine`.`v_published_source_generation_history` AS history",
                 "AND notEmpty(trimBoth(e.model))",
                 "FORMAT JSONEachRow",
             ],
@@ -293,7 +293,7 @@ pub(crate) fn analytics_responses(
         ScriptedResponse::rows(
             &[
                 interval_literal,
-                "FROM (SELECT * FROM `moraine`.`events` FINAL) AS e",
+                "FROM `moraine`.`v_published_source_generation_history` AS history",
                 "intDiv(toUnixTimestamp64Milli(e.event_ts), 1000) >= 100000",
                 "intDiv(toUnixTimestamp64Milli(e.event_ts), 1000) <= 200000",
                 "ARRAY JOIN mapKeys(e.token_usage_buckets)",
@@ -306,7 +306,7 @@ pub(crate) fn analytics_responses(
             &[
                 interval_literal,
                 "toUInt64(uniqExact(tuple(e.session_id, e.request_id))) AS turns",
-                "FROM (SELECT * FROM `moraine`.`events` FINAL) AS e",
+                "FROM `moraine`.`v_published_source_generation_history` AS history",
                 "intDiv(toUnixTimestamp64Milli(e.event_ts), 1000) >= 100000",
                 "ORDER BY bucket_unix ASC, model ASC",
                 "FORMAT JSONEachRow",
@@ -317,7 +317,7 @@ pub(crate) fn analytics_responses(
             &[
                 interval_literal,
                 "toUInt64(uniqExact(session_stream_key)) AS concurrent_sessions",
-                "FROM (SELECT * FROM `moraine`.`events` FINAL) AS e",
+                "FROM `moraine`.`v_published_source_generation_history` AS history",
                 "intDiv(toUnixTimestamp64Milli(e.event_ts), 1000) >= 100000",
                 "ORDER BY bucket_unix ASC",
                 "FORMAT JSONEachRow",

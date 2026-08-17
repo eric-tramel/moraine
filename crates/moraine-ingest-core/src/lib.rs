@@ -4,6 +4,8 @@ mod heartbeat;
 pub mod model;
 pub mod normalize;
 mod progress;
+pub(crate) mod publication;
+mod publication_identity;
 mod reconcile;
 mod redaction;
 mod sink;
@@ -19,6 +21,11 @@ use crate::dispatch::{
 };
 use crate::model::RowBatch;
 use crate::progress::{KiroTargetIdentity, ProgressState, TargetObservation};
+use crate::publication::PublicationOwnerLock;
+pub(crate) use crate::publication::{
+    CheckpointTransition, FinalizeReplayOutcome, ReplayBarrierAck,
+};
+use crate::publication_identity::PublicationIdentity;
 use crate::reconcile::spawn_reconcile_task;
 use crate::redaction::{RedactionAudit, SecretRedactor};
 use crate::sink::{spawn_sink_task, SinkAuthorConfig, SinkRole};
@@ -37,7 +44,7 @@ use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, Mutex};
-use tokio::sync::{mpsc, RwLock, Semaphore};
+use tokio::sync::{mpsc, oneshot, RwLock, Semaphore};
 use tracing::{info, warn};
 
 pub(crate) const WATCHER_BACKEND_UNKNOWN: u64 = 0;
@@ -137,6 +144,27 @@ pub(crate) enum SinkMessage {
         epoch: u64,
         persist_checkpoint: bool,
     },
+    /// A durable replay-start barrier. The sink flushes all earlier batches,
+    /// persists the causal replay transition synchronously, then acknowledges.
+    BeginReplay {
+        transition: CheckpointTransition,
+        ack: oneshot::Sender<std::result::Result<ReplayBarrierAck, String>>,
+    },
+    /// Final source-boundary validation and publication. The head switch is
+    /// the last durable operation before acknowledgement.
+    FinalizeReplay {
+        transition: CheckpointTransition,
+        ack: oneshot::Sender<std::result::Result<FinalizeReplayOutcome, String>>,
+    },
+    /// Persist a fail-closed replay transition without changing source heads.
+    BlockReplay {
+        transition: CheckpointTransition,
+        ack: oneshot::Sender<std::result::Result<ReplayBarrierAck, String>>,
+    },
+    /// Publish every source replay staged by a mirror after its fixed-point barrier.
+    MirrorCaughtUp {
+        ack: oneshot::Sender<std::result::Result<(), String>>,
+    },
     /// Ordered durability fence used by backend replay. The sink acknowledges
     /// only after every earlier batch (including its checkpoint) is durable.
     FlushBarrier(tokio::sync::oneshot::Sender<()>),
@@ -177,9 +205,43 @@ pub async fn run_ingestor(config: AppConfig, query_runtime: QueryRuntime) -> Res
         ));
     }
 
+    let has_named_backends = config
+        .backends
+        .keys()
+        .any(|name| name != DEFAULT_BACKEND_NAME);
+    let publication_identity = PublicationIdentity::load_or_create(&config.ingest.state_dir)
+        .context("failed to establish durable publication host identity")?;
+    let _publication_owner = PublicationOwnerLock::acquire(
+        &config.ingest.state_dir,
+        publication_identity.publisher_id(),
+    )
+    .context("failed to acquire publication ownership")?;
+
     let clickhouse =
         build_ingest_clickhouse_client(config.clickhouse.clone(), query_runtime.clone())?;
     probe_clickhouse(&clickhouse).await?;
+
+    for (table, column) in [
+        ("published_source_generations", "publication_revision"),
+        ("ingest_checkpoint_transitions", "checkpoint_revision"),
+        (
+            "source_generation_publication_readiness",
+            "readiness_revision",
+        ),
+        ("v_live_events", "source_host"),
+        ("v_live_search_postings", "source_host"),
+    ] {
+        if !table_column_available(&clickhouse, table, column)
+            .await
+            .with_context(|| {
+                format!("failed to inspect required publication column {table}.{column}")
+            })?
+        {
+            return Err(anyhow::anyhow!(
+                "publication-aware ingest requires {table}.{column}; run `moraine db migrate` before restarting ingest"
+            ));
+        }
+    }
 
     let checkpoint_cursor_columns = checkpoint_cursor_columns_available(&clickhouse)
         .await
@@ -204,10 +266,6 @@ pub async fn run_ingestor(config: AppConfig, query_runtime: QueryRuntime) -> Res
         enabled_sources.len()
     );
 
-    let has_named_backends = config
-        .backends
-        .keys()
-        .any(|name| name != DEFAULT_BACKEND_NAME);
     let raw_events_author_column = table_column_available(&clickhouse, "raw_events", "author")
         .await
         .context("failed to inspect raw_events author column")?;
@@ -306,6 +364,7 @@ pub async fn run_ingestor(config: AppConfig, query_runtime: QueryRuntime) -> Res
         metrics.clone(),
         default_sink_rx,
         checkpoint_cursor_columns,
+        publication_identity.clone(),
         SinkAuthorConfig::new(
             config.identity.author.clone(),
             raw_events_author_column,
@@ -330,6 +389,7 @@ pub async fn run_ingestor(config: AppConfig, query_runtime: QueryRuntime) -> Res
         resolver,
         backend_statuses,
         RedactionContext::new(redactor, redaction_audit),
+        publication_identity,
     );
 
     let sem = Arc::new(Semaphore::new(config.ingest.max_file_workers.max(1)));
@@ -520,6 +580,31 @@ struct CheckpointRow {
     schema_fingerprint: u64,
 }
 
+#[derive(Deserialize)]
+struct CausalCheckpointRow {
+    source_name: String,
+    source_file: String,
+    source_inode: u64,
+    source_generation: u32,
+    last_offset: u64,
+    last_line_no: u64,
+    status: String,
+    cursor_json: String,
+    source_fingerprint: u64,
+    schema_fingerprint: u64,
+    checkpoint_revision: u64,
+    operation_id: String,
+    scan_inode: u64,
+    scan_boundary: u64,
+    policy_fingerprint: String,
+    final_scan_complete: u8,
+    block_reason: String,
+    compatibility_prepared: u8,
+    backend_caught_up: u8,
+    append_batch_id: String,
+    cache_epoch: u64,
+}
+
 /// Returns whether `ingest_checkpoints` carries the SQLite cursor columns
 /// added by migration 015. Selecting them unconditionally would abort startup
 /// for every source on a database that has not run `moraine db migrate` yet.
@@ -603,11 +688,81 @@ fn checkpoints_query(database: &str, cursor_columns: bool, host: Option<&str>) -
     )
 }
 
+fn causal_checkpoints_query(database: &str, host: Option<&str>) -> String {
+    let host = host
+        .unwrap_or_default()
+        .replace('\\', "\\\\")
+        .replace('\'', "\\'");
+    format!(
+        "SELECT source_name, source_file, \
+            toUInt64(inode) AS source_inode, \
+            toUInt32(source_generation) AS source_generation, \
+            toUInt64(last_offset) AS last_offset, \
+            toUInt64(last_line) AS last_line_no, \
+            lifecycle AS status, cursor_json, \
+            toUInt64(source_fingerprint) AS source_fingerprint, \
+            toUInt64(schema_fingerprint) AS schema_fingerprint, \
+            toUInt64(checkpoint_revision) AS checkpoint_revision, operation_id, \
+            toUInt64(scan_inode) AS scan_inode, \
+            toUInt64(scan_boundary) AS scan_boundary, policy_fingerprint, \
+            toUInt8(final_scan_complete) AS final_scan_complete, block_reason, \
+            toUInt8(compatibility_prepared) AS compatibility_prepared, \
+            toUInt8(backend_caught_up) AS backend_caught_up, append_batch_id, \
+            toUInt64(cache_epoch) AS cache_epoch \
+         FROM {}.v_current_ingest_checkpoint_transitions \
+         WHERE host = '{}'",
+        database, host
+    )
+}
+
 async fn load_checkpoints(
     clickhouse: &ClickHouseClient,
     cursor_columns: bool,
     host: Option<&str>,
 ) -> Result<HashMap<String, model::Checkpoint>> {
+    if table_column_available(
+        clickhouse,
+        "ingest_checkpoint_transitions",
+        "checkpoint_revision",
+    )
+    .await?
+    {
+        let query = causal_checkpoints_query(&clickhouse.config().database, host);
+        let owner = QueryOwner::new(&clickhouse.runtime(), QueryWorkload::Background)?;
+        let rows: Vec<CausalCheckpointRow> =
+            owner.scope(clickhouse.query_rows(&query, None)).await?;
+        let mut map = HashMap::new();
+        for row in rows {
+            let key = checkpoint_key(&row.source_name, &row.source_file);
+            map.insert(
+                key,
+                model::Checkpoint {
+                    source_name: row.source_name,
+                    source_file: row.source_file,
+                    source_inode: row.source_inode,
+                    source_generation: row.source_generation.max(1),
+                    last_offset: row.last_offset,
+                    last_line_no: row.last_line_no,
+                    status: row.status,
+                    cursor_json: row.cursor_json,
+                    source_fingerprint: row.source_fingerprint,
+                    schema_fingerprint: row.schema_fingerprint,
+                    policy_fingerprint: row.policy_fingerprint,
+                    checkpoint_revision: row.checkpoint_revision,
+                    operation_id: row.operation_id,
+                    scan_inode: row.scan_inode,
+                    scan_boundary: row.scan_boundary,
+                    final_scan_complete: row.final_scan_complete != 0,
+                    block_reason: row.block_reason,
+                    compatibility_prepared: row.compatibility_prepared != 0,
+                    backend_caught_up: row.backend_caught_up != 0,
+                    append_batch_id: row.append_batch_id,
+                    cache_epoch: row.cache_epoch,
+                },
+            );
+        }
+        return Ok(map);
+    }
     let query = checkpoints_query(&clickhouse.config().database, cursor_columns, host);
     let owner = QueryOwner::new(&clickhouse.runtime(), QueryWorkload::Background)?;
     let rows: Vec<CheckpointRow> = owner.scope(clickhouse.query_rows(&query, None)).await?;
@@ -628,6 +783,7 @@ async fn load_checkpoints(
                 cursor_json: row.cursor_json,
                 source_fingerprint: row.source_fingerprint,
                 schema_fingerprint: row.schema_fingerprint,
+                ..model::Checkpoint::default()
             },
         );
     }

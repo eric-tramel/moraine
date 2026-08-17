@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct Checkpoint {
     pub source_name: String,
     pub source_file: String,
@@ -22,6 +22,42 @@ pub struct Checkpoint {
     /// Hash of the relevant database schema for DB-backed sources.
     #[serde(default)]
     pub schema_fingerprint: u64,
+    /// Fingerprint of the normalization and exclusion policy that produced
+    /// this cursor. A policy change is a whole-source replacement even when
+    /// the underlying file identity is unchanged.
+    #[serde(default)]
+    pub policy_fingerprint: String,
+    /// Causal revision assigned by the serialized checkpoint writer. Zero is
+    /// an unassigned in-memory transition and is never persisted to the
+    /// causal transition relation.
+    #[serde(default)]
+    pub checkpoint_revision: u64,
+    /// Retry-stable identity for one causal transition.
+    #[serde(default)]
+    pub operation_id: String,
+    /// File identity and boundary captured for a replacement scan.
+    #[serde(default)]
+    pub scan_inode: u64,
+    #[serde(default)]
+    pub scan_boundary: u64,
+    /// True only after the captured scan boundary has been consumed and the
+    /// source identity has been revalidated.
+    #[serde(default)]
+    pub final_scan_complete: bool,
+    /// Durable fail-closed reason. Lifecycle remains in `status`; error detail
+    /// is intentionally separate so an error string cannot accidentally make
+    /// a generation active.
+    #[serde(default)]
+    pub block_reason: String,
+    #[serde(default)]
+    pub compatibility_prepared: bool,
+    #[serde(default)]
+    pub backend_caught_up: bool,
+    /// Same-generation append fence state associated with this cursor.
+    #[serde(default)]
+    pub append_batch_id: String,
+    #[serde(default)]
+    pub cache_epoch: u64,
 }
 
 #[derive(Debug, Clone, Default)]

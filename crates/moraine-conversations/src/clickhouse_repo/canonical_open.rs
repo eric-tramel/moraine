@@ -188,7 +188,7 @@ impl ClickHouseConversationRepository {
         &self,
         session_id: &str,
     ) -> RepoResult<Option<McpSessionOpen>> {
-        if !self.session_in_scope(session_id).await? {
+        if !self.session_in_scope(None, session_id).await? {
             return Ok(None);
         }
         let scan = match self.scan_canonical_session(session_id, None, None).await? {
@@ -228,7 +228,7 @@ impl ClickHouseConversationRepository {
         turn_seq: u32,
         include_events: bool,
     ) -> RepoResult<Option<McpTurnOpen>> {
-        if !self.session_in_scope(session_id).await? {
+        if !self.session_in_scope(None, session_id).await? {
             return Ok(None);
         }
         let scan = match self
@@ -287,20 +287,26 @@ impl ClickHouseConversationRepository {
         &self,
         event_uid: &str,
     ) -> RepoResult<Option<McpEventOpen>> {
-        let locator = self.table_ref("mcp_event_locator");
+        let locator = self.table_ref("v_live_mcp_event_locator");
         #[derive(Deserialize)]
         struct OwnerRow {
+            #[allow(dead_code)]
+            source_host: String,
             session_id: String,
         }
         let sql = format!(
-            "SELECT session_id FROM {locator} FINAL WHERE event_uid = {} LIMIT 1 FORMAT JSONEachRow",
+            "SELECT DISTINCT source_host, session_id FROM {locator} WHERE event_uid = {} LIMIT 2 FORMAT JSONEachRow",
             sql_quote(event_uid)
         );
         let owners: Vec<OwnerRow> = self.map_backend(self.query_rows(&sql, None).await)?;
-        let Some(owner) = owners.first() else {
+        if owners.len() != 1 {
             return Ok(None);
-        };
-        if !self.session_in_scope(&owner.session_id).await? {
+        }
+        let owner = &owners[0];
+        if !self
+            .session_in_scope(Some(&owner.source_host), &owner.session_id)
+            .await?
+        {
             return Ok(None);
         }
         let scan = match self
@@ -355,7 +361,7 @@ impl ClickHouseConversationRepository {
         selected_turn: Option<u32>,
         target_uid: Option<&str>,
     ) -> RepoResult<Option<SessionScan>> {
-        let navigation = self.table_ref("mcp_event_navigation_seek");
+        let navigation = self.table_ref("v_live_mcp_event_navigation_seek");
         let mut cursor: Option<NavRow> = None;
         let mut event_order = 0u64;
         let mut user_count = 0u32;
@@ -409,7 +415,7 @@ impl ClickHouseConversationRepository {
   toUInt8(is_user_message) AS is_user_message, toUInt8(is_metadata_bearing) AS is_metadata_bearing,
   toUInt8(has_session_title) AS has_session_title, toUInt8(has_session_name) AS has_session_name,
   toUInt8(has_session_summary) AS has_session_summary, toUInt8(has_session_slug) AS has_session_slug
-FROM {navigation} AS n FINAL
+FROM {navigation} AS n
 WHERE n.session_id = {}{after}
 ORDER BY n.sort_time, n.source_file, n.source_generation, n.source_offset, n.source_line_no, n.emission_index, n.event_uid, n.event_version
 LIMIT {NAVIGATION_PAGE_SIZE}
@@ -426,7 +432,7 @@ FORMAT JSONEachRow",
                 .iter()
                 .map(|row| row.event_uid.clone())
                 .collect::<Vec<_>>();
-            let current = self.current_version_rows(&uids).await?;
+            let current = self.current_version_rows(session_id, &uids).await?;
             let rows = candidates.into_iter().filter(|candidate| {
                 current
                     .get(&candidate.event_uid)
@@ -603,13 +609,18 @@ FORMAT JSONEachRow",
         &self,
         session_id: &str,
     ) -> RepoResult<Option<CanonicalSessionSignals>> {
-        let signals = self.table_ref("mcp_session_mutation_signals");
+        let events = self.live_events_source();
         let sql = format!(
-            "SELECT
-  toUInt64(uniqExactMerge(unique_versions)) AS unique_versions,
-  toUInt64(sumDistinctMerge(fingerprint_a)) AS fingerprint_a,
-  toUInt64(sumDistinctMerge(fingerprint_b)) AS fingerprint_b
-FROM {signals}
+            "WITH
+  ifNull(parseDateTime64BestEffortOrNull(record_ts), toDateTime64('1970-01-01 00:00:00', 3)) AS sort_time,
+  toUInt32(JSONExtractUInt(payload_json, 'moraine_emission_index')) AS emission_index,
+  cityHash64(event_uid, event_version, sort_time, source_file, source_generation, source_offset, source_line_no, emission_index) AS row_hash_a,
+  sipHash64(event_uid, event_version, sort_time, source_file, source_generation, source_offset, source_line_no, emission_index) AS row_hash_b
+SELECT
+  toUInt64(uniqExact(row_hash_a)) AS unique_versions,
+  toUInt64(sumDistinct(row_hash_a)) AS fingerprint_a,
+  toUInt64(sumDistinct(row_hash_b)) AS fingerprint_b
+FROM {events}
 WHERE session_id = {}
 GROUP BY session_id
 FORMAT JSONEachRow",
@@ -629,7 +640,7 @@ FORMAT JSONEachRow",
         after: &CanonicalReadAnchor,
         row_limit: usize,
     ) -> RepoResult<Vec<SeekRow>> {
-        let seek = self.table_ref("mcp_event_navigation_seek");
+        let seek = self.table_ref("v_live_mcp_event_navigation_seek");
         let sql = format!(
             "SELECT
   s.session_id AS session_id, toString(s.sort_time) AS sort_time,
@@ -672,7 +683,7 @@ FORMAT JSONEachRow",
         after_turn_seq: u32,
         turn_limit: u16,
     ) -> RepoResult<Vec<SeekRow>> {
-        let seek = self.table_ref("mcp_event_turn_seek");
+        let seek = self.table_ref("v_live_mcp_event_turn_seek");
         let turn_limit_plus_one = usize::from(turn_limit).saturating_add(1);
         let sql = format!(
             "SELECT
@@ -714,7 +725,7 @@ FORMAT JSONEachRow",
         after: &CanonicalReadAnchor,
         limit: u16,
     ) -> RepoResult<Vec<SeekRow>> {
-        let seek = self.table_ref("mcp_event_turn_seek");
+        let seek = self.table_ref("v_live_mcp_event_turn_seek");
         let row_limit = usize::from(limit).saturating_add(1);
         let sql = format!(
             "SELECT
@@ -842,9 +853,10 @@ FORMAT JSONEachRow",
 
     async fn current_version_rows(
         &self,
+        session_id: &str,
         uids: &[String],
     ) -> RepoResult<StdHashMap<String, VersionRow>> {
-        let versions = self.table_ref("mcp_event_version_seek");
+        let versions = self.table_ref("v_live_mcp_event_version_seek");
         let sql = format!(
             "SELECT
   event_uid, toUInt64(event_version) AS event_version, session_id,
@@ -853,9 +865,10 @@ FORMAT JSONEachRow",
   toUInt64(source_offset) AS source_offset, toUInt64(source_line_no) AS source_line_no,
   toUInt32(emission_index) AS emission_index
 FROM {versions}
-WHERE event_uid IN {}
+WHERE session_id = {} AND event_uid IN {}
 ORDER BY event_uid, event_version
 FORMAT JSONEachRow",
+            sql_quote(session_id),
             sql_array_strings(uids),
         );
         let current: Vec<VersionRow> = self.map_backend(self.query_rows(&sql, None).await)?;
@@ -877,7 +890,7 @@ FORMAT JSONEachRow",
             .iter()
             .map(|row| row.event_uid.clone())
             .collect::<Vec<_>>();
-        let by_uid = self.current_version_rows(&uids).await?;
+        let by_uid = self.current_version_rows(session_id, &uids).await?;
         let mut rows = candidates
             .into_iter()
             .filter_map(|candidate| {
@@ -1105,7 +1118,7 @@ FORMAT JSONEachRow",
         limit: u16,
         after: Option<CanonicalContinuation>,
     ) -> RepoResult<Option<CanonicalReadOutcome<CanonicalSessionPage>>> {
-        if !self.session_in_scope(session_id).await? {
+        if !self.session_in_scope(None, session_id).await? {
             return Ok(None);
         }
         if let Some(cursor) = after.as_ref() {
@@ -1469,7 +1482,7 @@ FORMAT JSONEachRow",
         limit: u16,
         after: Option<CanonicalContinuation>,
     ) -> RepoResult<Option<CanonicalReadOutcome<CanonicalTurnPage>>> {
-        if !self.session_in_scope(session_id).await? {
+        if !self.session_in_scope(None, session_id).await? {
             return Ok(None);
         }
         if let Some(cursor) = after.as_ref() {
@@ -1671,7 +1684,7 @@ FORMAT JSONEachRow",
     ) -> RepoResult<StdHashMap<String, HydratedRow>> {
         event_keys.sort_unstable();
         event_keys.dedup();
-        let events = self.table_ref("events");
+        let events = self.live_events_source();
         let mut hydrated = StdHashMap::with_capacity(event_keys.len());
         for chunk in event_keys.chunks(HYDRATION_BATCH_SIZE) {
             if chunk.is_empty() {
@@ -1691,8 +1704,8 @@ FORMAT JSONEachRow",
                 "SELECT event_uid, source_ref, text_content, payload_json, token_usage_json,
   endpoint_kind, token_usage_buckets, token_usage_native_units
 FROM {events}
-PREWHERE session_id = {} AND event_uid IN {}
-WHERE event_ts >= fromUnixTimestamp64Milli({})
+WHERE session_id = {} AND event_uid IN {}
+  AND event_ts >= fromUnixTimestamp64Milli({})
   AND event_ts <= fromUnixTimestamp64Milli({})
   AND (event_uid, event_version) IN ({})
 FORMAT JSONEachRow",

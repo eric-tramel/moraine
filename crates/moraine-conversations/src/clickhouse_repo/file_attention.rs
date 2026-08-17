@@ -5,21 +5,21 @@ const FILE_ATTENTION_READ_TOOL_NAMES_SQL: &str =
 
 impl ClickHouseConversationRepository {
     fn tool_events_source(&self, rel: &str, use_candidate_index: bool) -> String {
-        let events_ref = self.table_ref("events");
+        let events_ref = self.live_events_source();
         let events = if use_candidate_index {
-            let locator = self.table_ref("mcp_event_locator");
+            let locator = self.table_ref("v_live_mcp_event_locator");
             let rel_sql = sql_quote(rel);
             let slash_rel_sql = sql_quote(&format!("/{rel}"));
             format!(
-                "(SELECT * FROM {events_ref} FINAL
+                "(SELECT * FROM {events_ref}
 WHERE (session_id, event_uid) IN (
   SELECT session_id, event_uid
-  FROM {locator} FINAL
+  FROM {locator}
   WHERE arrayExists(path -> path = {rel_sql} OR endsWith(path, {slash_rel_sql}), path_tokens)
 ))"
             )
         } else {
-            canonical_events_source(&events_ref)
+            events_ref
         };
         let event_scope_columns = if use_candidate_index {
             ",
@@ -50,8 +50,8 @@ WHERE JSONHas(e.payload_json, 'moraine_tool_io'))"
     }
 
     fn file_attention_navigation_source(&self, candidate_predicate: &str) -> String {
-        let locator = self.table_ref("mcp_event_locator");
-        let navigation = self.table_ref("mcp_event_navigation");
+        let locator = self.table_ref("v_live_mcp_event_locator");
+        let navigation = self.table_ref("v_live_mcp_event_navigation");
         format!(
             "(SELECT
   session_id,
@@ -74,22 +74,15 @@ FROM (
       ORDER BY sort_time, source_file, source_generation, source_offset, source_line_no, emission_index, event_uid
       ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
     ) AS running_user_count
-  FROM {navigation} FINAL
+  FROM {navigation}
   WHERE session_id IN (
-    SELECT session_id FROM {locator} FINAL WHERE {candidate_predicate}
+    SELECT session_id FROM {locator} WHERE {candidate_predicate}
   )
 )
 WHERE (session_id, event_uid) IN (
-  SELECT session_id, event_uid FROM {locator} FINAL WHERE {candidate_predicate}
+  SELECT session_id, event_uid FROM {locator} WHERE {candidate_predicate}
 ))"
         )
-    }
-
-    pub async fn file_attention(
-        &self,
-        query: FileAttentionQuery,
-    ) -> RepoResult<Vec<FileAttentionTouch>> {
-        self.file_attention_impl(query).await
     }
 
     /// Tier-0 file-attention query: every captured tool call whose input path
@@ -189,8 +182,8 @@ WHERE (session_id, event_uid) IN (
     ) -> RepoResult<Vec<FileAttentionTouch>> {
         let rel = query.rel.as_str();
 
-        let locator = self.table_ref("mcp_event_locator");
-        let events = self.table_ref("events");
+        let locator = self.table_ref("v_live_mcp_event_locator");
+        let events = self.live_events_source();
         let rel_sql = sql_quote(rel);
         let project_predicate = if query.apply_project_scope {
             let project_id = query
@@ -225,7 +218,7 @@ WHERE (session_id, event_uid) IN (
                 "lowerUTF8(e.tool_name) NOT IN ({FILE_ATTENTION_READ_TOOL_NAMES_SQL})"
             ));
         }
-        if let Some(scope_clause) = self.session_scope_clause("e.session_id") {
+        if let Some(scope_clause) = self.session_scope_clause("e.source_host", "e.session_id") {
             inner_clauses.push(scope_clause);
         }
         let match_predicate = inner_clauses.join("\n      AND ");
@@ -254,7 +247,7 @@ WHERE (session_id, event_uid) IN (
         let sql = format!(
             "WITH matched_ids AS (
     SELECT session_id, event_uid, project_id, repo_rel_path, worktree_root
-    FROM {locator} FINAL
+    FROM {locator}
     WHERE {project_predicate}
       AND repo_rel_path = {rel_sql}
   ),
@@ -273,10 +266,10 @@ WHERE (session_id, event_uid) IN (
       mi.worktree_root AS worktree_root,
       e.cwd AS cwd
     FROM (
-      SELECT * FROM {events} FINAL
+      SELECT * FROM {events}
       WHERE (session_id, event_uid) IN (
         SELECT session_id, event_uid
-        FROM {locator} FINAL
+        FROM {locator}
         WHERE {exact_candidate_predicate}
       )
     ) AS e
@@ -446,7 +439,7 @@ WHERE (session_id, event_uid) IN (SELECT session_id, event_uid FROM matched))"
                 "lowerUTF8(tool_name) NOT IN ({FILE_ATTENTION_READ_TOOL_NAMES_SQL})"
             ));
         }
-        if let Some(scope_clause) = self.session_scope_clause("session_id") {
+        if let Some(scope_clause) = self.session_scope_clause("source_host", "session_id") {
             inner_clauses.push(scope_clause);
         }
         let match_predicate = inner_clauses.join("\n      AND ");

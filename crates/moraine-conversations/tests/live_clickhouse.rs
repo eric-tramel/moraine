@@ -20,6 +20,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
+#[path = "live_clickhouse/source_publication.rs"]
+mod source_publication;
 #[path = "live_clickhouse/support.rs"]
 mod support;
 

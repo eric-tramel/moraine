@@ -117,7 +117,10 @@ assert_monitor_api_alias() {
   local canonical_status
   local legacy_status
   # Deliberately omit --location: compatibility aliases must respond directly,
-  # not pass by redirecting curl to the canonical route.
+  # not pass by redirecting curl to the canonical route. Retry each endpoint's
+  # transient read-model transitions before comparing direct responses.
+  wait_for_endpoint_ok "$python_bin" "${base_url}${canonical_path}" 90
+  wait_for_endpoint_ok "$python_bin" "${base_url}${legacy_path}" 90
   if ! canonical_status="$(curl -sS --max-time 30 -o "$canonical_body_file" -w '%{http_code}' -- "${base_url}${canonical_path}")"; then
     echo "[e2e] canonical monitor request failed: ${canonical_path}" >&2
     rm -f "$canonical_body_file" "$legacy_body_file"
@@ -180,6 +183,31 @@ wait_for_endpoint_ok() {
   done
 }
 
+read_endpoint_ok() {
+  local python_bin="$1"
+  local url="$2"
+  local timeout_seconds="${3:-90}"
+  local started
+  started="$(date +%s)"
+
+  while true; do
+    local now
+    now="$(date +%s)"
+    if (( now - started >= timeout_seconds )); then
+      echo "timed out reading successful endpoint: $url" >&2
+      return 1
+    fi
+
+    local body=""
+    if body="$(curl -sS --max-time 30 "$url" 2>/dev/null)" &&
+      printf '%s' "$body" | json_ok_true "$python_bin"; then
+      printf '%s' "$body"
+      return 0
+    fi
+    sleep 1
+  done
+}
+
 wait_for_clickhouse_count() {
   local clickhouse_url="$1"
   local query="$2"
@@ -232,7 +260,10 @@ wait_for_clickhouse_scalar_stable() {
 
     local actual
     actual="$(clickhouse_scalar "$clickhouse_url" "$query" 2>/dev/null || true)"
-    if [[ -n "$actual" && "$actual" == "$previous" ]]; then
+    if [[ -z "$actual" ]]; then
+      previous=""
+      stable_observations=0
+    elif [[ "$actual" == "$previous" ]]; then
       stable_observations=$((stable_observations + 1))
     else
       previous="$actual"
@@ -1814,6 +1845,12 @@ EOF
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE positionCaseInsensitiveUTF8(text_content, '${nac_keyword}') > 0" 120
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.search_postings WHERE term = '${nac_keyword}'" 120
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-nac' AND tool_call_id = '${nac_tool_call_id}'" 120
+  wait_for_clickhouse_count "$clickhouse_url" "SELECT toUInt64(JSONExtractBool(progress_json, 'discovery_complete') AND JSONExtractUInt(progress_json, 'files_total') > 0 AND JSONExtractUInt(progress_json, 'files_completed') = JSONExtractUInt(progress_json, 'files_total') AND JSONExtractUInt(progress_json, 'sink_pending_rows') = 0 AND JSONExtractUInt(progress_json, 'oldest_pending_unix_ms') = 0 AND NOT JSONExtractBool(progress_json, 'sink_retrying')) FROM ${clickhouse_database}.ingest_heartbeats ORDER BY ts DESC LIMIT 1" 120
+  echo "[e2e] waiting for atomic source publication to reach a fixed point"
+  wait_for_clickhouse_count "$clickhouse_url" "SELECT toUInt64((SELECT count() FROM ${clickhouse_database}.v_current_published_source_generations WHERE source_host = '') = (SELECT count() FROM ${clickhouse_database}.ingest_checkpoints FINAL WHERE host = ''))" 120
+  wait_for_clickhouse_scalar_stable "$clickhouse_url" "SELECT concat(toString(count()), ':', toString(max(publication_revision))) FROM ${clickhouse_database}.v_current_published_source_generations WHERE source_host = ''" 120 3 >/dev/null
+  wait_for_clickhouse_count "$clickhouse_url" "SELECT toUInt64(count() > 0 AND countIf(state != 'idle') = 0) FROM ${clickhouse_database}.v_current_ingest_append_control WHERE host = ''" 120
+  wait_for_clickhouse_scalar_stable "$clickhouse_url" "SELECT concat(toString(control_revision), ':', toString(cache_epoch), ':', state) FROM ${clickhouse_database}.v_current_ingest_append_control WHERE host = ''" 120 3 >/dev/null
 
   echo "[e2e] checking concurrent clients through shared HTTP MCP endpoint"
   "$python_bin" "$repo_root/scripts/ci/mcp_http_smoke.py" \
@@ -1900,20 +1937,23 @@ PY
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.ingest_checkpoints FINAL WHERE source_name = 'ci-claude' AND source_generation = 2" 120
   local claude_raw_coordinates_after_replay=$((claude_raw_coordinates_before + 3))
   wait_for_clickhouse_count "$clickhouse_url" "SELECT uniqExact(tuple(source_generation, source_line_no, source_offset, raw_json_hash)) = ${claude_raw_coordinates_after_replay} FROM ${clickhouse_database}.raw_events WHERE source_name = 'ci-claude'" 120
-  assert_clickhouse_scalar "$clickhouse_url" "claude replay keeps canonical UID set stable" "SELECT arrayStringConcat(arraySort(groupUniqArray(event_uid)), ',') FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-claude'" "$claude_uids_before"
-  assert_clickhouse_scalar "$clickhouse_url" "claude replay keeps derived document set stable" "SELECT uniqExact(doc_id) FROM ${clickhouse_database}.search_postings FINAL WHERE source_name = 'ci-claude'" "$claude_docs_before"
+  assert_clickhouse_scalar "$clickhouse_url" "claude replay keeps canonical UID set stable" "SELECT arrayStringConcat(arraySort(groupUniqArray(event_uid)), ',') FROM ${clickhouse_database}.v_live_events WHERE source_name = 'ci-claude'" "$claude_uids_before"
+  assert_clickhouse_scalar "$clickhouse_url" "claude replay keeps derived document set stable" "SELECT uniqExact(doc_id) FROM ${clickhouse_database}.v_live_search_postings WHERE source_name = 'ci-claude'" "$claude_docs_before"
   assert_clickhouse_scalar "$clickhouse_url" "claude replay advances raw audit coordinates" "SELECT uniqExact(tuple(source_generation, source_line_no, source_offset, raw_json_hash)) FROM ${clickhouse_database}.raw_events WHERE source_name = 'ci-claude'" "$claude_raw_coordinates_after_replay"
 
+  local same_generation_append_heartbeat_before
+  same_generation_append_heartbeat_before="$(clickhouse_scalar "$clickhouse_url" "SELECT toUnixTimestamp64Milli(max(ts)) FROM ${clickhouse_database}.ingest_heartbeats")"
   cat >> "$claude_fixture_file" <<EOF
 {"type":"user","sessionId":"${claude_session_id}","uuid":"claude-semantic-change-${run_stamp}","cwd":"${claude_project_dir}","parentUuid":"claude-tool-result-${run_stamp}","timestamp":"2026-02-16T12:00:06.000Z","message":{"role":"user","content":[{"type":"text","text":"semantic change ${claude_semantic_change_keyword}"}]}}
 EOF
-  wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-claude' AND position(text_content, '${claude_semantic_change_keyword}') > 0" 120
+  wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.v_live_events WHERE source_name = 'ci-claude' AND position(text_content, '${claude_semantic_change_keyword}') > 0" 120
+  wait_for_clickhouse_count "$clickhouse_url" "SELECT toUInt64(max(toUnixTimestamp64Milli(ts)) > ${same_generation_append_heartbeat_before} AND argMax(append_to_visible_p95_ms, ts) <= 2000) FROM ${clickhouse_database}.ingest_heartbeats" 120
   local claude_docs_after_change=$((claude_docs_before + 1))
-  wait_for_clickhouse_count "$clickhouse_url" "SELECT uniqExact(doc_id) = ${claude_docs_after_change} FROM ${clickhouse_database}.search_postings FINAL WHERE source_name = 'ci-claude'" 120
-  assert_clickhouse_count "$clickhouse_url" "claude semantic change appends one event" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-claude'" "6"
-  assert_clickhouse_scalar "$clickhouse_url" "claude replay preserves old term documents" "SELECT uniqExact(doc_id) FROM ${clickhouse_database}.search_postings FINAL WHERE source_name = 'ci-claude' AND term = '${claude_keyword}'" "$claude_keyword_docs_before"
-  assert_clickhouse_count "$clickhouse_url" "claude semantic change owns one new term document" "SELECT uniqExact(doc_id) FROM ${clickhouse_database}.search_postings FINAL WHERE source_name = 'ci-claude' AND term = '${claude_semantic_change_keyword}'" "1"
-  assert_clickhouse_count "$clickhouse_url" "claude old and changed terms remain on distinct events" "SELECT count() FROM (SELECT doc_id FROM ${clickhouse_database}.search_postings FINAL WHERE source_name = 'ci-claude' AND term IN ('${claude_keyword}', '${claude_semantic_change_keyword}') GROUP BY doc_id HAVING uniqExact(term) = 2)" "0"
+  wait_for_clickhouse_count "$clickhouse_url" "SELECT uniqExact(doc_id) = ${claude_docs_after_change} FROM ${clickhouse_database}.v_live_search_postings WHERE source_name = 'ci-claude'" 120
+  assert_clickhouse_count "$clickhouse_url" "claude semantic change appends one event" "SELECT count() FROM ${clickhouse_database}.v_live_events WHERE source_name = 'ci-claude'" "6"
+  assert_clickhouse_scalar "$clickhouse_url" "claude replay preserves old term documents" "SELECT uniqExact(doc_id) FROM ${clickhouse_database}.v_live_search_postings WHERE source_name = 'ci-claude' AND term = '${claude_keyword}'" "$claude_keyword_docs_before"
+  assert_clickhouse_count "$clickhouse_url" "claude semantic change owns one new term document" "SELECT uniqExact(doc_id) FROM ${clickhouse_database}.v_live_search_postings WHERE source_name = 'ci-claude' AND term = '${claude_semantic_change_keyword}'" "1"
+  assert_clickhouse_count "$clickhouse_url" "claude old and changed terms remain on distinct events" "SELECT count() FROM (SELECT doc_id FROM ${clickhouse_database}.v_live_search_postings WHERE source_name = 'ci-claude' AND term IN ('${claude_keyword}', '${claude_semantic_change_keyword}') GROUP BY doc_id HAVING uniqExact(term) = 2)" "0"
 
   assert_clickhouse_count "$clickhouse_url" "kimi unique raw rows" "SELECT uniqExact(raw_json_hash) FROM ${clickhouse_database}.raw_events WHERE source_name = 'ci-kimi'" "8"
   assert_clickhouse_count "$clickhouse_url" "kimi event rows" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-kimi'" "7"
@@ -1976,7 +2016,8 @@ EOF
 
   wait_for_clickhouse_count "$clickhouse_url" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-kiro' AND event_kind = 'session_meta' AND JSONExtractString(payload_json, 'title') = '${kiro_updated_session_title}' AND input_tokens = 31 AND output_tokens = 13 AND token_usage_native_units['credits'] = 1.25" 120
   assert_clickhouse_count "$clickhouse_url" "kiro unique raw rows after sidecar update" "SELECT uniqExact(raw_json_hash) FROM ${clickhouse_database}.raw_events WHERE source_name = 'ci-kiro'" "7"
-  assert_clickhouse_count "$clickhouse_url" "kiro event rows after sidecar update" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-kiro'" "9"
+  assert_clickhouse_count "$clickhouse_url" "kiro physical generation rows after sidecar replay" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-kiro'" "16"
+  assert_clickhouse_count "$clickhouse_url" "kiro live rows after sidecar replay" "SELECT count() FROM ${clickhouse_database}.v_live_events WHERE source_name = 'ci-kiro'" "8"
   assert_clickhouse_count "$clickhouse_url" "kiro session_meta archives changed metadata" "SELECT count() FROM ${clickhouse_database}.events FINAL WHERE source_name = 'ci-kiro' AND event_kind = 'session_meta'" "2"
   assert_clickhouse_count "$clickhouse_url" "Kiro ingest errors after sidecar update" "SELECT count() FROM ${clickhouse_database}.ingest_errors WHERE source_name = 'ci-kiro'" "0"
 
@@ -2240,6 +2281,11 @@ PY
     return 1
   fi
 
+  # Mutation assertions may observe durable table rows before the append epoch
+  # commits. API reads begin only after the publication fence is quiescent.
+  wait_for_clickhouse_count "$clickhouse_url" "SELECT toUInt64(count() > 0 AND countIf(state != 'idle') = 0) FROM ${clickhouse_database}.v_current_ingest_append_control WHERE host = ''" 120
+  wait_for_clickhouse_scalar_stable "$clickhouse_url" "SELECT concat(toString(control_revision), ':', toString(cache_epoch), ':', state) FROM ${clickhouse_database}.v_current_ingest_append_control WHERE host = ''" 120 3 >/dev/null
+
   # Run-scoped lower bound for the final owner-ID acceptance query. This
   # direct observer query uses curl's User-Agent and is excluded below.
   local ownership_query_log_start
@@ -2256,7 +2302,7 @@ PY
     "/api/v1/tables/v_conversation_trace?limit=500" \
     "/api/v1/sessions?since=all&limit=200"; do
     local body
-    body="$(curl -fsS "http://127.0.0.1:${monitor_port}${path}")"
+    body="$(read_endpoint_ok "$python_bin" "http://127.0.0.1:${monitor_port}${path}" 90)"
     printf '%s' "$body" | json_ok_true "$python_bin"
   done
 
@@ -2267,7 +2313,7 @@ PY
   expected_server_version="$("$moraine_bin" --version)"
   expected_server_version="${expected_server_version##* }"
   local capabilities_body
-  capabilities_body="$(curl -fsS "http://127.0.0.1:${monitor_port}/api/v1/capabilities")"
+  capabilities_body="$(read_endpoint_ok "$python_bin" "http://127.0.0.1:${monitor_port}/api/v1/capabilities" 90)"
   printf '%s' "$capabilities_body" | "$python_bin" -c '
 import json
 import sys
@@ -2324,7 +2370,7 @@ if not valid:
     "/api/sessions?since=all&limit=200"
 
   local sessions_body
-  sessions_body="$(curl -fsS "http://127.0.0.1:${monitor_port}/api/v1/sessions?since=all&limit=200")"
+  sessions_body="$(read_endpoint_ok "$python_bin" "http://127.0.0.1:${monitor_port}/api/v1/sessions?since=all&limit=200" 90)"
   printf '%s' "$sessions_body" | "$python_bin" -c 'import json,sys; data=json.load(sys.stdin); sid=sys.argv[1]; ok=any(s.get("id")==sid and s.get("harness",{}).get("id")=="cursor" for s in data.get("sessions", [])); sys.exit(0 if ok else 1)' "$cursor_session_id"
   printf '%s' "$sessions_body" | "$python_bin" -c 'import json,sys; data=json.load(sys.stdin); sid=sys.argv[1]; ok=any(s.get("id")==sid and s.get("harness",{}).get("id")=="pi-coding-agent" for s in data.get("sessions", [])); sys.exit(0 if ok else 1)' "$pi_session_id"
   printf '%s' "$sessions_body" | "$python_bin" -c 'import json,sys; data=json.load(sys.stdin); sid=sys.argv[1]; ok=any(s.get("id")==sid and s.get("harness",{}).get("id")=="kiro-cli" for s in data.get("sessions", [])); sys.exit(0 if ok else 1)' "$kiro_session_id"
@@ -2428,6 +2474,9 @@ PY
     --file-attention-expect-absent-session-id "$codex_nested_path_session_id" \
     --write-tools-snapshot "$daemon_tools_snapshot"
 
+  echo "[e2e] checking shared-daemon MCP cache miss -> hit markers"
+  wait_for_mcp_cache_sequence "$python_bin" "$backend_log" "$cache_log_baseline" 20
+
   echo "[e2e] checking second fresh stdio MCP process (identical codex cache hit)"
   "$python_bin" "$repo_root/scripts/ci/mcp_smoke.py" \
     --moraine "$moraine_bin" \
@@ -2446,8 +2495,6 @@ PY
     --file-attention-expect-absent-session-id "$codex_nested_path_session_id" \
     --write-tools-snapshot "$daemon_tools_snapshot"
 
-  echo "[e2e] checking shared-daemon MCP cache miss -> hit markers"
-  wait_for_mcp_cache_sequence "$python_bin" "$backend_log" "$cache_log_baseline" 20
 
   local routed_cache_log_baseline
   routed_cache_log_baseline="$("$python_bin" - "$backend_log" <<'PY'
@@ -2469,6 +2516,52 @@ PY
     --expect-open-text "$claude_trace_marker" \
     --file-attention-path "Cargo.toml"
 
+  # The complete smoke performs several expensive open/list checks after its
+  # search, so a 15-second result TTL can expire before a second full smoke.
+  # Exercise the routed cache itself with two immediate, uniquely keyed calls.
+  "$python_bin" - \
+    "http://127.0.0.1:${monitor_port}/mcp" \
+    "$claude_project_dir" \
+    "${claude_keyword} cache-probe-${run_stamp}" <<'PY'
+import json
+import sys
+import urllib.request
+
+url, project_dir, query = sys.argv[1:]
+headers = {
+    "Accept": "application/json, text/event-stream",
+    "Content-Type": "application/json",
+    "MCP-Protocol-Version": "2025-06-18",
+    "Origin": "http://127.0.0.1",
+    "X-Moraine-Project-Dir": project_dir,
+}
+
+def post(payload):
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload, separators=(",", ":")).encode(),
+        headers=headers,
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        return response.status, response.read()
+
+for request_id in (1, 2):
+    status, body = post({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": "tools/call",
+        "params": {
+            "name": "search_sessions",
+            "arguments": {"query": query, "n_hits": 3},
+        },
+    })
+    payload = json.loads(body)
+    if status != 200 or payload.get("result", {}).get("isError") is not False:
+        raise SystemExit(f"routed cache probe failed: status={status}, payload={payload!r}")
+PY
+  wait_for_mcp_cache_sequence "$python_bin" "$backend_log" "$routed_cache_log_baseline" 20
+
   echo "[e2e] checking named-backend HTTP route through shared daemon router"
   routed_sessions_body="$(curl -fsS \
     -H "X-Moraine-Project-Dir: ${claude_project_dir}" \
@@ -2488,7 +2581,6 @@ PY
     --expect-session-id "$claude_session_id" \
     --expect-open-text "$claude_trace_marker" \
     --file-attention-path "Cargo.toml"
-  wait_for_mcp_cache_sequence "$python_bin" "$backend_log" "$routed_cache_log_baseline" 20
 
   echo "[e2e] checking named route excludes default-only content"
   "$python_bin" "$repo_root/scripts/ci/mcp_smoke.py" \
@@ -2566,7 +2658,7 @@ PY
     --query "$kiro_keyword" \
     --expect-session-id "$kiro_session_id" \
     --expect-open-text "$kiro_trace_marker" \
-    --expect-event-count "9" \
+    --expect-event-count "8" \
     --file-attention-path "/workspace/kiro-e2e.txt"
 
   echo "[e2e] checking MCP initialize/tools/search_sessions/open/list_sessions (cursor)"

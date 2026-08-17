@@ -457,6 +457,8 @@
           "linked_external_id": "qwen-u1",
           "metadata_json": "{}",
           "session_id": "qwen-session-001",
+          "source_file": "/fixtures/qwen-code/session.jsonl",
+          "source_generation": 1,
           "source_name": "golden-qwen-code"
         },
         {
@@ -469,6 +471,8 @@
           "linked_external_id": "qwen-u1",
           "metadata_json": "{}",
           "session_id": "qwen-session-001",
+          "source_file": "/fixtures/qwen-code/session.jsonl",
+          "source_generation": 1,
           "source_name": "golden-qwen-code"
         },
         {
@@ -481,6 +485,8 @@
           "linked_external_id": "qwen-u1",
           "metadata_json": "{}",
           "session_id": "qwen-session-001",
+          "source_file": "/fixtures/qwen-code/session.jsonl",
+          "source_generation": 1,
           "source_name": "golden-qwen-code"
         },
         {
@@ -493,6 +499,8 @@
           "linked_external_id": "qwen-u1",
           "metadata_json": "{}",
           "session_id": "qwen-session-001",
+          "source_file": "/fixtures/qwen-code/session.jsonl",
+          "source_generation": 1,
           "source_name": "golden-qwen-code"
         }
       ],
@@ -643,6 +651,8 @@
           "linked_external_id": "qwen-a1",
           "metadata_json": "{}",
           "session_id": "qwen-session-001",
+          "source_file": "/fixtures/qwen-code/session.jsonl",
+          "source_generation": 1,
           "source_name": "golden-qwen-code"
         }
       ],
@@ -875,6 +885,8 @@
           "linked_external_id": "qwen-r1",
           "metadata_json": "{}",
           "session_id": "qwen-session-001",
+          "source_file": "/fixtures/qwen-code/session.jsonl",
+          "source_generation": 1,
           "source_name": "golden-qwen-code"
         },
         {
@@ -887,6 +899,8 @@
           "linked_external_id": "qwen-r1",
           "metadata_json": "{}",
           "session_id": "qwen-session-001",
+          "source_file": "/fixtures/qwen-code/session.jsonl",
+          "source_generation": 1,
           "source_name": "golden-qwen-code"
         }
       ],
@@ -1037,6 +1051,8 @@
           "linked_external_id": "qwen-a2",
           "metadata_json": "{}",
           "session_id": "qwen-session-001",
+          "source_file": "/fixtures/qwen-code/session.jsonl",
+          "source_generation": 1,
           "source_name": "golden-qwen-code"
         }
       ],
@@ -1187,6 +1203,8 @@
           "linked_external_id": "qwen-r2",
           "metadata_json": "{}",
           "session_id": "qwen-session-001",
+          "source_file": "/fixtures/qwen-code/session.jsonl",
+          "source_generation": 1,
           "source_name": "golden-qwen-code"
         }
       ],
@@ -1337,6 +1355,8 @@
           "linked_external_id": "qwen-a3",
           "metadata_json": "{}",
           "session_id": "qwen-session-001",
+          "source_file": "/fixtures/qwen-code/session.jsonl",
+          "source_generation": 1,
           "source_name": "golden-qwen-code"
         }
       ],
@@ -1485,6 +1505,8 @@
           "linked_external_id": "qwen-r3",
           "metadata_json": "{}",
           "session_id": "qwen-session-001",
+          "source_file": "/fixtures/qwen-code/session.jsonl",
+          "source_generation": 1,
           "source_name": "golden-qwen-code"
         }
       ],
@@ -1607,6 +1629,8 @@
           "linked_external_id": "qwen-title",
           "metadata_json": "{}",
           "session_id": "qwen-session-001",
+          "source_file": "/fixtures/qwen-code/session.jsonl",
+          "source_generation": 1,
           "source_name": "golden-qwen-code"
         }
       ],
@@ -1731,6 +1755,8 @@
           "linked_external_id": "qwen-compression",
           "metadata_json": "{}",
           "session_id": "qwen-session-001",
+          "source_file": "/fixtures/qwen-code/session.jsonl",
+          "source_generation": 1,
           "source_name": "golden-qwen-code"
         }
       ],
@@ -1855,6 +1881,8 @@
           "linked_external_id": "qwen-notification",
           "metadata_json": "{}",
           "session_id": "qwen-session-001",
+          "source_file": "/fixtures/qwen-code/session.jsonl",
+          "source_generation": 1,
           "source_name": "golden-qwen-code"
         }
       ],
@@ -1979,6 +2007,8 @@
           "linked_external_id": "qwen-cron",
           "metadata_json": "{}",
           "session_id": "qwen-session-001",
+          "source_file": "/fixtures/qwen-code/session.jsonl",
+          "source_generation": 1,
           "source_name": "golden-qwen-code"
         }
       ],
@@ -2103,6 +2133,8 @@
           "linked_external_id": "qwen-midturn",
           "metadata_json": "{}",
           "session_id": "qwen-session-001",
+          "source_file": "/fixtures/qwen-code/session.jsonl",
+          "source_generation": 1,
           "source_name": "golden-qwen-code"
         }
       ],
@@ -2225,6 +2257,8 @@
           "linked_external_id": "qwen-a1",
           "metadata_json": "{}",
           "session_id": "qwen-session-001",
+          "source_file": "/fixtures/qwen-code/session.jsonl",
+          "source_generation": 1,
           "source_name": "golden-qwen-code"
         }
       ],
@@ -2349,6 +2383,8 @@
           "linked_external_id": "qwen-rewind",
           "metadata_json": "{}",
           "session_id": "qwen-session-001",
+          "source_file": "/fixtures/qwen-code/session.jsonl",
+          "source_generation": 1,
           "source_name": "golden-qwen-code"
         }
       ],
@@ -2473,6 +2509,8 @@
           "linked_external_id": "qwen-replacement-u",
           "metadata_json": "{}",
           "session_id": "qwen-session-001",
+          "source_file": "/fixtures/qwen-code/session.jsonl",
+          "source_generation": 1,
           "source_name": "golden-qwen-code"
         }
       ],
@@ -2723,6 +2761,8 @@
           "linked_external_id": "qwen-replacement-a",
           "metadata_json": "{}",
           "session_id": "qwen-session-001",
+          "source_file": "/fixtures/qwen-code/session.jsonl",
+          "source_generation": 1,
           "source_name": "golden-qwen-code"
         }
       ],

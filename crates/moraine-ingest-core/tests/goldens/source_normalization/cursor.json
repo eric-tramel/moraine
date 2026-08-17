@@ -293,6 +293,8 @@
           "linked_external_id": "/workspace/src/main.rs",
           "metadata_json": "{\"field_path\":\"$.input.path\",\"reference_kind\":\"file\",\"references\":[{\"field_path\":\"$.input.path\",\"reference_kind\":\"file\",\"target\":\"/workspace/src/main.rs\"},{\"field_path\":\"$.input.range\",\"reference_kind\":\"code\",\"target\":\"1:1-20:1\"},{\"field_path\":\"$.input.symbol\",\"reference_kind\":\"code\",\"target\":\"main\"}],\"source\":\"cursor\"}",
           "session_id": "11111111-2222-4333-8444-555555555555",
+          "source_file": "/fixtures/cursor/projects/demo/agent-transcripts/11111111-2222-4333-8444-555555555555/11111111-2222-4333-8444-555555555555.jsonl",
+          "source_generation": 1,
           "source_name": "golden-cursor"
         }
       ],

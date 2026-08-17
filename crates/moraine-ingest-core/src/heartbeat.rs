@@ -1,3 +1,5 @@
+/// Human-readable diagnostic label only. Publication and shared-checkpoint
+/// authority comes from the durable `PublicationIdentity`, never this value.
 pub(crate) fn host_name() -> String {
     std::env::var("HOSTNAME")
         .ok()

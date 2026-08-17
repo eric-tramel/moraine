@@ -373,6 +373,8 @@
           "linked_external_id": "user-1",
           "metadata_json": "{}",
           "session_id": "7c666c01-d38e-4658-8650-854ffb5b626e",
+          "source_file": "/fixtures/claude-code/session.jsonl",
+          "source_generation": 1,
           "source_name": "golden-claude-code"
         },
         {
@@ -385,6 +387,8 @@
           "linked_external_id": "user-1",
           "metadata_json": "{}",
           "session_id": "7c666c01-d38e-4658-8650-854ffb5b626e",
+          "source_file": "/fixtures/claude-code/session.jsonl",
+          "source_generation": 1,
           "source_name": "golden-claude-code"
         },
         {
@@ -397,6 +401,8 @@
           "linked_external_id": "user-1",
           "metadata_json": "{}",
           "session_id": "7c666c01-d38e-4658-8650-854ffb5b626e",
+          "source_file": "/fixtures/claude-code/session.jsonl",
+          "source_generation": 1,
           "source_name": "golden-claude-code"
         }
       ],
@@ -547,6 +553,8 @@
           "linked_external_id": "assistant-1",
           "metadata_json": "{}",
           "session_id": "7c666c01-d38e-4658-8650-854ffb5b626e",
+          "source_file": "/fixtures/claude-code/session.jsonl",
+          "source_generation": 1,
           "source_name": "golden-claude-code"
         },
         {
@@ -559,6 +567,8 @@
           "linked_external_id": "toolu_1",
           "metadata_json": "{}",
           "session_id": "7c666c01-d38e-4658-8650-854ffb5b626e",
+          "source_file": "/fixtures/claude-code/session.jsonl",
+          "source_generation": 1,
           "source_name": "golden-claude-code"
         },
         {
@@ -571,6 +581,8 @@
           "linked_external_id": "assistant-1",
           "metadata_json": "{}",
           "session_id": "7c666c01-d38e-4658-8650-854ffb5b626e",
+          "source_file": "/fixtures/claude-code/session.jsonl",
+          "source_generation": 1,
           "source_name": "golden-claude-code"
         }
       ],
@@ -719,6 +731,8 @@
           "linked_external_id": "user-2",
           "metadata_json": "{}",
           "session_id": "7c666c01-d38e-4658-8650-854ffb5b626e",
+          "source_file": "/fixtures/claude-code/session.jsonl",
+          "source_generation": 1,
           "source_name": "golden-claude-code"
         }
       ],

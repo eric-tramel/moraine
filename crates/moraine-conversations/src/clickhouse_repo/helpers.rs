@@ -25,7 +25,7 @@ impl ClickHouseConversationRepository {
     }
 
     pub(super) fn mode_subquery_for_sessions(&self, session_ids_sql: Option<&str>) -> String {
-        let events_source = canonical_events_source(&self.table_ref("events"));
+        let events_source = self.live_events_source();
         let mode_aggregate = Self::mode_aggregate_sql();
         let session_filter = session_ids_sql
             .map(|session_ids_sql| format!("WHERE session_id IN ({session_ids_sql})\n"))

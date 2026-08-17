@@ -750,6 +750,8 @@ pub struct SearchEventHit {
     pub event_uid: String,
     pub session_id: String,
     #[serde(default)]
+    pub source_host: String,
+    #[serde(default)]
     pub event_time: Option<String>,
     pub first_event_time: String,
     pub last_event_time: String,
@@ -816,6 +818,8 @@ pub struct SearchMcpEventsStats {
 pub struct SearchMcpEventHit {
     pub rank: usize,
     pub event_uid: String,
+    #[serde(default)]
+    pub source_host: String,
     pub session_id: String,
     pub event_type: McpEventType,
     pub event_time: String,

@@ -455,6 +455,7 @@ mod tests {
         let hit = SearchMcpEventHit {
             rank: 1,
             event_uid: "evt-1".to_string(),
+            source_host: String::new(),
             session_id: "sess-1".to_string(),
             event_type: RepoMcpEventType::ToolResponse,
             event_time: "2026-04-29 08:00:01.123".to_string(),
@@ -516,6 +517,7 @@ mod tests {
         let hit = SearchMcpEventHit {
             rank: 1,
             event_uid: "evt-open".to_string(),
+            source_host: String::new(),
             session_id: "sess-open".to_string(),
             event_type: RepoMcpEventType::AssistantResponse,
             event_time: "2026-04-29 18:42:31.125".to_string(),

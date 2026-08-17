@@ -316,6 +316,8 @@
           "linked_external_id": "00000001",
           "metadata_json": "{}",
           "session_id": "12345678-1234-4234-8234-123456789abc",
+          "source_file": "/fixtures/prime-agent/session.jsonl",
+          "source_generation": 1,
           "source_name": "golden-prime-agent"
         }
       ],
@@ -466,6 +468,8 @@
           "linked_external_id": "00000003",
           "metadata_json": "{}",
           "session_id": "12345678-1234-4234-8234-123456789abc",
+          "source_file": "/fixtures/prime-agent/session.jsonl",
+          "source_generation": 1,
           "source_name": "golden-prime-agent"
         }
       ],
@@ -590,6 +594,8 @@
           "linked_external_id": "00000004",
           "metadata_json": "{}",
           "session_id": "12345678-1234-4234-8234-123456789abc",
+          "source_file": "/fixtures/prime-agent/session.jsonl",
+          "source_generation": 1,
           "source_name": "golden-prime-agent"
         }
       ],
@@ -714,6 +720,8 @@
           "linked_external_id": "00000005",
           "metadata_json": "{}",
           "session_id": "12345678-1234-4234-8234-123456789abc",
+          "source_file": "/fixtures/prime-agent/session.jsonl",
+          "source_generation": 1,
           "source_name": "golden-prime-agent"
         }
       ],
@@ -1002,6 +1010,8 @@
           "linked_external_id": "00000005",
           "metadata_json": "{}",
           "session_id": "12345678-1234-4234-8234-123456789abc",
+          "source_file": "/fixtures/prime-agent/session.jsonl",
+          "source_generation": 1,
           "source_name": "golden-prime-agent"
         },
         {
@@ -1014,6 +1024,8 @@
           "linked_external_id": "00000005",
           "metadata_json": "{}",
           "session_id": "12345678-1234-4234-8234-123456789abc",
+          "source_file": "/fixtures/prime-agent/session.jsonl",
+          "source_generation": 1,
           "source_name": "golden-prime-agent"
         },
         {
@@ -1026,6 +1038,8 @@
           "linked_external_id": "00000005",
           "metadata_json": "{}",
           "session_id": "12345678-1234-4234-8234-123456789abc",
+          "source_file": "/fixtures/prime-agent/session.jsonl",
+          "source_generation": 1,
           "source_name": "golden-prime-agent"
         }
       ],
@@ -1176,6 +1190,8 @@
           "linked_external_id": "00000006",
           "metadata_json": "{}",
           "session_id": "12345678-1234-4234-8234-123456789abc",
+          "source_file": "/fixtures/prime-agent/session.jsonl",
+          "source_generation": 1,
           "source_name": "golden-prime-agent"
         }
       ],
@@ -1326,6 +1342,8 @@
           "linked_external_id": "00000007",
           "metadata_json": "{}",
           "session_id": "12345678-1234-4234-8234-123456789abc",
+          "source_file": "/fixtures/prime-agent/session.jsonl",
+          "source_generation": 1,
           "source_name": "golden-prime-agent"
         }
       ],
@@ -1450,6 +1468,8 @@
           "linked_external_id": "00000008",
           "metadata_json": "{}",
           "session_id": "12345678-1234-4234-8234-123456789abc",
+          "source_file": "/fixtures/prime-agent/session.jsonl",
+          "source_generation": 1,
           "source_name": "golden-prime-agent"
         }
       ],
@@ -1796,6 +1816,8 @@
           "linked_external_id": "00000010",
           "metadata_json": "{}",
           "session_id": "12345678-1234-4234-8234-123456789abc",
+          "source_file": "/fixtures/prime-agent/session.jsonl",
+          "source_generation": 1,
           "source_name": "golden-prime-agent"
         }
       ],
