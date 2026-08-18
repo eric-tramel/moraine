@@ -14,7 +14,7 @@ use crate::render::{
 use crate::service::Service;
 use anyhow::{bail, Context, Result};
 use moraine_clickhouse::{DoctorReport, QueryPressureSnapshot};
-use moraine_config::AppConfig;
+use moraine_config::{AppConfig, StorageEngine};
 use moraine_conversations::{
     ConversationRepository, IngestHeartbeatRead, IngestStatus, StoreDiagnostics,
 };
@@ -67,13 +67,26 @@ impl DaemonStatusReadError {
 #[derive(Debug, serde::Deserialize)]
 struct DaemonStatusResponse {
     ok: bool,
-    clickhouse: DaemonClickhouseStatus,
+    #[serde(default)]
+    storage: Option<DaemonStorageStatus>,
+    #[serde(default)]
+    clickhouse: Option<DaemonClickhouseStatus>,
     database: DaemonDatabaseStatus,
     ingestor: DaemonIngestorStatus,
     #[serde(default)]
     ingest_status: Option<IngestStatus>,
     #[serde(default)]
     query_pressure: Option<QueryPressureSnapshot>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct DaemonStorageStatus {
+    engine: String,
+    location: String,
+    database: String,
+    healthy: bool,
+    version: RequiredNullable<String>,
+    error: RequiredNullable<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -187,14 +200,25 @@ fn daemon_status_data(payload: DaemonStatusResponse) -> Result<StatusData> {
     if !payload.ok {
         bail!("daemon API reported ok=false");
     }
-    let version_present = payload.clickhouse.version.0.is_some();
-    let error_present = payload.clickhouse.error.0.is_some();
-    if payload.clickhouse.healthy && (!payload.database.exists || !version_present || error_present)
-    {
-        bail!("daemon API returned contradictory healthy ClickHouse fields");
+    let storage = match (payload.storage, payload.clickhouse) {
+        (Some(storage), _) => storage,
+        (None, Some(clickhouse)) => DaemonStorageStatus {
+            engine: "clickhouse".to_string(),
+            location: clickhouse.url,
+            database: clickhouse.database,
+            healthy: clickhouse.healthy,
+            version: clickhouse.version,
+            error: clickhouse.error,
+        },
+        (None, None) => bail!("daemon API omitted both storage and clickhouse status"),
+    };
+    let version_present = storage.version.0.is_some();
+    let error_present = storage.error.0.is_some();
+    if storage.healthy && (!payload.database.exists || !version_present || error_present) {
+        bail!("daemon API returned contradictory healthy storage fields");
     }
-    if !payload.clickhouse.healthy && !error_present {
-        bail!("daemon API returned an unhealthy ClickHouse without an error");
+    if !storage.healthy && !error_present {
+        bail!("daemon API returned unhealthy storage without an error");
     }
 
     let latest = payload.ingestor.latest.0;
@@ -214,14 +238,14 @@ fn daemon_status_data(payload: DaemonStatusResponse) -> Result<StatusData> {
         None => HeartbeatSnapshot::Unavailable,
     };
     let report = DoctorReport {
-        clickhouse_healthy: payload.clickhouse.healthy,
-        clickhouse_version: payload.clickhouse.version.0,
-        database: payload.clickhouse.database,
+        clickhouse_healthy: storage.healthy,
+        clickhouse_version: storage.version.0,
+        database: storage.database,
         database_exists: payload.database.exists,
         applied_migrations: Vec::new(),
         pending_migrations: Vec::new(),
         missing_tables: Vec::new(),
-        errors: payload.clickhouse.error.0.into_iter().collect(),
+        errors: storage.error.0.into_iter().collect(),
     };
 
     Ok(StatusData {
@@ -231,7 +255,11 @@ fn daemon_status_data(payload: DaemonStatusResponse) -> Result<StatusData> {
         query_pressure: payload.query_pressure,
         source: StatusDataSource::DaemonApi,
         fallback_note: None,
-        clickhouse_health_url: payload.clickhouse.url,
+        clickhouse_health_url: if storage.engine == "duckdb" {
+            "local DuckDB (redacted)".to_string()
+        } else {
+            storage.location
+        },
     })
 }
 
@@ -474,20 +502,21 @@ async fn collect_status(
     probe_mcp: bool,
 ) -> Result<StatusSnapshot> {
     let backend_endpoints = backend_endpoint_status(cfg);
-    let services = vec![
-        managed_runtime_status(
+    let mut services = Vec::new();
+    if cfg.storage.engine == StorageEngine::Clickhouse {
+        services.push(managed_runtime_status(
             Service::ClickHouse,
             service_running_read_only(paths, Service::ClickHouse),
-        ),
-        managed_runtime_status(
+        ));
+        services.push(managed_runtime_status(
             Service::Ingest,
             service_running_read_only(paths, Service::Ingest),
-        ),
-        backend_runtime_status(
-            service_running_read_only(paths, Service::Backend),
-            backend_endpoints,
-        ),
-    ];
+        ));
+    }
+    services.push(backend_runtime_status(
+        service_running_read_only(paths, Service::Backend),
+        backend_endpoints,
+    ));
     let managed_server = managed_clickhouse_bin(paths, "clickhouse-server");
     let (source, source_path) = active_clickhouse_source(paths);
     let StatusData {
@@ -505,7 +534,11 @@ async fn collect_status(
         STATUS_API_TIMEOUT,
     )
     .await?;
-    let mut status_notes = build_status_notes(&services, &report, &clickhouse_health_url);
+    let mut status_notes = if cfg.storage.engine == StorageEngine::Clickhouse {
+        build_status_notes(&services, &report, &clickhouse_health_url)
+    } else {
+        Vec::new()
+    };
     if let Some(note) = fallback_note {
         status_notes.push(note);
     }
@@ -536,6 +569,7 @@ async fn collect_status(
     };
 
     Ok(StatusSnapshot {
+        storage_engine: cfg.storage.engine.as_str().to_string(),
         services,
         monitor_url,
         mcp_health,

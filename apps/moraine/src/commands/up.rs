@@ -3,7 +3,7 @@ use dialoguer::console::Style;
 use moraine_clickhouse::{
     ClickHouseClient, MigrationProgress, QueryOwner, QueryRuntime, QueryWorkload,
 };
-use moraine_config::{AppConfig, LoadedConfigPath};
+use moraine_config::{AppConfig, LoadedConfigPath, StorageEngine};
 use std::future::Future;
 use std::io::Write;
 use std::process::ExitCode;
@@ -402,7 +402,7 @@ pub(super) async fn handle_args(
     query_runtime: &QueryRuntime,
 ) -> Result<ExitCode> {
     let paths = runtime_paths(cfg);
-    let services_to_start = selected_up_services(args);
+    let services_to_start = selected_up_services(cfg, args);
     let mut progress = StartupProgress::from_output(output);
     progress.startup_plan(&services_to_start);
 
@@ -411,6 +411,7 @@ pub(super) async fn handle_args(
         cfg,
         &paths,
         services_to_start,
+        args.no_ingest,
         &mut progress,
         query_runtime,
     )
@@ -433,6 +434,7 @@ async fn start_selected_services<W: Write>(
     cfg: &AppConfig,
     paths: &RuntimePaths,
     services_to_start: Vec<Service>,
+    no_ingest: bool,
     progress: &mut StartupProgress<W>,
     query_runtime: &QueryRuntime,
 ) -> Result<UpSnapshot> {
@@ -444,44 +446,65 @@ async fn start_selected_services<W: Write>(
     ensure_runtime_dirs(paths)?;
     progress.success_step("Preflight complete", None);
 
-    progress.phase("ClickHouse", "inspecting endpoint and managed runtime");
-    let clickhouse =
-        start_clickhouse_with_progress(config_path, cfg, paths, query_runtime, |event| {
-            progress.clickhouse_wait(event);
-        })
-        .await?;
-    progress.clickhouse_outcome(&clickhouse);
+    let (clickhouse, migrations) = if cfg.storage.engine == StorageEngine::Clickhouse {
+        progress.phase("ClickHouse", "inspecting endpoint and managed runtime");
+        let clickhouse =
+            start_clickhouse_with_progress(config_path, cfg, paths, query_runtime, |event| {
+                progress.clickhouse_wait(event);
+            })
+            .await?;
+        progress.clickhouse_outcome(&clickhouse);
 
-    let migration_client =
-        ClickHouseClient::new_with_runtime(cfg.clickhouse.clone(), query_runtime.clone())?;
-    let migration_owner = QueryOwner::new(query_runtime, QueryWorkload::Migration)?;
-    let schema_skew = migration_owner
-        .scope(migration_client.schema_skew())
-        .await?;
-    let migration_gate = if writer_barrier_required(&schema_skew.missing_on_server) {
-        let gate = lock_storage_migration(paths)?;
-        progress.phase(
-            "Storage cutover",
-            "stopping tracked writers before rebuilding canonical tables and UID logs",
-        );
-        stop_storage_writers_with(|service| stop_service(paths, service))?;
-        progress.success_step(
-            "Tracked cutover services stopped",
-            Some("backend, ingest, and MCP are quiescent"),
-        );
-        Some(gate)
+        let migration_client =
+            ClickHouseClient::new_with_runtime(cfg.clickhouse.clone(), query_runtime.clone())?;
+        let migration_owner = QueryOwner::new(query_runtime, QueryWorkload::Migration)?;
+        let schema_skew = migration_owner
+            .scope(migration_client.schema_skew())
+            .await?;
+        let migration_gate = if writer_barrier_required(&schema_skew.missing_on_server) {
+            let gate = lock_storage_migration(paths)?;
+            progress.phase(
+                "Storage cutover",
+                "stopping tracked writers before rebuilding canonical tables and UID logs",
+            );
+            stop_storage_writers_with(|service| stop_service(paths, service))?;
+            progress.success_step(
+                "Tracked cutover services stopped",
+                Some("backend, ingest, and MCP are quiescent"),
+            );
+            Some(gate)
+        } else {
+            None
+        };
+
+        progress.database_start();
+        let migrations = drive_database_progress(cfg, progress, query_runtime).await?;
+        drop(migration_gate);
+        (Some(clickhouse), Some(migrations))
     } else {
-        None
+        progress.phase(
+            "DuckDB",
+            "embedded store migration and recovery are owned by the backend",
+        );
+        progress.info_step(
+            "ClickHouse skipped",
+            Some("experimental DuckDB single-process topology"),
+        );
+        (None, None)
     };
-
-    progress.database_start();
-    let migrations = drive_database_progress(cfg, progress, query_runtime).await?;
-    drop(migration_gate);
 
     progress.phase("Services", "starting selected Moraine processes");
     let mut started_services = Vec::with_capacity(services_to_start.len());
     for service in services_to_start {
-        let outcome = start_background_service(service, config_path, cfg, paths, &[])?;
+        let extra_args = if cfg.storage.engine == StorageEngine::Duckdb
+            && service == Service::Backend
+            && no_ingest
+        {
+            vec!["--no-ingest".to_string()]
+        } else {
+            Vec::new()
+        };
+        let outcome = start_background_service(service, config_path, cfg, paths, &extra_args)?;
         progress.service_outcome(&outcome);
         started_services.push(outcome);
     }
@@ -494,7 +517,7 @@ async fn start_selected_services<W: Write>(
     let status_owner = QueryOwner::new(query_runtime, QueryWorkload::Administrative)?;
     let status_started = Instant::now();
     let status = drive_status_progress(
-        status_owner.scope(cmd_status_for_up(paths, cfg, &repository)),
+        status_owner.scope(cmd_status_for_up(paths, cfg, repository.as_ref())),
         status_started,
         progress,
     )
@@ -580,7 +603,10 @@ where
     }
 }
 
-fn selected_up_services(args: &UpArgs) -> Vec<Service> {
+fn selected_up_services(cfg: &AppConfig, args: &UpArgs) -> Vec<Service> {
+    if cfg.storage.engine == StorageEngine::Duckdb {
+        return vec![Service::Backend];
+    }
     let mut services = Vec::new();
     if !args.no_ingest {
         services.push(Service::Ingest);
@@ -737,11 +763,26 @@ mod tests {
 
     #[test]
     fn selected_up_services_always_includes_backend() {
+        let clickhouse = AppConfig::default();
         assert_eq!(
-            selected_up_services(&up_args(false)),
+            selected_up_services(&clickhouse, &up_args(false)),
             vec![Service::Ingest, Service::Backend]
         );
-        assert_eq!(selected_up_services(&up_args(true)), vec![Service::Backend]);
+        assert_eq!(
+            selected_up_services(&clickhouse, &up_args(true)),
+            vec![Service::Backend]
+        );
+
+        let mut duckdb = AppConfig::default();
+        duckdb.storage.engine = StorageEngine::Duckdb;
+        assert_eq!(
+            selected_up_services(&duckdb, &up_args(false)),
+            vec![Service::Backend]
+        );
+        assert_eq!(
+            selected_up_services(&duckdb, &up_args(true)),
+            vec![Service::Backend]
+        );
     }
 
     #[test]

@@ -35,6 +35,8 @@ on:
       - 'crates/moraine-config/src/**'
       # Repository queries and row decoding are the production side of analytics/live assertions.
       - 'crates/moraine-conversations/src/**'
+      - 'crates/moraine-duckdb/src/**'
+      - 'crates/moraine-ingest-core/src/**'
       # Live parity starts the production monitor handlers and validates their decoded responses.
       - 'crates/moraine-monitor-core/src/**'
   workflow_dispatch:

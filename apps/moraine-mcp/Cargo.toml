@@ -22,5 +22,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 moraine-config = { path = "../../crates/moraine-config" }
 moraine-conversations = { path = "../../crates/moraine-conversations" }
+moraine-duckdb = { path = "../../crates/moraine-duckdb" }
 moraine-mcp-core = { path = "../../crates/moraine-mcp-core" }
 moraine-monitor-core = { path = "../../crates/moraine-monitor-core" }

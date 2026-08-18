@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::cli::{SetupCommand, SetupMcpTarget};
+use crate::cli::{SetupCommand, SetupMcpTarget, SetupStorageEngine};
 use crate::mcp_health::{probe_mcp_backend, McpHealthSnapshot};
 use crate::paths::load_cfg;
 use crate::render::CliOutput;
@@ -46,11 +46,20 @@ pub(super) async fn handle(
     command: Option<SetupCommand>,
 ) -> Result<ExitCode> {
     let interactive = can_prompt(output);
+    let storage_engine = match &command {
+        Some(SetupCommand::Config(config)) => config.storage_engine,
+        _ => None,
+    };
     let args = setup_execution_args(command, interactive)?;
     let target = resolve_setup_config_target(raw_config)?;
     let config_path = target.path.clone();
     let mut runner = RealCommandRunner;
     let mut report = run_setup(output, &args, target, interactive, &mut runner)?;
+    if let Some(engine) = storage_engine {
+        if matches!(report.config.status, SetupStatus::Ok | SetupStatus::Planned) {
+            apply_storage_engine_selection(&config_path, engine, args.dry_run, &mut report.config)?;
+        }
+    }
     record_setup_mcp_health(&mut report, &args, &config_path).await;
     render_report(output, &report)?;
 
@@ -350,6 +359,60 @@ fn run_setup_with_paths(
         mcp_targets,
         mcp_health: None,
     })
+}
+
+fn apply_storage_engine_selection(
+    path: &Path,
+    engine: SetupStorageEngine,
+    dry_run: bool,
+    report: &mut ConfigReport,
+) -> Result<()> {
+    let desired = engine.as_str();
+    if dry_run && !path.exists() {
+        report.action = "would_create".to_string();
+        report.message = format!(
+            "default config would be written with storage.engine = `{desired}`; DuckDB starts a separate dataset and does not migrate ClickHouse data"
+        );
+        return Ok(());
+    }
+
+    let mut document = read_config_document(path)?;
+    let current = document
+        .as_table()
+        .get("storage")
+        .and_then(Item::as_table_like)
+        .and_then(|storage| storage.get("engine"))
+        .and_then(Item::as_str)
+        .unwrap_or("clickhouse");
+    if current == desired {
+        return Ok(());
+    }
+
+    if dry_run {
+        report.action = "would_update".to_string();
+        report.status = SetupStatus::Planned;
+        report.message = format!(
+            "storage.engine would change from `{current}` to `{desired}`; engine data remains separate and is not migrated"
+        );
+        return Ok(());
+    }
+
+    if document.as_table().get("storage").is_none() {
+        document["storage"] = Item::Table(Table::new());
+    }
+    document["storage"]["engine"] = toml_edit::value(desired);
+    write_toml_atomic(path, &document.to_string())?;
+    moraine_config::load_config(path).with_context(|| {
+        format!(
+            "storage-engine selection produced an invalid config at {}",
+            path.display()
+        )
+    })?;
+    report.action = "updated".to_string();
+    report.message = format!(
+        "storage.engine set to `{desired}`; engine data remains separate and is not migrated"
+    );
+    Ok(())
 }
 
 fn nac_ingest_manual_report(
@@ -3406,6 +3469,7 @@ mod tests {
                 yes: false,
                 dry_run: false,
                 repair: false,
+                storage_engine: None,
             })),
             false,
         )
@@ -3426,12 +3490,44 @@ mod tests {
     }
 
     #[test]
+    fn setup_storage_selection_updates_only_the_engine_and_preserves_clickhouse_config() {
+        let root = temp_path("duckdb-storage-selection");
+        fs::create_dir_all(&root).expect("create temp root");
+        let path = root.join("moraine.toml");
+        fs::write(&path, DEFAULT_CONFIG_TEMPLATE).expect("write default config");
+        let original = fs::read_to_string(&path).expect("read original config");
+        let original_clickhouse = original
+            .split("[clickhouse]")
+            .nth(1)
+            .expect("default ClickHouse table")
+            .to_string();
+        let mut report = ConfigReport::ok(&path, "unchanged", "valid");
+
+        apply_storage_engine_selection(&path, SetupStorageEngine::Duckdb, false, &mut report)
+            .expect("select DuckDB");
+
+        let config = moraine_config::load_config(&path).expect("load selected config");
+        assert_eq!(config.storage.engine, moraine_config::StorageEngine::Duckdb);
+        let updated = fs::read_to_string(&path).expect("read updated config");
+        assert_eq!(
+            updated
+                .split("[clickhouse]")
+                .nth(1)
+                .expect("retained ClickHouse table"),
+            original_clickhouse
+        );
+        assert!(report.message.contains("not migrated"));
+        fs::remove_dir_all(root).expect("remove temp root");
+    }
+
+    #[test]
     fn setup_modes_isolate_config_and_harness_work() {
         let config = setup_execution_args(
             Some(SetupCommand::Config(SetupConfigArgs {
                 yes: true,
                 dry_run: false,
                 repair: true,
+                storage_engine: None,
             })),
             false,
         )

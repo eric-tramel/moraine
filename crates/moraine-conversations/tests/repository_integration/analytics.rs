@@ -6,7 +6,7 @@ async fn session_analytics_assembles_canonical_views_and_public_steps() {
         ScriptedResponse::rows(
             &[
                 "FROM `moraine`.`v_session_summary` AS s",
-                "FROM (SELECT * FROM `moraine`.`events` FINAL) AS meta_events",
+                "FROM `moraine`.`events` AS e FINAL",
                 "WHERE meta_events.event_kind = 'session_meta'",
                 "nullIf(trimBoth(JSONExtractString(payload_json, 'title')), '')",
                 "nullIf(trimBoth(JSONExtractString(payload_json, 'name')), '')",
@@ -38,7 +38,7 @@ async fn session_analytics_assembles_canonical_views_and_public_steps() {
             &[
                 "FROM `moraine`.`v_conversation_trace` AS t",
                 "toInt64(toUnixTimestamp64Milli(t.event_time)) AS event_unix_ms",
-                "LEFT JOIN (SELECT * FROM `moraine`.`events` FINAL) AS e",
+                "FROM `moraine`.`events` AS e FINAL",
                 "ON e.session_id = t.session_id",
                 "AND e.source_file = t.source_file",
                 "AND e.source_generation = t.source_generation",

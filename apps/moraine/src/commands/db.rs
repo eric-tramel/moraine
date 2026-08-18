@@ -1,9 +1,12 @@
 use anyhow::{bail, Result};
 use moraine_clickhouse::{ClickHouseClient, DoctorReport, QueryOwner, QueryRuntime, QueryWorkload};
-use moraine_config::AppConfig;
+use moraine_config::{AppConfig, StorageEngine};
 use std::process::ExitCode;
 
-use super::{doctor_is_healthy, writer_barrier_required, WRITER_BARRIER_SERVICES};
+use super::{
+    conversation_repository, doctor_is_healthy, status, writer_barrier_required,
+    WRITER_BARRIER_SERVICES,
+};
 use crate::cli::{DbArgs, DbCommand};
 use crate::paths::{runtime_paths, RuntimePaths};
 use crate::process::{lock_storage_migration, service_running_read_only};
@@ -18,6 +21,9 @@ pub(super) async fn handle(
     let output = CliOutput::from_options(args.output.output, false);
     match args.command {
         DbCommand::Migrate => {
+            if cfg.storage.engine == StorageEngine::Duckdb {
+                bail!("manual `moraine db migrate` is unsupported by experimental DuckDB storage; the unified backend migrates transactionally before readiness");
+            }
             let outcome = migrate(cfg, &runtime_paths(cfg), query_runtime).await?;
             render_db_migrate(&output, &outcome)?;
             Ok(ExitCode::SUCCESS)
@@ -58,6 +64,13 @@ async fn migrate(
 }
 
 async fn doctor(cfg: &AppConfig, query_runtime: &QueryRuntime) -> Result<DoctorReport> {
+    if cfg.storage.engine == StorageEngine::Duckdb {
+        let paths = runtime_paths(cfg);
+        let repository = conversation_repository(cfg, query_runtime)?;
+        return Ok(status::cmd_status(&paths, cfg, repository.as_ref())
+            .await?
+            .doctor);
+    }
     let ch = ClickHouseClient::new_with_runtime(cfg.clickhouse.clone(), query_runtime.clone())?;
     let owner = QueryOwner::new(query_runtime, QueryWorkload::Administrative)?;
     owner.scope(ch.doctor_report()).await

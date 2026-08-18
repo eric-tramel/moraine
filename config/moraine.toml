@@ -1,3 +1,18 @@
+[storage]
+# ClickHouse remains the production default. `duckdb` is an experimental,
+# local single-user mode owned by the unified moraine-mcp backend process.
+engine = "clickhouse"
+
+[duckdb]
+# Empty paths resolve to <runtime.root_dir>/duckdb/moraine.duckdb and
+# <runtime.root_dir>/duckdb/tmp. Explicit paths must stay beneath that root.
+database_path = ""
+temp_directory = ""
+memory_limit_mb = 512
+threads = 2
+read_connections = 2
+max_temp_directory_size_mb = 2048
+
 [clickhouse]
 url = "http://127.0.0.1:8123"
 database = "moraine"

@@ -52,6 +52,7 @@
 
 services:
   clickhouse:
+    profiles: ["clickhouse"]
     image: ${SANDBOX_CLICKHOUSE_IMAGE}
     container_name: ${COMPOSE_PROJECT_NAME}-clickhouse
     restart: "no"
@@ -88,7 +89,9 @@ services:
     depends_on:
       clickhouse:
         condition: service_healthy
+        required: ${SANDBOX_CLICKHOUSE_REQUIRED:-true}
     environment:
+      SANDBOX_STORAGE_ENGINE: ${SANDBOX_STORAGE_ENGINE:-clickhouse}
       SANDBOX_CLICKHOUSE_HOST: clickhouse
       SANDBOX_CLICKHOUSE_PORT: "8123"
       SANDBOX_REBUILD: "${SANDBOX_REBUILD:-0}"

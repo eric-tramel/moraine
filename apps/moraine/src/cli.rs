@@ -12,6 +12,21 @@ pub(crate) enum OutputFormat {
     Json,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum SetupStorageEngine {
+    Clickhouse,
+    Duckdb,
+}
+
+impl SetupStorageEngine {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Clickhouse => "clickhouse",
+            Self::Duckdb => "duckdb",
+        }
+    }
+}
+
 #[derive(Debug, Args)]
 pub(crate) struct OutputArgs {
     /// Select automatic terminal output, rich text, plain text, or JSON.
@@ -308,6 +323,9 @@ pub(crate) struct SetupConfigArgs {
     /// Back up and replace an invalid config with the default template.
     #[arg(long)]
     pub(crate) repair: bool,
+    /// Select the primary storage engine for this installation.
+    #[arg(long, value_enum)]
+    pub(crate) storage_engine: Option<SetupStorageEngine>,
 }
 
 #[derive(Debug, Args)]
@@ -571,6 +589,29 @@ mod tests {
             }
             _ => panic!("expected setup integrations command"),
         }
+    }
+
+    #[test]
+    fn clap_parses_duckdb_setup_selection() {
+        let cli = Cli::parse_from([
+            "moraine",
+            "setup",
+            "config",
+            "--storage-engine",
+            "duckdb",
+            "--yes",
+        ]);
+        assert!(matches!(
+            cli.command,
+            CliCommand::Setup(SetupArgs {
+                command: Some(SetupCommand::Config(SetupConfigArgs {
+                    storage_engine: Some(SetupStorageEngine::Duckdb),
+                    yes: true,
+                    ..
+                })),
+                ..
+            })
+        ));
     }
 
     #[test]

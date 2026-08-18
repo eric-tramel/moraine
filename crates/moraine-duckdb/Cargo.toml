@@ -1,0 +1,23 @@
+[package]
+name = "moraine-duckdb"
+version = "0.7.3"
+edition = "2021"
+description = "Experimental embedded DuckDB storage adapter for Moraine"
+
+[dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+duckdb = { version = "~1.10505.0", features = ["bundled"] }
+fs2 = "0.4"
+moraine-config = { path = "../moraine-config" }
+moraine-conversations = { path = "../moraine-conversations" }
+moraine-ingest-core = { path = "../moraine-ingest-core" }
+sha2 = "0.10"
+serde_json = "1.0"
+thiserror = "2.0"
+tokio = { version = "1.40", features = ["rt", "sync", "time"] }
+
+[dev-dependencies]
+tempfile = "3.14"
+tokio = { version = "1.40", features = ["macros", "rt-multi-thread"] }

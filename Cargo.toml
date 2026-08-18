@@ -4,6 +4,7 @@ members = [
   "crates/moraine-config",
   "crates/moraine-clickhouse",
   "crates/moraine-conversations",
+  "crates/moraine-duckdb",
   "crates/moraine-ingest-core",
   "crates/moraine-mcp-core",
   "crates/moraine-monitor-core",

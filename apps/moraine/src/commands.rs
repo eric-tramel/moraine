@@ -14,9 +14,13 @@ use anyhow::Result;
 use moraine_clickhouse::{
     ClickHouseClient, DoctorReport, MigrationProgress, QueryOwner, QueryRuntime, QueryWorkload,
 };
-use moraine_config::AppConfig;
-use moraine_conversations::{ClickHouseConversationRepository, RepoConfig};
+use moraine_config::{AppConfig, StorageEngine};
+use moraine_conversations::{
+    ClickHouseConversationRepository, ConversationRepository, InMemoryConversationRepository,
+    RepoConfig,
+};
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use crate::cli::{Cli, CliCommand, ExportCommand, SchemaCommand};
 use crate::paths::{load_cfg, runtime_paths};
@@ -47,7 +51,7 @@ pub(crate) async fn dispatch(cli: Cli, query_runtime: &QueryRuntime) -> Result<E
             let repository = conversation_repository(&cfg, query_runtime)?;
             let owner = QueryOwner::new(query_runtime, QueryWorkload::Administrative)?;
             let snapshot = owner
-                .scope(status::cmd_status(&paths, &cfg, &repository))
+                .scope(status::cmd_status(&paths, &cfg, repository.as_ref()))
                 .await?;
             crate::render::render_status(&output, &snapshot)?;
             Ok(ExitCode::SUCCESS)
@@ -96,12 +100,17 @@ pub(crate) async fn dispatch(cli: Cli, query_runtime: &QueryRuntime) -> Result<E
 fn conversation_repository(
     cfg: &AppConfig,
     query_runtime: &QueryRuntime,
-) -> Result<ClickHouseConversationRepository> {
+) -> Result<Arc<dyn ConversationRepository>> {
+    if cfg.storage.engine == StorageEngine::Duckdb {
+        return Ok(Arc::new(InMemoryConversationRepository::new(
+            RepoConfig::default(),
+        )));
+    }
     let ch = ClickHouseClient::new_with_runtime(cfg.clickhouse.clone(), query_runtime.clone())?;
-    Ok(ClickHouseConversationRepository::new(
+    Ok(Arc::new(ClickHouseConversationRepository::new(
         ch,
         RepoConfig::default(),
-    ))
+    )))
 }
 
 // Deliberate shared-read-layer exception: `db *`/`doctor` are storage administration,

@@ -1615,6 +1615,16 @@ pub fn bundled_migrations() -> Vec<Migration> {
             name: "035_canonical_open_seek.sql",
             sql: include_str!("../../../sql/035_canonical_open_seek.sql"),
         },
+        Migration {
+            version: "036",
+            name: "036_atomic_source_publication_control.sql",
+            sql: include_str!("../../../sql/036_atomic_source_publication_control.sql"),
+        },
+        Migration {
+            version: "037",
+            name: "037_generation_preserving_live_read_model.sql",
+            sql: include_str!("../../../sql/037_generation_preserving_live_read_model.sql"),
+        },
     ]
 }
 
@@ -3658,7 +3668,12 @@ mod tests {
         let bundled = bundled_migrations();
         let pending = bundled
             .iter()
-            .filter(|migration| matches!(migration.version, "031" | "032" | "033" | "034" | "035"))
+            .filter(|migration| {
+                matches!(
+                    migration.version,
+                    "031" | "032" | "033" | "034" | "035" | "036" | "037"
+                )
+            })
             .cloned()
             .collect::<Vec<_>>();
         assert_eq!(
@@ -3666,11 +3681,16 @@ mod tests {
                 .iter()
                 .map(|migration| migration.version)
                 .collect::<Vec<_>>(),
-            vec!["031", "032", "033", "034", "035"]
+            vec!["031", "032", "033", "034", "035", "036", "037"]
         );
         let applied = bundled
             .iter()
-            .filter(|migration| !matches!(migration.version, "031" | "032" | "033" | "034" | "035"))
+            .filter(|migration| {
+                !matches!(
+                    migration.version,
+                    "031" | "032" | "033" | "034" | "035" | "036" | "037"
+                )
+            })
             .map(|migration| migration.version.to_string())
             .collect::<Vec<_>>();
         assert_eq!(applied.last().map(String::as_str), Some("030"));
@@ -3691,7 +3711,10 @@ mod tests {
         .await
         .expect("apply post-v0.7.1 migrations");
 
-        assert_eq!(executed, vec!["031", "032", "033", "034", "035"]);
+        assert_eq!(
+            executed,
+            vec!["031", "032", "033", "034", "035", "036", "037"]
+        );
         let mut expected_events = vec![MigrationProgress::Plan {
             applied: bundled.len() - pending.len(),
             pending: pending.len(),

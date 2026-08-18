@@ -322,10 +322,12 @@ NAC stores parent sessions in `sessions` and managed-worker activity in
   or host identifiers. Raw records are compact projections, not copies of
   NAC's credential-bearing session rows.
 - Replacing `store.db` at the same path changes the SQLite schema/data
-  fingerprint, advances `source_generation`, and archives the previous
-  generation after the replacement scan commits. A malformed or mixed
-  DB/WAL/SHM snapshot fails closed and leaves both the data cursor and durable
-  checkpoint unchanged for retry.
+  fingerprint and advances `source_generation`. Live readers continue using
+  the prior published generation until the replacement scan and durable final
+  checkpoint both succeed; activation then switches the complete stream
+  atomically. A malformed, interrupted, or mixed DB/WAL/SHM snapshot fails
+  closed, leaves the prior generation query-visible, and preserves the data
+  cursor for retry.
 
 Fixtures: `fixtures/cursor/state-vscdb-kv.jsonl` stores `cursorDiskKV` rows as
 JSONL (`key`/`value` pairs), `fixtures/opencode/session.jsonl` stores OpenCode

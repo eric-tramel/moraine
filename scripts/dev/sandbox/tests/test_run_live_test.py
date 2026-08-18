@@ -451,8 +451,21 @@ class RunLiveTestTests(unittest.TestCase):
             "query-ownership", "live_query_ownership_and_cancellation"
         )
 
-    def test_live_target_has_five_ignored_functions(self) -> None:
-        source = LIVE_CLICKHOUSE_SOURCE.read_text(encoding="utf-8")
+    def test_source_publication_mode_runs_only_exact_ignored_function(self) -> None:
+        self.assert_exact_invocation(
+            "source-publication",
+            "source_publication::live_source_generation_publication_is_atomic",
+        )
+
+    def test_live_target_has_six_ignored_functions(self) -> None:
+        source = (
+            LIVE_CLICKHOUSE_SOURCE.read_text(encoding="utf-8")
+            + (
+                LIVE_CLICKHOUSE_SOURCE.parent
+                / "live_clickhouse"
+                / "source_publication.rs"
+            ).read_text(encoding="utf-8")
+        )
         ignored_functions = re.findall(
             r'#\[ignore\s*=\s*"[^"]+"\]\s*async fn ([a-zA-Z0-9_]+)', source
         )
@@ -463,6 +476,7 @@ class RunLiveTestTests(unittest.TestCase):
                 "live_schema_032_replay_stable_upgrade_stays_within_memory_budget",
                 "live_mcp_open_boundedness_benchmark",
                 "live_monitor_repository_semantic_parity",
+                "live_source_generation_publication_is_atomic",
             ],
             ignored_functions,
         )
@@ -651,6 +665,7 @@ class RunLiveTestTests(unittest.TestCase):
 
     def test_unsafe_precreated_and_symlink_roots_are_rejected_before_boot(self) -> None:
         self.diagnostics.mkdir(mode=0o755)
+        self.diagnostics.chmod(0o755)
         insecure = self.run_wrapper("analytics-schema")
         self.assertEqual(insecure.returncode, 2, insecure.stderr)
         self.assertIn("unsafe pre-created temporary root", insecure.stderr)

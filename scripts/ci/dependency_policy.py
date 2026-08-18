@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 CLICKHOUSE_PACKAGE = "moraine-clickhouse"
+DUCKDB_PACKAGE = "moraine-duckdb"
 ALLOWED_DIRECT_DEPENDENTS = frozenset(
     {
         "moraine",
@@ -22,6 +23,7 @@ ALLOWED_DIRECT_DEPENDENTS = frozenset(
         "moraine-ingest-core",
     }
 )
+ALLOWED_DUCKDB_DIRECT_DEPENDENTS = frozenset({"moraine-mcp"})
 EPIC_RULE = "epic #451 Phase 1 dependency rule"
 SQL_STATEMENT = re.compile(
     r"(?i)(?P<select>\bSELECT\b)|(?P<insert>\bINSERT\s+INTO\b)"
@@ -68,6 +70,21 @@ def direct_clickhouse_dependents(metadata: dict[str, Any]) -> tuple[str, ...]:
     return tuple(sorted(dependents))
 
 
+def direct_duckdb_dependents(metadata: dict[str, Any]) -> tuple[str, ...]:
+    """Return workspace packages with a direct dependency on moraine-duckdb."""
+    workspace_members = set(metadata.get("workspace_members", ()))
+    dependents: set[str] = set()
+    for package in metadata.get("packages", ()):
+        if workspace_members and package.get("id") not in workspace_members:
+            continue
+        if any(
+            dependency.get("name") == DUCKDB_PACKAGE
+            for dependency in package.get("dependencies", ())
+        ):
+            dependents.add(package["name"])
+    return tuple(sorted(dependents))
+
+
 def assert_clickhouse_dependency_policy(metadata: dict[str, Any]) -> tuple[str, ...]:
     dependents = direct_clickhouse_dependents(metadata)
     offenders = tuple(
@@ -81,6 +98,22 @@ def assert_clickhouse_dependency_policy(metadata: dict[str, Any]) -> tuple[str, 
             f"{CLICKHOUSE_PACKAGE} outside the allowlist:\n"
             f"{offender_lines}\n"
             f"Allowed direct dependents: {allowed}"
+        )
+    return dependents
+
+
+def assert_duckdb_dependency_policy(metadata: dict[str, Any]) -> tuple[str, ...]:
+    dependents = direct_duckdb_dependents(metadata)
+    offenders = tuple(
+        package
+        for package in dependents
+        if package not in ALLOWED_DUCKDB_DIRECT_DEPENDENTS
+    )
+    if offenders:
+        offender_lines = "\n".join(f"  - {package}" for package in offenders)
+        raise PolicyViolation(
+            "DuckDB leaf-adapter dependency rule violated: only moraine-mcp may "
+            f"directly depend on {DUCKDB_PACKAGE}; found:\n{offender_lines}"
         )
     return dependents
 
@@ -587,6 +620,7 @@ def main(argv: list[str] | None = None) -> int:
             cargo_command = os.environ.get("MORAINE_CARGO", "cargo")
             metadata = load_cargo_metadata(workspace_root, cargo_command)
         dependents = assert_clickhouse_dependency_policy(metadata)
+        duckdb_dependents = assert_duckdb_dependency_policy(metadata)
         assert_monitor_sql_policy(monitor_source)
     except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as error:
         print(f"[dependency-policy] FAIL: {error}", file=sys.stderr)
@@ -595,6 +629,10 @@ def main(argv: list[str] | None = None) -> int:
     print(
         "[dependency-policy] direct moraine-clickhouse dependents: "
         + ", ".join(dependents)
+    )
+    print(
+        "[dependency-policy] direct moraine-duckdb dependents: "
+        + ", ".join(duckdb_dependents)
     )
     print(
         "[dependency-policy] moraine-monitor-core non-test Rust sources contain "

@@ -5,7 +5,7 @@ use anyhow::{anyhow, Context as _, Result};
 use moraine_clickhouse::{
     enforce_remote_schema_policy, ClickHouseClient, QueryOwner, QueryRuntime, QueryWorkload,
 };
-use moraine_config::{AppConfig, ClickHouseConfig, DEFAULT_BACKEND_NAME};
+use moraine_config::{AppConfig, ClickHouseConfig, StorageEngine, DEFAULT_BACKEND_NAME};
 use tokio::sync::{watch, Mutex};
 use tracing::warn;
 use url::Url;
@@ -33,6 +33,7 @@ fn clickhouse_display_url(raw_url: &str) -> Arc<str> {
 pub struct BackendRepository {
     backend_name: Arc<str>,
     repository: Arc<dyn ConversationRepository>,
+    engine: Arc<str>,
     clickhouse_url: Arc<str>,
     clickhouse_database: Arc<str>,
 }
@@ -46,8 +47,23 @@ impl BackendRepository {
         Self {
             backend_name,
             repository,
+            engine: Arc::from("clickhouse"),
             clickhouse_url: clickhouse_display_url(&clickhouse.url),
             clickhouse_database: Arc::from(clickhouse.database.as_str()),
+        }
+    }
+
+    fn new_local(
+        backend_name: Arc<str>,
+        repository: Arc<dyn ConversationRepository>,
+        engine: &'static str,
+    ) -> Self {
+        Self {
+            backend_name,
+            repository,
+            engine: Arc::from(engine),
+            clickhouse_url: Arc::from("<local>"),
+            clickhouse_database: Arc::from(DEFAULT_BACKEND_NAME),
         }
     }
 
@@ -57,6 +73,10 @@ impl BackendRepository {
 
     pub fn repository(&self) -> &Arc<dyn ConversationRepository> {
         &self.repository
+    }
+
+    pub fn engine(&self) -> &str {
+        &self.engine
     }
 
     pub fn clickhouse_url(&self) -> &str {
@@ -174,7 +194,7 @@ enum SlotState {
 
 struct BackendSlot {
     backend_name: Arc<str>,
-    clickhouse: ClickHouseConfig,
+    clickhouse: Option<ClickHouseConfig>,
     checked: bool,
     query_runtime: QueryRuntime,
     state: Mutex<SlotState>,
@@ -199,10 +219,29 @@ impl BackendSlot {
         };
         Self {
             backend_name,
-            clickhouse,
+            clickhouse: Some(clickhouse),
             checked,
             query_runtime,
             state: Mutex::new(state),
+        }
+    }
+
+    fn new_local(
+        backend_name: String,
+        query_runtime: QueryRuntime,
+        repository: Arc<dyn ConversationRepository>,
+    ) -> Self {
+        let backend_name: Arc<str> = Arc::from(backend_name);
+        Self {
+            backend_name: backend_name.clone(),
+            clickhouse: None,
+            checked: false,
+            query_runtime,
+            state: Mutex::new(SlotState::Ready(Arc::new(BackendRepository::new_local(
+                backend_name,
+                repository,
+                "duckdb",
+            )))),
         }
     }
 
@@ -280,10 +319,16 @@ impl BackendSlot {
         repo_config: RepoConfig,
         user_agent: &str,
     ) -> Result<Arc<BackendRepository>> {
+        let clickhouse = self.clickhouse.clone().ok_or_else(|| {
+            anyhow!(
+                "local backend '{}' cannot be rebuilt after initialization",
+                self.backend_name
+            )
+        })?;
         let repository = if self.checked {
             build_checked_clickhouse_repository_with_user_agent(
                 &self.backend_name,
-                self.clickhouse.clone(),
+                clickhouse.clone(),
                 repo_config,
                 self.query_runtime.clone(),
                 user_agent,
@@ -291,7 +336,7 @@ impl BackendSlot {
             .await?
         } else {
             build_clickhouse_repository_with_user_agent(
-                self.clickhouse.clone(),
+                clickhouse.clone(),
                 repo_config,
                 self.query_runtime.clone(),
                 user_agent,
@@ -301,7 +346,7 @@ impl BackendSlot {
         Ok(Arc::new(BackendRepository::new(
             self.backend_name.clone(),
             repository,
-            &self.clickhouse,
+            &clickhouse,
         )))
     }
 }
@@ -338,6 +383,32 @@ impl BackendRepositoryRouter {
         )
     }
 
+    /// Construct the production router around one process-local default
+    /// repository. DuckDB mode has no named slots and never synthesizes a
+    /// ClickHouse backend merely to satisfy routing internals.
+    pub fn with_local_default(
+        config: Arc<AppConfig>,
+        repo_config: RepoConfig,
+        query_runtime: QueryRuntime,
+        user_agent: impl Into<Arc<str>>,
+        repository: Arc<dyn ConversationRepository>,
+    ) -> Result<Self> {
+        if config.storage.engine != StorageEngine::Duckdb {
+            return Err(anyhow!(
+                "local default repository requires storage.engine = `duckdb`"
+            ));
+        }
+        let mut repositories = BTreeMap::new();
+        repositories.insert(DEFAULT_BACKEND_NAME.to_string(), repository);
+        Self::new_inner(
+            config,
+            repo_config,
+            user_agent.into(),
+            query_runtime,
+            repositories,
+        )
+    }
+
     /// Construct a router with already-built repositories for consumer tests.
     /// Production composition roots must use [`Self::new`].
     #[doc(hidden)]
@@ -362,7 +433,9 @@ impl BackendRepositoryRouter {
         query_runtime: QueryRuntime,
         mut preloaded: BTreeMap<String, Arc<dyn ConversationRepository>>,
     ) -> Result<Self> {
-        if !config.backends.contains_key(DEFAULT_BACKEND_NAME) {
+        if config.storage.engine == StorageEngine::Clickhouse
+            && !config.backends.contains_key(DEFAULT_BACKEND_NAME)
+        {
             return Err(anyhow!(
                 "normalized app config is missing the '{}' backend",
                 DEFAULT_BACKEND_NAME
@@ -370,18 +443,32 @@ impl BackendRepositoryRouter {
         }
 
         let mut slots = BTreeMap::new();
-        for (backend_name, clickhouse) in &config.backends {
-            let repository = preloaded.remove(backend_name);
+        if config.storage.engine == StorageEngine::Duckdb {
+            let repository = preloaded.remove(DEFAULT_BACKEND_NAME).ok_or_else(|| {
+                anyhow!("DuckDB router requires an injected local default repository")
+            })?;
             slots.insert(
-                backend_name.clone(),
-                Arc::new(BackendSlot::new(
-                    backend_name.clone(),
-                    clickhouse.clone(),
-                    backend_name != DEFAULT_BACKEND_NAME,
+                DEFAULT_BACKEND_NAME.to_string(),
+                Arc::new(BackendSlot::new_local(
+                    DEFAULT_BACKEND_NAME.to_string(),
                     query_runtime.clone(),
                     repository,
                 )),
             );
+        } else {
+            for (backend_name, clickhouse) in &config.backends {
+                let repository = preloaded.remove(backend_name);
+                slots.insert(
+                    backend_name.clone(),
+                    Arc::new(BackendSlot::new(
+                        backend_name.clone(),
+                        clickhouse.clone(),
+                        backend_name != DEFAULT_BACKEND_NAME,
+                        query_runtime.clone(),
+                        repository,
+                    )),
+                );
+            }
         }
         if let Some(unknown) = preloaded.keys().next() {
             return Err(anyhow!(
@@ -400,6 +487,15 @@ impl BackendRepositoryRouter {
 
     pub fn query_runtime(&self) -> QueryRuntime {
         self.query_runtime.clone()
+    }
+
+    /// Names of the repository slots this router can actually select.
+    ///
+    /// DuckDB intentionally has no synthesized `[backends.default]` entry, so
+    /// consumers must derive per-backend state from the router rather than
+    /// from ClickHouse-oriented configuration maps.
+    pub fn backend_names(&self) -> impl Iterator<Item = &str> {
+        self.slots.keys().map(String::as_str)
     }
 
     pub async fn default_repository(&self) -> Result<Arc<BackendRepository>> {
@@ -506,7 +602,7 @@ async fn build_checked_clickhouse_repository_with_user_agent(
     })?;
     enforce_remote_schema_policy(backend_name, &skew, allow_newer_server)?;
 
-    Ok(Arc::new(ClickHouseConversationRepository::new(
+    Ok(Arc::new(ClickHouseConversationRepository::new_shared(
         client, config,
     )))
 }
@@ -525,7 +621,7 @@ mod tests {
         Router,
     };
     use moraine_clickhouse::bundled_migrations;
-    use moraine_config::{RouteConfig, ROUTE_MODE_MIRROR};
+    use moraine_config::{RouteConfig, StorageEngine, ROUTE_MODE_MIRROR};
     use serde_json::json;
     use tokio::sync::{Barrier, Notify};
 
@@ -1273,5 +1369,29 @@ mod tests {
         assert!(Arc::ptr_eq(&first, &second));
         assert!(Arc::ptr_eq(first.repository(), second.repository()));
         assert_eq!(state.requests.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn duckdb_router_uses_only_the_injected_local_default() {
+        let mut config = AppConfig::default();
+        config.storage.engine = StorageEngine::Duckdb;
+        config.backends.clear();
+        let repository: Arc<dyn ConversationRepository> =
+            Arc::new(InMemoryConversationRepository::default());
+        let router = BackendRepositoryRouter::with_local_default(
+            Arc::new(config),
+            RepoConfig::default(),
+            QueryRuntime::new(),
+            "moraine-backend/test",
+            repository.clone(),
+        )
+        .expect("DuckDB local router");
+
+        let selected = router.default_repository().await.expect("local default");
+        assert_eq!(selected.backend_name(), DEFAULT_BACKEND_NAME);
+        assert_eq!(selected.engine(), "duckdb");
+        assert_eq!(selected.clickhouse_url(), "<local>");
+        assert!(Arc::ptr_eq(selected.repository(), &repository));
+        assert_eq!(router.backend_names().collect::<Vec<_>>(), vec!["default"]);
     }
 }

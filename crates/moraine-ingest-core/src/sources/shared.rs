@@ -1346,6 +1346,8 @@ pub(crate) fn build_link_row(
         "harness": ctx.harness,
         "inference_provider": ctx.inference_provider,
         "source_name": ctx.source_name,
+        "source_file": ctx.source_file,
+        "source_generation": ctx.source_generation,
         "metadata_json": metadata_json,
         "event_version": event_version(),
     })

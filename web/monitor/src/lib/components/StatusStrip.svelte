@@ -38,11 +38,17 @@
     return `${((completed / total) * 100).toFixed(1)}%`;
   }
 
-  function buildHealthChips(data: HealthResponse | null, error: string | null): Chip[] {
+  function buildHealthChips(
+    data: HealthResponse | null,
+    error: string | null,
+    statusData: StatusResponse | null,
+  ): Chip[] {
+    const storage = statusData?.storage;
+    const engine = storage?.engine === 'duckdb' ? 'DuckDB' : 'ClickHouse';
     if (error || !data?.ok) {
       return [
         {
-          key: 'ClickHouse',
+          key: engine,
           value: error ?? data?.error ?? 'unavailable',
           ok: false,
           tone: 'bad',
@@ -50,17 +56,17 @@
       ];
     }
 
-    const url = data.url ?? 'unknown';
+    const url = storage?.location ?? data.url ?? 'unknown';
     const host = url.replace(/^https?:\/\//, '');
     const connections = data.connections?.total;
     const connectionsLabel =
       connections === null || connections === undefined ? 'n/a' : `${Number(connections).toLocaleString()}`;
 
     return [
-      { key: 'ClickHouse', value: host, ok: true },
-      { key: 'db', value: data.database ?? 'unknown', ok: false },
-      { key: 'ver', value: data.version ?? 'n/a', ok: false },
-      { key: 'ping', value: formatPing(data.ping_ms), ok: false },
+      { key: engine, value: host, ok: storage?.healthy ?? true },
+      { key: 'db', value: storage?.database ?? data.database ?? 'unknown', ok: false },
+      { key: 'ver', value: storage?.version ?? data.version ?? 'n/a', ok: false },
+      { key: 'ping', value: formatPing(storage?.latency_ms ?? data.ping_ms), ok: false },
       { key: 'conns', value: connectionsLabel, ok: false },
     ];
   }
@@ -193,7 +199,7 @@
     return chips;
   }
 
-  $: healthChips = buildHealthChips(health, healthError);
+  $: healthChips = buildHealthChips(health, healthError, status);
   $: ingestorChips = buildIngestorChips(status, statusError);
 </script>
 

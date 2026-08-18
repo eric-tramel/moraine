@@ -1,7 +1,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, SecondsFormat, TimeZone, Utc};
 use moraine_clickhouse::{ClickHouseClient, QueryCause, QueryOwner, QueryRuntime, QueryWorkload};
-use moraine_config::AppConfig;
+use moraine_config::{AppConfig, StorageEngine};
 use serde::Serialize;
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -22,6 +22,9 @@ pub(crate) async fn events(
     args: ExportEventsArgs,
     query_runtime: &QueryRuntime,
 ) -> Result<ExitCode> {
+    if cfg.storage.engine == StorageEngine::Duckdb {
+        bail!("moraine export is not supported by experimental DuckDB storage; switch back to the untouched ClickHouse store to export");
+    }
     let prepared = prepare_export(cfg, args)?;
     let client = ClickHouseClient::new_with_runtime(cfg.clickhouse.clone(), query_runtime.clone())?;
     let owner = QueryOwner::new(query_runtime, QueryWorkload::Export)?;

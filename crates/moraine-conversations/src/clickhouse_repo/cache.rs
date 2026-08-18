@@ -5,6 +5,8 @@ pub(super) const ANALYTICS_CACHE_TTL: Duration = Duration::from_secs(30);
 pub(super) const ANALYTICS_RANGE_COUNT: usize = AnalyticsRange::ALL.len();
 pub(super) const CORPUS_STATS_CACHE_TTL: Duration = Duration::from_secs(30);
 pub(super) const TERM_DF_CACHE_TTL: Duration = Duration::from_secs(300);
+pub(super) const TERM_DF_CACHE_MAX_ENTRIES: usize = 16_384;
+pub(super) const SCOPED_SESSION_CACHE_MAX_ENTRIES: usize = 16_384;
 pub(super) const SEARCH_RESULT_CACHE_TTL: Duration = Duration::from_secs(15);
 pub(super) const SEARCH_RESULT_CACHE_MAX_ENTRIES: usize = 256;
 pub(super) const MCP_SEARCH_RESULT_CACHE_TTL: Duration = Duration::from_secs(15);
@@ -28,15 +30,18 @@ pub(super) const SEARCH_DOC_EXTRA_CACHE_MAX_ENTRIES: usize = 65536;
 
 #[derive(Debug, Clone)]
 pub(super) struct AnalyticsCacheEntry {
+    pub(super) publication_token: String,
     pub(super) snapshot: AnalyticsSnapshot,
     pub(super) fetched_at: Instant,
 }
 
 impl AnalyticsCacheEntry {
-    pub(super) fn is_fresh(&self, now: Instant) -> bool {
-        now.checked_duration_since(self.fetched_at)
-            .unwrap_or_default()
-            <= ANALYTICS_CACHE_TTL
+    pub(super) fn is_fresh(&self, now: Instant, publication_token: &str) -> bool {
+        self.publication_token == publication_token
+            && now
+                .checked_duration_since(self.fetched_at)
+                .unwrap_or_default()
+                <= ANALYTICS_CACHE_TTL
     }
 }
 
@@ -53,6 +58,7 @@ pub(super) const fn analytics_range_index(range: AnalyticsRange) -> usize {
 
 #[derive(Debug, Clone)]
 pub(super) struct CorpusStatsCacheEntry {
+    pub(super) publication_token: String,
     pub(super) docs: u64,
     pub(super) total_doc_len: u64,
     pub(super) fetched_at: Instant,
@@ -60,6 +66,7 @@ pub(super) struct CorpusStatsCacheEntry {
 
 #[derive(Debug, Clone)]
 pub(super) struct TermDfCacheEntry {
+    pub(super) publication_token: String,
     pub(super) df: u64,
     pub(super) fetched_at: Instant,
 }
@@ -70,14 +77,49 @@ pub(super) struct SearchStatsCache {
     pub(super) term_df_by_term: HashMap<String, TermDfCacheEntry>,
 }
 
+pub(super) fn scoped_session_cache_contains(
+    cache: &HashMap<String, String>,
+    session_id: &str,
+    publication_token: &str,
+) -> bool {
+    cache
+        .get(session_id)
+        .is_some_and(|cached_token| cached_token == publication_token)
+}
+
+pub(super) fn insert_scoped_session_cache_entry(
+    cache: &mut HashMap<String, String>,
+    session_id: String,
+    publication_token: String,
+    max_entries: usize,
+) {
+    if max_entries == 0 {
+        return;
+    }
+    while !cache.contains_key(&session_id) && cache.len() >= max_entries {
+        let eviction = cache
+            .iter()
+            .find(|(_, cached_token)| *cached_token != &publication_token)
+            .or_else(|| cache.iter().next())
+            .map(|(session_id, _)| session_id.clone());
+        let Some(eviction) = eviction else {
+            break;
+        };
+        cache.remove(&eviction);
+    }
+    cache.insert(session_id, publication_token);
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct SearchEventsCacheEntry {
+    pub(super) publication_token: String,
     pub(super) hits: Vec<SearchEventHit>,
     pub(super) fetched_at: Instant,
 }
 
 #[derive(Debug, Clone)]
 pub(super) struct SearchMcpEventsCacheEntry {
+    pub(super) publication_token: String,
     pub(super) hits: Vec<SearchMcpEventHit>,
     pub(super) truncated: bool,
     pub(super) docs: u64,
@@ -87,12 +129,14 @@ pub(super) struct SearchMcpEventsCacheEntry {
 
 #[derive(Debug, Clone)]
 pub(super) struct TermPostingsCacheEntry {
+    pub(super) publication_token: String,
     pub(super) rows: Arc<[CachedPostingRow]>,
     pub(super) fetched_at: Instant,
 }
 
 #[derive(Debug, Clone)]
 pub(super) struct SearchDocExtraCacheEntry {
+    pub(super) publication_token: String,
     pub(super) session_id: String,
     pub(super) event_time: String,
     pub(super) source_name: String,
@@ -153,7 +197,7 @@ impl ClickHouseConversationRepository {
         tokenize_query(query, max_terms).len() >= 2
     }
 
-    pub async fn prewarm_mcp_search_state(&self) -> RepoResult<()> {
+    pub(super) async fn prewarm_mcp_search_state_impl(&self) -> RepoResult<()> {
         const PREWARM_QUERY_LIMIT: u16 = 10;
         const PREWARM_HOT_QUERY_COUNT: usize = 6;
         const PREWARM_FALLBACK_QUERIES: [&str; 5] = [
@@ -219,18 +263,23 @@ impl ClickHouseConversationRepository {
     }
 
     pub(super) async fn search_events_cache_get(&self, key: &str) -> Option<Vec<SearchEventHit>> {
+        let publication_token = publication_cache_token()?;
         let now = Instant::now();
         {
             let cache = self.search_cache.read().await;
             let entry = cache.get(key)?;
-            if now.duration_since(entry.fetched_at) <= SEARCH_RESULT_CACHE_TTL {
+            if entry.publication_token == publication_token
+                && now.duration_since(entry.fetched_at) <= SEARCH_RESULT_CACHE_TTL
+            {
                 return Some(entry.hits.clone());
             }
         }
 
         let mut cache = self.search_cache.write().await;
         if let Some(entry) = cache.get(key) {
-            if now.duration_since(entry.fetched_at) <= SEARCH_RESULT_CACHE_TTL {
+            if entry.publication_token == publication_token
+                && now.duration_since(entry.fetched_at) <= SEARCH_RESULT_CACHE_TTL
+            {
                 return Some(entry.hits.clone());
             }
         }
@@ -239,6 +288,9 @@ impl ClickHouseConversationRepository {
     }
 
     pub(super) async fn search_events_cache_put(&self, key: String, hits: &[SearchEventHit]) {
+        let Some(publication_token) = publication_cache_token() else {
+            return;
+        };
         let now = Instant::now();
         let mut cache = self.search_cache.write().await;
         cache.retain(|_, entry| now.duration_since(entry.fetched_at) <= SEARCH_RESULT_CACHE_TTL);
@@ -256,6 +308,7 @@ impl ClickHouseConversationRepository {
         cache.insert(
             key,
             SearchEventsCacheEntry {
+                publication_token,
                 hits: hits.to_vec(),
                 fetched_at: now,
             },
@@ -298,18 +351,23 @@ impl ClickHouseConversationRepository {
         &self,
         key: &str,
     ) -> Option<SearchMcpEventsCacheEntry> {
+        let publication_token = publication_cache_token()?;
         let now = Instant::now();
         {
             let cache = self.mcp_search_cache.read().await;
             let entry = cache.get(key)?;
-            if now.duration_since(entry.fetched_at) <= MCP_SEARCH_RESULT_CACHE_TTL {
+            if entry.publication_token == publication_token
+                && now.duration_since(entry.fetched_at) <= MCP_SEARCH_RESULT_CACHE_TTL
+            {
                 return Some(entry.clone());
             }
         }
 
         let mut cache = self.mcp_search_cache.write().await;
         if let Some(entry) = cache.get(key) {
-            if now.duration_since(entry.fetched_at) <= MCP_SEARCH_RESULT_CACHE_TTL {
+            if entry.publication_token == publication_token
+                && now.duration_since(entry.fetched_at) <= MCP_SEARCH_RESULT_CACHE_TTL
+            {
                 return Some(entry.clone());
             }
         }
@@ -325,6 +383,9 @@ impl ClickHouseConversationRepository {
         docs: u64,
         avgdl: f64,
     ) {
+        let Some(publication_token) = publication_cache_token() else {
+            return;
+        };
         let now = Instant::now();
         let mut cache = self.mcp_search_cache.write().await;
         cache
@@ -343,6 +404,7 @@ impl ClickHouseConversationRepository {
         cache.insert(
             key,
             SearchMcpEventsCacheEntry {
+                publication_token,
                 hits: hits.to_vec(),
                 truncated,
                 docs,
@@ -353,10 +415,12 @@ impl ClickHouseConversationRepository {
     }
 
     pub(super) async fn cached_corpus_stats(&self) -> Option<(u64, u64)> {
+        let publication_token = publication_cache_key("corpus-stats")?;
         let now = Instant::now();
         let cache = self.stats_cache.read().await;
         cache.corpus_stats.as_ref().and_then(|entry| {
-            (now.duration_since(entry.fetched_at) <= CORPUS_STATS_CACHE_TTL)
+            (entry.publication_token == publication_token
+                && now.duration_since(entry.fetched_at) <= CORPUS_STATS_CACHE_TTL)
                 .then_some((entry.docs, entry.total_doc_len))
         })
     }
@@ -384,8 +448,8 @@ impl ClickHouseConversationRepository {
         }
 
         let fallback_query = format!(
-            "SELECT toUInt64(count()) AS docs, toUInt64(ifNull(sum(doc_len), 0)) AS total_doc_len FROM (SELECT doc_id, any(doc_len) AS doc_len FROM {} FINAL WHERE doc_len > 0 GROUP BY doc_id) FORMAT JSONEachRow",
-            self.table_ref("search_postings")
+            "SELECT toUInt64(count()) AS docs, toUInt64(ifNull(sum(doc_len), 0)) AS total_doc_len FROM (SELECT doc_id, any(doc_len) AS doc_len FROM {} WHERE doc_len > 0 GROUP BY doc_id) FORMAT JSONEachRow",
+            self.table_ref("v_live_search_postings")
         );
         let fallback: Vec<CorpusStatsRow> =
             self.map_backend(self.query_rows(&fallback_query, None).await)?;
@@ -395,12 +459,15 @@ impl ClickHouseConversationRepository {
             (0, 0)
         };
 
-        let mut cache = self.stats_cache.write().await;
-        cache.corpus_stats = Some(CorpusStatsCacheEntry {
-            docs: resolved.0,
-            total_doc_len: resolved.1,
-            fetched_at: now,
-        });
+        if let Some(publication_token) = publication_cache_key("corpus-stats") {
+            let mut cache = self.stats_cache.write().await;
+            cache.corpus_stats = Some(CorpusStatsCacheEntry {
+                publication_token,
+                docs: resolved.0,
+                total_doc_len: resolved.1,
+                fetched_at: now,
+            });
+        }
         Ok(resolved)
     }
 
@@ -410,12 +477,15 @@ impl ClickHouseConversationRepository {
         total_doc_len: u64,
         fetched_at: Instant,
     ) {
-        let mut cache = self.stats_cache.write().await;
-        cache.corpus_stats = Some(CorpusStatsCacheEntry {
-            docs,
-            total_doc_len,
-            fetched_at,
-        });
+        if let Some(publication_token) = publication_cache_key("corpus-stats") {
+            let mut cache = self.stats_cache.write().await;
+            cache.corpus_stats = Some(CorpusStatsCacheEntry {
+                publication_token,
+                docs,
+                total_doc_len,
+                fetched_at,
+            });
+        }
     }
 
     pub(super) async fn cache_term_df_values(
@@ -424,12 +494,40 @@ impl ClickHouseConversationRepository {
         map: &HashMap<String, u64>,
         fetched_at: Instant,
     ) {
+        let Some(publication_token) = publication_cache_token() else {
+            return;
+        };
         let mut cache = self.stats_cache.write().await;
+        if cache.term_df_by_term.len() >= TERM_DF_CACHE_MAX_ENTRIES {
+            cache.term_df_by_term.retain(|_, entry| {
+                fetched_at
+                    .checked_duration_since(entry.fetched_at)
+                    .unwrap_or_default()
+                    <= TERM_DF_CACHE_TTL
+            });
+        }
         for term in terms {
             let df = *map.get(&term).unwrap_or(&0);
-            cache
-                .term_df_by_term
-                .insert(term, TermDfCacheEntry { df, fetched_at });
+            if !cache.term_df_by_term.contains_key(&term)
+                && cache.term_df_by_term.len() >= TERM_DF_CACHE_MAX_ENTRIES
+            {
+                if let Some(eviction) = cache
+                    .term_df_by_term
+                    .iter()
+                    .min_by_key(|(_, entry)| entry.fetched_at)
+                    .map(|(term, _)| term.clone())
+                {
+                    cache.term_df_by_term.remove(&eviction);
+                }
+            }
+            cache.term_df_by_term.insert(
+                term,
+                TermDfCacheEntry {
+                    publication_token: publication_token.clone(),
+                    df,
+                    fetched_at,
+                },
+            );
         }
     }
 
@@ -462,7 +560,8 @@ FORMAT JSONEachRow",
 
     pub(super) async fn df_map(&self, terms: &[String]) -> RepoResult<HashMap<String, u64>> {
         let now = Instant::now();
-        let postings_table = self.table_ref("search_postings");
+        let publication_token = publication_cache_token();
+        let postings_table = self.table_ref("v_live_search_postings");
 
         let mut map = HashMap::<String, u64>::new();
         let mut missing_terms = Vec::<String>::new();
@@ -470,11 +569,14 @@ FORMAT JSONEachRow",
         {
             let cache = self.stats_cache.read().await;
             for term in terms {
-                if let Some(entry) = cache.term_df_by_term.get(term) {
-                    if now.duration_since(entry.fetched_at) <= TERM_DF_CACHE_TTL {
-                        map.insert(term.clone(), entry.df);
-                        continue;
-                    }
+                if let Some(entry) = publication_token.as_deref().and_then(|token| {
+                    cache.term_df_by_term.get(term).filter(|entry| {
+                        entry.publication_token == token
+                            && now.duration_since(entry.fetched_at) <= TERM_DF_CACHE_TTL
+                    })
+                }) {
+                    map.insert(term.clone(), entry.df);
+                    continue;
                 }
                 missing_terms.push(term.clone());
             }

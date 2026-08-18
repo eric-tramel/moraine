@@ -745,6 +745,31 @@ class SandboxOwnershipShellTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stderr.count("already down"), 2)
 
+    def test_recorded_storage_engine_restores_compose_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            root.chmod(0o700)
+            sandbox_id = "sb-abcdef"
+            config = root / f"moraine-sandbox-{sandbox_id}"
+            config.mkdir(mode=0o700)
+            (config / ".storage-engine").write_text("duckdb\n")
+            result = self.run_shell(
+                f'configure_compose_for_sandbox {sandbox_id}\n'
+                'printf "%s %s" "$SANDBOX_STORAGE_ENGINE" "$SANDBOX_CLICKHOUSE_REQUIRED"\n',
+                env={"MORAINE_SANDBOX_STATE_ROOT": directory},
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "duckdb false")
+
+            (config / ".storage-engine").unlink()
+            legacy = self.run_shell(
+                f'configure_compose_for_sandbox {sandbox_id}\n'
+                'printf "%s %s" "$SANDBOX_STORAGE_ENGINE" "$SANDBOX_CLICKHOUSE_REQUIRED"\n',
+                env={"MORAINE_SANDBOX_STATE_ROOT": directory},
+            )
+            self.assertEqual(legacy.returncode, 0, legacy.stderr)
+            self.assertEqual(legacy.stdout, "clickhouse true")
+
     def test_machine_status_is_strict_owned_role_classification(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
