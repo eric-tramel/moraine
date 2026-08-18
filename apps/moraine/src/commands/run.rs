@@ -11,12 +11,16 @@ use crate::process::{
     service_args_with_defaults, write_pid_exclusive, StorageGateGuard,
 };
 use crate::service::Service;
+use moraine_config::StorageEngine;
 
 pub(super) async fn handle(global_config: Option<PathBuf>, run: RunArgs) -> Result<ExitCode> {
     let (inline_config, passthrough) = parse_config_flag(&run.args)?;
     let raw_config = inline_config.or(global_config);
     let (config_path, cfg) = load_cfg(raw_config)?;
     let paths = runtime_paths(&cfg);
+    if cfg.storage.engine == StorageEngine::Duckdb && run.service == Service::Ingest {
+        bail!("standalone `moraine run ingest` is unsupported by experimental DuckDB storage; ingest is owned by the unified backend");
+    }
     if run.service == Service::ClickHouse {
         return run_foreground_clickhouse(&cfg, &paths).await;
     }

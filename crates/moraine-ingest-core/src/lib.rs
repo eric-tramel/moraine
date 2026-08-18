@@ -11,6 +11,7 @@ mod redaction;
 mod sink;
 mod sources;
 pub mod sqlite_poll;
+pub mod store;
 mod tee;
 mod watch;
 
@@ -30,6 +31,9 @@ use crate::reconcile::spawn_reconcile_task;
 use crate::redaction::{RedactionAudit, SecretRedactor};
 use crate::sink::{spawn_sink_task, SinkAuthorConfig, SinkRole};
 use crate::sources::kiro_cli::load_kiro_session_metadata;
+use crate::store::{
+    IngestStore, IngestWrite, PreparedIngestBatch, PublicationTransition as StoreTransition,
+};
 use crate::tee::{
     spawn_tee_router, RedactionContext, RouteResolver, SharedRouteResolver, StatusRegistry,
 };
@@ -41,10 +45,11 @@ use moraine_config::{
     AppConfig, ClickHouseConfig, IngestSource, SourceFormat, DEFAULT_BACKEND_NAME,
 };
 use serde::Deserialize;
+use serde_json::json;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::sync::{mpsc, oneshot, RwLock, Semaphore};
+use tokio::sync::{mpsc, oneshot, watch as tokio_watch, RwLock, Semaphore};
 use tracing::{info, warn};
 
 pub(crate) const WATCHER_BACKEND_UNKNOWN: u64 = 0;
@@ -188,6 +193,523 @@ async fn probe_clickhouse(clickhouse: &ClickHouseClient) -> Result<()> {
         .scope(clickhouse.ping())
         .await
         .context("clickhouse ping failed")
+}
+
+fn store_transition(
+    mut transition: CheckpointTransition,
+    checkpoint_revision: u64,
+    publication_revision: u64,
+) -> StoreTransition {
+    transition.checkpoint.checkpoint_revision = checkpoint_revision;
+    transition.checkpoint.operation_id = transition.operation_id.clone();
+    StoreTransition {
+        source_name: transition.source.source_name,
+        source_file: transition.source.source_file,
+        source_generation: transition.checkpoint.source_generation,
+        operation_id: transition.operation_id,
+        checkpoint_revision,
+        publication_revision,
+        cache_epoch: transition.cache_epoch,
+        checkpoint: transition.checkpoint,
+    }
+}
+
+fn spawn_store_sink_task(
+    store: Arc<dyn IngestStore>,
+    checkpoints: Arc<RwLock<HashMap<String, model::Checkpoint>>>,
+    metrics: Arc<Metrics>,
+    mut receiver: mpsc::Receiver<SinkMessage>,
+    failure_tx: mpsc::UnboundedSender<String>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let loaded = checkpoints.read().await;
+        let mut checkpoint_revision = loaded
+            .values()
+            .map(|checkpoint| checkpoint.checkpoint_revision)
+            .max()
+            .unwrap_or(0);
+        let mut publication_revision = checkpoint_revision;
+        drop(loaded);
+        let mut assigned = HashMap::<String, (u64, u64)>::new();
+        let mut published = HashSet::<String>::new();
+
+        while let Some(message) = receiver.recv().await {
+            match message {
+                SinkMessage::Batch(mut batch) => {
+                    let raw_rows = batch.raw_rows.len() as u64;
+                    let event_rows = batch.event_rows.len() as u64;
+                    let error_rows = batch.error_rows.len() as u64;
+                    let started = std::time::Instant::now();
+                    if let Some(checkpoint) = batch.checkpoint.as_mut() {
+                        if checkpoint.checkpoint_revision == 0 {
+                            checkpoint_revision = checkpoint_revision.saturating_add(1);
+                            checkpoint.checkpoint_revision = checkpoint_revision;
+                        }
+                        if checkpoint.operation_id.is_empty() {
+                            checkpoint.operation_id = format!(
+                                "append:{}:{}:{}:{}",
+                                checkpoint.source_name,
+                                checkpoint.source_file,
+                                checkpoint.source_generation,
+                                checkpoint.checkpoint_revision
+                            );
+                        }
+                    }
+                    let checkpoint = batch.checkpoint.clone();
+                    let result = store
+                        .clone()
+                        .write(IngestWrite::Append(PreparedIngestBatch::from(batch)))
+                        .await;
+                    if result.is_ok() {
+                        metrics
+                            .raw_rows_written
+                            .fetch_add(raw_rows, Ordering::Relaxed);
+                        metrics
+                            .event_rows_written
+                            .fetch_add(event_rows, Ordering::Relaxed);
+                        metrics
+                            .err_rows_written
+                            .fetch_add(error_rows, Ordering::Relaxed);
+                        metrics.last_flush_ms.store(
+                            started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+                            Ordering::Relaxed,
+                        );
+                        if let Some(checkpoint) = checkpoint {
+                            checkpoints.write().await.insert(
+                                checkpoint_key(&checkpoint.source_name, &checkpoint.source_file),
+                                checkpoint,
+                            );
+                        }
+                    } else if let Err(error) = result {
+                        *metrics
+                            .last_error
+                            .lock()
+                            .expect("metrics last_error mutex poisoned") = error.to_string();
+                        tracing::error!("DuckDB ingest append failed: {error}");
+                        let _ = failure_tx.send(format!("DuckDB ingest append failed: {error}"));
+                        break;
+                    }
+                }
+                SinkMessage::BackendBatch { .. } => {
+                    tracing::error!("DuckDB default sink received a named-backend batch");
+                    let _ = failure_tx
+                        .send("DuckDB default sink received a named-backend batch".to_string());
+                    break;
+                }
+                SinkMessage::BeginReplay { transition, ack } => {
+                    let revisions = *assigned
+                        .entry(transition.operation_id.clone())
+                        .or_insert_with(|| {
+                            checkpoint_revision = checkpoint_revision.saturating_add(1);
+                            (checkpoint_revision, 0)
+                        });
+                    let command = IngestWrite::BeginReplay(store_transition(
+                        transition,
+                        revisions.0,
+                        revisions.1,
+                    ));
+                    let result = store.clone().write(command).await;
+                    let failure = result.as_ref().err().map(ToString::to_string);
+                    let _ = ack.send(
+                        result
+                            .map(|durable| ReplayBarrierAck {
+                                checkpoint_revision: durable.checkpoint_revision,
+                                operation_id: durable.operation_id,
+                            })
+                            .map_err(|error| error.to_string()),
+                    );
+                    if let Some(error) = failure {
+                        let _ = failure_tx.send(format!("DuckDB replay begin failed: {error}"));
+                        break;
+                    }
+                }
+                SinkMessage::FinalizeReplay { transition, ack } => {
+                    let operation_id = transition.operation_id.clone();
+                    let already_published = published.contains(&operation_id);
+                    let revisions = assigned.entry(operation_id.clone()).or_insert_with(|| {
+                        checkpoint_revision = checkpoint_revision.saturating_add(1);
+                        (checkpoint_revision, 0)
+                    });
+                    if revisions.1 == 0 {
+                        checkpoint_revision = checkpoint_revision.saturating_add(1);
+                        publication_revision = publication_revision.saturating_add(1);
+                        *revisions = (checkpoint_revision, publication_revision);
+                    }
+                    let revisions = *revisions;
+                    let command = IngestWrite::PublishReplay {
+                        transition: store_transition(transition, revisions.0, revisions.1),
+                        batch: Box::new(PreparedIngestBatch::default()),
+                    };
+                    let result = store.clone().write(command).await;
+                    let failure = result.as_ref().err().map(ToString::to_string);
+                    if result.is_ok() {
+                        published.insert(operation_id.clone());
+                    }
+                    let _ = ack.send(
+                        result
+                            .map(|durable| {
+                                FinalizeReplayOutcome::Published(
+                                    crate::publication::PublicationAck {
+                                        checkpoint_revision: durable.checkpoint_revision,
+                                        publication_revision: durable.publication_revision,
+                                        already_published,
+                                    },
+                                )
+                            })
+                            .map_err(|error| error.to_string()),
+                    );
+                    if let Some(error) = failure {
+                        let _ = failure_tx.send(format!("DuckDB replay publish failed: {error}"));
+                        break;
+                    }
+                }
+                SinkMessage::BlockReplay { transition, ack } => {
+                    let reason = transition.block_reason.clone();
+                    let revisions = *assigned
+                        .entry(transition.operation_id.clone())
+                        .or_insert_with(|| {
+                            checkpoint_revision = checkpoint_revision.saturating_add(1);
+                            (checkpoint_revision, 0)
+                        });
+                    let command = IngestWrite::BlockReplay {
+                        transition: store_transition(transition, revisions.0, revisions.1),
+                        reason,
+                    };
+                    let result = store.clone().write(command).await;
+                    let failure = result.as_ref().err().map(ToString::to_string);
+                    let _ = ack.send(
+                        result
+                            .map(|durable| ReplayBarrierAck {
+                                checkpoint_revision: durable.checkpoint_revision,
+                                operation_id: durable.operation_id,
+                            })
+                            .map_err(|error| error.to_string()),
+                    );
+                    if let Some(error) = failure {
+                        let _ = failure_tx.send(format!("DuckDB replay block failed: {error}"));
+                        break;
+                    }
+                }
+                SinkMessage::MirrorCaughtUp { ack } => {
+                    let _ = ack.send(Ok(()));
+                }
+                SinkMessage::FlushBarrier(ack) => {
+                    let _ = ack.send(());
+                }
+            }
+        }
+    })
+}
+
+fn spawn_store_heartbeat_task(
+    store: Arc<dyn IngestStore>,
+    metrics: Arc<Metrics>,
+    dispatch: Arc<Mutex<DispatchState>>,
+    interval_seconds: f64,
+    mut shutdown: tokio_watch::Receiver<bool>,
+    failure_tx: mpsc::UnboundedSender<String>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let interval = std::time::Duration::from_secs_f64(interval_seconds.max(0.05));
+        let mut tick = tokio::time::interval(interval);
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {
+                    let (files_active, oldest_pending_unix_ms) = {
+                        let state = dispatch.lock().expect("dispatch mutex poisoned");
+                        (
+                            state.inflight.len() as u32,
+                            state.pending_since_unix_ms.values().copied().min().unwrap_or(0),
+                        )
+                    };
+                    let watcher_backend = match metrics.watcher_backend_state.load(Ordering::Relaxed) {
+                        WATCHER_BACKEND_NATIVE => "native",
+                        WATCHER_BACKEND_POLL => "poll",
+                        WATCHER_BACKEND_MIXED => "mixed",
+                        _ => "unknown",
+                    };
+                    let progress_json = metrics
+                        .progress
+                        .lock()
+                        .expect("ingest progress mutex poisoned")
+                        .to_json(
+                            oldest_pending_unix_ms,
+                            metrics.sink_pending_rows.load(Ordering::Relaxed),
+                            metrics.sink_pending_bytes.load(Ordering::Relaxed),
+                            metrics.sink_retrying.load(Ordering::Relaxed),
+                        );
+                    let heartbeat = json!({
+                        "host": heartbeat::host_name(),
+                        "service_version": moraine_config::BUILD_VERSION,
+                        "queue_depth": metrics.queue_depth.load(Ordering::Relaxed),
+                        "files_active": files_active,
+                        "files_watched": metrics.watcher_registrations.load(Ordering::Relaxed) as u32,
+                        "rows_raw_written": metrics.raw_rows_written.load(Ordering::Relaxed),
+                        "rows_events_written": metrics.event_rows_written.load(Ordering::Relaxed),
+                        "rows_errors_written": metrics.err_rows_written.load(Ordering::Relaxed),
+                        "flush_latency_ms": metrics.last_flush_ms.load(Ordering::Relaxed).min(u64::from(u32::MAX)) as u32,
+                        "append_to_visible_p50_ms": metrics.append_to_visible_p50_ms.load(Ordering::Relaxed).min(u64::from(u32::MAX)) as u32,
+                        "append_to_visible_p95_ms": metrics.append_to_visible_p95_ms.load(Ordering::Relaxed).min(u64::from(u32::MAX)) as u32,
+                        "last_error": metrics.last_error.lock().expect("metrics last_error mutex poisoned").clone(),
+                        "watcher_backend": watcher_backend,
+                        "watcher_error_count": metrics.watcher_error_count.load(Ordering::Relaxed),
+                        "watcher_reset_count": metrics.watcher_reset_count.load(Ordering::Relaxed),
+                        "watcher_last_reset_unix_ms": metrics.watcher_last_reset_unix_ms.load(Ordering::Relaxed),
+                        "progress_json": progress_json,
+                    });
+                    if let Err(error) = store.clone().write(IngestWrite::Heartbeat(heartbeat)).await {
+                        tracing::error!("DuckDB ingest heartbeat failed: {error}");
+                        let _ = failure_tx.send(format!("DuckDB ingest heartbeat failed: {error}"));
+                        break;
+                    }
+                }
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        break;
+                    }
+                }
+            }
+        }
+    })
+}
+
+/// Run the existing parser, redaction, watcher, replay, and publication state
+/// machine against a process-local semantic store. Process signal ownership
+/// stays with the unified backend and is injected through `shutdown`.
+pub async fn run_ingestor_with_store(
+    config: AppConfig,
+    query_runtime: QueryRuntime,
+    store: Arc<dyn IngestStore>,
+    mut shutdown: tokio_watch::Receiver<bool>,
+) -> Result<()> {
+    let enabled_sources = config
+        .ingest
+        .sources
+        .iter()
+        .filter(|source| source.enabled)
+        .cloned()
+        .collect::<Vec<_>>();
+    if enabled_sources.is_empty() {
+        return Err(anyhow::anyhow!(
+            "no enabled ingest sources found in config.ingest.sources"
+        ));
+    }
+    store
+        .clone()
+        .validate_capabilities()
+        .await
+        .map_err(|error| anyhow::anyhow!(error))?;
+    let checkpoint_map = store
+        .clone()
+        .load_checkpoints()
+        .await
+        .map_err(|error| anyhow::anyhow!(error))?
+        .into_iter()
+        .map(|checkpoint| {
+            (
+                checkpoint_key(&checkpoint.source_name, &checkpoint.source_file),
+                checkpoint,
+            )
+        })
+        .collect::<HashMap<_, _>>();
+
+    let publication_identity = PublicationIdentity::load_or_create(&config.ingest.state_dir)
+        .context("failed to establish durable publication host identity")?;
+    let _publication_owner = PublicationOwnerLock::acquire(
+        &config.ingest.state_dir,
+        publication_identity.publisher_id(),
+    )
+    .context("failed to acquire publication ownership")?;
+
+    let process_queue_capacity = config
+        .ingest
+        .max_inflight_batches
+        .saturating_mul(16)
+        .max(1024);
+    let checkpoints = Arc::new(RwLock::new(checkpoint_map));
+    let dispatch = Arc::new(Mutex::new(DispatchState::default()));
+    let metrics = Arc::new(Metrics::new(process_queue_capacity));
+    let redactor = Arc::new(
+        SecretRedactor::new(&config.redaction).context("failed to initialize secret redaction")?,
+    );
+    let redaction_audit = Arc::new(RedactionAudit::default());
+    let (process_tx, mut process_rx) = mpsc::channel::<WorkItem>(process_queue_capacity);
+    let (sink_tx, sink_rx) =
+        mpsc::channel::<SinkMessage>(config.ingest.max_inflight_batches.max(1));
+    let (watch_path_tx, watch_path_rx) = mpsc::unbounded_channel::<WorkItem>();
+    let (default_sink_tx, default_sink_rx) =
+        mpsc::channel::<SinkMessage>(config.ingest.max_inflight_batches.max(1));
+    let (failure_tx, mut failure_rx) = mpsc::unbounded_channel::<String>();
+    let shared_config = Arc::new(config.clone());
+    let resolver: SharedRouteResolver =
+        Arc::new(Mutex::new(RouteResolver::new(shared_config.clone())));
+    let backend_statuses: StatusRegistry = Arc::new(Mutex::new(BTreeMap::new()));
+    let sink_handle = spawn_store_sink_task(
+        store.clone(),
+        checkpoints.clone(),
+        metrics.clone(),
+        default_sink_rx,
+        failure_tx.clone(),
+    );
+    let heartbeat_handle = spawn_store_heartbeat_task(
+        store,
+        metrics.clone(),
+        dispatch.clone(),
+        config.ingest.heartbeat_interval_seconds,
+        shutdown.clone(),
+        failure_tx,
+    );
+    let router_handle = spawn_tee_router(
+        shared_config,
+        query_runtime,
+        enabled_sources.clone(),
+        sink_rx,
+        default_sink_tx,
+        resolver,
+        backend_statuses,
+        RedactionContext::new(redactor, redaction_audit),
+        publication_identity,
+    );
+
+    let worker_limit = config.ingest.max_file_workers.max(1).min(u32::MAX as usize);
+    let sem = Arc::new(Semaphore::new(worker_limit));
+    let sqlite_poll_state = crate::sqlite_poll::VolatilePollMap::new();
+    let processor_handle = {
+        let process_tx_clone = process_tx.clone();
+        let sink_tx_clone = sink_tx.clone();
+        let checkpoints_clone = checkpoints.clone();
+        let poll_state_clone = sqlite_poll_state.clone();
+        let dispatch_clone = dispatch.clone();
+        let sem_clone = sem.clone();
+        let metrics_clone = metrics.clone();
+        let cfg_clone = config.clone();
+        tokio::spawn(async move {
+            while let Some(work) = process_rx.recv().await {
+                note_work_received(&metrics_clone);
+                let key = work.key();
+                {
+                    let mut state = dispatch_clone.lock().expect("dispatch mutex poisoned");
+                    state.pending.remove(&key);
+                    state.pending_since_unix_ms.remove(&key);
+                    state.inflight.insert(key);
+                }
+                let Ok(permit) = sem_clone.clone().acquire_owned().await else {
+                    break;
+                };
+                tokio::spawn(run_work_item(
+                    cfg_clone.clone(),
+                    work,
+                    permit,
+                    checkpoints_clone.clone(),
+                    poll_state_clone.clone(),
+                    sink_tx_clone.clone(),
+                    process_tx_clone.clone(),
+                    dispatch_clone.clone(),
+                    metrics_clone.clone(),
+                ));
+            }
+        })
+    };
+    let debounce_handle = spawn_debounce_task(
+        config.clone(),
+        watch_path_rx,
+        process_tx.clone(),
+        dispatch.clone(),
+        metrics.clone(),
+    );
+
+    if config.ingest.backfill_on_start {
+        let checkpoint_snapshot = checkpoints.read().await.clone();
+        for source in &enabled_sources {
+            for path in enumerate_tracked_files(&source.glob, source.format)?
+                .into_iter()
+                .filter(|path| source_path_is_ingestable(source, path))
+            {
+                metrics
+                    .progress
+                    .lock()
+                    .expect("ingest progress mutex poisoned")
+                    .register_target(
+                        source,
+                        &path,
+                        TargetObservation::unknown(),
+                        &checkpoint_snapshot,
+                    );
+                enqueue_work(
+                    WorkItem {
+                        source_name: source.name.clone(),
+                        harness: source.harness.clone(),
+                        format: source.format,
+                        source_glob: source.glob.clone(),
+                        path,
+                    },
+                    &process_tx,
+                    &dispatch,
+                    &metrics,
+                )
+                .await;
+            }
+        }
+        metrics
+            .progress
+            .lock()
+            .expect("ingest progress mutex poisoned")
+            .finish_discovery();
+    }
+
+    let reconcile_handle = spawn_reconcile_task(
+        config.clone(),
+        enabled_sources.clone(),
+        process_tx.clone(),
+        dispatch.clone(),
+        metrics.clone(),
+    );
+    let watcher_shutdown = Arc::new(AtomicBool::new(false));
+    let watcher_threads = spawn_watcher_threads(
+        enabled_sources,
+        watch_path_tx,
+        metrics,
+        watcher_shutdown.clone(),
+    )?;
+    let ingest_failure = loop {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break None;
+                }
+            }
+            failure = failure_rx.recv() => {
+                break failure;
+            }
+        }
+    };
+    watcher_shutdown.store(true, Ordering::Release);
+    for handle in watcher_threads {
+        let _ = handle.join();
+    }
+
+    debounce_handle.abort();
+    reconcile_handle.abort();
+    processor_handle.abort();
+    let _ = debounce_handle.await;
+    let _ = reconcile_handle.await;
+    let _ = processor_handle.await;
+
+    drop(process_tx);
+    let worker_drain = sem
+        .acquire_many(worker_limit as u32)
+        .await
+        .map_err(|error| anyhow::anyhow!("embedded ingest worker drain failed: {error}"))?;
+    drop(sink_tx);
+    let _ = router_handle.await;
+    let _ = sink_handle.await;
+    heartbeat_handle.abort();
+    let _ = heartbeat_handle.await;
+    drop(worker_drain);
+    if let Some(error) = ingest_failure {
+        return Err(anyhow::anyhow!(error));
+    }
+    Ok(())
 }
 
 pub async fn run_ingestor(config: AppConfig, query_runtime: QueryRuntime) -> Result<()> {
@@ -512,8 +1034,13 @@ pub async fn run_ingestor(config: AppConfig, query_runtime: QueryRuntime) -> Res
         metrics.clone(),
     );
 
-    let watcher_threads =
-        spawn_watcher_threads(enabled_sources.clone(), watch_path_tx, metrics.clone())?;
+    let watcher_shutdown = Arc::new(AtomicBool::new(false));
+    let watcher_threads = spawn_watcher_threads(
+        enabled_sources.clone(),
+        watch_path_tx,
+        metrics.clone(),
+        watcher_shutdown.clone(),
+    )?;
 
     loop {
         let mut queued_any = false;
@@ -556,8 +1083,9 @@ pub async fn run_ingestor(config: AppConfig, query_runtime: QueryRuntime) -> Res
     router_handle.abort();
     sink_handle.abort();
 
+    watcher_shutdown.store(true, Ordering::Release);
     for handle in watcher_threads {
-        let _ = handle.thread().id();
+        let _ = handle.join();
     }
 
     Ok(())

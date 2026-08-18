@@ -148,6 +148,55 @@ pub enum ClickHouseRequestCompression {
     Gzip,
 }
 
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum StorageEngine {
+    #[default]
+    Clickhouse,
+    Duckdb,
+}
+
+impl StorageEngine {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Clickhouse => "clickhouse",
+            Self::Duckdb => "duckdb",
+        }
+    }
+}
+
+impl fmt::Display for StorageEngine {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StorageConfig {
+    #[serde(default)]
+    pub engine: StorageEngine,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DuckDbConfig {
+    /// Empty values are resolved beneath `runtime.root_dir` during loading.
+    #[serde(default)]
+    pub database_path: String,
+    /// Empty values are resolved beneath `runtime.root_dir` during loading.
+    #[serde(default)]
+    pub temp_directory: String,
+    #[serde(default = "default_duckdb_memory_limit_mb")]
+    pub memory_limit_mb: u32,
+    #[serde(default = "default_duckdb_threads")]
+    pub threads: u16,
+    #[serde(default = "default_duckdb_read_connections")]
+    pub read_connections: u16,
+    #[serde(default = "default_duckdb_max_temp_directory_size_mb")]
+    pub max_temp_directory_size_mb: u32,
+}
+
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClickHouseConfig {
@@ -446,6 +495,10 @@ pub struct RuntimeConfig {
 #[serde(deny_unknown_fields)]
 pub struct AppConfig {
     #[serde(default)]
+    pub storage: StorageConfig,
+    #[serde(default)]
+    pub duckdb: DuckDbConfig,
+    #[serde(default)]
     pub clickhouse: ClickHouseConfig,
     /// Named ClickHouse backends. `"default"` always exists after config
     /// load: it is synthesized from `[clickhouse]` (or built-in defaults)
@@ -582,6 +635,8 @@ impl Default for AppConfig {
         let mut backends = BTreeMap::new();
         backends.insert(DEFAULT_BACKEND_NAME.to_string(), clickhouse.clone());
         Self {
+            storage: StorageConfig::default(),
+            duckdb: DuckDbConfig::default(),
             clickhouse,
             backends,
             routes: Vec::new(),
@@ -593,6 +648,19 @@ impl Default for AppConfig {
             bm25: Bm25Config::default(),
             monitor: MonitorConfig::default(),
             runtime: RuntimeConfig::default(),
+        }
+    }
+}
+
+impl Default for DuckDbConfig {
+    fn default() -> Self {
+        Self {
+            database_path: String::new(),
+            temp_directory: String::new(),
+            memory_limit_mb: default_duckdb_memory_limit_mb(),
+            threads: default_duckdb_threads(),
+            read_connections: default_duckdb_read_connections(),
+            max_temp_directory_size_mb: default_duckdb_max_temp_directory_size_mb(),
         }
     }
 }
@@ -690,6 +758,22 @@ impl Default for RuntimeConfig {
 
 fn default_ch_url() -> String {
     "http://127.0.0.1:8123".to_string()
+}
+
+fn default_duckdb_memory_limit_mb() -> u32 {
+    512
+}
+
+fn default_duckdb_threads() -> u16 {
+    2
+}
+
+fn default_duckdb_read_connections() -> u16 {
+    2
+}
+
+fn default_duckdb_max_temp_directory_size_mb() -> u32 {
+    2048
 }
 
 fn default_ch_database() -> String {
@@ -1539,6 +1623,100 @@ fn normalize_backends_and_routes(cfg: &mut AppConfig) -> Result<()> {
     Ok(())
 }
 
+fn validate_duckdb_topology(cfg: &AppConfig, raw: &toml::Value) -> Result<()> {
+    if cfg.storage.engine != StorageEngine::Duckdb {
+        return Ok(());
+    }
+    if raw
+        .get("backends")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|backends| !backends.is_empty())
+    {
+        return Err(anyhow::anyhow!(
+            "experimental DuckDB storage does not support [backends.*]; remove named backends or select storage.engine = \"clickhouse\""
+        ));
+    }
+    if raw
+        .get("routes")
+        .and_then(toml::Value::as_array)
+        .is_some_and(|routes| !routes.is_empty())
+    {
+        return Err(anyhow::anyhow!(
+            "experimental DuckDB storage does not support [[routes]]; remove routes or select storage.engine = \"clickhouse\""
+        ));
+    }
+    Ok(())
+}
+
+fn validate_duckdb_path(root: &Path, value: &str, field: &str) -> Result<()> {
+    let path = Path::new(value);
+    if value.trim().is_empty() || value == ":memory:" {
+        return Err(anyhow::anyhow!(
+            "duckdb.{field} must be a non-empty file-system path"
+        ));
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(anyhow::anyhow!(
+            "duckdb.{field} must not contain `..` path traversal"
+        ));
+    }
+    if !path.starts_with(root) {
+        return Err(anyhow::anyhow!(
+            "duckdb.{field} must remain beneath runtime.root_dir"
+        ));
+    }
+    Ok(())
+}
+
+fn normalize_duckdb(cfg: &mut AppConfig) -> Result<()> {
+    if cfg.duckdb.memory_limit_mb == 0 {
+        return Err(anyhow::anyhow!(
+            "duckdb.memory_limit_mb must be greater than zero"
+        ));
+    }
+    if cfg.duckdb.threads == 0 {
+        return Err(anyhow::anyhow!("duckdb.threads must be greater than zero"));
+    }
+    if cfg.duckdb.read_connections == 0 {
+        return Err(anyhow::anyhow!(
+            "duckdb.read_connections must be greater than zero"
+        ));
+    }
+    if cfg.duckdb.max_temp_directory_size_mb == 0 {
+        return Err(anyhow::anyhow!(
+            "duckdb.max_temp_directory_size_mb must be greater than zero"
+        ));
+    }
+
+    let root = PathBuf::from(&cfg.runtime.root_dir);
+    let database_path = if cfg.duckdb.database_path.trim().is_empty() {
+        root.join("duckdb/moraine.duckdb")
+    } else {
+        PathBuf::from(resolve_runtime_subdir(
+            &cfg.runtime.root_dir,
+            cfg.duckdb.database_path.trim(),
+        ))
+    };
+    let temp_directory = if cfg.duckdb.temp_directory.trim().is_empty() {
+        root.join("duckdb/tmp")
+    } else {
+        PathBuf::from(resolve_runtime_subdir(
+            &cfg.runtime.root_dir,
+            cfg.duckdb.temp_directory.trim(),
+        ))
+    };
+    let database = database_path.to_string_lossy().into_owned();
+    let temp = temp_directory.to_string_lossy().into_owned();
+    validate_duckdb_path(&root, &database, "database_path")?;
+    validate_duckdb_path(&root, &temp, "temp_directory")?;
+    cfg.duckdb.database_path = database;
+    cfg.duckdb.temp_directory = temp;
+    Ok(())
+}
+
 #[cfg(target_os = "macos")]
 fn migrate_legacy_claude_source(sources: &mut Vec<IngestSource>) {
     if sources
@@ -1722,6 +1900,7 @@ fn normalize_config(mut cfg: AppConfig) -> Result<AppConfig> {
     cfg.runtime.pids_dir = resolve_runtime_subdir(&cfg.runtime.root_dir, &cfg.runtime.pids_dir);
     cfg.runtime.service_bin_dir = expand_path(&cfg.runtime.service_bin_dir);
     cfg.runtime.managed_clickhouse_dir = expand_path(&cfg.runtime.managed_clickhouse_dir);
+    normalize_duckdb(&mut cfg)?;
 
     // Resolve the central MCP socket path against the (already-normalized)
     // pids dir so a bare filename lands at `~/.moraine/run/mcp.sock` while an
@@ -1731,8 +1910,13 @@ fn normalize_config(mut cfg: AppConfig) -> Result<AppConfig> {
     cfg.mcp.central_socket_path =
         resolve_runtime_subdir(&cfg.runtime.pids_dir, &cfg.mcp.central_socket_path);
 
-    normalize_backends_and_routes(&mut cfg)?;
-    validate_clickhouse_connect_timeouts(&cfg)?;
+    if cfg.storage.engine == StorageEngine::Clickhouse {
+        normalize_backends_and_routes(&mut cfg)?;
+        validate_clickhouse_connect_timeouts(&cfg)?;
+    } else {
+        cfg.backends.clear();
+        cfg.routes.clear();
+    }
     normalize_redaction(&mut cfg)?;
     normalize_identity(&mut cfg);
 
@@ -2104,6 +2288,8 @@ where
     // errors point to the user's file without any resolved value in memory.
     let sanitized_content = sanitize_clickhouse_environment_references(&content, &references)?;
     let mut cfg: AppConfig = parse_config_toml(&sanitized_content)?;
+
+    validate_duckdb_topology(&cfg, &raw)?;
 
     // The struct-level parse cannot tell an explicit `[clickhouse]` block
     // from its serde default, so the both-declared ambiguity is detected on
@@ -5409,5 +5595,101 @@ watch_root = "~/.pi/agent/sessions"
             .expect("pi source");
         assert_eq!(source.format, SourceFormat::Jsonl);
         assert_eq!(source.tracked_extension(), "jsonl");
+    }
+
+    #[test]
+    fn storage_defaults_to_clickhouse_and_duckdb_resources_are_bounded() {
+        let path = write_temp_config("", "storage-defaults");
+        let cfg = load_config(&path).expect("default config loads");
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(cfg.storage.engine, StorageEngine::Clickhouse);
+        assert_eq!(cfg.duckdb.memory_limit_mb, 512);
+        assert_eq!(cfg.duckdb.threads, 2);
+        assert_eq!(cfg.duckdb.read_connections, 2);
+        assert_eq!(cfg.duckdb.max_temp_directory_size_mb, 2048);
+        assert!(cfg.backends.contains_key(DEFAULT_BACKEND_NAME));
+    }
+
+    #[test]
+    fn duckdb_paths_resolve_beneath_runtime_root_without_fake_backend() {
+        let path = write_temp_config(
+            r#"
+[storage]
+engine = "duckdb"
+
+[runtime]
+root_dir = "/tmp/moraine-duckdb-config-test"
+"#,
+            "duckdb-path-defaults",
+        );
+        let cfg = load_config(&path).expect("DuckDB config loads");
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(cfg.storage.engine, StorageEngine::Duckdb);
+        assert_eq!(
+            cfg.duckdb.database_path,
+            "/tmp/moraine-duckdb-config-test/duckdb/moraine.duckdb"
+        );
+        assert_eq!(
+            cfg.duckdb.temp_directory,
+            "/tmp/moraine-duckdb-config-test/duckdb/tmp"
+        );
+        assert!(cfg.backends.is_empty());
+        assert!(cfg.routes.is_empty());
+    }
+
+    #[test]
+    fn duckdb_rejects_named_backends_routes_and_unsafe_paths() {
+        for (label, contents, expected) in [
+            (
+                "named-backend",
+                r#"
+[storage]
+engine = "duckdb"
+[backends.team]
+url = "http://127.0.0.1:8123"
+"#,
+                "does not support [backends.*]",
+            ),
+            (
+                "route",
+                r#"
+[storage]
+engine = "duckdb"
+[[routes]]
+dir = "/tmp/**"
+backend = "default"
+"#,
+                "does not support [[routes]]",
+            ),
+            (
+                "escape",
+                r#"
+[storage]
+engine = "duckdb"
+[runtime]
+root_dir = "/tmp/moraine-duckdb-config-test"
+[duckdb]
+database_path = "../escaped.duckdb"
+"#,
+                "must not contain `..`",
+            ),
+            (
+                "memory",
+                r#"
+[storage]
+engine = "duckdb"
+[duckdb]
+memory_limit_mb = 0
+"#,
+                "memory_limit_mb must be greater than zero",
+            ),
+        ] {
+            let path = write_temp_config(contents, label);
+            let error = load_config(&path).expect_err("invalid DuckDB config must fail");
+            std::fs::remove_file(&path).ok();
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+        }
     }
 }

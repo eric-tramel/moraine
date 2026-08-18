@@ -10,7 +10,7 @@ use notify::{
     Config as NotifyConfig, Event, PollWatcher, RecommendedWatcher, RecursiveMode, Watcher,
 };
 use std::collections::BTreeSet;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
@@ -221,6 +221,7 @@ pub(crate) fn spawn_watcher_threads(
     sources: Vec<IngestSource>,
     tx: mpsc::UnboundedSender<WorkItem>,
     metrics: Arc<Metrics>,
+    shutdown: Arc<AtomicBool>,
 ) -> Result<Vec<std::thread::JoinHandle<()>>> {
     let mut handles = Vec::<std::thread::JoinHandle<()>>::new();
 
@@ -232,6 +233,7 @@ pub(crate) fn spawn_watcher_threads(
         let watch_root = std::path::PathBuf::from(source.watch_root.clone());
         let tx_clone = tx.clone();
         let metrics_clone = metrics.clone();
+        let shutdown_clone = shutdown.clone();
 
         info!(
             "starting watcher on {} (source={}, harness={}, format={})",
@@ -334,7 +336,10 @@ pub(crate) fn spawn_watcher_threads(
             registration.mark_registered();
 
             loop {
-                match event_rx.recv() {
+                if shutdown_clone.load(Ordering::Acquire) {
+                    break;
+                }
+                match event_rx.recv_timeout(Duration::from_millis(250)) {
                     Ok(Ok(event)) => {
                         if event_requires_rescan(&event) {
                             queue_rescan(
@@ -377,7 +382,8 @@ pub(crate) fn spawn_watcher_threads(
                             &metrics_clone,
                         );
                     }
-                    Err(_) => break,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                 }
             }
         });

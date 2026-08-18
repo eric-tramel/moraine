@@ -772,11 +772,13 @@ async fn api_status(
 
     let estimated_total_rows = tables.iter().map(|table| table.rows).sum::<u64>();
     let clickhouse = status_clickhouse_payload(&backend, &health, database_exists);
+    let storage = status_storage_payload(&backend, &health, database_exists);
 
     json_response(
         json!({
             "ok": true,
-            "clickhouse": clickhouse,
+            "storage": storage,
+            "clickhouse": (backend.engine() == "clickhouse").then_some(clickhouse),
             "database": {
                 "exists": database_exists,
                 "table_count": tables.len(),
@@ -789,6 +791,40 @@ async fn api_status(
         }),
         StatusCode::OK,
     )
+}
+
+fn status_storage_payload(
+    backend: &BackendRepository,
+    health: &StoreHealth,
+    database_exists: bool,
+) -> Value {
+    let (version, latency_ms, healthy, error) = if !database_exists {
+        (Value::Null, Value::Null, false, json!("database not found"))
+    } else {
+        match &health.version {
+            StoreProbe::Failed { message } => (Value::Null, Value::Null, false, json!(message)),
+            StoreProbe::Available(version) => match &health.ping {
+                StoreProbe::Available(latency_ms) => {
+                    (json!(version), json!(latency_ms), true, Value::Null)
+                }
+                StoreProbe::Failed { message } => {
+                    (json!(version), Value::Null, false, json!(message))
+                }
+            },
+        }
+    };
+
+    json!({
+        "engine": backend.engine(),
+        "location": if backend.engine() == "duckdb" { "local (redacted)" } else { backend.clickhouse_url() },
+        "database": backend.clickhouse_database(),
+        "healthy": healthy,
+        "version": version,
+        "schema_ready": database_exists,
+        "latency_ms": latency_ms,
+        "error": error,
+        "connections": connection_payload(&health.connections),
+    })
 }
 
 fn probe_bool(probe: &StoreProbe<bool>) -> Option<bool> {

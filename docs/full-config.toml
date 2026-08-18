@@ -10,6 +10,26 @@
 # for what each key does, and commented examples for optional named backends,
 # routes, and extra ingest sources.
 
+[storage]
+# Primary storage engine. ClickHouse remains the default. DuckDB is an
+# experimental local single-user mode and cannot be combined with named
+# backends or routes.
+engine = "clickhouse"
+
+[duckdb]
+# Empty paths use <runtime.root_dir>/duckdb/moraine.duckdb and
+# <runtime.root_dir>/duckdb/tmp. Explicit paths must remain beneath the
+# runtime root; in-memory databases and symlinks are rejected.
+database_path = ""
+temp_directory = ""
+
+# DuckDB is synchronous and can otherwise size itself from all host resources,
+# so Moraine always applies these explicit process-local bounds.
+memory_limit_mb = 512
+threads = 2
+read_connections = 2
+max_temp_directory_size_mb = 2048
+
 [clickhouse]
 # HTTP URL for the default ClickHouse backend. Moraine starts managed
 # ClickHouse only for local URLs; remote URLs must already be reachable.

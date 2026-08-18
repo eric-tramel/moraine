@@ -121,11 +121,14 @@ rows. They do not use `null` to mean an empty collection.
 
 - `capabilities.schema_migration_level` is `null` under the conditions described
   in the capabilities contract.
-- `/api/v1/status` can return HTTP `200` and `ok: true` while
-  `clickhouse.healthy` is `false`. In that diagnostic response, unavailable
-  `clickhouse.version` or `clickhouse.ping_ms` values are `null` and
-  `clickhouse.error` explains the probe result. If the database does not exist,
-  its table list is empty.
+- `/api/v1/status` always includes a generic `storage` object. Its `engine`,
+  redacted `location`, `database`, `healthy`, `version`, `schema_ready`,
+  `latency_ms`, `error`, and `connections` fields describe the selected engine
+  without exposing a DuckDB path. ClickHouse responses also preserve the
+  existing `clickhouse` object unchanged; DuckDB responses set that field to
+  `null`. The route can return HTTP `200` and `ok: true` while
+  `storage.healthy` is `false`. If the database does not exist, its table list
+  is empty.
 - Health and status connection diagnostics use `connections.total: null` with
   a sibling `connections.error` when connection metrics are unavailable. A
   connection-metrics error alone does not make an otherwise successful health

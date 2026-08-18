@@ -22,6 +22,9 @@ worktree's code. See RFC #232.
 # Bring up a fresh sandbox with a random id; prints monitor + clickhouse URLs.
 scripts/dev/sandbox/moraine-sandbox up
 
+# Exercise DuckDB's single-process topology without a ClickHouse container.
+scripts/dev/sandbox/moraine-sandbox up --storage-engine duckdb
+
 # Optionally mount your host session archives (read-only), including Codex,
 # Claude Code, Cursor (Agent transcripts + SQLite state), Hermes, Kimi, and Kiro
 # when their default directories exist:
@@ -69,8 +72,11 @@ sandbox exists to exercise it.
 
 - Host config dir: `/tmp/moraine-sandbox-<id>/` — generated `moraine.toml`
   and (when no host mounts are used) empty fixture directories.
-- Named Docker volume: `moraine-sandbox-<id>_state` — ClickHouse data,
-  ingest state, logs. Removed on `down`.
+- Named Docker volume: `moraine-sandbox-<id>_state` — Moraine runtime state,
+  ingest state, logs, and (in DuckDB mode) the database/WAL/temp footprint.
+  Removed on `down`.
+- Named Docker volume: `moraine-sandbox-<id>_clickhouse-data` — created only
+  by the default ClickHouse topology and removed on `down`.
 - Docker compose project: `moraine-sandbox-<id>`.
 
 Nothing touches `~/.moraine/` on the host. Host mounts, when enabled, are

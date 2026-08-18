@@ -27,6 +27,8 @@ pub struct CliArgs {
     pub port: Option<u16>,
     /// Optional monitor asset directory, valid only in socket/backend mode.
     pub static_dir: Option<PathBuf>,
+    /// Disable the in-process ingestor in experimental DuckDB backend mode.
+    pub no_ingest: bool,
     /// `--project-only`: restrict retrieval to sessions that originated from
     /// the directory this process was launched in. Forces an embedded server
     /// (the shared central server cannot scope per session) and is rejected
@@ -39,7 +41,7 @@ pub struct CliArgs {
 pub(crate) fn usage() {
     eprintln!(
         "usage:
-  moraine-mcp [--config <path>] [--serve <stdio|socket>] [--socket <path>] [--host <host>] [--port <port>] [--static-dir <path>] [--project-only]
+  moraine-mcp [--config <path>] [--serve <stdio|socket>] [--socket <path>] [--host <host>] [--port <port>] [--static-dir <path>] [--no-ingest] [--project-only]
 
   --serve stdio   (default) serve over stdio: proxy to the central MCP
                   server if enabled and reachable, else run embedded.
@@ -52,6 +54,7 @@ pub(crate) fn usage() {
   --project-only  only retrieve sessions that originated from the current
                   working directory (runs embedded, never via the central
                   server).
+  --no-ingest     disable embedded ingest in experimental DuckDB socket mode.
 "
     );
 }
@@ -79,6 +82,7 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> Result<CliArgs> {
     let mut host = None;
     let mut port = None;
     let mut static_dir = None;
+    let mut no_ingest = false;
     let mut project_only = false;
     let mut help = false;
 
@@ -123,6 +127,9 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> Result<CliArgs> {
             "--project-only" => {
                 project_only = true;
             }
+            "--no-ingest" => {
+                no_ingest = true;
+            }
             "-h" | "--help" | "help" => {
                 help = true;
                 break;
@@ -150,9 +157,9 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> Result<CliArgs> {
     }
     if !help
         && serve_mode != ServeMode::Socket
-        && (host.is_some() || port.is_some() || static_dir.is_some())
+        && (host.is_some() || port.is_some() || static_dir.is_some() || no_ingest)
     {
-        bail!("--host, --port, and --static-dir require --serve socket");
+        bail!("--host, --port, --static-dir, and --no-ingest require --serve socket");
     }
 
     Ok(CliArgs {
@@ -162,6 +169,7 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> Result<CliArgs> {
         host,
         port,
         static_dir,
+        no_ingest,
         project_only,
         help,
     })

@@ -109,9 +109,22 @@ export interface IngestStatus {
   history?: IngestHistoryPoint[];
 }
 
+export interface StorageStatus {
+  engine: 'clickhouse' | 'duckdb' | string;
+  location: string;
+  database: string;
+  healthy: boolean;
+  version: string | null;
+  schema_ready: boolean;
+  latency_ms: number | null;
+  error: string | null;
+  connections?: ConnectionStats;
+}
+
 
 export interface StatusResponse {
   ok: boolean;
+  storage?: StorageStatus;
   ingestor?: IngestorStatus;
   ingest_status?: IngestStatus | null;
   error?: string;

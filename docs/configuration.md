@@ -49,6 +49,8 @@ future keys.
 
 | Section | Purpose |
 | --- | --- |
+| `[storage]` | Select the primary storage engine. ClickHouse remains the default; `duckdb` is experimental and local-only. |
+| `[duckdb]` | Bounded resources and private paths for the experimental embedded DuckDB store. |
 | `[clickhouse]` | Default ClickHouse backend used by local ingest, monitor, MCP, and migrations. |
 | `[backends.<name>]` | Optional named ClickHouse backend for project mirroring and routed MCP. |
 | `[[routes]]` | Optional ordered working-directory routes to named backends. |
@@ -105,6 +107,51 @@ process and reported as `disabled_missing_identity_author`; default ingest
 continues. After setting `author`, restart the ingest service. Retained source
 files are then replayed to the mirror using the configured author; files
 deleted before the mirror catches up cannot be recovered by this replay path.
+
+## Experimental local DuckDB
+
+ClickHouse remains the default when `[storage]` is absent. A single-user,
+offline installation can opt into the embedded engine with setup:
+
+```bash
+moraine setup config --storage-engine duckdb --yes
+```
+
+or by editing TOML directly:
+
+```toml
+[storage]
+engine = "duckdb"
+
+[duckdb]
+memory_limit_mb = 512
+threads = 2
+read_connections = 2
+max_temp_directory_size_mb = 2048
+```
+
+The database defaults to `<runtime.root_dir>/duckdb/moraine.duckdb` and spill
+files default to `<runtime.root_dir>/duckdb/tmp`. `database_path` and
+`temp_directory` may override those locations, but both must remain beneath
+the runtime root. Empty paths, `:memory:`, `..` traversal, symlinks, and zero
+resource limits are rejected before the database is opened.
+
+DuckDB mode is intentionally one-process and local-only. `moraine up` starts
+the unified backend, which owns the database and supervises embedded ingest;
+it does not start ClickHouse or standalone `moraine-ingest`. `moraine up
+--no-ingest` opens the store read-only from Moraine's lifecycle perspective
+while still retaining the sole owner process. Named backends, routes, mirrors,
+standalone ingest, embedded MCP fallback, `--project-only`, manual `db migrate`,
+and export are unsupported in this experimental mode.
+
+Switching engines never imports, deletes, or mutates the other engine's data.
+DuckDB builds a distinct dataset by replaying retained source files; deleted or
+truncated inputs cannot be reconstructed. For a cold backup, stop Moraine
+cleanly, verify no owner process or `.wal` remains, copy the closed database to
+a private empty directory, then start Moraine and run `moraine db doctor`.
+
+The dormant `[clickhouse]` section is retained when DuckDB is selected so that
+rollback consists of changing `storage.engine` back to `clickhouse`.
 
 ## ClickHouse
 

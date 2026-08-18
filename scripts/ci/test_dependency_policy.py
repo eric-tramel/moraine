@@ -11,27 +11,27 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import dependency_policy as policy
 
 
-def metadata_fixture(*dependents: str) -> dict[str, object]:
+def metadata_fixture(*dependents: str, dependency: str = policy.CLICKHOUSE_PACKAGE) -> dict[str, object]:
     package_ids = {name: f"path+file:///{name}#0.0.0" for name in dependents}
     packages = [
         {
             "id": package_id,
             "name": name,
-            "dependencies": [{"name": policy.CLICKHOUSE_PACKAGE}],
+            "dependencies": [{"name": dependency}],
         }
         for name, package_id in package_ids.items()
     ]
     packages.append(
         {
-            "id": "path+file:///moraine-clickhouse#0.0.0",
-            "name": policy.CLICKHOUSE_PACKAGE,
+            "id": f"path+file:///{dependency}#0.0.0",
+            "name": dependency,
             "dependencies": [],
         }
     )
     return {
         "workspace_members": [
             *package_ids.values(),
-            "path+file:///moraine-clickhouse#0.0.0",
+            f"path+file:///{dependency}#0.0.0",
         ],
         "packages": packages,
     }
@@ -55,6 +55,20 @@ class ClickHouseDependencyPolicyTests(unittest.TestCase):
         self.assertIn("epic #451 Phase 1 dependency rule", message)
         self.assertIn("moraine-mcp-core", message)
         self.assertIn("outside the allowlist", message)
+
+
+class DuckDbDependencyPolicyTests(unittest.TestCase):
+    def test_only_mcp_may_link_duckdb(self) -> None:
+        fixture = metadata_fixture("moraine-mcp", dependency=policy.DUCKDB_PACKAGE)
+        self.assertEqual(policy.assert_duckdb_dependency_policy(fixture), ("moraine-mcp",))
+
+    def test_other_direct_duckdb_dependent_is_rejected(self) -> None:
+        fixture = metadata_fixture(
+            "moraine-mcp", "moraine-conversations", dependency=policy.DUCKDB_PACKAGE
+        )
+        with self.assertRaises(policy.PolicyViolation) as raised:
+            policy.assert_duckdb_dependency_policy(fixture)
+        self.assertIn("moraine-conversations", str(raised.exception))
 
 
 class MonitorSqlPolicyTests(unittest.TestCase):

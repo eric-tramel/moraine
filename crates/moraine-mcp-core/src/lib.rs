@@ -1743,11 +1743,10 @@ struct BackendPrewarmGates {
 }
 
 impl BackendPrewarmGates {
-    fn new(cfg: &AppConfig) -> Self {
-        let by_backend = cfg
-            .backends
-            .keys()
-            .map(|name| (name.clone(), Arc::new(AtomicBool::new(false))))
+    fn new(router: &BackendRepositoryRouter) -> Self {
+        let by_backend = router
+            .backend_names()
+            .map(|name| (name.to_string(), Arc::new(AtomicBool::new(false))))
             .collect();
         Self {
             by_backend: Arc::new(by_backend),
@@ -1773,7 +1772,7 @@ pub struct McpDaemonState {
 
 impl McpDaemonState {
     pub fn new(cfg: Arc<AppConfig>, router: Arc<BackendRepositoryRouter>) -> Self {
-        let prewarm_gates = BackendPrewarmGates::new(&cfg);
+        let prewarm_gates = BackendPrewarmGates::new(&router);
         let request_admission = build_request_admission(&cfg);
         Self {
             cfg,

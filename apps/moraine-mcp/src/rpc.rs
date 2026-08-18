@@ -1,9 +1,10 @@
 use crate::cli::ServeMode;
 use anyhow::{anyhow, bail, Context, Result};
-use moraine_config::AppConfig;
+use moraine_config::{AppConfig, StorageEngine};
 use moraine_conversations::{
-    BackendRepositoryRouter, QueryRuntime, RepoConfig, QUERY_CLEANUP_GRACE,
+    BackendRepositoryRouter, ConversationRepository, QueryRuntime, RepoConfig, QUERY_CLEANUP_GRACE,
 };
+use moraine_duckdb::{DuckDbStore, DuckDbStoreOptions};
 #[cfg(unix)]
 use moraine_mcp_core::PrivateRouteNegotiation;
 use moraine_mcp_core::SessionOriginScope;
@@ -18,6 +19,7 @@ pub struct BackendOptions {
     pub host: Option<String>,
     pub port: Option<u16>,
     pub static_dir: Option<PathBuf>,
+    pub no_ingest: bool,
 }
 
 fn is_explicit_loopback_bind(bind: &str) -> bool {
@@ -75,6 +77,11 @@ pub fn run(
     session_scope: Option<SessionOriginScope>,
     options: BackendOptions,
 ) -> Result<()> {
+    if options.no_ingest
+        && (serve_mode != ServeMode::Socket || cfg.storage.engine != StorageEngine::Duckdb)
+    {
+        bail!("--no-ingest is supported only by the experimental DuckDB socket backend");
+    }
     match serve_mode {
         ServeMode::Socket => {
             if session_scope.is_some() {
@@ -88,7 +95,14 @@ pub fn run(
                 .enable_all()
                 .build()
                 .context("failed to build multi-threaded runtime")?;
-            runtime.block_on(run_backend(cfg, socket_path, host, port, static_dir))
+            runtime.block_on(run_backend(
+                cfg,
+                socket_path,
+                host,
+                port,
+                static_dir,
+                options.no_ingest,
+            ))
         }
         // Only the unscoped, central-enabled path can become a thin proxy, so
         ServeMode::Stdio if session_scope.is_none() && cfg.mcp.use_central_server => {
@@ -205,6 +219,12 @@ async fn run_stdio_entry(cfg: AppConfig, session_scope: Option<SessionOriginScop
         }
     }
 
+    if cfg.storage.engine == StorageEngine::Duckdb {
+        bail!(
+            "experimental DuckDB storage requires the central Moraine backend; embedded MCP fallback and --project-only are unsupported"
+        );
+    }
+
     let cfg = Arc::new(cfg);
     let query_runtime = QueryRuntime::new();
     let result = async {
@@ -239,6 +259,7 @@ async fn run_backend(
     host: String,
     port: u16,
     static_dir: PathBuf,
+    no_ingest: bool,
 ) -> Result<()> {
     validate_backend_bind_policy(&host, cfg.backend.auth_token.as_deref())?;
     let serve_mcp_http = permits_direct_mcp_http(&host);
@@ -248,9 +269,39 @@ async fn run_backend(
     // shares one checked client, repository, and cache set across MCP and HTTP.
     let cfg = Arc::new(cfg);
     let query_runtime = QueryRuntime::new();
-    let router = match backend_router(cfg.clone(), None, query_runtime.clone(), "moraine-backend")
-        .context("failed to build backend repository router")
-    {
+    let mut local_store: Option<Arc<DuckDbStore>> = None;
+    let router_result = if cfg.storage.engine == StorageEngine::Duckdb {
+        let repository_config = repository_config(&cfg, None);
+        match DuckDbStoreOptions::from_config(&cfg) {
+            Ok(options) => {
+                match DuckDbStore::open_with_repository_config(options, repository_config.clone())
+                    .await
+                {
+                    Ok(store) => {
+                        let repository: Arc<dyn ConversationRepository> = store.clone();
+                        local_store = Some(store);
+                        BackendRepositoryRouter::with_local_default(
+                            cfg.clone(),
+                            repository_config,
+                            query_runtime.clone(),
+                            format!(
+                                "moraine-backend/{} (pid={})",
+                                moraine_config::BUILD_VERSION,
+                                std::process::id()
+                            ),
+                            repository,
+                        )
+                        .map(Arc::new)
+                    }
+                    Err(error) => Err(error.into()),
+                }
+            }
+            Err(error) => Err(error.into()),
+        }
+    } else {
+        backend_router(cfg.clone(), None, query_runtime.clone(), "moraine-backend")
+    };
+    let router = match router_result.context("failed to build backend repository router") {
         Ok(router) => router,
         Err(error) => {
             query_runtime.close_and_drain().await;
@@ -275,6 +326,22 @@ async fn run_backend(
     };
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut services = JoinSet::new();
+
+    if let Some(store) = local_store.as_ref().filter(|_| !no_ingest).cloned() {
+        let ingest_config = Arc::unwrap_or_clone(cfg.clone());
+        let ingest_runtime = query_runtime.clone();
+        let ingest_shutdown = shutdown_rx.clone();
+        services.spawn(async move {
+            let result = moraine_duckdb::run_embedded_ingest(
+                ingest_config,
+                ingest_runtime,
+                store,
+                ingest_shutdown,
+            )
+            .await;
+            ("embedded ingest service", result)
+        });
+    }
 
     let socket_shutdown = shutdown_rx.clone();
     services.spawn(async move {
@@ -332,6 +399,12 @@ async fn run_backend(
         query_runtime.close_and_drain(),
         tokio::time::timeout_at(shutdown_deadline, service_drain),
     );
+    if let Some(store) = local_store {
+        store
+            .close()
+            .await
+            .context("failed to checkpoint and close DuckDB store")?;
+    }
     let shutdown_failure = match service_result {
         Ok(failure) => failure,
         Err(_) => {
@@ -559,6 +632,7 @@ mod tests {
                 "0.0.0.0".to_string(),
                 port,
                 static_dir,
+                false,
             ))
             .expect_err("unguarded non-loopback bind must refuse startup");
 
@@ -596,6 +670,7 @@ mod tests {
                 "127.0.0.1".to_string(),
                 port,
                 static_dir.clone(),
+                false,
             ))
             .expect_err("occupied HTTP port must fail unified backend startup");
 

@@ -31,6 +31,7 @@ RUN_DIR=/home/moraine/.moraine/run
 CH_HOST="${SANDBOX_CLICKHOUSE_HOST:-clickhouse}"
 CH_PORT="${SANDBOX_CLICKHOUSE_PORT:-8123}"
 CH_URL="http://${CH_HOST}:${CH_PORT}"
+STORAGE_ENGINE="${SANDBOX_STORAGE_ENGINE:-clickhouse}"
 
 log()  { printf '[sandbox] %s\n' "$*"; }
 warn() { printf '[sandbox] WARN: %s\n' "$*" >&2; }
@@ -134,17 +135,19 @@ done
 # Wait for the compose-managed ClickHouse to be reachable
 # ---------------------------------------------------------------------------
 
-log "waiting for clickhouse at ${CH_URL}"
-for attempt in $(seq 1 60); do
-    if curl -fsS --max-time 2 "${CH_URL}/ping" >/dev/null 2>&1; then
-        log "clickhouse reachable after ${attempt} attempt(s)"
-        break
-    fi
-    if (( attempt == 60 )); then
-        die "clickhouse did not become reachable at ${CH_URL} within 60s"
-    fi
-    sleep 1
-done
+if [[ "$STORAGE_ENGINE" == "clickhouse" ]]; then
+    log "waiting for clickhouse at ${CH_URL}"
+    for attempt in $(seq 1 60); do
+        if curl -fsS --max-time 2 "${CH_URL}/ping" >/dev/null 2>&1; then
+            log "clickhouse reachable after ${attempt} attempt(s)"
+            break
+        fi
+        if (( attempt == 60 )); then
+            die "clickhouse did not become reachable at ${CH_URL} within 60s"
+        fi
+        sleep 1
+    done
+fi
 
 # ---------------------------------------------------------------------------
 # Fake the ClickHouse pid file so `moraine up` skips starting its own.
@@ -157,16 +160,18 @@ done
 # moraine.toml (set to http://clickhouse:8123 by the host CLI).
 # ---------------------------------------------------------------------------
 
-(sleep infinity) &
-ch_sentinel_pid=$!
-echo "$ch_sentinel_pid" > "$RUN_DIR/clickhouse.pid"
-log "registered clickhouse sentinel pid ${ch_sentinel_pid} (real CH is in sibling container)"
+if [[ "$STORAGE_ENGINE" == "clickhouse" ]]; then
+    (sleep infinity) &
+    ch_sentinel_pid=$!
+    echo "$ch_sentinel_pid" > "$RUN_DIR/clickhouse.pid"
+    log "registered clickhouse sentinel pid ${ch_sentinel_pid} (real CH is in sibling container)"
+fi
 
 # ---------------------------------------------------------------------------
 # Bring the moraine services up
 # ---------------------------------------------------------------------------
 
-log "bringing up moraine stack against ${CH_URL}"
+log "bringing up moraine stack with storage engine ${STORAGE_ENGINE}"
 log "running: moraine up --config $MORAINE_CONFIG_PATH"
 if ! "$MORAINE_BIN" up --config "$MORAINE_CONFIG_PATH"; then
     warn "'moraine up' failed"
@@ -176,7 +181,11 @@ fi
 
 log "moraine stack is up"
 log "  monitor (container): http://127.0.0.1:8080"
-log "  clickhouse (compose DNS): ${CH_URL}"
+if [[ "$STORAGE_ENGINE" == "clickhouse" ]]; then
+    log "  clickhouse (compose DNS): ${CH_URL}"
+else
+    log "  storage: DuckDB under the isolated state volume"
+fi
 log "(the host CLI prints the matching host-published URLs)"
 
 # ---------------------------------------------------------------------------

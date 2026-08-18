@@ -9,6 +9,10 @@ mod session_label;
 
 pub use backend_router::{BackendRepository, BackendRepositoryRouter};
 pub use clickhouse_repo::ClickHouseConversationRepository;
+pub use cursor::{
+    decode_cursor, encode_cursor, ConversationCursor, McpSessionListCursor, SessionEventCursor,
+    TurnCursor,
+};
 pub use domain::{
     is_user_facing_content_event, CanonicalContinuation, CanonicalReadAnchor, CanonicalReadOutcome,
     CanonicalSessionPage, CanonicalSessionSignals, CanonicalTurnPage, Conversation,

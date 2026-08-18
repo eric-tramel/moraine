@@ -42,6 +42,31 @@ function statusResponse(
 }
 
 describe('StatusStrip ingestion conditions', () => {
+  it('renders the selected storage engine from generic status', () => {
+    render(StatusStrip, {
+      props: {
+        health: { ok: true, version: '1.4.1', ping_ms: 0.4 },
+        status: {
+          ok: true,
+          storage: {
+            engine: 'duckdb',
+            location: 'local (redacted)',
+            database: 'moraine',
+            healthy: true,
+            version: 'v1.4.1',
+            schema_ready: true,
+            latency_ms: 0.2,
+            error: null,
+          },
+        },
+      },
+    });
+
+    expect(screen.getByText('DuckDB')).toBeInTheDocument();
+    expect(screen.getByText('local (redacted)')).toBeInTheDocument();
+    expect(screen.queryByText('ClickHouse')).not.toBeInTheDocument();
+  });
+
   it('renders all independent unknown conditions without decoded progress', () => {
     render(StatusStrip, {
       props: {

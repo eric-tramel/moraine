@@ -91,6 +91,7 @@ pub(crate) enum HeartbeatSnapshot {
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct StatusSnapshot {
+    pub(crate) storage_engine: String,
     pub(crate) services: Vec<ServiceRuntimeStatus>,
     pub(crate) monitor_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -146,8 +147,10 @@ pub(crate) struct ClickhouseStatusSnapshot {
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct UpSnapshot {
-    pub(crate) clickhouse: StartOutcome,
-    pub(crate) migrations: MigrationOutcome,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) clickhouse: Option<StartOutcome>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) migrations: Option<MigrationOutcome>,
     pub(crate) services: Vec<StartOutcome>,
     pub(crate) status: StatusSnapshot,
 }
@@ -504,6 +507,11 @@ pub(crate) fn render_status(output: &CliOutput, snapshot: &StatusSnapshot) -> Re
 
     // -- Database Health (concise) --
     let db_healthy = snapshot.doctor.clickhouse_healthy && snapshot.doctor.database_exists;
+    let engine_label = if snapshot.storage_engine == "duckdb" {
+        "DuckDB"
+    } else {
+        "ClickHouse"
+    };
     let mut doctor_lines = vec![format!(
         "{} {}",
         stoplight(db_healthy),
@@ -511,7 +519,8 @@ pub(crate) fn render_status(output: &CliOutput, snapshot: &StatusSnapshot) -> Re
             "database healthy".to_string()
         } else {
             format!(
-                "clickhouse {} / db {}",
+                "{} {} / db {}",
+                engine_label.to_ascii_lowercase(),
                 health_label(snapshot.doctor.clickhouse_healthy),
                 if snapshot.doctor.database_exists {
                     "exists"
@@ -675,8 +684,8 @@ pub(crate) fn render_status(output: &CliOutput, snapshot: &StatusSnapshot) -> Re
         );
     }
 
-    // -- ClickHouse runtime details (verbose only) --
-    if output.verbose {
+    // -- ClickHouse runtime details (verbose only, and only for that engine) --
+    if output.verbose && snapshot.storage_engine == "clickhouse" {
         let mut ch_lines = vec![
             format!(
                 "managed install: {}",
@@ -843,11 +852,17 @@ pub(crate) fn render_up(output: &CliOutput, snapshot: &UpSnapshot) -> Result<()>
         println!("{}", serde_json::to_string_pretty(snapshot)?);
         return Ok(());
     }
-    let mut rows = vec![vec![
-        snapshot.clickhouse.service.name().to_string(),
-        format_start_state(&snapshot.clickhouse),
-        format_start_pid(&snapshot.clickhouse),
-    ]];
+    let mut rows = snapshot
+        .clickhouse
+        .iter()
+        .map(|outcome| {
+            vec![
+                outcome.service.name().to_string(),
+                format_start_state(outcome),
+                format_start_pid(outcome),
+            ]
+        })
+        .collect::<Vec<_>>();
     rows.extend(snapshot.services.iter().map(|outcome| {
         vec![
             outcome.service.name().to_string(),
@@ -856,7 +871,9 @@ pub(crate) fn render_up(output: &CliOutput, snapshot: &UpSnapshot) -> Result<()>
         ]
     }));
     output.table("Startup Results", &["service", "result", "pid"], &rows);
-    render_db_migrate(output, &snapshot.migrations)?;
+    if let Some(migrations) = &snapshot.migrations {
+        render_db_migrate(output, migrations)?;
+    }
     render_status(output, &snapshot.status)?;
     Ok(())
 }

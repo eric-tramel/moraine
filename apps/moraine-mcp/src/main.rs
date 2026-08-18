@@ -63,6 +63,7 @@ fn main() -> Result<()> {
             host: args.host,
             port: args.port,
             static_dir: args.static_dir,
+            no_ingest: args.no_ingest,
         },
     )
 }
