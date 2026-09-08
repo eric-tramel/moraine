@@ -50,9 +50,16 @@ pub(crate) fn lock_storage_writer_launch(
 
 pub(crate) fn lock_storage_migration(paths: &RuntimePaths) -> Result<StorageGateGuard> {
     let file = open_storage_gate(paths)?;
-    file.lock()
-        .context("failed to acquire storage migration gate")?;
-    Ok(StorageGateGuard { _file: file })
+    match file.try_lock() {
+        Ok(()) => Ok(StorageGateGuard { _file: file }),
+        Err(std::fs::TryLockError::WouldBlock) => bail!(
+            "cannot apply a storage cutover while Moraine writers still hold the launch gate; \
+             exit the agent sessions running `moraine run mcp`, then retry"
+        ),
+        Err(std::fs::TryLockError::Error(error)) => {
+            Err(error).context("failed to acquire storage migration gate")
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, serde::Serialize)]
@@ -1329,21 +1336,17 @@ mod tests {
         let launch_gate = lock_storage_writer_launch(&paths, Service::Ingest)
             .expect("acquire launch gate")
             .expect("ingest is a storage writer");
-        let migration_paths = paths.clone();
-        let (migration_tx, migration_rx) = std::sync::mpsc::channel();
-        let migration = std::thread::spawn(move || {
-            let gate = lock_storage_migration(&migration_paths).expect("acquire migration gate");
-            migration_tx.send(()).expect("report migration gate");
-            drop(gate);
-        });
-        assert!(migration_rx
-            .recv_timeout(Duration::from_millis(50))
-            .is_err());
+        let Err(blocked) = lock_storage_migration(&paths) else {
+            panic!("exclusive lock must not wait on a shared launch gate");
+        };
+        assert!(
+            blocked
+                .to_string()
+                .contains("writers still hold the launch gate"),
+            "unexpected cutover error: {blocked:#}"
+        );
         drop(launch_gate);
-        migration_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("migration must proceed after launch registration");
-        migration.join().expect("join migration contender");
+        drop(lock_storage_migration(&paths).expect("migration proceeds after writers release"));
 
         let migration_gate = lock_storage_migration(&paths).expect("reacquire migration gate");
         let launch_paths = paths.clone();

@@ -9,7 +9,7 @@ pub(crate) enum Service {
     Ingest,
     #[value(name = "backend")]
     Backend,
-    /// Foreground MCP stdio/proxy service retained for `moraine run mcp`.
+    /// Per-session MCP stdio proxy for `moraine run mcp`. Not a singleton.
     #[value(name = "mcp")]
     Mcp,
 }

@@ -213,12 +213,36 @@ async fn run_service(global_config: Option<PathBuf>, run: RunArgs) -> Result<Exi
     if let Some((key, value)) = config_path.child_origin_environment() {
         command.env(key, value);
     }
-    run_registered_foreground_child(
-        command,
-        &pid_path(&paths, run.service),
-        run.service.name(),
-        writer_gate,
-    )
+    if run.service == Service::Mcp {
+        run_foreground_child(command, run.service.name(), writer_gate)
+    } else {
+        run_registered_foreground_child(
+            command,
+            &pid_path(&paths, run.service),
+            run.service.name(),
+            writer_gate,
+        )
+    }
+}
+
+fn run_foreground_child(
+    mut command: Command,
+    service_name: &str,
+    writer_gate: Option<StorageGateGuard>,
+) -> Result<ExitCode> {
+    let mut child = command
+        .spawn()
+        .map_err(anyhow::Error::from)
+        .with_context(|| format!("failed to run {service_name}"))?;
+    let status = child
+        .wait()
+        .map_err(anyhow::Error::from)
+        .with_context(|| format!("failed to wait for {service_name}"))?;
+    // Stdio MCP is not pid-tracked. Keep the shared launch gate until the
+    // child exits so 031/033 cutover cannot take the exclusive lock while
+    // an embedded fallback can still write.
+    drop(writer_gate);
+    Ok(ExitCode::from(status.code().unwrap_or(1) as u8))
 }
 
 fn run_registered_foreground_child(
@@ -603,6 +627,46 @@ mod tests {
             !pid_file.exists(),
             "completed child must remove its PID file"
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mcp_stdio_session_holds_writer_gate_until_exit() {
+        let root =
+            std::env::temp_dir().join(format!("moraine-mcp-writer-gate-{}", std::process::id()));
+        let mut cfg = AppConfig::default();
+        cfg.runtime.pids_dir = root.join("run").to_string_lossy().to_string();
+        let paths = runtime_paths(&cfg);
+        let gate = lock_storage_writer_launch(&paths, Service::Mcp)
+            .expect("acquire MCP launch gate")
+            .expect("MCP is a storage writer");
+
+        let shim = root.join("moraine-mcp");
+        std::fs::create_dir_all(&root).expect("create shim dir");
+        std::fs::write(&shim, "#!/bin/sh\nsleep 0.4\nexit 0\n").expect("write mcp shim");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod mcp shim");
+        }
+        let command = Command::new(&shim);
+        let child = std::thread::spawn(move || run_foreground_child(command, "mcp", Some(gate)));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let Err(blocked) = lock_storage_migration(&paths) else {
+            panic!("cutover must not proceed while a stdio MCP session is live");
+        };
+        assert!(
+            blocked
+                .to_string()
+                .contains("writers still hold the launch gate"),
+            "unexpected cutover error: {blocked:#}"
+        );
+
+        let code = child.join().expect("join MCP child").expect("MCP child");
+        assert_eq!(code, ExitCode::SUCCESS);
+        drop(lock_storage_migration(&paths).expect("cutover after MCP exit"));
         let _ = std::fs::remove_dir_all(root);
     }
 }
