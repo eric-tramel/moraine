@@ -1752,7 +1752,18 @@ mod tests {
     async fn durability_request_handler(
         State(state): State<DurabilityRequestState>,
         Query(params): Query<HashMap<String, String>>,
+        body: axum::body::Bytes,
     ) -> (StatusCode, String) {
+        let params = {
+            let mut params = params;
+            if !params.contains_key("query") && !body.is_empty() {
+                params.insert(
+                    "query".to_string(),
+                    String::from_utf8_lossy(&body).into_owned(),
+                );
+            }
+            params
+        };
         state
             .params
             .lock()
@@ -1859,7 +1870,18 @@ mod tests {
     async fn skew_mock_handler(
         State(state): State<SkewMockState>,
         Query(params): Query<HashMap<String, String>>,
+        body: axum::body::Bytes,
     ) -> (StatusCode, String) {
+        let params = {
+            let mut params = params;
+            if !params.contains_key("query") && !body.is_empty() {
+                params.insert(
+                    "query".to_string(),
+                    String::from_utf8_lossy(&body).into_owned(),
+                );
+            }
+            params
+        };
         let query = params.get("query").cloned().unwrap_or_default();
         state.queries.fetch_add(1, Ordering::Relaxed);
 

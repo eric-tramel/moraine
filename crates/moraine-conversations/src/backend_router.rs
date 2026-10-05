@@ -566,7 +566,18 @@ mod tests {
             method: Method,
             Query(params): Query<HashMap<String, String>>,
             headers: HeaderMap,
+            body: axum::body::Bytes,
         ) -> (StatusCode, String) {
+            let params = {
+                let mut params = params;
+                if !params.contains_key("query") && !body.is_empty() {
+                    params.insert(
+                        "query".to_string(),
+                        String::from_utf8_lossy(&body).into_owned(),
+                    );
+                }
+                params
+            };
             let query = params.get("query").cloned().unwrap_or_default();
             if query.contains("FROM system.workloads") {
                 return (StatusCode::OK, "0".to_string());

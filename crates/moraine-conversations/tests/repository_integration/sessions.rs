@@ -714,6 +714,31 @@ async fn get_mcp_session_uses_only_bounded_projection_queries() {
         .all(|query| { !query.contains("mcp_open_") && !query.contains("v_conversation_trace") }));
 }
 #[tokio::test(flavor = "multi_thread")]
+async fn get_mcp_session_opens_full_navigation_page_with_oversized_version_lookup() {
+    let (repo, state) = build_repo().await;
+
+    let session = repo
+        .get_mcp_session("sess-large")
+        .await
+        .expect("a full navigation page must open")
+        .expect("large session exists");
+    assert_eq!(session.metadata.session_id, "sess-large");
+
+    let queries = state.queries.lock().expect("queries lock").clone();
+    let version_query = queries
+        .iter()
+        .find(|query| {
+            query.contains("FROM `moraine`.`mcp_event_version_seek`")
+                && query.contains("WHERE event_uid IN")
+        })
+        .expect("navigation reconciliation must look up current versions");
+    assert!(
+        version_query.len() > 64 * 1024,
+        "regression needs a statement larger than the HTTP URL limit, got {} bytes",
+        version_query.len()
+    );
+}
+#[tokio::test(flavor = "multi_thread")]
 async fn get_mcp_session_missing_canonical_navigation_returns_none() {
     let (repo, _state) = build_repo().await;
 
