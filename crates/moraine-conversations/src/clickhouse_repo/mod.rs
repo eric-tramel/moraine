@@ -54,6 +54,7 @@ mod repo_impl;
 mod rows;
 mod scope;
 mod search;
+mod session_page;
 mod sql;
 
 #[cfg(test)]
@@ -62,6 +63,7 @@ mod tests;
 use cache::*;
 use helpers::*;
 use rows::*;
+use session_page::*;
 use sql::*;
 
 #[derive(Clone)]
@@ -131,6 +133,41 @@ impl ClickHouseConversationRepository {
         self.ch
             .query_rows_with_params(query, database, &request_params)
             .await
+    }
+
+    /// Runs a phase-2 page query over `session_ids`. `build` renders the SQL
+    /// for the id list; phase-2 queries run with `SESSION_PAGE_SUMMARY_SETTINGS`.
+    ///
+    /// A resource-limit failure is not retried here: a request's query owner
+    /// rejects further queries once one fails, so callers bound the work up
+    /// front instead (page size and per-stage session chunks).
+    pub(super) async fn query_session_page_rows<T: DeserializeOwned>(
+        &self,
+        session_ids: &[String],
+        build: impl Fn(&str) -> String,
+    ) -> RepoResult<Vec<T>> {
+        let query = build(&sql_string_list(session_ids));
+        self.map_backend(
+            self.query_rows_with_params(&query, None, &SESSION_PAGE_SUMMARY_SETTINGS)
+                .await,
+        )
+    }
+
+    /// [`Self::query_session_page_rows`] over contiguous slices of at most
+    /// `chunk` ids, concatenated in order. Peak ClickHouse memory then tracks
+    /// the slice, not the whole page; because slices are contiguous and every
+    /// slice query orders by the same key, the concatenation keeps page order.
+    pub(super) async fn query_session_page_chunks<T: DeserializeOwned>(
+        &self,
+        session_ids: &[String],
+        chunk: usize,
+        build: impl Fn(&str) -> String,
+    ) -> RepoResult<Vec<T>> {
+        let mut rows = Vec::new();
+        for slice in session_ids.chunks(chunk.max(1)) {
+            rows.extend(self.query_session_page_rows(slice, &build).await?);
+        }
+        Ok(rows)
     }
 
     pub(super) fn map_backend<T>(&self, result: AnyResult<T>) -> RepoResult<T> {

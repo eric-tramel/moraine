@@ -1,5 +1,20 @@
 use super::*;
 
+fn page_select_queries(queries: &[String]) -> Vec<&String> {
+    queries
+        .iter()
+        .filter(|q| is_session_page_select(q))
+        .collect()
+}
+
+/// Both listing phases must avoid the corpus-wide view chain.
+fn assert_no_view_chain(query: &str) {
+    assert!(
+        !query.contains("v_session_summary") && !query.contains("v_conversation_trace"),
+        "listing SQL must not read the window-sorting view chain: {query}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn list_conversations_applies_filters_and_cursor_pagination() {
     let (repo, state) = build_repo().await;
@@ -48,21 +63,37 @@ async fn list_conversations_applies_filters_and_cursor_pagination() {
     assert!(second.next_cursor.is_none());
 
     let queries = state.queries.lock().expect("queries lock").clone();
-    let list_query = queries
-        .iter()
-        .find(|q| {
-            q.contains("FROM `moraine`.`v_session_summary` AS s")
-                && q.contains("ORDER BY s.last_event_time")
-        })
-        .expect("list query should be captured");
+    let selects = page_select_queries(&queries);
+    assert_eq!(selects.len(), 2, "one page-selection query per page");
+    let select_query = selects[0];
+    assert_no_view_chain(select_query);
+    assert!(select_query.contains("session_mode = 'web_search'"));
+    assert!(select_query.contains("toUnixTimestamp64Milli(last_event_time) >= 1767261600000"));
+    assert!(select_query.contains("toUnixTimestamp64Milli(last_event_time) < 1767500000000"));
+    assert!(select_query.contains("ORDER BY last_event_time DESC, session_id DESC"));
+    assert!(select_query.contains("LIMIT 3"));
+    assert!(
+        !select_query.contains("payload_json"),
+        "page selection must stay narrow: {select_query}"
+    );
+    assert!(select_query.contains("SELECT session_id, record_ts, ingested_at, event_kind"));
+    assert!(selects[1].contains("session_id < 'sess_b'"));
+    assert!(selects[1].contains("toUnixTimestamp64Milli(last_event_time) < 1767348600000"));
 
-    assert!(list_query.contains("ifNull(m.mode, 'chat') = 'web_search'"));
-    assert!(list_query.contains("JSONExtractString(payload_json, 'summary')"));
-    assert!(list_query.contains("s.session_id AS session_id"));
-    assert!(list_query.contains("AS session_slug"));
-    assert!(list_query.contains("toUnixTimestamp64Milli(s.last_event_time) >= 1767261600000"));
-    assert!(list_query.contains("toUnixTimestamp64Milli(s.last_event_time) < 1767500000000"));
-    assert!(list_query.contains("ORDER BY s.last_event_time DESC, s.session_id DESC"));
+    let summary_query = queries
+        .iter()
+        .find(|q| q.contains("ANY LEFT JOIN") && q.contains("AS session_slug"))
+        .expect("page summary query should be captured");
+    assert_no_view_chain(summary_query);
+    assert!(summary_query.contains("JSONExtractString(payload_json, 'summary')"));
+    assert!(summary_query.contains("ORDER BY s.last_event_time DESC, s.session_id DESC"));
+    assert!(
+        summary_query
+            .matches("session_id IN ('sess_c', 'sess_b')")
+            .count()
+            >= 3,
+        "summary window, mode, and metadata must all be restricted to the page: {summary_query}"
+    );
 }
 #[tokio::test(flavor = "multi_thread")]
 async fn list_conversations_supports_ascending_sort_with_deterministic_cursor() {
@@ -109,15 +140,18 @@ async fn list_conversations_supports_ascending_sort_with_deterministic_cursor() 
     let queries = state.queries.lock().expect("queries lock").clone();
     let first_query = queries
         .iter()
-        .find(|q| q.contains("ORDER BY s.last_event_time ASC, s.session_id ASC"))
+        .find(|q| {
+            is_session_page_select(q) && q.contains("ORDER BY last_event_time ASC, session_id ASC")
+        })
         .expect("ascending list query should be captured");
-    assert!(first_query.contains("ifNull(m.mode, 'chat') = 'web_search'"));
+    assert_no_view_chain(first_query);
+    assert!(first_query.contains("session_mode = 'web_search'"));
 
     let paged_query = queries
         .iter()
-        .find(|q| q.contains("s.session_id > 'sess_b'"))
+        .find(|q| is_session_page_select(q) && q.contains("session_id > 'sess_b'"))
         .expect("ascending pagination query should include deterministic cursor predicate");
-    assert!(paged_query.contains("toUnixTimestamp64Milli(s.last_event_time) > 1767348600000"));
+    assert!(paged_query.contains("toUnixTimestamp64Milli(last_event_time) > 1767348600000"));
 }
 #[tokio::test(flavor = "multi_thread")]
 async fn list_conversations_rejects_cursor_when_sort_changes() {
@@ -218,16 +252,27 @@ async fn list_mcp_sessions_uses_overlap_filter_and_cursor_pagination() {
     assert!(second.next_cursor.is_none());
 
     let queries = state.queries.lock().expect("queries lock").clone();
+    let select_query = queries
+        .iter()
+        .find(|q| is_session_page_select(q))
+        .expect("list_sessions page selection should be captured");
+    assert_no_view_chain(select_query);
+    assert!(select_query.contains("toUnixTimestamp64Milli(last_event_time) >= 1767261600000"));
+    assert!(select_query.contains("toUnixTimestamp64Milli(first_event_time) < 1767500000000"));
+    assert!(select_query.contains("session_mode = 'web_search'"));
+    assert!(select_query.contains("latest_harness = 'codex'"));
+    assert!(select_query.contains("latest_source_name = 'codex'"));
+    assert!(select_query.contains("notEmpty(trimBoth(session_id))"));
+    assert!(select_query.contains("ORDER BY last_event_time DESC, session_id DESC"));
+    assert!(select_query.contains("LIMIT 3"));
+    assert!(!select_query.contains("payload_json"));
+
     let list_query = queries
         .iter()
         .find(|q| q.contains("AS completed") && q.contains("latest_terminal_payload_type"))
         .expect("list_sessions query should be captured");
+    assert_no_view_chain(list_query);
 
-    assert!(list_query.contains("toUnixTimestamp64Milli(s.last_event_time) >= 1767261600000"));
-    assert!(list_query.contains("toUnixTimestamp64Milli(s.first_event_time) < 1767500000000"));
-    assert!(list_query.contains("ifNull(r.mode, 'chat') = 'web_search'"));
-    assert!(list_query.contains("r.latest_harness = 'codex'"));
-    assert!(list_query.contains("r.latest_source_name = 'codex'"));
     assert!(list_query.contains("ifNull(r.latest_source_name, '') AS source"));
     assert!(list_query.contains(
         "e.source_name = 'omp' AND JSONExtractString(e.payload_json, 'type') IN ('title', 'title_change')"
@@ -235,12 +280,12 @@ async fn list_mcp_sessions_uses_overlap_filter_and_cursor_pagination() {
     assert!(list_query.contains("replaceRegexpOne("));
     assert!(list_query.contains("replaceAll(e.source_file, '\\\\', '/')"));
     assert!(list_query.contains("NOT endsWith(e.source_file, concat(e.session_id, '.jsonl'))"));
-    assert!(list_query.contains("nullIf(r.latest_metadata_title, '')"));
-    assert!(list_query.contains("nullIf(r.latest_metadata_name, '')"));
-    assert!(list_query.contains("nullIf(r.latest_metadata_summary, '')"));
-    assert!(list_query.contains("nullIf(r.omp_dispatch_title, '')"));
-    assert!(list_query.contains("ifNull(r.latest_session_meta_title, '')"));
-    assert!(list_query.contains("ifNull(r.latest_session_meta_summary, '')"));
+    assert!(list_query.contains("nullIf(x.latest_metadata_title, '')"));
+    assert!(list_query.contains("nullIf(x.latest_metadata_name, '')"));
+    assert!(list_query.contains("nullIf(x.latest_metadata_summary, '')"));
+    assert!(list_query.contains("nullIf(x.omp_dispatch_title, '')"));
+    assert!(list_query.contains("ifNull(x.latest_session_meta_title, '')"));
+    assert!(list_query.contains("ifNull(x.latest_session_meta_summary, '')"));
     assert!(list_query.contains("substringUTF8(e.text_preview, 1, 320)"));
     assert!(list_query.contains("nullIf(trimBoth(JSONExtractString(payload_json, 'title')), '')"));
     assert!(list_query.contains("nullIf(trimBoth(JSONExtractString(payload_json, 'name')), '')"));
@@ -252,20 +297,86 @@ async fn list_mcp_sessions_uses_overlap_filter_and_cursor_pagination() {
     assert!(list_query.contains("source_offset"));
     assert!(list_query.contains("source_line_no"));
     assert!(!list_query.contains("text_content"));
-    assert!(list_query.contains("ORDER BY w.last_event_unix_ms DESC, w.session_id DESC"));
+    assert!(list_query.contains("ORDER BY last_event_unix_ms DESC, session_id DESC"));
     assert!(list_query.contains("payload_type IN ('task_complete', 'turn_aborted')"));
-    // Blank session_id rows are filtered at the source so they never consume a
-    // LIMIT slot or anchor the keyset cursor (#386).
-    assert!(list_query.contains("notEmpty(trimBoth(s.session_id))"));
-    assert!(list_query.contains("window_sessions AS ("));
+    assert!(list_query.contains("page_sessions AS ("));
     assert!(list_query.contains("candidate_sessions AS ("));
+    assert!(list_query.contains("ANY LEFT JOIN event_rollups AS r"));
+    assert!(list_query.contains("ANY LEFT JOIN metadata_rollups AS x"));
+    assert!(
+        list_query.contains("AND (session_id, event_uid, event_version) IN ("),
+        "wide payload reads must be keyed by a narrow FINAL, not read through FINAL"
+    );
     assert_eq!(
         list_query
-            .matches("session_id IN (SELECT session_id FROM window_sessions)")
+            .matches("session_id IN ('sess_c', 'sess_b')")
             .count(),
-        1,
-        "all event-backed fields must share one window-bounded aggregate"
+        6,
+        "summary, tie lookup, event rollups, and metadata reads must share the page-id restriction"
     );
+}
+#[tokio::test(flavor = "multi_thread")]
+async fn list_mcp_sessions_summarizes_the_page_in_bounded_chunks() {
+    let ids: Vec<String> = (0..25).map(|i| format!("page-session-{i:02}")).collect();
+    let row = |id: &str, ms: i64| {
+        json!({
+            "session_id": id,
+            "first_event_time": "2026-01-01 10:00:00",
+            "first_event_unix_ms": ms,
+            "last_event_time": "2026-01-01 10:10:00",
+            "last_event_unix_ms": ms,
+            "total_turns": 1, "total_events": 2,
+            "mode": "chat", "completed": 0_u8
+        })
+    };
+    let leak = |text: String| -> &'static str { Box::leak(text.into_boxed_str()) };
+    let page: Vec<_> = ids.iter().map(|id| json!({ "session_id": id })).collect();
+    let mut responses = vec![ScriptedResponse::rows(&["LIMIT 26"], json!(page))];
+    for (chunk, slice) in ids.chunks(10).enumerate() {
+        let rows: Vec<_> = slice
+            .iter()
+            .enumerate()
+            .map(|(i, id)| row(id, 2_000_000 - (chunk * 10 + i) as i64))
+            .collect();
+        let required: &'static [&'static str] = Box::leak(
+            vec![leak(format!(
+                "session_id IN ('{}'",
+                slice.first().expect("non-empty chunk")
+            ))]
+            .into_boxed_slice(),
+        );
+        let other = ids
+            .iter()
+            .find(|id| !slice.contains(id))
+            .expect("some id outside the chunk");
+        let forbidden: &'static [&'static str] =
+            Box::leak(vec![leak(format!("'{other}'"))].into_boxed_slice());
+        responses.push(ScriptedResponse::rows(required, json!(rows)).forbidding(forbidden));
+    }
+    let (repo, state) = build_scripted_repo(responses).await;
+
+    let page = repo
+        .list_mcp_sessions(
+            McpSessionListFilter {
+                start_unix_ms: 0,
+                end_unix_ms: 4_102_444_800_000,
+                mode: None,
+                harness: None,
+                source_name: None,
+                sort: ConversationListSort::Desc,
+            },
+            PageRequest {
+                limit: 25,
+                cursor: None,
+            },
+        )
+        .await
+        .expect("chunked list_sessions succeeds");
+    assert_eq!(page.items.len(), 25);
+    assert_eq!(page.items[0].session_id, "page-session-00");
+    assert_eq!(page.items[24].session_id, "page-session-24");
+    assert!(page.next_cursor.is_none());
+    assert_script_consumed(&state, 4);
 }
 #[tokio::test(flavor = "multi_thread")]
 async fn list_mcp_sessions_rejects_cursor_filter_mismatch() {
@@ -357,17 +468,23 @@ async fn list_mcp_sessions_applies_session_origin_scope() {
         .find(|q| q.contains("AS completed") && q.contains("latest_terminal_payload_type"))
         .expect("list_sessions query should be captured");
 
-    assert!(list_query.contains("s.session_id IN (SELECT session_id FROM ("));
-    assert!(list_query.contains("argMin(cwd, tuple(event_ts, event_uid)) AS origin_cwd"));
-    assert!(list_query.contains("WHERE cwd != ''"));
-    assert!(list_query.contains("origin_cwd = '/work/project'"));
-    assert!(list_query.contains("startsWith(origin_cwd, '/work/project/')"));
-    let window_sessions = list_query
-        .split_once("event_rollups AS (")
-        .map(|(window, _)| window)
-        .expect("list query must define event rollups after the session window");
-    assert!(window_sessions.contains("ORDER BY s.last_event_time DESC, s.session_id DESC"));
-    assert!(window_sessions.contains("LIMIT 6"));
+    let select_query = queries
+        .iter()
+        .find(|q| is_session_page_select(q))
+        .expect("scoped page selection should be captured");
+    assert!(select_query.contains("session_id IN (SELECT session_id FROM ("));
+    assert!(select_query.contains("argMin(cwd, tuple(event_ts, event_uid)) AS origin_cwd"));
+    assert!(select_query.contains("WHERE cwd != ''"));
+    assert!(select_query.contains("origin_cwd = '/work/project'"));
+    assert!(select_query.contains("startsWith(origin_cwd, '/work/project/')"));
+    assert!(select_query.contains("ORDER BY last_event_time DESC, session_id DESC"));
+    assert!(select_query.contains("LIMIT 6"));
+    // Scope is a pre-FINAL WHERE, not a post-aggregation filter.
+    let (before_group, _) = select_query
+        .rsplit_once("\n)\nGROUP BY session_id")
+        .expect("page selection groups by session");
+    assert!(before_group.contains("origin_cwd = '/work/project'"));
+    assert_no_view_chain(list_query);
 }
 #[tokio::test(flavor = "multi_thread")]
 async fn list_mcp_sessions_rejects_cursor_from_differently_scoped_server() {

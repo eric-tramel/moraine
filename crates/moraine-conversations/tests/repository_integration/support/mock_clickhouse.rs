@@ -15,6 +15,9 @@ use tokio::sync::Notify;
 
 use super::canonical_open_fixtures::{hydrated_rows, navigation_rows, version_rows};
 use super::responses::{json_each_row, trace_event_row, turn_summary_row};
+use super::session_pages::{
+    is_session_page_select, session_page_select_response, session_page_summary_response,
+};
 use super::OwnedRepository;
 
 #[derive(Clone)]
@@ -370,174 +373,11 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
             );
         }
 
-        if query.contains("FROM `moraine`.`v_session_summary` AS s")
-            && query.contains("AS completed")
-            && query.contains("latest_terminal_payload_type")
-        {
-            if query.contains("s.session_id < 'sess_b'") {
-                return (
-                    StatusCode::OK,
-                    json_each_row(json!([
-                        {
-                            "session_id": "sess_a",
-                            "first_event_time": "2026-01-01 10:00:00",
-                            "first_event_unix_ms": 1767261600000_i64,
-                            "last_event_time": "2026-01-01 10:10:00",
-                            "last_event_unix_ms": 1767262200000_i64,
-                            "total_turns": 2,
-                            "total_events": 20,
-                            "mode": "web_search",
-                            "completed": 0_u8,
-                            "title": "",
-                            "source": "codex",
-                            "harness": "codex",
-                            "session_slug": "",
-                            "session_summary": "",
-                            "explicit_title": "",
-                            "codex_user_message_preview": "Genuine A request"
-                        }
-                    ])),
-                );
-            }
-
-            return (
-                StatusCode::OK,
-                json_each_row(json!([
-                    {
-                        "session_id": "sess_c",
-                        "first_event_time": "2026-01-03 10:00:00",
-                        "first_event_unix_ms": 1767434400000_i64,
-                        "last_event_time": "2026-01-03 10:10:00",
-                        "last_event_unix_ms": 1767435000000_i64,
-                        "total_turns": 3,
-                        "total_events": 30,
-                        "mode": "web_search",
-                        "completed": 1_u8,
-                        "title": "Session C title",
-                        "source": "codex",
-                        "harness": "codex",
-                        "originator": "Codex Desktop",
-                        "origin_cwd": "/work/acme-secret-merger",
-                        "project": "acme-secret-merger",
-                        "session_slug": "project-c",
-                        "session_summary": "Session C summary",
-                        "explicit_title": "Session C title",
-                        "codex_user_message_preview": "Genuine C request"
-                    },
-                    {
-                        "session_id": "sess_b",
-                        "first_event_time": "2026-01-02 10:00:00",
-                        "first_event_unix_ms": 1767348000000_i64,
-                        "last_event_time": "2026-01-02 10:10:00",
-                        "last_event_unix_ms": 1767348600000_i64,
-                        "total_turns": 2,
-                        "total_events": 22,
-                        "mode": "web_search",
-                        "completed": 1_u8,
-                        "title": "Session B title",
-                        "source": "codex",
-                        "harness": "codex",
-                        "session_slug": "project-b",
-                        "session_summary": "Session B summary",
-                        "explicit_title": "",
-                        "codex_user_message_preview": "Genuine B request"
-                    },
-                    {
-                        "session_id": "sess_a",
-                        "first_event_time": "2026-01-01 10:00:00",
-                        "first_event_unix_ms": 1767261600000_i64,
-                        "last_event_time": "2026-01-01 10:10:00",
-                        "last_event_unix_ms": 1767262200000_i64,
-                        "total_turns": 2,
-                        "total_events": 20,
-                        "mode": "web_search",
-                        "completed": 0_u8,
-                        "title": "",
-                        "source": "codex",
-                        "harness": "codex",
-                        "session_slug": "",
-                        "session_summary": "",
-                        "explicit_title": "",
-                        "codex_user_message_preview": "Genuine A request"
-                    }
-                ])),
-            );
+        if is_session_page_select(&query) {
+            return session_page_select_response(&query);
         }
-
-        if query.contains("FROM `moraine`.`v_session_summary` AS s")
-            && query.contains("ORDER BY s.last_event_time DESC")
-        {
-            if query.contains("s.session_id < 'sess_b'") {
-                return (
-                    StatusCode::OK,
-                    json_each_row(json!([
-                        {
-                            "session_id": "sess_a",
-                            "first_event_time": "2026-01-01 10:00:00",
-                            "first_event_unix_ms": 1767261600000_i64,
-                            "last_event_time": "2026-01-01 10:10:00",
-                            "last_event_unix_ms": 1767262200000_i64,
-                            "total_turns": 2,
-                            "total_events": 20,
-                            "user_messages": 4,
-                            "assistant_messages": 4,
-                            "tool_calls": 2,
-                            "tool_results": 2,
-                            "mode": "web_search"
-                        }
-                    ])),
-                );
-            }
-
-            return (
-                StatusCode::OK,
-                json_each_row(json!([
-                    {
-                        "session_id": "sess_c",
-                        "first_event_time": "2026-01-03 10:00:00",
-                        "first_event_unix_ms": 1767434400000_i64,
-                        "last_event_time": "2026-01-03 10:10:00",
-                        "last_event_unix_ms": 1767435000000_i64,
-                        "total_turns": 3,
-                        "total_events": 30,
-                        "user_messages": 6,
-                        "assistant_messages": 6,
-                        "tool_calls": 3,
-                        "tool_results": 3,
-                        "mode": "web_search",
-                        "session_slug": "project-c",
-                        "session_summary": "Session C summary"
-                    },
-                    {
-                        "session_id": "sess_b",
-                        "first_event_time": "2026-01-02 10:00:00",
-                        "first_event_unix_ms": 1767348000000_i64,
-                        "last_event_time": "2026-01-02 10:10:00",
-                        "last_event_unix_ms": 1767348600000_i64,
-                        "total_turns": 2,
-                        "total_events": 22,
-                        "user_messages": 4,
-                        "assistant_messages": 4,
-                        "tool_calls": 2,
-                        "tool_results": 2,
-                        "mode": "web_search"
-                    },
-                    {
-                        "session_id": "sess_a",
-                        "first_event_time": "2026-01-01 10:00:00",
-                        "first_event_unix_ms": 1767261600000_i64,
-                        "last_event_time": "2026-01-01 10:10:00",
-                        "last_event_unix_ms": 1767262200000_i64,
-                        "total_turns": 2,
-                        "total_events": 20,
-                        "user_messages": 4,
-                        "assistant_messages": 4,
-                        "tool_calls": 2,
-                        "tool_results": 2,
-                        "mode": "web_search"
-                    }
-                ])),
-            );
+        if let Some(response) = session_page_summary_response(&query) {
+            return response;
         }
 
         if query.contains("FROM `moraine`.`v_session_summary` AS s")
@@ -670,80 +510,6 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
                         "inference_provider": "openai",
                         "session_slug": "open-model-session",
                         "session_summary": "Session summary from metadata"
-                    }
-                ])),
-            );
-        }
-
-        if query.contains("FROM `moraine`.`v_session_summary` AS s")
-            && query.contains("ORDER BY s.last_event_time ASC")
-        {
-            if query.contains("s.session_id > 'sess_b'") {
-                return (
-                    StatusCode::OK,
-                    json_each_row(json!([
-                        {
-                            "session_id": "sess_c",
-                            "first_event_time": "2026-01-03 10:00:00",
-                            "first_event_unix_ms": 1767434400000_i64,
-                            "last_event_time": "2026-01-03 10:10:00",
-                            "last_event_unix_ms": 1767435000000_i64,
-                            "total_turns": 3,
-                            "total_events": 30,
-                            "user_messages": 6,
-                            "assistant_messages": 6,
-                            "tool_calls": 3,
-                            "tool_results": 3,
-                            "mode": "web_search"
-                        }
-                    ])),
-                );
-            }
-
-            return (
-                StatusCode::OK,
-                json_each_row(json!([
-                    {
-                        "session_id": "sess_a",
-                        "first_event_time": "2026-01-01 10:00:00",
-                        "first_event_unix_ms": 1767261600000_i64,
-                        "last_event_time": "2026-01-01 10:10:00",
-                        "last_event_unix_ms": 1767262200000_i64,
-                        "total_turns": 2,
-                        "total_events": 20,
-                        "user_messages": 4,
-                        "assistant_messages": 4,
-                        "tool_calls": 2,
-                        "tool_results": 2,
-                        "mode": "web_search"
-                    },
-                    {
-                        "session_id": "sess_b",
-                        "first_event_time": "2026-01-02 10:00:00",
-                        "first_event_unix_ms": 1767348000000_i64,
-                        "last_event_time": "2026-01-02 10:10:00",
-                        "last_event_unix_ms": 1767348600000_i64,
-                        "total_turns": 2,
-                        "total_events": 22,
-                        "user_messages": 4,
-                        "assistant_messages": 4,
-                        "tool_calls": 2,
-                        "tool_results": 2,
-                        "mode": "web_search"
-                    },
-                    {
-                        "session_id": "sess_c",
-                        "first_event_time": "2026-01-03 10:00:00",
-                        "first_event_unix_ms": 1767434400000_i64,
-                        "last_event_time": "2026-01-03 10:10:00",
-                        "last_event_unix_ms": 1767435000000_i64,
-                        "total_turns": 3,
-                        "total_events": 30,
-                        "user_messages": 6,
-                        "assistant_messages": 6,
-                        "tool_calls": 3,
-                        "tool_results": 3,
-                        "mode": "web_search"
                     }
                 ])),
             );
