@@ -12,6 +12,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{BTreeSet, HashSet};
 use std::io::Write;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -62,6 +63,9 @@ struct ClientInner {
     admin: Arc<AdminBackend>,
     runtime: QueryRuntime,
     workload_capability: tokio::sync::Mutex<Option<bool>>,
+    /// Server `max_memory_usage`, probed once with the workload capability.
+    /// Zero means unknown or unlimited.
+    server_query_memory: AtomicU64,
 }
 
 pub struct ClickHouseByteStream {
@@ -267,6 +271,7 @@ impl ClickHouseClient {
                 admin,
                 runtime,
                 workload_capability: tokio::sync::Mutex::new(None),
+                server_query_memory: AtomicU64::new(0),
             }),
         })
     }
@@ -289,6 +294,13 @@ impl ClickHouseClient {
             .execute_unprofiled(query, timeout)
             .await
             .map_err(Into::into)
+    }
+
+    fn server_query_memory_bytes(&self) -> Option<u64> {
+        match self.inner.server_query_memory.load(Ordering::Relaxed) {
+            0 => None,
+            bytes => Some(bytes),
+        }
     }
 
     async fn managed_workloads_available(
@@ -321,7 +333,7 @@ impl ClickHouseClient {
             owner.register_statement(&self.inner.runtime, self.inner.admin.clone(), admission)?;
         let probe_query_id = ticket.query_id().to_owned();
         let probe = self.inner.admin.probe_unprofiled(
-            "SELECT count() FROM system.workloads WHERE name IN ('moraine_all', 'moraine_interactive', 'moraine_background', 'moraine_migration', 'moraine_administrative', 'default') FORMAT TabSeparated",
+            "SELECT (SELECT count() FROM system.workloads WHERE name IN ('moraine_all', 'moraine_interactive', 'moraine_background', 'moraine_migration', 'moraine_administrative', 'default')) AS workloads, toUInt64(getSetting('max_memory_usage')) AS per_query_memory FORMAT TabSeparated",
             probe_timeout,
             &probe_query_id,
         );
@@ -338,14 +350,26 @@ impl ClickHouseClient {
             }
         };
         owner.remaining()?;
+        // Tab-separated `workloads, per_query_memory`; the second field is
+        // optional so older fixtures and servers answering only the count work.
+        let mut fields = response
+            .as_deref()
+            .unwrap_or_default()
+            .split_whitespace()
+            .map(|field| field.parse::<u64>().ok());
+        let workload_count = fields.next().flatten();
+        let server_limit = fields.next().flatten().unwrap_or(0);
         let available = match response {
-            Ok(value) => value.trim().parse::<u64>().ok() == Some(6),
+            Ok(_) => workload_count == Some(6),
             Err(error) if error.status().is_some() => false,
             Err(error) => {
                 ticket.fail(QueryCause::Backend);
                 return Err(error.into());
             }
         };
+        self.inner
+            .server_query_memory
+            .store(server_limit, Ordering::Relaxed);
         let admission = ticket.succeed_reusing_admission();
         self.inner.admin.set_managed_workloads_available(available);
         *capability = Some(available);
@@ -401,21 +425,9 @@ impl ClickHouseClient {
             if managed_workloads {
                 qp.append_pair("workload", profile.workload_name());
             }
-            qp.append_pair("max_memory_usage", &profile.memory_bytes().to_string());
-            qp.append_pair(
-                "max_bytes_before_external_group_by",
-                &profile.spill_bytes().to_string(),
-            );
-            qp.append_pair(
-                "max_bytes_before_external_sort",
-                &profile.spill_bytes().to_string(),
-            );
-            qp.append_pair("max_bytes_ratio_before_external_group_by", "0");
-            qp.append_pair("max_bytes_ratio_before_external_sort", "0");
-            qp.append_pair(
-                "max_temporary_data_on_disk_size_for_query",
-                &profile.temporary_disk_bytes().to_string(),
-            );
+            profile
+                .limits(self.server_query_memory_bytes())
+                .append_to(&mut qp);
             if let Some(database) = options.database {
                 qp.append_pair("database", database);
             }
@@ -2079,7 +2091,8 @@ mod tests {
             body: Bytes,
         ) -> (StatusCode, &'static str) {
             if is_workload_capability_probe(&params) {
-                return (StatusCode::OK, "6");
+                // Managed stack: six workloads, 1 GiB per-query limit.
+                return (StatusCode::OK, "6\t1073741824");
             }
             state
                 .requests
@@ -3306,6 +3319,57 @@ mod tests {
                 .map(String::as_str),
             Some("134217728")
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn workload_budgets_derive_from_the_server_query_limit() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let base_url = spawn_request_capture_server(RequestCaptureState {
+            requests: requests.clone(),
+        })
+        .await;
+        let client = ClickHouseClient::new(test_clickhouse_config(base_url)).expect("new client");
+
+        for workload in [
+            QueryWorkload::Mcp,
+            QueryWorkload::Background,
+            QueryWorkload::Migration,
+        ] {
+            let owner = QueryOwner::new(&client.runtime(), workload).expect("owner");
+            owner
+                .scope(client.request_text("SELECT 1", None, None, false, None))
+                .await
+                .expect("request");
+        }
+
+        let requests = requests.lock().expect("request capture mutex poisoned");
+        assert_eq!(requests.len(), 3);
+        // Interactive: the 1 GiB server limit.
+        let interactive = &requests[0].params;
+        assert_eq!(
+            interactive.get("max_memory_usage").map(String::as_str),
+            Some("1073741824")
+        );
+        assert_eq!(
+            interactive
+                .get("max_bytes_before_external_sort")
+                .map(String::as_str),
+            Some("268435456")
+        );
+        // Writers inherit the server configuration instead of being capped.
+        for writer in &requests[1..] {
+            for key in [
+                "max_memory_usage",
+                "max_bytes_before_external_group_by",
+                "max_bytes_before_external_sort",
+                "max_temporary_data_on_disk_size_for_query",
+            ] {
+                assert!(
+                    !writer.params.contains_key(key),
+                    "{key} must not be overridden for writers"
+                );
+            }
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
