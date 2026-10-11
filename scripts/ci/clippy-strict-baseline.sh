@@ -19,7 +19,11 @@ elif [[ -n "${CARGO_CMD:-}" ]]; then
 elif command -v rustup >/dev/null 2>&1; then
   rustup_bin="$(dirname "$(command -v rustup)")"
   export PATH="${rustup_bin}:${PATH}"
-  export RUSTUP_TOOLCHAIN="${RUST_TOOLCHAIN:-stable}"
+  # Default to the rust-toolchain.toml pin; floating stable breaks CI whenever
+  # a new release adds lints or deprecations. RUST_TOOLCHAIN still overrides.
+  if [[ -n "${RUST_TOOLCHAIN:-}" ]]; then
+    export RUSTUP_TOOLCHAIN="${RUST_TOOLCHAIN}"
+  fi
   CARGO_CMD=(cargo)
 else
   CARGO_CMD=(cargo)
