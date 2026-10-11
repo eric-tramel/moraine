@@ -107,26 +107,86 @@ impl QueryResourceProfile {
         }
     }
 
-    pub(crate) const fn memory_bytes(self) -> u64 {
+    /// Resolves the per-request resource settings for this profile.
+    ///
+    /// `server_per_query_bytes` is the server's own `max_memory_usage` (for the
+    /// managed stack this is already host-derived), or `None` when it is not
+    /// known, e.g. an external ClickHouse that could not be probed.
+    ///
+    /// * Background and Migration are writers (ingest inserts fire materialized
+    ///   views, migrations rebuild tables). They are never capped below the
+    ///   server's own per-query limit, so they send no memory, spill or
+    ///   temporary-disk override and inherit the server configuration.
+    /// * Interactive reads get the server's per-query limit (the managed
+    ///   stack already sizes it from the host as `min(user/2, 1 GiB)`), so
+    ///   anything that fit in v0.7.3 still fits. A single query can never
+    ///   exceed that limit and the server's per-user limit still bounds
+    ///   concurrent reads. Spill is a quarter of the budget and temporary
+    ///   disk twice the budget.
+    /// * Administrative stays small and fixed.
+    pub(crate) fn limits(self, server_per_query_bytes: Option<u64>) -> QueryResourceLimits {
         match self {
-            Self::Interactive | Self::Background => 268_435_456,
-            Self::Migration => 1_073_741_824,
-            Self::Administrative => 134_217_728,
-        }
-    }
-
-    pub(crate) const fn spill_bytes(self) -> u64 {
-        self.memory_bytes() / 4
-    }
-
-    pub(crate) const fn temporary_disk_bytes(self) -> u64 {
-        match self {
-            Self::Interactive | Self::Background => 536_870_912,
-            Self::Migration => 2_147_483_648,
-            Self::Administrative => 134_217_728,
+            Self::Background | Self::Migration => QueryResourceLimits::default(),
+            Self::Interactive => {
+                let memory = server_per_query_bytes
+                    .filter(|bytes| *bytes > 0)
+                    .unwrap_or(FALLBACK_SERVER_QUERY_BYTES);
+                QueryResourceLimits {
+                    memory_bytes: Some(memory),
+                    spill_bytes: Some(memory / 4),
+                    temporary_disk_bytes: Some(memory * 2),
+                }
+            }
+            Self::Administrative => QueryResourceLimits {
+                memory_bytes: Some(ADMINISTRATIVE_MEMORY_BYTES),
+                spill_bytes: Some(ADMINISTRATIVE_MEMORY_BYTES / 4),
+                temporary_disk_bytes: Some(ADMINISTRATIVE_MEMORY_BYTES),
+            },
         }
     }
 }
+
+/// Per-request ClickHouse resource settings. `None` means "do not send the
+/// setting; the server's configured value applies".
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct QueryResourceLimits {
+    pub(crate) memory_bytes: Option<u64>,
+    pub(crate) spill_bytes: Option<u64>,
+    pub(crate) temporary_disk_bytes: Option<u64>,
+}
+
+impl QueryResourceLimits {
+    /// Appends the resource settings to a request's query string. Absolute
+    /// spill thresholds are only sent alongside a memory budget; the ratio
+    /// variants are always zeroed so only the absolute thresholds apply.
+    pub(crate) fn append_to(
+        &self,
+        pairs: &mut url::form_urlencoded::Serializer<'_, url::UrlQuery<'_>>,
+    ) {
+        if let Some(memory) = self.memory_bytes {
+            pairs.append_pair("max_memory_usage", &memory.to_string());
+        }
+        if let Some(spill) = self.spill_bytes {
+            pairs.append_pair("max_bytes_before_external_group_by", &spill.to_string());
+            pairs.append_pair("max_bytes_before_external_sort", &spill.to_string());
+        }
+        pairs.append_pair("max_bytes_ratio_before_external_group_by", "0");
+        pairs.append_pair("max_bytes_ratio_before_external_sort", "0");
+        if let Some(disk) = self.temporary_disk_bytes {
+            pairs.append_pair(
+                "max_temporary_data_on_disk_size_for_query",
+                &disk.to_string(),
+            );
+        }
+    }
+}
+
+/// Per-query memory assumed when the server's `max_memory_usage` is unknown or
+/// unlimited (an external ClickHouse that could not be probed, or one with no
+/// limit configured). Matches the
+/// managed stack's ceiling of `min(user/2, 1 GiB)`.
+pub(crate) const FALLBACK_SERVER_QUERY_BYTES: u64 = 1_073_741_824;
+const ADMINISTRATIVE_MEMORY_BYTES: u64 = 134_217_728;
 
 impl From<QueryWorkload> for QueryResourceProfile {
     fn from(workload: QueryWorkload) -> Self {
@@ -1257,21 +1317,7 @@ impl AdminBackend {
             if cleanup && self.managed_workloads_available.load(Ordering::Relaxed) {
                 let profile = QueryResourceProfile::Administrative;
                 pairs.append_pair("workload", profile.workload_name());
-                pairs.append_pair("max_memory_usage", &profile.memory_bytes().to_string());
-                pairs.append_pair(
-                    "max_bytes_before_external_group_by",
-                    &profile.spill_bytes().to_string(),
-                );
-                pairs.append_pair(
-                    "max_bytes_before_external_sort",
-                    &profile.spill_bytes().to_string(),
-                );
-                pairs.append_pair("max_bytes_ratio_before_external_group_by", "0");
-                pairs.append_pair("max_bytes_ratio_before_external_sort", "0");
-                pairs.append_pair(
-                    "max_temporary_data_on_disk_size_for_query",
-                    &profile.temporary_disk_bytes().to_string(),
-                );
+                profile.limits(None).append_to(&mut pairs);
             }
         }
         let mut request = self
@@ -1608,9 +1654,71 @@ mod tests {
         for profile in QueryResourceProfile::ALL {
             assert!(profile.max_running() > 0);
             assert!(profile.max_queued() > 0);
-            assert!(profile.spill_bytes() < profile.memory_bytes());
-            assert!(profile.temporary_disk_bytes() > 0);
+            for server in [None, Some(256 * MIB), Some(GIB), Some(4 * GIB)] {
+                let limits = profile.limits(server);
+                if let (Some(spill), Some(memory)) = (limits.spill_bytes, limits.memory_bytes) {
+                    assert!(spill < memory);
+                }
+                assert_eq!(limits.memory_bytes.is_some(), limits.spill_bytes.is_some());
+                assert_eq!(
+                    limits.memory_bytes.is_some(),
+                    limits.temporary_disk_bytes.is_some()
+                );
+            }
         }
+    }
+
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * MIB;
+
+    #[test]
+    fn writers_are_never_capped_below_the_server_limit() {
+        for profile in [
+            QueryResourceProfile::Background,
+            QueryResourceProfile::Migration,
+        ] {
+            for server in [None, Some(128 * MIB), Some(GIB), Some(32 * GIB)] {
+                assert_eq!(
+                    profile.limits(server),
+                    QueryResourceLimits::default(),
+                    "{profile:?} must inherit the server configuration"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn interactive_budget_tracks_the_server_limit_with_a_fallback() {
+        let interactive = QueryResourceProfile::Interactive;
+        // Managed stack on 8 GiB and 32 GiB hosts: per-query limit is 1 GiB.
+        assert_eq!(interactive.limits(Some(GIB)).memory_bytes, Some(GIB));
+        // A 2 GiB host gets a 256 MiB server limit; never exceed it.
+        assert_eq!(
+            interactive.limits(Some(256 * MIB)).memory_bytes,
+            Some(256 * MIB)
+        );
+        // A larger external limit scales the budget up.
+        assert_eq!(
+            interactive.limits(Some(4 * GIB)).memory_bytes,
+            Some(4 * GIB)
+        );
+        // Unknown or unlimited (0) falls back to the documented default,
+        // which is well above the old fixed 256 MiB.
+        for server in [None, Some(0)] {
+            let limits = interactive.limits(server);
+            assert_eq!(limits.memory_bytes, Some(FALLBACK_SERVER_QUERY_BYTES));
+            assert!(limits.memory_bytes.unwrap() >= 4 * 256 * MIB);
+        }
+        let limits = interactive.limits(Some(GIB));
+        assert_eq!(limits.spill_bytes, Some(256 * MIB));
+        assert_eq!(limits.temporary_disk_bytes, Some(2 * GIB));
+    }
+
+    #[test]
+    fn administrative_budget_is_small_and_fixed() {
+        let admin = QueryResourceProfile::Administrative;
+        assert_eq!(admin.limits(Some(32 * GIB)), admin.limits(None));
+        assert_eq!(admin.limits(None).memory_bytes, Some(128 * MIB));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
