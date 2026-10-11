@@ -5,52 +5,68 @@ async fn session_analytics_assembles_canonical_views_and_public_steps() {
     let responses = vec![
         ScriptedResponse::rows(
             &[
-                "FROM `moraine`.`v_session_summary` AS s",
-                "FROM (SELECT * FROM `moraine`.`events` FINAL) AS meta_events",
-                "WHERE meta_events.event_kind = 'session_meta'",
+                "FROM `moraine`.`events` FINAL",
+                "min(ifNull(parseDateTime64BestEffortOrNull(record_ts), ingested_at)) AS first_event_time",
+                "WHERE notEmpty(trimBoth(session_id))",
+                "ORDER BY last_event_time DESC, session_id DESC",
+                "LIMIT 1",
+                "FORMAT JSONEachRow",
+            ],
+            json!([{ "session_id": "analytics-session" }]),
+        )
+        .forbidding(&[
+            "now() - INTERVAL",
+            "payload_json",
+            "v_session_summary",
+            "v_conversation_trace",
+        ]),
+        ScriptedResponse::rows(
+            &[
+                "FROM (SELECT\n  session_id,\n  min(event_time) AS first_event_time",
+                "ANY LEFT JOIN",
+                "WHERE session_id IN ('analytics-session')",
+                "AND (session_id, event_uid, event_version) IN (",
+                "event_kind = 'session_meta'",
                 "nullIf(trimBoth(JSONExtractString(payload_json, 'title')), '')",
                 "nullIf(trimBoth(JSONExtractString(payload_json, 'name')), '')",
-                "WHERE notEmpty(trimBoth(s.session_id))",
                 "ORDER BY s.last_event_time DESC, s.session_id DESC",
-                "LIMIT 1",
                 "FORMAT JSONEachRow",
             ],
             json!([session_analytics_summary_row()]),
         )
-        .forbidding(&["now() - INTERVAL"]),
+        .forbidding(&["v_session_summary", "v_conversation_trace", "LIMIT 1\nFORMAT"]),
         ScriptedResponse::rows(
             &[
-                "FROM `moraine`.`v_turn_summary` AS ts",
                 "toInt64(toUnixTimestamp64Milli(ts.started_at)) AS started_at_unix_ms",
                 "toInt64(toUnixTimestamp64Milli(ts.ended_at)) AS ended_at_unix_ms",
-                "WHERE session_id IN ['analytics-session']",
+                "WHERE session_id IN ('analytics-session')",
+                "GROUP BY session_id, turn_seq",
                 "ORDER BY session_id ASC, turn_seq ASC",
                 "FORMAT JSONEachRow",
             ],
             session_analytics_turn_rows(),
         )
         .forbidding(&[
+            "v_turn_summary",
+            "v_conversation_trace",
             "toInt64(toUnixTimestamp64Milli(started_at)) AS started_at_unix_ms",
             "toInt64(toUnixTimestamp64Milli(ended_at)) AS ended_at_unix_ms",
-            "parseDateTime64BestEffort",
+            "parseDateTime64BestEffort(",
         ]),
         ScriptedResponse::rows(
             &[
-                "FROM `moraine`.`v_conversation_trace` AS t",
                 "toInt64(toUnixTimestamp64Milli(t.event_time)) AS event_unix_ms",
-                "LEFT JOIN (SELECT * FROM `moraine`.`events` FINAL) AS e",
-                "ON e.session_id = t.session_id",
-                "AND e.source_file = t.source_file",
-                "AND e.source_generation = t.source_generation",
-                "AND e.source_offset = t.source_offset",
-                "AND e.source_line_no = t.source_line_no",
-                "AND e.event_uid = t.event_uid",
-                "WHERE t.session_id IN ['analytics-session']",
+                "WHERE session_id IN ('analytics-session')",
+                "AS tool_args_json",
                 "ORDER BY t.session_id ASC, t.event_order ASC",
                 "FORMAT JSONEachRow",
             ],
             session_analytics_event_rows(),
-        ),
+        )
+        .forbidding(&[
+            "v_conversation_trace",
+            "LEFT JOIN (SELECT * FROM `moraine`.`events` FINAL) AS e",
+        ]),
     ];
     let (repo, state) = build_scripted_repo(responses).await;
     let repo: Arc<dyn ConversationRepository> = Arc::new(repo);
@@ -151,15 +167,15 @@ async fn session_analytics_assembles_canonical_views_and_public_steps() {
         session.turns[1].token_usage_buckets.get("output_text"),
         Some(&3)
     );
-    assert_script_consumed(&state, 3);
+    assert_script_consumed(&state, 4);
 }
 #[tokio::test(flavor = "multi_thread")]
 async fn session_analytics_empty_and_timed_limit_sql_are_deterministic() {
     let (repo, state) = build_scripted_repo(vec![ScriptedResponse::rows(
         &[
-            "FROM `moraine`.`v_session_summary` AS s",
-            "AND s.last_event_time >= now() - INTERVAL 86400 SECOND",
-            "ORDER BY s.last_event_time DESC, s.session_id DESC",
+            "FROM `moraine`.`events` FINAL",
+            "HAVING last_event_time >= now() - INTERVAL 86400 SECOND",
+            "ORDER BY last_event_time DESC, session_id DESC",
             "LIMIT 200",
             "FORMAT JSONEachRow",
         ],
@@ -178,35 +194,91 @@ async fn session_analytics_empty_and_timed_limit_sql_are_deterministic() {
     assert_script_consumed(&state, 1);
 }
 #[tokio::test(flavor = "multi_thread")]
+async fn session_analytics_bounds_phase_two_queries_to_session_chunks() {
+    let ids: Vec<String> = (0..60).map(|i| format!("chunk-session-{i:02}")).collect();
+    let page: Vec<_> = ids.iter().map(|id| json!({ "session_id": id })).collect();
+    let mut summary = session_analytics_summary_row();
+    summary["session_id"] = json!("chunk-session-00");
+    let mut responses = vec![
+        ScriptedResponse::rows(&["LIMIT 60"], json!(page)),
+        // 50 sessions per summary/turn chunk.
+        ScriptedResponse::rows(&["'chunk-session-49'"], json!([summary]))
+            .forbidding(&["'chunk-session-50'"]),
+        ScriptedResponse::rows(&["'chunk-session-59'"], json!([]))
+            .forbidding(&["'chunk-session-49'"]),
+        ScriptedResponse::rows(&["'chunk-session-49'"], json!([]))
+            .forbidding(&["'chunk-session-50'"]),
+        ScriptedResponse::rows(&["'chunk-session-59'"], json!([]))
+            .forbidding(&["'chunk-session-49'"]),
+    ];
+    // 10 sessions per event-stream chunk.
+    let leak = |text: String| -> &'static str { Box::leak(text.into_boxed_str()) };
+    for chunk in 0..6 {
+        let first = chunk * 10;
+        let last = first + 9;
+        let required: &'static [&'static str] =
+            Box::leak(vec![leak(format!("'chunk-session-{last:02}'"))].into_boxed_slice());
+        let mut forbidden = vec![leak(format!("'chunk-session-{:02}'", last + 1))];
+        if first > 0 {
+            forbidden.push(leak(format!("'chunk-session-{:02}'", first - 1)));
+        }
+        let forbidden: &'static [&'static str] = Box::leak(forbidden.into_boxed_slice());
+        responses.push(ScriptedResponse::rows(required, json!([])).forbidding(forbidden));
+    }
+    let (repo, state) = build_scripted_repo(responses).await;
+
+    let sessions = repo
+        .list_session_analytics(SessionAnalyticsQuery {
+            lookback: SessionLookback::All,
+            limit: 60,
+        })
+        .await
+        .expect("chunked analytics succeeds");
+    assert_eq!(sessions.len(), 1);
+    assert_script_consumed(&state, 11);
+}
+#[tokio::test(flavor = "multi_thread")]
 async fn session_analytics_propagates_each_wire_stage_error() {
+    let page_select = || {
+        ScriptedResponse::rows(
+            &["GROUP BY session_id\nORDER BY last_event_time DESC"],
+            json!([{ "session_id": "analytics-session" }]),
+        )
+    };
+    let summary = || {
+        ScriptedResponse::rows(
+            &["min(event_time) AS first_event_time"],
+            json!([session_analytics_summary_row()]),
+        )
+    };
     let scenarios = vec![
         vec![ScriptedResponse::failure(
-            &["FROM `moraine`.`v_session_summary` AS s"],
-            "session stage summary failed",
+            &["GROUP BY session_id\nORDER BY last_event_time DESC"],
+            "session stage page selection failed",
         )],
         vec![
-            ScriptedResponse::rows(
-                &["FROM `moraine`.`v_session_summary` AS s"],
-                json!([session_analytics_summary_row()]),
-            ),
+            page_select(),
             ScriptedResponse::failure(
-                &["FROM `moraine`.`v_turn_summary`"],
+                &["min(event_time) AS first_event_time"],
+                "session stage summary failed",
+            ),
+        ],
+        vec![
+            page_select(),
+            summary(),
+            ScriptedResponse::failure(
+                &["GROUP BY session_id, turn_seq"],
                 "session stage turns failed",
             ),
         ],
         vec![
+            page_select(),
+            summary(),
             ScriptedResponse::rows(
-                &["FROM `moraine`.`v_session_summary` AS s"],
-                json!([session_analytics_summary_row()]),
-            ),
-            ScriptedResponse::rows(
-                &["FROM `moraine`.`v_turn_summary`"],
+                &["GROUP BY session_id, turn_seq"],
                 session_analytics_turn_rows(),
             ),
-            ScriptedResponse::failure(
-                &["FROM `moraine`.`v_conversation_trace` AS t"],
-                "session stage events failed",
-            ),
+            ScriptedResponse::failure(&["AS tool_args_json"], "session stage events failed"),
         ],
     ];
 
