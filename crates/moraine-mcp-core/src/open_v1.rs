@@ -473,7 +473,129 @@ fn error_tool_response(request: Value, error: ToolError, started_at: Instant) ->
     ))
 }
 
+/// Text block for `open`. Clients that only surface `content` to the model
+/// (not `structuredContent`) must still see what was opened (#672), so the
+/// header is followed by a plain-text rendering of the opened object.
 fn open_result_text(payload: &Value) -> String {
+    let header = open_result_header(payload);
+    if payload.get("error").is_some() {
+        return header;
+    }
+    let body = match payload.pointer("/data/kind").and_then(Value::as_str) {
+        Some("event") => open_event_text(payload),
+        Some("turn") => open_turn_text(payload),
+        Some("session") => open_session_text(payload),
+        _ => Vec::new(),
+    };
+    if body.is_empty() {
+        header
+    } else {
+        format!("{header}\n\n{}", body.join("\n"))
+    }
+}
+
+fn open_event_text(payload: &Value) -> Vec<String> {
+    let mut lines = Vec::new();
+    let event_type = str_at(payload, "/data/event/type").unwrap_or("event");
+    let mut meta = vec![format!("type={event_type}")];
+    if let Some(tool) = str_at(payload, "/data/event/tool_name") {
+        meta.push(format!("tool={tool}"));
+    }
+    if let Some(turn) = str_at(payload, "/data/turn/id") {
+        meta.push(format!("turn={turn}"));
+    }
+    if let Some(timestamp) = str_at(payload, "/data/event/timestamp") {
+        meta.push(format!("at={timestamp}"));
+    }
+    lines.push(meta.join(" "));
+    if let Some(arguments) = payload.pointer("/data/content/arguments") {
+        if !arguments.is_null() {
+            lines.push(format!("arguments: {arguments}"));
+        }
+    }
+    if let Some(exit_code) = payload
+        .pointer("/data/content/exit_code")
+        .and_then(Value::as_i64)
+    {
+        lines.push(format!("exit_code: {exit_code}"));
+    }
+    if let Some(text) = str_at(payload, "/data/content/text").filter(|text| !text.is_empty()) {
+        lines.push(String::new());
+        lines.push(text.to_string());
+    }
+    let neighbors: Vec<String> = [
+        ("previous_event", "/data/traversal/previous_event_id"),
+        ("next_event", "/data/traversal/next_event_id"),
+    ]
+    .into_iter()
+    .filter_map(|(label, pointer)| str_at(payload, pointer).map(|id| format!("{label}={id}")))
+    .collect();
+    if !neighbors.is_empty() {
+        lines.push(String::new());
+        lines.push(neighbors.join(" "));
+    }
+    lines
+}
+
+fn open_turn_text(payload: &Value) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(text) = str_at(payload, "/data/summary/user_input/text") {
+        lines.push(format!("user: {text}"));
+    }
+    if let Some(text) = str_at(payload, "/data/summary/final_response/text") {
+        lines.push(format!("assistant: {text}"));
+    }
+    if let Some(events) = payload.pointer("/data/events").and_then(Value::as_array) {
+        if !lines.is_empty() && !events.is_empty() {
+            lines.push(String::new());
+        }
+        for event in events {
+            let ordinal = event.get("ordinal").and_then(Value::as_u64).unwrap_or(0);
+            let event_type = str_at(event, "/type").unwrap_or("event");
+            let tool = str_at(event, "/tool_name")
+                .map(|tool| format!(" [{tool}]"))
+                .unwrap_or_default();
+            let summary = str_at(event, "/summary").unwrap_or("");
+            let id = str_at(event, "/id").unwrap_or("");
+            lines.push(format!("{ordinal}. {event_type}{tool}: {summary} ({id})"));
+        }
+    }
+    lines
+}
+
+fn open_session_text(payload: &Value) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(title) = str_at(payload, "/data/session/title") {
+        lines.push(format!("title: {title}"));
+    }
+    if let Some(summary) = str_at(payload, "/data/session/session_summary") {
+        lines.push(format!("summary: {summary}"));
+    }
+    if let Some(turns) = payload.pointer("/data/turns").and_then(Value::as_array) {
+        if !lines.is_empty() && !turns.is_empty() {
+            lines.push(String::new());
+        }
+        for turn in turns {
+            let ordinal = turn.get("ordinal").and_then(Value::as_u64).unwrap_or(0);
+            let user = str_at(turn, "/user_input/text").unwrap_or("");
+            let response = str_at(turn, "/final_response/text").unwrap_or("");
+            let id = str_at(turn, "/id").unwrap_or("");
+            lines.push(format!(
+                "{ordinal}. user: {user} | assistant: {response} ({id})"
+            ));
+        }
+    }
+    lines
+}
+
+fn str_at<'a>(value: &'a Value, pointer: &str) -> Option<&'a str> {
+    value
+        .pointer(pointer)
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+}
+
+fn open_result_header(payload: &Value) -> String {
     if let Some(error) = payload.get("error") {
         let code = error.get("code").and_then(Value::as_str).unwrap_or("error");
         let message = error
@@ -1604,6 +1726,102 @@ mod tests {
             "moraine.mcp.error.v1"
         );
         assert_eq!(result["structuredContent"]["error"]["code"], "invalid_id");
+    }
+
+    #[test]
+    fn event_text_carries_the_full_body_for_content_only_clients() {
+        let body = format!(
+            "search label near the start. {} synthetic-fact-42",
+            "x".repeat(4000)
+        );
+        let payload = json!({
+            "request": { "id": "event:abc" },
+            "data": {
+                "kind": "event",
+                "event": { "type": "user_input", "timestamp": "2026-04-29T12:00:01.123Z" },
+                "turn": { "id": "turn:t1" },
+                "content": { "format": "text", "text": body },
+                "traversal": { "previous_event_id": "event:prev", "next_event_id": null }
+            }
+        });
+
+        let text = open_result_text(&payload);
+        assert!(text.starts_with("Opened event event:abc."));
+        assert!(
+            text.contains("synthetic-fact-42"),
+            "body beyond any preview must be visible"
+        );
+        assert!(text.contains("type=user_input turn=turn:t1"));
+        assert!(text.contains("previous_event=event:prev"));
+        assert!(!text.contains("next_event="));
+    }
+
+    #[test]
+    fn tool_call_event_text_includes_arguments_and_exit_code() {
+        let payload = json!({
+            "request": { "id": "event:tool" },
+            "data": {
+                "kind": "event",
+                "event": { "type": "tool_response", "tool_name": "exec_command" },
+                "content": { "format": "tool_response", "text": "ok", "exit_code": 2,
+                             "arguments": { "cmd": "cargo test" } }
+            }
+        });
+
+        let text = open_result_text(&payload);
+        assert!(text.contains("tool=exec_command"));
+        assert!(text.contains(r#"arguments: {"cmd":"cargo test"}"#));
+        assert!(text.contains("exit_code: 2"));
+    }
+
+    #[test]
+    fn turn_and_session_text_list_their_children() {
+        let turn = json!({
+            "request": { "id": "turn:t1", "limit": 2 },
+            "data": {
+                "kind": "turn",
+                "turn": { "event_count": 2 },
+                "summary": {
+                    "user_input": { "text": "Please check startup." },
+                    "final_response": { "text": "Fixed the guard." }
+                },
+                "events": [
+                    { "ordinal": 1, "type": "user_input", "summary": "Please check startup.", "id": "event:1" },
+                    { "ordinal": 2, "type": "tool_call", "tool_name": "exec_command", "summary": "cargo test", "id": "event:2" }
+                ],
+                "next_cursor": null
+            }
+        });
+        let text = open_result_text(&turn);
+        assert!(text.contains("user: Please check startup."));
+        assert!(text.contains("2. tool_call [exec_command]: cargo test (event:2)"));
+
+        let session = json!({
+            "request": { "id": "session:s1" },
+            "data": {
+                "kind": "session",
+                "session": { "title": "Investigate startup", "turn_count": 1 },
+                "turns": [
+                    { "ordinal": 1, "id": "turn:t1",
+                      "user_input": { "text": "Please check startup." },
+                      "final_response": { "text": "Fixed the guard." } }
+                ]
+            }
+        });
+        let text = open_result_text(&session);
+        assert!(text.contains("title: Investigate startup"));
+        assert!(
+            text.contains("1. user: Please check startup. | assistant: Fixed the guard. (turn:t1)")
+        );
+    }
+
+    #[test]
+    fn error_text_is_unchanged() {
+        let payload = json!({ "error": { "code": "not_found", "message": "no such id" } });
+        assert_eq!(
+            open_result_text(&payload),
+            "open failed (not_found): no such id"
+        );
     }
 
     fn session_metadata() -> SessionMetadata {
