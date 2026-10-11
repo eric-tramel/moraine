@@ -73,159 +73,227 @@ struct WebSearchRow {
     source_ref: String,
 }
 
+/// Sessions per phase-2 summary/turn query when listing session analytics.
+const SESSION_SUMMARY_CHUNK: usize = 50;
+/// Sessions per event-stream query; events carry the wide text columns.
+const SESSION_EVENTS_CHUNK: usize = 10;
+
 impl ClickHouseConversationRepository {
     pub(super) async fn list_session_analytics_impl(
         &self,
         query: SessionAnalyticsQuery,
     ) -> RepoResult<Vec<SessionAnalytics>> {
-        let session_summary = self.table_ref("v_session_summary");
-        let turn_summary = self.table_ref("v_turn_summary");
-        let trace = self.table_ref("v_conversation_trace");
-        let canonical_events = canonical_events_source(&self.table_ref("events"));
-        let mode_subquery = self.mode_subquery();
-        let lookback_clause = query
-            .lookback
-            .window_seconds()
-            .map(|seconds| {
-                format!("\n  AND s.last_event_time >= now() - INTERVAL {seconds} SECOND")
-            })
-            .unwrap_or_default();
+        let events_ref = self.table_ref("events");
         let limit = query.normalized_limit();
 
-        let summary_query = format!(
-            "SELECT
-  s.session_id AS session_id,
-  toString(s.first_event_time) AS first_event_time,
-  toInt64(toUnixTimestamp64Milli(s.first_event_time)) AS first_event_unix_ms,
-  toString(s.last_event_time) AS last_event_time,
-  toInt64(toUnixTimestamp64Milli(s.last_event_time)) AS last_event_unix_ms,
-  toUInt32(s.total_turns) AS total_turns,
-  toUInt64(s.total_events) AS total_events,
-  toUInt64(s.user_messages) AS user_messages,
-  toUInt64(s.assistant_messages) AS assistant_messages,
-  toUInt64(s.tool_calls) AS tool_calls,
-  toUInt64(s.tool_results) AS tool_results,
-  ifNull(m.mode, 'chat') AS mode,
-  ifNull(meta.session_slug, '') AS session_slug,
-  ifNull(meta.session_summary, '') AS session_summary,
-  ifNull(meta.explicit_title, '') AS explicit_title
-FROM {session_summary} AS s
-LEFT JOIN ({mode_subquery}) AS m ON m.session_id = s.session_id
-LEFT JOIN (
-  SELECT
-    session_id,
-    ifNull(argMax(nullIf(JSONExtractString(payload_json, 'slug'), ''), tuple(event_ts, event_uid)), '') AS session_slug,
-    ifNull(
-      argMaxIf(
-        coalesce(
-          nullIf(trimBoth(JSONExtractString(payload_json, 'title')), ''),
-          nullIf(trimBoth(JSONExtractString(payload_json, 'name')), '')
-        ),
-        tuple(event_ts, event_uid),
-        event_kind = 'session_meta'
-          AND (
-            notEmpty(trimBoth(JSONExtractString(payload_json, 'title')))
-            OR notEmpty(trimBoth(JSONExtractString(payload_json, 'name')))
-          )
-      ),
-      ''
-    ) AS explicit_title,
-    ifNull(
-      argMax(
-        coalesce(
-          nullIf(JSONExtractString(payload_json, 'summary'), ''),
-          nullIf(JSONExtractString(payload_json, 'title'), ''),
-          nullIf(JSONExtractString(payload_json, 'name'), '')
-        ),
-        tuple(event_ts, event_uid)
-      ),
-      ''
-    ) AS session_summary
-  FROM {canonical_events} AS meta_events
-  WHERE meta_events.event_kind = 'session_meta'
-  GROUP BY session_id
-) AS meta ON meta.session_id = s.session_id
-WHERE notEmpty(trimBoth(s.session_id)){lookback_clause}
-ORDER BY s.last_event_time DESC, s.session_id DESC
-LIMIT {limit}
-FORMAT JSONEachRow"
-        );
-        let summary_rows: Vec<ConversationSummaryRow> =
-            self.map_backend(self.query_rows(&summary_query, None).await)?;
+        // Phase 1: pick the newest `limit` session ids from narrow columns.
+        // Every later stage is restricted to these ids before any window runs.
+        let select_sql = SessionPageSelect {
+            events_ref: events_ref.clone(),
+            last_event_from_ms: None,
+            last_event_to_ms: None,
+            last_event_within_secs: query.lookback.window_seconds().map(u64::from),
+            first_event_before_ms: None,
+            cursor: None,
+            sort: ConversationListSort::Desc,
+            mode: None,
+            harness: None,
+            source_name: None,
+            scope_clause: None,
+            limit_plus: limit as usize,
+        }
+        .to_sql();
+        let selected: Vec<SessionIdRow> = self.map_backend(
+            self.query_rows_with_params(&select_sql, None, &SESSION_PAGE_SELECT_SETTINGS)
+                .await,
+        )?;
+        if selected.is_empty() {
+            return Ok(Vec::new());
+        }
+        let session_ids = selected
+            .into_iter()
+            .map(|row| row.session_id)
+            .collect::<Vec<_>>();
+        // Phase 2 runs over bounded chunks of the page so peak ClickHouse memory
+        // tracks the chunk, not the (up to 200 session) page.
+        let mut summary_rows: Vec<ConversationSummaryRow> = Vec::with_capacity(session_ids.len());
+        for chunk in session_ids.chunks(SESSION_SUMMARY_CHUNK) {
+            let build_query = |ids_sql: &str| {
+                let summary = session_summary_sql(&events_ref, ids_sql);
+                let mode_subquery = self.mode_subquery_for_sessions(Some(ids_sql));
+                let meta_rows = payload_rows_sql(
+                    &events_ref,
+                    ids_sql,
+                    "event_kind = 'session_meta'",
+                    "session_id, event_ts, event_uid, event_kind, payload_json",
+                );
+                format!(
+                "SELECT
+      s.session_id AS session_id,
+      toString(s.first_event_time) AS first_event_time,
+      toInt64(toUnixTimestamp64Milli(s.first_event_time)) AS first_event_unix_ms,
+      toString(s.last_event_time) AS last_event_time,
+      toInt64(toUnixTimestamp64Milli(s.last_event_time)) AS last_event_unix_ms,
+      toUInt32(s.total_turns) AS total_turns,
+      toUInt64(s.total_events) AS total_events,
+      toUInt64(s.user_messages) AS user_messages,
+      toUInt64(s.assistant_messages) AS assistant_messages,
+      toUInt64(s.tool_calls) AS tool_calls,
+      toUInt64(s.tool_results) AS tool_results,
+      ifNull(m.mode, 'chat') AS mode,
+      ifNull(meta.session_slug, '') AS session_slug,
+      ifNull(meta.session_summary, '') AS session_summary,
+      ifNull(meta.explicit_title, '') AS explicit_title
+    FROM ({summary}) AS s
+    ANY LEFT JOIN ({mode_subquery}) AS m ON m.session_id = s.session_id
+    ANY LEFT JOIN (
+      SELECT
+        session_id,
+        ifNull(argMax(nullIf(JSONExtractString(payload_json, 'slug'), ''), tuple(event_ts, event_uid)), '') AS session_slug,
+        ifNull(
+          argMaxIf(
+            coalesce(
+              nullIf(trimBoth(JSONExtractString(payload_json, 'title')), ''),
+              nullIf(trimBoth(JSONExtractString(payload_json, 'name')), '')
+            ),
+            tuple(event_ts, event_uid),
+            event_kind = 'session_meta'
+              AND (
+                notEmpty(trimBoth(JSONExtractString(payload_json, 'title')))
+                OR notEmpty(trimBoth(JSONExtractString(payload_json, 'name')))
+              )
+          ),
+          ''
+        ) AS explicit_title,
+        ifNull(
+          argMax(
+            coalesce(
+              nullIf(JSONExtractString(payload_json, 'summary'), ''),
+              nullIf(JSONExtractString(payload_json, 'title'), ''),
+              nullIf(JSONExtractString(payload_json, 'name'), '')
+            ),
+            tuple(event_ts, event_uid)
+          ),
+          ''
+        ) AS session_summary
+      FROM ({meta_rows})
+      GROUP BY session_id
+    ) AS meta ON meta.session_id = s.session_id
+    ORDER BY s.last_event_time DESC, s.session_id DESC
+    FORMAT JSONEachRow"
+            )
+            };
+            let rows: Vec<ConversationSummaryRow> =
+                self.query_session_page_rows(chunk, build_query).await?;
+            summary_rows.extend(rows);
+        }
+        // Chunks are fetched independently; restore the page order.
+        summary_rows.sort_by(|a, b| {
+            (b.last_event_unix_ms, &b.session_id).cmp(&(a.last_event_unix_ms, &a.session_id))
+        });
         if summary_rows.is_empty() {
             return Ok(Vec::new());
         }
 
-        let session_ids = summary_rows
-            .iter()
-            .map(|row| row.session_id.clone())
-            .collect::<Vec<_>>();
-        let session_ids_sql = sql_array_strings(&session_ids);
+        let mut turn_rows: Vec<TurnSummaryRow> = Vec::new();
+        for chunk in session_ids.chunks(SESSION_SUMMARY_CHUNK) {
+            let build_query = |ids_sql: &str| {
+                let turn_summary = turn_summary_sql(&events_ref, ids_sql);
+                format!(
+                    "SELECT
+      session_id,
+      toUInt32(turn_seq) AS turn_seq,
+      ifNull(turn_id, '') AS turn_id,
+      toString(ts.started_at) AS started_at,
+      toInt64(toUnixTimestamp64Milli(ts.started_at)) AS started_at_unix_ms,
+      toString(ts.ended_at) AS ended_at,
+      toInt64(toUnixTimestamp64Milli(ts.ended_at)) AS ended_at_unix_ms,
+      toUInt64(total_events) AS total_events,
+      toUInt64(user_messages) AS user_messages,
+      toUInt64(assistant_messages) AS assistant_messages,
+      toUInt64(tool_calls) AS tool_calls,
+      toUInt64(tool_results) AS tool_results,
+      toUInt64(reasoning_items) AS reasoning_items
+    FROM ({turn_summary}) AS ts
+    ORDER BY session_id ASC, turn_seq ASC
+    FORMAT JSONEachRow"
+                )
+            };
+            let rows: Vec<TurnSummaryRow> =
+                self.query_session_page_rows(chunk, build_query).await?;
+            turn_rows.extend(rows);
+        }
 
-        let turns_query = format!(
-            "SELECT
-  session_id,
-  toUInt32(turn_seq) AS turn_seq,
-  ifNull(turn_id, '') AS turn_id,
-  toString(ts.started_at) AS started_at,
-  toInt64(toUnixTimestamp64Milli(ts.started_at)) AS started_at_unix_ms,
-  toString(ts.ended_at) AS ended_at,
-  toInt64(toUnixTimestamp64Milli(ts.ended_at)) AS ended_at_unix_ms,
-  toUInt64(total_events) AS total_events,
-  toUInt64(user_messages) AS user_messages,
-  toUInt64(assistant_messages) AS assistant_messages,
-  toUInt64(tool_calls) AS tool_calls,
-  toUInt64(tool_results) AS tool_results,
-  toUInt64(reasoning_items) AS reasoning_items
-FROM {turn_summary} AS ts
-WHERE session_id IN {session_ids_sql}
-ORDER BY session_id ASC, turn_seq ASC
-FORMAT JSONEachRow"
-        );
-        let turn_rows: Vec<TurnSummaryRow> =
-            self.map_backend(self.query_rows(&turns_query, None).await)?;
-
-        let events_query = format!(
-            "SELECT
-  t.session_id AS session_id,
-  toUInt64(t.event_order) AS event_order,
-  toUInt32(t.turn_seq) AS turn_seq,
-  toInt64(toUnixTimestamp64Milli(t.event_time)) AS event_unix_ms,
-  t.event_class AS event_class,
-  t.actor_role AS actor_role,
-  t.payload_type AS payload_type,
-  ifNull(t.call_id, '') AS call_id,
-  ifNull(t.name, '') AS tool_name,
-  toUInt8(ifNull(e.tool_error, 0)) AS tool_error,
-  toUInt32(ifNull(e.latency_ms, 0)) AS latency_ms,
-  ifNull(e.model, '') AS model,
-  ifNull(t.endpoint_kind, '') AS endpoint_kind,
-  toUInt32(ifNull(e.input_tokens, 0)) AS input_tokens,
-  toUInt32(ifNull(e.output_tokens, 0)) AS output_tokens,
-  toUInt32(ifNull(e.cache_read_tokens, 0)) AS cache_read_tokens,
-  toUInt32(ifNull(e.cache_write_tokens, 0)) AS cache_write_tokens,
-  t.token_usage_buckets AS token_usage_buckets,
-  t.token_usage_native_units AS token_usage_native_units,
-  substringUTF8(ifNull(e.text_preview, ''), 1, 2000) AS text_preview,
-  substringUTF8(ifNull(t.text_content, ''), 1, 2000) AS text_content,
-  if(t.event_class = 'tool_call', substringUTF8(JSONExtractRaw(t.payload_json, 'input'), 1, 2000), '') AS tool_args_json,
-  ifNull(e.harness, '') AS harness,
-  ifNull(e.source_name, '') AS source_name,
-  ifNull(e.trace_id, '') AS trace_id
-FROM {trace} AS t
-LEFT JOIN {canonical_events} AS e
-  ON e.session_id = t.session_id
-  AND e.source_file = t.source_file
-  AND e.source_generation = t.source_generation
-  AND e.source_offset = t.source_offset
-  AND e.source_line_no = t.source_line_no
-  AND e.event_uid = t.event_uid
-WHERE t.session_id IN {session_ids_sql}
-ORDER BY t.session_id ASC, t.event_order ASC
-FORMAT JSONEachRow"
-        );
-        let event_rows: Vec<SessionAnalyticsEventRow> =
-            self.map_backend(self.query_rows(&events_query, None).await)?;
+        let mut event_rows: Vec<SessionAnalyticsEventRow> = Vec::new();
+        for chunk in session_ids.chunks(SESSION_EVENTS_CHUNK) {
+            let build_query = |ids_sql: &str| {
+                // The trace row and its canonical `events` row are the same physical
+                // row (the old self-join matched on the full unique key), so read the
+                // extra columns straight from the one windowed `events FINAL` scan.
+                let trace = session_trace_sql(
+                    &events_ref,
+                    ids_sql,
+                    &TraceExtras {
+                        narrow_columns: &[
+                            ("payload_type", "payload_type"),
+                            ("tool_call_id", "call_id"),
+                            ("tool_name", "name"),
+                            ("tool_error", "tool_error"),
+                            ("latency_ms", "latency_ms"),
+                            ("model", "model"),
+                            ("endpoint_kind", "endpoint_kind"),
+                            ("input_tokens", "input_tokens"),
+                            ("output_tokens", "output_tokens"),
+                            ("cache_read_tokens", "cache_read_tokens"),
+                            ("cache_write_tokens", "cache_write_tokens"),
+                            ("token_usage_buckets", "token_usage_buckets"),
+                            ("token_usage_native_units", "token_usage_native_units"),
+                            ("substringUTF8(text_preview, 1, 2000)", "text_preview"),
+                            ("substringUTF8(text_content, 1, 2000)", "text_content"),
+                            ("harness", "harness"),
+                            ("source_name", "source_name"),
+                            ("trace_id", "trace_id"),
+                        ],
+                        with_event_order: true,
+                        with_tool_args: true,
+                    },
+                );
+                format!(
+                    "SELECT
+      t.session_id AS session_id,
+      toUInt64(t.event_order) AS event_order,
+      toUInt32(t.turn_seq) AS turn_seq,
+      toInt64(toUnixTimestamp64Milli(t.event_time)) AS event_unix_ms,
+      t.event_class AS event_class,
+      t.actor_role AS actor_role,
+      t.payload_type AS payload_type,
+      ifNull(t.call_id, '') AS call_id,
+      ifNull(t.name, '') AS tool_name,
+      toUInt8(ifNull(t.tool_error, 0)) AS tool_error,
+      toUInt32(ifNull(t.latency_ms, 0)) AS latency_ms,
+      ifNull(t.model, '') AS model,
+      ifNull(t.endpoint_kind, '') AS endpoint_kind,
+      toUInt32(ifNull(t.input_tokens, 0)) AS input_tokens,
+      toUInt32(ifNull(t.output_tokens, 0)) AS output_tokens,
+      toUInt32(ifNull(t.cache_read_tokens, 0)) AS cache_read_tokens,
+      toUInt32(ifNull(t.cache_write_tokens, 0)) AS cache_write_tokens,
+      t.token_usage_buckets AS token_usage_buckets,
+      t.token_usage_native_units AS token_usage_native_units,
+      ifNull(t.text_preview, '') AS text_preview,
+      ifNull(t.text_content, '') AS text_content,
+      if(t.event_class = 'tool_call', t.tool_args_json, '') AS tool_args_json,
+      ifNull(t.harness, '') AS harness,
+      ifNull(t.source_name, '') AS source_name,
+      ifNull(t.trace_id, '') AS trace_id
+    FROM ({trace}) AS t
+    ORDER BY t.session_id ASC, t.event_order ASC
+    FORMAT JSONEachRow"
+                )
+            };
+            let rows: Vec<SessionAnalyticsEventRow> =
+                self.query_session_page_rows(chunk, build_query).await?;
+            event_rows.extend(rows);
+        }
 
         Ok(assemble_sessions(summary_rows, turn_rows, event_rows))
     }

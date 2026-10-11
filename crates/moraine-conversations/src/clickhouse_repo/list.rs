@@ -1,5 +1,9 @@
 use super::*;
 
+/// Sessions per phase-2 query. Wide-column reads cost whole granules, so peak
+/// ClickHouse memory is bounded by chunking the page rather than by its size.
+const SESSION_LIST_CHUNK: usize = 10;
+
 impl ClickHouseConversationRepository {
     pub(super) async fn list_conversations_impl(
         &self,
@@ -29,46 +33,53 @@ impl ClickHouseConversationRepository {
             None
         };
 
-        let session_summary = self.table_ref("v_session_summary");
-        let events_source = canonical_events_source(&self.table_ref("events"));
-        let mode_subquery = self.mode_subquery();
-
-        let mut where_clauses = vec!["1 = 1".to_string()];
-
-        if let Some(from_unix_ms) = filter.from_unix_ms {
-            where_clauses.push(format!(
-                "toUnixTimestamp64Milli(s.last_event_time) >= {from_unix_ms}"
-            ));
-        }
-        if let Some(to_unix_ms) = filter.to_unix_ms {
-            where_clauses.push(format!(
-                "toUnixTimestamp64Milli(s.last_event_time) < {to_unix_ms}"
-            ));
-        }
-        if let Some(mode_clause) = Self::mode_filter_clause(filter.mode) {
-            where_clauses.push(mode_clause);
-        }
-
-        if let Some(cursor) = &cursor {
-            let (time_cmp, session_cmp) = match sort {
-                ConversationListSort::Desc => ("<", "<"),
-                ConversationListSort::Asc => (">", ">"),
-            };
-            where_clauses.push(format!(
-                "(toUnixTimestamp64Milli(s.last_event_time) {time_cmp} {} OR (toUnixTimestamp64Milli(s.last_event_time) = {} AND s.session_id {session_cmp} {}))",
-                cursor.last_event_unix_ms,
-                cursor.last_event_unix_ms,
-                sql_quote(&cursor.session_id)
-            ));
-        }
-
-        let where_sql = where_clauses.join("\n  AND ");
+        let events_ref = self.table_ref("events");
         let order_dir = match sort {
             ConversationListSort::Desc => "DESC",
             ConversationListSort::Asc => "ASC",
         };
 
-        let query = format!(
+        // Phase 1: pick the page of session ids from narrow columns only.
+        let select_sql = SessionPageSelect {
+            events_ref: events_ref.clone(),
+            last_event_from_ms: filter.from_unix_ms,
+            last_event_to_ms: filter.to_unix_ms,
+            last_event_within_secs: None,
+            first_event_before_ms: None,
+            cursor: cursor
+                .as_ref()
+                .map(|c| (c.last_event_unix_ms, c.session_id.as_str())),
+            sort,
+            mode: filter.mode,
+            harness: None,
+            source_name: None,
+            scope_clause: None,
+            limit_plus: (limit as usize) + 1,
+        }
+        .to_sql();
+        let selected: Vec<SessionIdRow> = self.map_backend(
+            self.query_rows_with_params(&select_sql, None, &SESSION_PAGE_SELECT_SETTINGS)
+                .await,
+        )?;
+        let has_more = selected.len() > limit as usize;
+        let page_ids: Vec<String> = selected
+            .into_iter()
+            .take(limit as usize)
+            .map(|row| row.session_id)
+            .collect();
+        if page_ids.is_empty() {
+            return Ok(Page {
+                items: Vec::new(),
+                next_cursor: None,
+            });
+        }
+
+        // Phase 2: summarize only the selected sessions. Every subquery and
+        // join side below is restricted to `page_ids` before aggregation.
+        let build_query = |ids_sql: &str| {
+            let summary = session_summary_sql(&events_ref, ids_sql);
+            let mode_subquery = self.mode_subquery_for_sessions(Some(ids_sql));
+            format!(
             "SELECT
   s.session_id AS session_id,
   toString(s.first_event_time) AS first_event_time,
@@ -84,9 +95,9 @@ impl ClickHouseConversationRepository {
   ifNull(m.mode, 'chat') AS mode,
   ifNull(meta.session_slug, '') AS session_slug,
   ifNull(meta.session_summary, '') AS session_summary
-FROM {session_summary} AS s
-LEFT JOIN ({mode_subquery}) AS m ON m.session_id = s.session_id
-LEFT JOIN (
+FROM ({summary}) AS s
+ANY LEFT JOIN ({mode_subquery}) AS m ON m.session_id = s.session_id
+ANY LEFT JOIN (
   SELECT
     session_id,
     ifNull(argMax(nullIf(JSONExtractString(payload_json, 'slug'), ''), tuple(event_ts, event_uid)), '') AS session_slug,
@@ -101,33 +112,31 @@ LEFT JOIN (
       ),
       ''
     ) AS session_summary
-  FROM {events_source}
-  WHERE event_kind = 'session_meta'
+  FROM ({meta_rows})
   GROUP BY session_id
 ) AS meta ON meta.session_id = s.session_id
-WHERE {where_sql}
 ORDER BY s.last_event_time {order_dir}, s.session_id {order_dir}
-LIMIT {limit_plus}
 FORMAT JSONEachRow",
-            session_summary = session_summary,
-            events_source = events_source,
+            summary = summary,
             mode_subquery = mode_subquery,
-            where_sql = where_sql,
+            meta_rows = payload_rows_sql(
+                &events_ref,
+                ids_sql,
+                "event_kind = 'session_meta'",
+                "session_id, event_ts, event_uid, payload_json",
+            ),
             order_dir = order_dir,
-            limit_plus = (limit as usize) + 1,
-        );
+        )
+        };
 
-        let rows: Vec<ConversationSummaryRow> =
-            self.map_backend(self.query_rows(&query, None).await)?;
+        let rows: Vec<ConversationSummaryRow> = self
+            .query_session_page_chunks(&page_ids, SESSION_LIST_CHUNK, build_query)
+            .await?;
 
-        let mut items: Vec<ConversationSummary> = rows
-            .iter()
-            .take(limit as usize)
-            .cloned()
-            .map(Self::map_conversation_row)
-            .collect();
+        let mut items: Vec<ConversationSummary> =
+            rows.into_iter().map(Self::map_conversation_row).collect();
 
-        let next_cursor = if rows.len() > limit as usize {
+        let next_cursor = if has_more {
             if let Some(last) = items.last() {
                 Some(encode_cursor(&ConversationCursor {
                     last_event_unix_ms: last.last_event_unix_ms,
@@ -176,88 +185,70 @@ FORMAT JSONEachRow",
             None
         };
 
-        let session_summary = self.table_ref("v_session_summary");
-        let events_source = canonical_events_source(&self.table_ref("events"));
-
-        let mut where_clauses = vec![
-            // A blank session_id is never a real session (e.g. the orphan
-            // Workflow-journal events ingested before #386's exclusion). Drop
-            // them here so they never consume a LIMIT slot or anchor the keyset
-            // cursor. `notEmpty(trimBoth(...))` mirrors the MCP contract's
-            // `trim().is_empty()` rejection so the repo filter and the mcp-core
-            // skip agree on what counts as blank.
-            "notEmpty(trimBoth(s.session_id))".to_string(),
-            format!(
-                "toUnixTimestamp64Milli(s.last_event_time) >= {}",
-                filter.start_unix_ms
-            ),
-            format!(
-                "toUnixTimestamp64Milli(s.first_event_time) < {}",
-                filter.end_unix_ms
-            ),
-        ];
-        if let Some(scope_clause) = self.session_scope_clause("s.session_id") {
-            where_clauses.push(scope_clause);
-        }
-
-        if let Some(cursor) = &cursor {
-            let (time_cmp, session_cmp) = match sort {
-                ConversationListSort::Desc => ("<", "<"),
-                ConversationListSort::Asc => (">", ">"),
-            };
-            where_clauses.push(format!(
-                "(toUnixTimestamp64Milli(s.last_event_time) {time_cmp} {} OR (toUnixTimestamp64Milli(s.last_event_time) = {} AND s.session_id {session_cmp} {}))",
-                cursor.last_event_unix_ms,
-                cursor.last_event_unix_ms,
-                sql_quote(&cursor.session_id)
-            ));
-        }
-
-        let where_sql = where_clauses.join("\n  AND ");
+        let events_ref = self.table_ref("events");
         let order_dir = match sort {
             ConversationListSort::Desc => "DESC",
             ConversationListSort::Asc => "ASC",
         };
-        let limit_plus = (limit as usize) + 1;
-        let window_limit_sql = if filter.mode.is_none()
-            && filter.harness.is_none()
-            && filter.source_name.is_none()
-        {
-            format!(
-                    "  ORDER BY s.last_event_time {order_dir}, s.session_id {order_dir}\n  LIMIT {limit_plus}\n"
-                )
-        } else {
-            String::new()
-        };
-        let mut event_filter_clauses = Vec::new();
-        if let Some(mode) = filter.mode {
-            event_filter_clauses.push(format!(
-                "ifNull(r.mode, 'chat') = {}",
-                sql_quote(mode.as_str())
-            ));
-        }
-        if let Some(harness) = filter.harness.as_deref() {
-            event_filter_clauses.push(format!("r.latest_harness = {}", sql_quote(harness)));
-        }
-        if let Some(source_name) = filter.source_name.as_deref() {
-            event_filter_clauses.push(format!("r.latest_source_name = {}", sql_quote(source_name)));
-        }
-        let event_filter_sql = if event_filter_clauses.is_empty() {
-            String::new()
-        } else {
-            format!("WHERE {}\n", event_filter_clauses.join("\n    AND "))
-        };
-        let mode_aggregate = Self::mode_aggregate_sql();
 
-        // Resolve the time/scope window first, applying the keyset LIMIT before
-        // event aggregation whenever no mode predicate depends on that
-        // aggregation. Then compute every event-backed field in one grouped pass
-        // over only the candidate sessions. The previous query independently
-        // aggregated mode, completion state, and metadata across the entire
-        // events table before applying the window and LIMIT.
-        let query = format!(
+        // Phase 1: pick the page of session ids. Time window, scope, keyset
+        // cursor, and the mode/harness/source filters all resolve here from
+        // narrow columns (no payload_json, no window functions). The mode
+        // filter is an aggregate over event rows, so it reads four extra
+        // narrow columns for every candidate session in the time window; that
+        // is the one remaining corpus-proportional cost, and it is still a
+        // plain GROUP BY, not a sort.
+        let select_sql = SessionPageSelect {
+            events_ref: events_ref.clone(),
+            last_event_from_ms: Some(filter.start_unix_ms),
+            last_event_to_ms: None,
+            last_event_within_secs: None,
+            first_event_before_ms: Some(filter.end_unix_ms),
+            cursor: cursor
+                .as_ref()
+                .map(|c| (c.last_event_unix_ms, c.session_id.as_str())),
+            sort,
+            mode: filter.mode,
+            harness: filter.harness.as_deref(),
+            source_name: filter.source_name.as_deref(),
+            scope_clause: self.session_scope_clause("session_id"),
+            limit_plus: (limit as usize) + 1,
+        }
+        .to_sql();
+        let selected: Vec<SessionIdRow> = self.map_backend(
+            self.query_rows_with_params(&select_sql, None, &SESSION_PAGE_SELECT_SETTINGS)
+                .await,
+        )?;
+        let has_more = selected.len() > limit as usize;
+        let page_ids: Vec<String> = selected
+            .into_iter()
+            .take(limit as usize)
+            .map(|row| row.session_id)
+            .collect();
+        if page_ids.is_empty() {
+            return Ok(Page {
+                items: Vec::new(),
+                next_cursor: None,
+            });
+        }
+
+        // Phase 2: every event-backed field is computed in one grouped pass
+        // over only the selected sessions.
+        let mode_aggregate = Self::mode_aggregate_sql();
+        let build_query = |ids_sql: &str| {
+            let summary = session_summary_sql(&events_ref, ids_sql);
+            // Title/slug/summary fields live in `payload_json`; read it only for
+            // the session_meta and OMP rows that carry them (see payload_rows_sql).
+            let metadata_rows = payload_rows_sql(
+            &events_ref,
+            ids_sql,
+            "event_kind = 'session_meta' OR source_name = 'omp'",
+            "session_id, event_ts, event_uid, event_kind, source_name, source_file, payload_json",
+        );
+
+            format!(
             "WITH
-window_sessions AS (
+page_sessions AS (
   SELECT
     s.session_id AS session_id,
     toString(s.first_event_time) AS first_event_time,
@@ -266,9 +257,8 @@ window_sessions AS (
     toInt64(toUnixTimestamp64Milli(s.last_event_time)) AS last_event_unix_ms,
     toUInt32(s.total_turns) AS total_turns,
     toUInt64(s.total_events) AS total_events
-  FROM {session_summary} AS s
-  WHERE {where_sql}
-{window_limit_sql}),
+  FROM ({summary}) AS s
+),
 event_rollups AS (
   SELECT
     session_id,
@@ -278,6 +268,39 @@ event_rollups AS (
       argMaxIf(payload_type, tuple(event_ts, event_uid), payload_type IN ('task_complete', 'turn_aborted')),
       ''
     ) AS latest_terminal_payload_type,
+    ifNull(argMax(nullIf(e.harness, ''), tuple(event_ts, event_uid)), '') AS latest_harness,
+    ifNull(argMax(nullIf(e.source_name, ''), tuple(event_ts, event_uid)), '') AS latest_source_name,
+    ifNull(
+      argMinIf(
+        nullIf(trimBoth(substringUTF8(e.text_preview, 1, 320)), ''),
+        tuple(
+          e.event_ts,
+          e.source_name,
+          e.source_file,
+          e.source_generation,
+          e.source_offset,
+          e.source_line_no,
+          e.event_uid
+        ),
+        e.harness = 'codex'
+          AND e.actor_kind = 'user'
+          AND e.event_kind = 'event_msg'
+          AND e.payload_type = 'user_message'
+      ),
+      ''
+    ) AS codex_user_message_preview
+  FROM (
+    SELECT session_id, event_ts, event_uid, event_kind, actor_kind, payload_type, tool_name,
+      source_name, source_file, source_generation, source_offset, source_line_no,
+      harness, turn_index, text_preview
+    FROM {events_ref} FINAL
+    WHERE session_id IN ({ids_sql})
+  ) AS e
+  GROUP BY session_id
+),
+metadata_rollups AS (
+  SELECT
+    session_id,
     ifNull(
       argMaxIf(
         coalesce(
@@ -362,27 +385,6 @@ event_rollups AS (
       ),
       ''
     ) AS omp_dispatch_title,
-    ifNull(argMax(nullIf(e.harness, ''), tuple(event_ts, event_uid)), '') AS latest_harness,
-    ifNull(argMax(nullIf(e.source_name, ''), tuple(event_ts, event_uid)), '') AS latest_source_name,
-    ifNull(
-      argMinIf(
-        nullIf(trimBoth(substringUTF8(e.text_preview, 1, 320)), ''),
-        tuple(
-          e.event_ts,
-          e.source_name,
-          e.source_file,
-          e.source_generation,
-          e.source_offset,
-          e.source_line_no,
-          e.event_uid
-        ),
-        e.harness = 'codex'
-          AND e.actor_kind = 'user'
-          AND e.event_kind = 'event_msg'
-          AND e.payload_type = 'user_message'
-      ),
-      ''
-    ) AS codex_user_message_preview,
     ifNull(
       argMaxIf(
         nullIf(JSONExtractString(payload_json, 'slug'), ''),
@@ -391,8 +393,9 @@ event_rollups AS (
       ),
       ''
     ) AS session_slug
-  FROM {events_source} AS e
-  WHERE session_id IN (SELECT session_id FROM window_sessions)
+  FROM (
+    {metadata_rows}
+  ) AS e
   GROUP BY session_id
 ),
 candidate_sessions AS (
@@ -412,38 +415,37 @@ candidate_sessions AS (
     if(
       ifNull(r.latest_source_name, '') = 'omp',
       coalesce(
-        nullIf(r.latest_metadata_title, ''),
-        nullIf(r.latest_metadata_name, ''),
-        nullIf(r.latest_metadata_summary, ''),
-        nullIf(r.omp_dispatch_title, ''),
+        nullIf(x.latest_metadata_title, ''),
+        nullIf(x.latest_metadata_name, ''),
+        nullIf(x.latest_metadata_summary, ''),
+        nullIf(x.omp_dispatch_title, ''),
         ''
       ),
-      ifNull(r.latest_session_meta_title, '')
+      ifNull(x.latest_session_meta_title, '')
     ) AS title,
     ifNull(r.latest_source_name, '') AS source,
     ifNull(r.latest_harness, '') AS harness,
-    ifNull(r.session_slug, '') AS session_slug,
+    ifNull(x.session_slug, '') AS session_slug,
     if(
       ifNull(r.latest_source_name, '') = 'omp',
       coalesce(
-        nullIf(r.latest_metadata_summary, ''),
-        nullIf(r.latest_metadata_title, ''),
-        nullIf(r.latest_metadata_name, ''),
-        nullIf(r.omp_dispatch_title, ''),
+        nullIf(x.latest_metadata_summary, ''),
+        nullIf(x.latest_metadata_title, ''),
+        nullIf(x.latest_metadata_name, ''),
+        nullIf(x.omp_dispatch_title, ''),
         ''
       ),
-      ifNull(r.latest_session_meta_summary, '')
+      ifNull(x.latest_session_meta_summary, '')
     ) AS session_summary,
-    ifNull(r.latest_explicit_title, '') AS explicit_title,
+    ifNull(x.latest_explicit_title, '') AS explicit_title,
     if(
       ifNull(r.latest_harness, '') = 'codex',
       ifNull(r.codex_user_message_preview, ''),
       ''
     ) AS codex_user_message_preview
-  FROM window_sessions AS w
-  LEFT JOIN event_rollups AS r ON r.session_id = w.session_id
-  {event_filter_sql}ORDER BY w.last_event_unix_ms {order_dir}, w.session_id {order_dir}
-  LIMIT {limit_plus}
+  FROM page_sessions AS w
+  ANY LEFT JOIN event_rollups AS r ON r.session_id = w.session_id
+  ANY LEFT JOIN metadata_rollups AS x ON x.session_id = w.session_id
 )
 SELECT
   session_id,
@@ -465,26 +467,25 @@ SELECT
 FROM candidate_sessions
 ORDER BY last_event_unix_ms {order_dir}, session_id {order_dir}
 FORMAT JSONEachRow",
-            session_summary = session_summary,
-            events_source = events_source,
-            where_sql = where_sql,
+            summary = summary,
+            events_ref = events_ref,
+            ids_sql = ids_sql,
+            metadata_rows = metadata_rows,
             mode_aggregate = mode_aggregate,
-            window_limit_sql = window_limit_sql,
-            event_filter_sql = event_filter_sql,
             order_dir = order_dir,
-            limit_plus = limit_plus,
-        );
+        )
+        };
 
-        let rows: Vec<McpSessionListRow> = self.map_backend(self.query_rows(&query, None).await)?;
+        let rows: Vec<McpSessionListRow> = self
+            .query_session_page_chunks(&page_ids, SESSION_LIST_CHUNK, build_query)
+            .await?;
 
         let mut items: Vec<McpSessionListItem> = rows
-            .iter()
-            .take(limit as usize)
-            .cloned()
+            .into_iter()
             .map(Self::map_mcp_session_list_row)
             .collect();
 
-        let next_cursor = if rows.len() > limit as usize {
+        let next_cursor = if has_more {
             if let Some(last) = items.last() {
                 Some(encode_cursor(&McpSessionListCursor {
                     last_event_unix_ms: last.last_event_unix_ms,

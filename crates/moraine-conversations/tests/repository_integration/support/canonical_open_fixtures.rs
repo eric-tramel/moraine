@@ -40,7 +40,37 @@ fn nav_row(
     })
 }
 
+/// Number of navigation rows in the `sess-large` fixture; equals the
+/// production navigation page size so the version lookup inlines a full page of
+/// event uids.
+pub(crate) const LARGE_SESSION_ROWS: u64 = 1024;
+
+fn large_navigation_rows(session_id: &str) -> Vec<Value> {
+    (1..=LARGE_SESSION_ROWS)
+        .map(|index| {
+            let (actor, kind, payload) = if index % 2 == 1 {
+                ("user", "message", "text")
+            } else {
+                ("assistant", "message", "text")
+            };
+            nav_row(
+                session_id,
+                &format!("evt-large-{index:0>64}"),
+                index,
+                index.div_ceil(2) as u32,
+                actor,
+                kind,
+                payload,
+                "",
+            )
+        })
+        .collect()
+}
+
 pub(crate) fn navigation_rows(session_id: &str) -> Vec<Value> {
+    if session_id == "sess-large" {
+        return large_navigation_rows(session_id);
+    }
     let specs: Vec<(&str, u32, &str, &str, &str, &str)> = match session_id {
         "sess-open" => vec![
             ("evt-open-1", 1, "user", "message", "text", ""),
@@ -119,6 +149,7 @@ pub(crate) fn version_rows() -> Vec<Value> {
         "sess-incomplete",
         "sess-event",
         "sess-out-of-scope",
+        "sess-large",
     ]
     .into_iter()
     .flat_map(navigation_rows)

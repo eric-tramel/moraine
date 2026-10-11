@@ -1,6 +1,11 @@
 use super::*;
 
 #[derive(Debug, Clone, Deserialize)]
+pub(super) struct SessionIdRow {
+    pub(super) session_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub(super) struct ConversationSummaryRow {
     pub(super) session_id: String,
     pub(super) first_event_time: String,

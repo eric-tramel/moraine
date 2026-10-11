@@ -1,5 +1,6 @@
 import json
 import multiprocessing as mp
+import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -55,7 +56,24 @@ def _session_rows() -> list[dict]:
     ]
 
 
+def _ordered_sessions(query: str) -> list[dict]:
+    rows = sorted(_session_rows(), key=lambda row: row["last_event_unix_ms"])
+    if "DESC" in query:
+        rows.reverse()
+    return rows
+
+
 def _rows_for_query(query: str) -> list[dict]:
+    # Page-first listing, phase 1: narrow page selection returning session ids.
+    if query.startswith("SELECT\n  session_id,\n  min(") and "FROM `moraine`.`events` FINAL" in query:
+        limit = int(re.search(r"LIMIT (\d+)", query).group(1))
+        return [{"session_id": row["session_id"]} for row in _ordered_sessions(query)[:limit]]
+
+    # Page-first listing, phase 2: summaries for the selected session ids only.
+    if "AS session_summary\nFROM (" in query:
+        ids = set(re.findall(r"'(sess_[a-z])'", query))
+        return [row for row in _ordered_sessions(query) if row["session_id"] in ids]
+
     if "FROM `moraine`.`v_session_summary` AS s" in query:
         if "WHERE s.session_id = 'sess_a'" in query:
             return [_session_rows()[2]]
@@ -131,6 +149,10 @@ def _run_mock_clickhouse(port_queue: mp.Queue) -> None:
         def _handle(self) -> None:
             parsed = urlparse(self.path)
             query = parse_qs(parsed.query).get("query", [""])[0]
+            if not query:
+                # SELECTs travel in the POST body; INSERTs keep `query` in the URL.
+                length = int(self.headers.get("Content-Length") or 0)
+                query = self.rfile.read(length).decode("utf-8") if length else ""
             rows = _rows_for_query(query)
             body = "".join(f"{json.dumps(row)}\n" for row in rows).encode("utf-8")
 
