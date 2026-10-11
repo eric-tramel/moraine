@@ -1198,10 +1198,14 @@ pub(crate) fn repo_error_to_contract_error(error: RepoError) -> contract::Contra
         RepoError::ResourceExhausted(message) => {
             contract::ContractError::new(contract::ToolErrorCode::ResourceExhausted, message)
         }
-        RepoError::Backend(_) => contract::ContractError::new(
-            contract::ToolErrorCode::BackendFailure,
-            "backend request failed",
-        ),
+        RepoError::Backend(error) => {
+            // The client-facing message is redacted; keep the real cause in logs.
+            warn!("mcp backend request failed: {error:#}");
+            contract::ContractError::new(
+                contract::ToolErrorCode::BackendFailure,
+                "backend request failed",
+            )
+        }
         RepoError::Internal(message) => {
             contract::ContractError::new(contract::ToolErrorCode::InternalError, message)
         }
