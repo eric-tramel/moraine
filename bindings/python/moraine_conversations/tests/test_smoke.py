@@ -131,6 +131,10 @@ def _run_mock_clickhouse(port_queue: mp.Queue) -> None:
         def _handle(self) -> None:
             parsed = urlparse(self.path)
             query = parse_qs(parsed.query).get("query", [""])[0]
+            if not query:
+                # SELECTs travel in the POST body; INSERTs keep `query` in the URL.
+                length = int(self.headers.get("Content-Length") or 0)
+                query = self.rfile.read(length).decode("utf-8") if length else ""
             rows = _rows_for_query(query)
             body = "".join(f"{json.dumps(row)}\n" for row in rows).encode("utf-8")
 
