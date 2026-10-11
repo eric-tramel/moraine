@@ -119,7 +119,26 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
         State(state): State<Arc<MockState>>,
         Query(params): Query<HashMap<String, String>>,
         headers: HeaderMap,
+        body: axum::body::Bytes,
     ) -> (StatusCode, String) {
+        // Real HTTP stacks reject URLs near 64 KB before sending; reproduce that so
+        // statements that must travel in the body cannot silently regress to the URL.
+        if params
+            .get("query")
+            .is_some_and(|query| query.len() > 32 * 1024)
+        {
+            return (StatusCode::URI_TOO_LONG, "uri too long".to_string());
+        }
+        let params = {
+            let mut params = params;
+            if !params.contains_key("query") && !body.is_empty() {
+                params.insert(
+                    "query".to_string(),
+                    String::from_utf8_lossy(&body).into_owned(),
+                );
+            }
+            params
+        };
         if headers.get("content-length").is_none() {
             return (
                 StatusCode::LENGTH_REQUIRED,
@@ -233,6 +252,10 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
                 .nth(1)
                 .and_then(|rest| rest.split('\'').next())
                 .unwrap_or("");
+            if session_id == "sess-large" && query.contains(" AND (n.sort_time") {
+                // The large fixture fills exactly one navigation page.
+                return (StatusCode::OK, String::new());
+            }
             return (
                 StatusCode::OK,
                 json_each_row(json!(navigation_rows(session_id))),

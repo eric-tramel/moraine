@@ -370,6 +370,16 @@ impl ClickHouseClient {
         let (managed_workloads, admission) =
             self.managed_workloads_available(&owner, admission).await?;
         let mut url = self.base_url()?;
+        // Statements travel in the POST body unless the body already carries
+        // INSERT data, in which case ClickHouse requires the statement in the
+        // URL. Keeping SELECTs out of the URL avoids reqwest/hyper URI limits
+        // (~64 KB) for statements with large inlined IN lists.
+        let statement_in_url = !body.is_empty();
+        let body = if statement_in_url {
+            body
+        } else {
+            query.as_bytes().to_vec()
+        };
         let (body, content_encoding) = match (self.cfg.request_compression, body.is_empty()) {
             (_, true) | (ClickHouseRequestCompression::None, false) => (body, None),
             (ClickHouseRequestCompression::Gzip, false) => {
@@ -395,7 +405,9 @@ impl ClickHouseClient {
             owner.register_statement(&self.inner.runtime, self.inner.admin.clone(), admission)?;
         {
             let mut qp = url.query_pairs_mut();
-            qp.append_pair("query", query);
+            if statement_in_url {
+                qp.append_pair("query", query);
+            }
             qp.append_pair("query_id", ticket.query_id());
             qp.append_pair("replace_running_query", "0");
             if managed_workloads {
@@ -1878,6 +1890,10 @@ mod tests {
         }
     }
 
+    fn param_query(params: &HashMap<String, String>) -> &str {
+        params.get("query").map(String::as_str).unwrap_or_default()
+    }
+
     fn is_workload_capability_probe(params: &HashMap<String, String>) -> bool {
         params
             .get("query")
@@ -1888,7 +1904,18 @@ mod tests {
         async fn handler(
             Query(params): Query<HashMap<String, String>>,
             headers: HeaderMap,
+            body: Bytes,
         ) -> (StatusCode, String) {
+            let params = {
+                let mut params = params;
+                if !params.contains_key("query") && !body.is_empty() {
+                    params.insert(
+                        "query".to_string(),
+                        String::from_utf8_lossy(&body).into_owned(),
+                    );
+                }
+                params
+            };
             if headers.get("content-length").is_none() {
                 return (
                     StatusCode::LENGTH_REQUIRED,
@@ -1938,7 +1965,18 @@ mod tests {
         async fn handler(
             State(state): State<MigrationMockState>,
             Query(params): Query<HashMap<String, String>>,
+            body: Bytes,
         ) -> (StatusCode, String) {
+            let params = {
+                let mut params = params;
+                if !params.contains_key("query") && !body.is_empty() {
+                    params.insert(
+                        "query".to_string(),
+                        String::from_utf8_lossy(&body).into_owned(),
+                    );
+                }
+                params
+            };
             if is_workload_capability_probe(&params) {
                 return (StatusCode::OK, "0".to_string());
             }
@@ -1993,7 +2031,18 @@ mod tests {
         async fn handler(
             State(state): State<AdaptiveBackfillMockState>,
             Query(params): Query<HashMap<String, String>>,
+            body: Bytes,
         ) -> (StatusCode, String) {
+            let params = {
+                let mut params = params;
+                if !params.contains_key("query") && !body.is_empty() {
+                    params.insert(
+                        "query".to_string(),
+                        String::from_utf8_lossy(&body).into_owned(),
+                    );
+                }
+                params
+            };
             let query = params.get("query").cloned().unwrap_or_default();
             state
                 .queries
@@ -2118,7 +2167,18 @@ mod tests {
             State(user_agents): State<Arc<Mutex<Vec<Option<String>>>>>,
             Query(params): Query<HashMap<String, String>>,
             headers: HeaderMap,
+            body: Bytes,
         ) -> (StatusCode, &'static str) {
+            let params = {
+                let mut params = params;
+                if !params.contains_key("query") && !body.is_empty() {
+                    params.insert(
+                        "query".to_string(),
+                        String::from_utf8_lossy(&body).into_owned(),
+                    );
+                }
+                params
+            };
             if is_workload_capability_probe(&params) {
                 return (StatusCode::OK, "0");
             }
@@ -2160,7 +2220,18 @@ mod tests {
             State(state): State<StreamCaptureState>,
             Query(params): Query<HashMap<String, String>>,
             headers: HeaderMap,
+            body: Bytes,
         ) -> (StatusCode, &'static str) {
+            let params = {
+                let mut params = params;
+                if !params.contains_key("query") && !body.is_empty() {
+                    params.insert(
+                        "query".to_string(),
+                        String::from_utf8_lossy(&body).into_owned(),
+                    );
+                }
+                params
+            };
             if is_workload_capability_probe(&params) {
                 return (StatusCode::OK, "0");
             }
@@ -2207,7 +2278,18 @@ mod tests {
         async fn handler(
             State(state): State<SkewMockState>,
             Query(params): Query<HashMap<String, String>>,
+            body: Bytes,
         ) -> (StatusCode, String) {
+            let params = {
+                let mut params = params;
+                if !params.contains_key("query") && !body.is_empty() {
+                    params.insert(
+                        "query".to_string(),
+                        String::from_utf8_lossy(&body).into_owned(),
+                    );
+                }
+                params
+            };
             if is_workload_capability_probe(&params) {
                 return (StatusCode::OK, "0".to_string());
             }
@@ -3309,7 +3391,9 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn gzip_request_compression_leaves_empty_body_unencoded() {
+    async fn gzip_request_compression_applies_to_statement_body() {
+        use std::io::Read;
+
         let requests = Arc::new(Mutex::new(Vec::new()));
         let base_url = spawn_request_capture_server(RequestCaptureState {
             requests: requests.clone(),
@@ -3324,20 +3408,109 @@ mod tests {
             client.request_text("SELECT 1", None, None, false, None),
         )
         .await
-        .expect("empty request");
+        .expect("statement request");
 
         let requests = requests.lock().expect("request capture mutex poisoned");
         assert_eq!(requests.len(), 1);
-        assert!(requests[0].headers.get("content-encoding").is_none());
-        assert!(requests[0].body.is_empty());
+        assert!(!requests[0].params.contains_key("query"));
+        assert_eq!(
+            requests[0]
+                .headers
+                .get("content-encoding")
+                .and_then(|value| value.to_str().ok()),
+            Some("gzip")
+        );
         assert_eq!(
             requests[0]
                 .headers
                 .get("content-length")
                 .and_then(|value| value.to_str().ok()),
-            Some("0")
+            Some(requests[0].body.len().to_string().as_str())
         );
+        let mut statement = String::new();
+        flate2::read::GzDecoder::new(requests[0].body.as_slice())
+            .read_to_string(&mut statement)
+            .expect("gunzip statement");
+        assert_eq!(statement, "SELECT 1");
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn large_bodyless_select_sends_statement_in_body_not_url() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let base_url = spawn_request_capture_server(RequestCaptureState {
+            requests: requests.clone(),
+        })
+        .await;
+        let client = ClickHouseClient::new(test_clickhouse_config(base_url)).expect("new client");
+        let list = (0..4096)
+            .map(|index| format!("'event-uid-{index:0>40}'"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let statement = format!("SELECT uid FROM events WHERE uid IN ({list})");
+        assert!(statement.len() > 100_000);
+
+        owned(
+            &client,
+            client.request_text(&statement, None, Some("moraine"), false, Some("JSON")),
+        )
+        .await
+        .expect("large select must build and send");
+
+        let requests = requests.lock().expect("request capture mutex poisoned");
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        assert!(!request.params.contains_key("query"));
+        assert_eq!(request.body, statement.as_bytes());
+        assert_eq!(
+            request
+                .headers
+                .get("content-length")
+                .and_then(|value| value.to_str().ok()),
+            Some(statement.len().to_string().as_str())
+        );
+        assert_eq!(
+            request.params.get("database").map(String::as_str),
+            Some("moraine")
+        );
+        assert_eq!(
+            request.params.get("default_format").map(String::as_str),
+            Some("JSON")
+        );
+        assert!(request.params.contains_key("query_id"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn insert_with_body_keeps_statement_in_url() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let base_url = spawn_request_capture_server(RequestCaptureState {
+            requests: requests.clone(),
+        })
+        .await;
+        let client = ClickHouseClient::new(test_clickhouse_config(base_url)).expect("new client");
+        let payload = b"{\"value\":1}\n".to_vec();
+
+        owned(
+            &client,
+            client.request_text(
+                "INSERT INTO events FORMAT JSONEachRow",
+                Some(payload.clone()),
+                None,
+                false,
+                None,
+            ),
+        )
+        .await
+        .expect("insert request");
+
+        let requests = requests.lock().expect("request capture mutex poisoned");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].params.get("query").map(String::as_str),
+            Some("INSERT INTO events FORMAT JSONEachRow")
+        );
+        assert_eq!(requests[0].body, payload);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn workload_probe_observes_owner_cancellation_before_data_egress() {
         #[derive(Clone)]
@@ -3561,7 +3734,14 @@ mod tests {
         let content_lengths = content_lengths
             .lock()
             .expect("stream headers mutex poisoned");
-        assert_eq!(content_lengths.as_slice(), &[Some("0".to_string())]);
+        assert_eq!(
+            content_lengths.as_slice(),
+            &[Some(
+                "SELECT value FROM events FORMAT JSONEachRow"
+                    .len()
+                    .to_string()
+            )]
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -4059,7 +4239,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(30)).await;
         let captured = requests.lock().unwrap();
         assert_eq!(captured.len(), 1);
-        assert!(!captured[0].params["query"].starts_with("KILL QUERY"));
+        assert!(!param_query(&captured[0].params).starts_with("KILL QUERY"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -4087,7 +4267,7 @@ mod tests {
                     .lock()
                     .unwrap()
                     .iter()
-                    .any(|request| request.params["query"].starts_with("KILL QUERY"))
+                    .any(|request| param_query(&request.params).starts_with("KILL QUERY"))
                 {
                     break;
                 }
@@ -4099,10 +4279,10 @@ mod tests {
         let captured = requests.lock().unwrap();
         let kill = captured
             .iter()
-            .find(|request| request.params["query"].starts_with("KILL QUERY"))
+            .find(|request| param_query(&request.params).starts_with("KILL QUERY"))
             .unwrap();
-        assert!(kill.params["query"].contains(&format!("query_id IN ('{child_id}')")));
-        assert!(!kill.params["query"].contains("LIKE"));
+        assert!(param_query(&kill.params).contains(&format!("query_id IN ('{child_id}')")));
+        assert!(!param_query(&kill.params).contains("LIKE"));
         assert!(kill.params["query_id"].starts_with("moraine-administrative-"));
         assert_eq!(kill.params["replace_running_query"], "0");
     }
@@ -4421,8 +4601,8 @@ mod tests {
         let requests = state.requests.lock().unwrap();
         let child = requests[0]["query_id"].clone();
         assert!(requests.iter().any(|request| {
-            request["query"].starts_with("KILL QUERY")
-                && request["query"].contains(&format!("'{child}'"))
+            param_query(request).starts_with("KILL QUERY")
+                && param_query(request).contains(&format!("'{child}'"))
         }));
     }
 
@@ -4537,11 +4717,11 @@ mod tests {
         let captured = requests.lock().unwrap();
         let kills = captured
             .iter()
-            .filter(|request| request.params["query"].starts_with("KILL QUERY"))
+            .filter(|request| param_query(&request.params).starts_with("KILL QUERY"))
             .collect::<Vec<_>>();
         let polls = captured
             .iter()
-            .filter(|request| request.params["query"].contains("system.processes"))
+            .filter(|request| param_query(&request.params).contains("system.processes"))
             .count();
         assert_eq!(
             polls, 3,
@@ -4550,7 +4730,7 @@ mod tests {
         assert_eq!(kills.len(), polls);
         assert!(
             kills.iter().all(|kill| {
-                kill.params["query"].contains(&format!("query_id IN ('{child_id}')"))
+                param_query(&kill.params).contains(&format!("query_id IN ('{child_id}')"))
                     && kill.params["query_id"].starts_with("moraine-administrative-")
                     && kill.params["query_id"] != child_id
             }),
@@ -4560,8 +4740,8 @@ mod tests {
             captured
                 .iter()
                 .filter(|request| {
-                    request.params["query"].starts_with("KILL QUERY")
-                        || request.params["query"].contains("system.processes")
+                    param_query(&request.params).starts_with("KILL QUERY")
+                        || param_query(&request.params).contains("system.processes")
                 })
                 .all(|request| request.headers.get("content-length").unwrap() == "0"),
             "empty administrative POSTs must carry an explicit zero content length"
