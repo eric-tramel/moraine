@@ -335,6 +335,9 @@ pub(crate) struct SetupIntegrationsArgs {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum SetupMcpTarget {
+    #[serde(rename = "antigravity")]
+    #[value(name = "antigravity", alias = "antigravity-ide")]
+    Antigravity,
     ClaudeCode,
     Codex,
     Hermes,

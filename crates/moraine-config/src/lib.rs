@@ -13,6 +13,7 @@ use std::path::{Component, Path, PathBuf};
 pub const BUILD_VERSION: &str = env!("MORAINE_BUILD_VERSION");
 
 pub const KNOWN_INGEST_HARNESSES: &[&str] = &[
+    "antigravity",
     "codex",
     "claude-code",
     "cursor",
@@ -716,6 +717,15 @@ fn default_sources() -> Vec<IngestSource> {
         "~/.config/Cursor/User"
     };
     let mut sources = vec![
+        IngestSource {
+            name: "antigravity".to_string(),
+            harness: "antigravity".to_string(),
+            enabled: true,
+            glob: "~/.gemini/antigravity/brain/*/.system_generated/logs/transcript.jsonl"
+                .to_string(),
+            watch_root: "~/.gemini/antigravity/brain".to_string(),
+            format: SourceFormat::Jsonl,
+        },
         IngestSource {
             name: "codex".to_string(),
             harness: "codex".to_string(),
@@ -3892,7 +3902,7 @@ watch_root = "~/.custom/sessions"
         std::fs::remove_file(&path).ok();
         assert!(
             format!("{err:#}").contains(
-                "expected one of: codex, claude-code, cursor, hermes, kiro-cli, kimi-cli, nac, opencode, pi-coding-agent, prime-agent, qwen-code"
+                "expected one of: antigravity, codex, claude-code, cursor, hermes, kiro-cli, kimi-cli, nac, opencode, pi-coding-agent, prime-agent, qwen-code"
             ),
             "unexpected error: {err:#}"
         );
@@ -3915,7 +3925,7 @@ watch_root = "~/.claude/projects"
         std::fs::remove_file(&path).ok();
         assert!(
             format!("{err:#}").contains(
-                "expected one of: codex, claude-code, cursor, hermes, kiro-cli, kimi-cli, nac, opencode, pi-coding-agent, prime-agent, qwen-code"
+                "expected one of: antigravity, codex, claude-code, cursor, hermes, kiro-cli, kimi-cli, nac, opencode, pi-coding-agent, prime-agent, qwen-code"
             ),
             "unexpected error: {err:#}"
         );
@@ -4105,6 +4115,33 @@ watch_root = "~/.cursor/projects"
     }
 
     #[test]
+    fn shipped_template_enables_antigravity_by_default() {
+        let path = write_temp_config(
+            include_str!("../../../config/moraine.toml"),
+            "shipped-template-antigravity",
+        );
+        let cfg = load_config(&path).expect("shipped template must parse");
+        std::fs::remove_file(&path).ok();
+        let source = cfg
+            .ingest
+            .sources
+            .iter()
+            .find(|source| source.name == "antigravity")
+            .expect("template ships an Antigravity source");
+        assert!(source.enabled);
+        assert_eq!(source.harness, "antigravity");
+        assert_eq!(source.format, SourceFormat::Jsonl);
+        assert_eq!(
+            source.glob,
+            expand_path("~/.gemini/antigravity/brain/*/.system_generated/logs/transcript.jsonl")
+        );
+        assert_eq!(
+            source.watch_root,
+            expand_path("~/.gemini/antigravity/brain")
+        );
+    }
+
+    #[test]
     fn shipped_template_enables_cursor_sqlite_by_default() {
         let path = write_temp_config(
             include_str!("../../../config/moraine.toml"),
@@ -4286,6 +4323,23 @@ watch_root = "~/.cursor/projects"
         assert!(sources
             .iter()
             .all(|source| source.format == SourceFormat::Jsonl));
+    }
+
+    #[test]
+    fn default_sources_enable_antigravity_jsonl() {
+        let sources = default_sources();
+        let source = sources
+            .iter()
+            .find(|source| source.name == "antigravity")
+            .expect("defaults include an Antigravity source");
+        assert!(source.enabled);
+        assert_eq!(source.harness, "antigravity");
+        assert_eq!(source.format, SourceFormat::Jsonl);
+        assert_eq!(
+            source.glob,
+            "~/.gemini/antigravity/brain/*/.system_generated/logs/transcript.jsonl"
+        );
+        assert_eq!(source.watch_root, "~/.gemini/antigravity/brain");
     }
 
     #[test]

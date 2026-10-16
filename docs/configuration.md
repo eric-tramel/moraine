@@ -474,9 +474,9 @@ format = "jsonl"
 | `watch_root` | derived from `glob` when empty | Directory watched for changes. Set it explicitly when the glob root is ambiguous or platform-specific. |
 | `format` | inferred from `harness` and `glob` | On-disk parser: `jsonl`, `session_json`, `kiro_session`, `cursor_sqlite`, `nac_sqlite`, or `opencode_sqlite`. |
 
-Supported `harness` values are `codex`, `claude-code`, `cursor`, `hermes`,
-`kiro-cli`, `kimi-cli`, `nac`, `opencode`, `pi-coding-agent`, `prime-agent`,
-and `qwen-code`.
+Supported `harness` values are `antigravity`, `codex`, `claude-code`,
+`cursor`, `hermes`, `kiro-cli`, `kimi-cli`, `nac`, `opencode`,
+`pi-coding-agent`, `prime-agent`, and `qwen-code`.
 Each value maps to a
 registered ingest source adapter; see
 [Ingest Sources](development/ingest-sources.md) for the adapter contract and
@@ -507,6 +507,7 @@ The built-in defaults and `config/moraine.toml` reference cover these source fam
 
 | Source | Harness | Default glob | Watch root | Format |
 | --- | --- | --- | --- | --- |
+| Antigravity | `antigravity` | `~/.gemini/antigravity/brain/*/.system_generated/logs/transcript.jsonl` | `~/.gemini/antigravity/brain` | inferred `jsonl` |
 | Codex | `codex` | `~/.codex/sessions/**/*.jsonl` | `~/.codex/sessions` | inferred `jsonl` |
 | Claude Code | `claude-code` | `~/.claude/projects/**/*.jsonl` | `~/.claude/projects` | inferred `jsonl` |
 | Claude Cowork (local macOS) | `claude-code` | `~/Library/Application Support/Claude/local-agent-mode-sessions/**/.claude/projects/**/*.jsonl` | `~/Library/Application Support/Claude/local-agent-mode-sessions` | inferred `jsonl` |

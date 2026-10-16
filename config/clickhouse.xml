@@ -16,6 +16,7 @@
   <pid>__MORAINE_HOME__/clickhouse/clickhouse.pid</pid>
 
   <listen_host>127.0.0.1</listen_host>
+  <timezone>UTC</timezone>
   <http_port>__CLICKHOUSE_HTTP_PORT__</http_port>
   <tcp_port>__CLICKHOUSE_TCP_PORT__</tcp_port>
   <interserver_http_port>__CLICKHOUSE_INTERSERVER_HTTP_PORT__</interserver_http_port>

@@ -61,6 +61,13 @@ reconcile_interval_seconds = 30.0
 heartbeat_interval_seconds = 5.0
 
 [[ingest.sources]]
+name = "antigravity"
+harness = "antigravity"
+enabled = true
+glob = "~/.gemini/antigravity/brain/*/.system_generated/logs/transcript.jsonl"
+watch_root = "~/.gemini/antigravity/brain"
+
+[[ingest.sources]]
 name = "codex"
 harness = "codex"
 enabled = true

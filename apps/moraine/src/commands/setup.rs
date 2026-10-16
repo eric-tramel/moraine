@@ -125,17 +125,19 @@ fn setup_execution_args(command: Option<SetupCommand>, interactive: bool) -> Res
             if integrations.all && !integrations.yes && !integrations.dry_run {
                 bail!("setup integrations --all requires --yes or --dry-run");
             }
+            let mcp_targets = if integrations.all {
+                harnesses::setup_targets()
+            } else {
+                integrations.targets
+            };
+            let updates_config = mcp_targets.contains(&SetupMcpTarget::Antigravity);
             Ok(SetupArgs {
                 yes: integrations.yes,
                 dry_run: integrations.dry_run,
-                skip_config: true,
+                skip_config: !updates_config,
                 skip_mcp: false,
                 repair_config: false,
-                mcp_targets: if integrations.all {
-                    harnesses::setup_targets()
-                } else {
-                    integrations.targets
-                },
+                mcp_targets,
             })
         }
     }
@@ -1339,15 +1341,22 @@ fn setup_target_selections(
     runner: &dyn CommandRunner,
 ) -> Result<SetupSelectionSet> {
     if !args.mcp_targets.is_empty() {
+        let targets = dedup_targets(&args.mcp_targets)
+            .into_iter()
+            .map(|target| SetupTargetSelection {
+                target,
+                mode: if !args.skip_config && target == SetupMcpTarget::Antigravity {
+                    SetupSelectionMode::IngestAndHarness
+                } else {
+                    SetupSelectionMode::HarnessOnly
+                },
+            })
+            .collect::<Vec<_>>();
         return Ok(SetupSelectionSet {
-            targets: dedup_targets(&args.mcp_targets)
-                .into_iter()
-                .map(|target| SetupTargetSelection {
-                    target,
-                    mode: SetupSelectionMode::HarnessOnly,
-                })
-                .collect(),
-            apply_ingest: false,
+            apply_ingest: targets
+                .iter()
+                .any(|selection| selection.mode.configures_ingest()),
+            targets,
             confirmed_harness: false,
         });
     }
@@ -2459,6 +2468,9 @@ fn apply_mcp_config_write(write: &McpConfigWrite) -> Result<McpConfigFileReport>
     if write.is_plugin_manifest_cleanup() {
         return apply_plugin_manifest_cleanup(write);
     }
+    if write.is_antigravity_plugin_cleanup() {
+        return apply_antigravity_plugin_cleanup(write);
+    }
     if matches!(write.format(), McpConfigFormat::Toml) {
         write.verify_nac_snapshot_current()?;
         if write.nac_is_unchanged() {
@@ -2547,6 +2559,21 @@ fn apply_plugin_manifest_cleanup(write: &McpConfigWrite) -> Result<McpConfigFile
         return Ok(McpConfigFileReport::unchanged(write));
     }
     write_json_atomic(write.path(), &Value::Object(root))?;
+    Ok(McpConfigFileReport::written(write))
+}
+
+fn apply_antigravity_plugin_cleanup(write: &McpConfigWrite) -> Result<McpConfigFileReport> {
+    let Some(parent) = write.path().parent() else {
+        bail!("Antigravity plugin cleanup path has no parent");
+    };
+    if !cleanup_path_is_real_directory(parent)? {
+        return Ok(McpConfigFileReport::unchanged(write));
+    }
+    if !cleanup_path_is_real_file(write.path())? {
+        return Ok(McpConfigFileReport::unchanged(write));
+    }
+    fs::remove_file(write.path())
+        .with_context(|| format!("failed to remove {}", write.path().display()))?;
     Ok(McpConfigFileReport::written(write))
 }
 
@@ -3460,6 +3487,28 @@ mod tests {
             .iter()
             .all(|selection| selection.mode == SetupSelectionMode::HarnessOnly));
 
+        let antigravity = setup_execution_args(
+            Some(SetupCommand::Integrations(SetupIntegrationsArgs {
+                targets: vec![SetupMcpTarget::Antigravity],
+                all: false,
+                yes: true,
+                dry_run: false,
+            })),
+            false,
+        )
+        .expect("Antigravity integration mode");
+        assert!(!antigravity.skip_config);
+        assert!(!antigravity.skip_mcp);
+        let selections = setup_target_selections(&antigravity, false, &FakeRunner::default())
+            .expect("Antigravity ingest+harness selections");
+        assert!(selections.apply_ingest);
+        assert_eq!(selections.targets.len(), 1);
+        assert_eq!(selections.targets[0].target, SetupMcpTarget::Antigravity);
+        assert_eq!(
+            selections.targets[0].mode,
+            SetupSelectionMode::IngestAndHarness
+        );
+
         let all = setup_execution_args(
             Some(SetupCommand::Integrations(SetupIntegrationsArgs {
                 targets: Vec::new(),
@@ -3470,16 +3519,19 @@ mod tests {
             false,
         )
         .expect("all-integration dry-run");
-        assert!(all.skip_config);
+        assert!(!all.skip_config);
         assert_eq!(all.mcp_targets, harnesses::setup_targets());
-        let selections = setup_target_selections(&all, false, &FakeRunner::default())
-            .expect("all harness-only selections");
-        assert!(!selections.apply_ingest);
-        assert_eq!(selections.harness_targets(), harnesses::setup_targets());
-        assert!(selections
-            .targets
-            .iter()
-            .all(|selection| selection.mode == SetupSelectionMode::HarnessOnly));
+        let selections =
+            setup_target_selections(&all, false, &FakeRunner::default()).expect("all selections");
+        assert!(selections.apply_ingest);
+        assert!(selections.targets.iter().any(|selection| {
+            selection.target == SetupMcpTarget::Antigravity
+                && selection.mode == SetupSelectionMode::IngestAndHarness
+        }));
+        assert!(selections.targets.iter().all(|selection| {
+            selection.target == SetupMcpTarget::Antigravity
+                || selection.mode == SetupSelectionMode::HarnessOnly
+        }));
     }
 
     fn setup_config_for_test(path: &Path, dry_run: bool, repair_config: bool) -> ConfigReport {
@@ -4364,6 +4416,23 @@ watch_root = "~/custom"
         let cfg = moraine_config::load_config(&path).expect("written config loads");
         assert_eq!(cfg.backend.bind, "127.0.0.1");
         assert!(cfg.backend.auth_token.is_none());
+        let antigravity = cfg
+            .ingest
+            .sources
+            .iter()
+            .find(|source| source.name == "antigravity")
+            .expect("default config enables Antigravity");
+        assert_eq!(antigravity.harness, "antigravity");
+        assert_eq!(
+            antigravity.glob,
+            moraine_config::expand_path(
+                "~/.gemini/antigravity/brain/*/.system_generated/logs/transcript.jsonl"
+            )
+        );
+        assert_eq!(
+            antigravity.watch_root,
+            moraine_config::expand_path("~/.gemini/antigravity/brain")
+        );
         let document = read_toml_document(&path);
         assert_eq!(
             config_item(&document, "backend", "bind").and_then(Item::as_str),
@@ -4371,6 +4440,14 @@ watch_root = "~/custom"
         );
         assert!(config_item(&document, "backend", "auth_token").is_none());
         assert!(config_item(&document, "monitor", "host").is_none());
+        assert_eq!(
+            source_value(&document, "antigravity", "glob"),
+            Some("~/.gemini/antigravity/brain/*/.system_generated/logs/transcript.jsonl")
+        );
+        assert_eq!(
+            source_value(&document, "antigravity", "watch_root"),
+            Some("~/.gemini/antigravity/brain")
+        );
         #[cfg(unix)]
         assert_eq!(
             fs::metadata(&path)
@@ -5670,6 +5747,253 @@ host = "127.42.0.9"
             0o600
         );
         let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn antigravity_config_write_merges_mcp_config_json() {
+        let home = temp_path("antigravity-home");
+        let gemini_config_dir = home.join(".gemini").join("config");
+        fs::create_dir_all(&gemini_config_dir).expect("create gemini config dir");
+        let path = gemini_config_dir.join("mcp_config.json");
+        fs::write(&path, r#"{"mcpServers":{"other":{"command":"node"}}}"#)
+            .expect("write existing antigravity config");
+
+        let target = ConfigTarget {
+            path: PathBuf::from("/tmp/config.toml"),
+            source: ConfigTargetSource::HomeDefault,
+        };
+        let write = McpConfigWrite::antigravity(&home, &target);
+        let report = apply_mcp_config_write(&write).expect("write antigravity config");
+        assert_eq!(report.action, "updated");
+
+        let value: Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("read antigravity config"))
+                .expect("antigravity config json");
+        assert_eq!(value["mcpServers"]["other"]["command"], "node");
+        assert_eq!(
+            value["mcpServers"]["moraine"]["args"],
+            serde_json::json!(["run", "mcp"])
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(&path)
+                .expect("antigravity metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn antigravity_setup_installs_plugin_and_global_mcp_config() {
+        let home = temp_path("antigravity-setup-home");
+        let target = ConfigTarget {
+            path: PathBuf::from("/tmp/config.toml"),
+            source: ConfigTargetSource::HomeDefault,
+        };
+        let plan =
+            McpPlan::for_target_with_home(SetupMcpTarget::Antigravity, &target, Some(home.clone()));
+        assert_eq!(plan.action, McpAction::WriteConfig);
+        assert_eq!(plan.config_writes.len(), 1);
+        assert_eq!(plan.managed_writes.len(), 4);
+
+        let report = execute_mcp_plan(plan, &mut FakeRunner::default()).expect("execute setup");
+        assert_eq!(report.status, SetupStatus::Ok);
+        assert_eq!(report.config_files.len(), 5);
+
+        let config_path = home.join(".gemini").join("config").join("mcp_config.json");
+        let config: Value = serde_json::from_str(
+            &fs::read_to_string(&config_path).expect("read Antigravity MCP config"),
+        )
+        .expect("parse Antigravity MCP config");
+        assert_eq!(config["mcpServers"]["moraine"]["command"], "moraine");
+        assert_eq!(
+            config["mcpServers"]["moraine"]["args"],
+            serde_json::json!(["run", "mcp"])
+        );
+
+        let plugin_root = home
+            .join(".gemini")
+            .join("config")
+            .join("plugins")
+            .join("moraine");
+        assert_eq!(
+            fs::read_to_string(plugin_root.join("plugin.json")).expect("read plugin manifest"),
+            include_str!("../../../../plugins/moraine/plugin.json")
+        );
+        assert_eq!(
+            fs::read_to_string(
+                plugin_root
+                    .join("skills")
+                    .join("bug-report")
+                    .join("SKILL.md")
+            )
+            .expect("read bug-report skill"),
+            include_str!("../../../../plugins/moraine/skills/bug-report/SKILL.md")
+        );
+        assert_eq!(
+            fs::read_to_string(
+                plugin_root
+                    .join("skills")
+                    .join("realtime-peek")
+                    .join("SKILL.md")
+            )
+            .expect("read realtime-peek skill"),
+            include_str!("../../../../plugins/moraine/skills/realtime-peek/SKILL.md")
+        );
+        assert_eq!(
+            fs::read_to_string(
+                plugin_root
+                    .join("skills")
+                    .join("session-search")
+                    .join("SKILL.md")
+            )
+            .expect("read session-search skill"),
+            include_str!("../../../../plugins/moraine/skills/session-search/SKILL.md")
+        );
+        assert!(
+            !plugin_root.join("mcp_config.json").exists(),
+            "global setup keeps MCP transport registration in ~/.gemini/config/mcp_config.json"
+        );
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn antigravity_config_write_uses_absolute_command_and_custom_config_args() {
+        let home = temp_path("antigravity-custom-home");
+        let gemini_config_dir = home.join(".gemini").join("config");
+        fs::create_dir_all(&gemini_config_dir).expect("create gemini config dir");
+        let path = gemini_config_dir.join("mcp_config.json");
+
+        let target = ConfigTarget {
+            path: PathBuf::from("/tmp/custom-moraine.toml"),
+            source: ConfigTargetSource::Cli,
+        };
+        let write = McpConfigWrite::antigravity(&home, &target);
+        let report = apply_mcp_config_write(&write).expect("write custom Antigravity config");
+        assert_eq!(report.action, "updated");
+
+        let value: Value = serde_json::from_str(
+            &fs::read_to_string(&path).expect("read custom Antigravity config"),
+        )
+        .expect("custom Antigravity config json");
+        assert_eq!(
+            value["mcpServers"]["moraine"]["args"],
+            serde_json::json!(["run", "mcp", "--config", "/tmp/custom-moraine.toml"])
+        );
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn antigravity_setup_removes_stale_plugin_mcp_config() {
+        let home = temp_path("antigravity-stale-plugin-home");
+        let plugin_root = home
+            .join(".gemini")
+            .join("config")
+            .join("plugins")
+            .join("moraine");
+        fs::create_dir_all(&plugin_root).expect("create Antigravity plugin root");
+        let stale = plugin_root.join("mcp_config.json");
+        fs::write(
+            &stale,
+            r#"{"mcpServers":{"moraine":{"command":"moraine","args":["run","mcp"]}}}"#,
+        )
+        .expect("write stale Antigravity plugin mcp config");
+
+        let target = ConfigTarget {
+            path: PathBuf::from("/tmp/config.toml"),
+            source: ConfigTargetSource::HomeDefault,
+        };
+        let plan =
+            McpPlan::for_target_with_home(SetupMcpTarget::Antigravity, &target, Some(home.clone()));
+        assert_eq!(
+            plan.config_writes.len(),
+            2,
+            "stale plugin mcp cleanup is planned"
+        );
+
+        let report = execute_mcp_plan(plan, &mut FakeRunner::default()).expect("execute setup");
+        assert_eq!(report.status, SetupStatus::Ok);
+        assert!(
+            !stale.exists(),
+            "stale plugin-local mcp_config.json must be removed"
+        );
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn explicit_antigravity_integration_backfills_ingest_source_into_existing_config() {
+        let home = temp_path("antigravity-existing-config");
+        fs::create_dir_all(home.join(".gemini").join("config")).expect("create gemini config dir");
+        let path = home.join(".moraine").join("config.toml");
+        fs::create_dir_all(path.parent().expect("config parent")).expect("create config parent");
+
+        let mut document = DEFAULT_CONFIG_TEMPLATE
+            .parse::<DocumentMut>()
+            .expect("template parses");
+        let sources = document["ingest"]["sources"]
+            .as_array_of_tables_mut()
+            .expect("ingest sources");
+        let antigravity_index = sources
+            .iter()
+            .position(|source| source.get("name").and_then(Item::as_str) == Some("antigravity"))
+            .expect("template contains Antigravity");
+        sources.remove(antigravity_index);
+        fs::write(&path, document.to_string()).expect("write config without Antigravity");
+
+        let args = setup_execution_args(
+            Some(SetupCommand::Integrations(SetupIntegrationsArgs {
+                targets: vec![SetupMcpTarget::Antigravity],
+                all: false,
+                yes: true,
+                dry_run: false,
+            })),
+            false,
+        )
+        .expect("Antigravity setup args");
+        let mut runner = FakeRunner::default();
+        let paths = harnesses::SetupPathContext::with_home(Some(home.clone()));
+        let report = run_setup_with_paths(
+            &plain_output(),
+            &args,
+            ConfigTarget {
+                path: path.clone(),
+                source: ConfigTargetSource::HomeDefault,
+            },
+            false,
+            &mut runner,
+            &paths,
+        )
+        .expect("run Antigravity integration setup");
+        assert!(report.success);
+
+        let updated = read_toml_document(&path);
+        assert_eq!(
+            source_value(&updated, "antigravity", "glob"),
+            Some("~/.gemini/antigravity/brain/*/.system_generated/logs/transcript.jsonl")
+        );
+        assert_eq!(
+            source_value(&updated, "antigravity", "watch_root"),
+            Some("~/.gemini/antigravity/brain")
+        );
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn bundled_antigravity_workspace_plugin_is_project_scoped() {
+        let plugin_root = repo_root().join("plugins").join("moraine");
+        let value: Value = serde_json::from_str(
+            &fs::read_to_string(plugin_root.join("mcp_config.json"))
+                .expect("read workspace Antigravity mcp config"),
+        )
+        .expect("workspace Antigravity mcp config JSON");
+        assert_eq!(value["mcpServers"]["moraine"]["command"], "moraine");
+        assert_eq!(
+            value["mcpServers"]["moraine"]["args"],
+            serde_json::json!(["run", "mcp", "--", "--project-only"])
+        );
     }
 
     #[test]

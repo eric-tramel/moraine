@@ -79,6 +79,7 @@ fn compact_user_message_preview(preview: &str) -> Option<String> {
 
 fn readable_harness(harness: &str) -> &str {
     match harness {
+        "antigravity" => "Antigravity",
         "codex" => "Codex",
         "claude-code" => "Claude Code",
         "cursor" => "Cursor",
@@ -171,6 +172,7 @@ second line  ",
     #[test]
     fn readable_harness_covers_canonical_harness_ids() {
         let cases = [
+            ("antigravity", "Antigravity"),
             ("codex", "Codex"),
             ("claude-code", "Claude Code"),
             ("cursor", "Cursor"),

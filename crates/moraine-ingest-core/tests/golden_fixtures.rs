@@ -125,8 +125,16 @@ const TOKEN_NATIVE_UNIT_KEYS: &[&str] = &[
     "output_images",
 ];
 
-fn golden_cases() -> [GoldenCase; 14] {
+fn golden_cases() -> [GoldenCase; 15] {
     [
+        GoldenCase {
+            name: "antigravity",
+            harness: "antigravity",
+            source_name: "golden-antigravity",
+            fixture_rel: "fixtures/antigravity/session.jsonl",
+            source_file: "/fixtures/antigravity/70d64200-ae6e-45b2-b92c-bac297c1d0db/transcript.jsonl",
+            format: GoldenFormat::Jsonl,
+        },
         GoldenCase {
             name: "codex",
             harness: "codex",

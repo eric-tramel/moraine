@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "moraine": {
+      "command": "moraine",
+      "args": ["run", "mcp", "--", "--project-only"]
+    }
+  }
+}

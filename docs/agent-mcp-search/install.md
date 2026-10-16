@@ -492,6 +492,51 @@ Equivalent manual config:
 }
 ```
 
+## Antigravity (App, CLI & IDE)
+
+Google Antigravity and Antigravity IDE read global MCP server definitions from
+`~/.gemini/config/mcp_config.json`. For global use, run:
+
+```bash
+moraine setup integrations antigravity
+```
+
+The alias below uses the same integration target:
+
+```bash
+moraine setup integrations antigravity-ide
+```
+
+Setup updates `~/.gemini/config/mcp_config.json` with a Moraine launcher and
+installs the bundled Moraine Antigravity plugin under
+`~/.gemini/config/plugins/moraine/`. Prefer setup when Moraine is not on
+`PATH` or when you use `moraine --config ...`, because setup writes the
+absolute/config-aware launcher for you.
+
+Alternatively, configure `~/.gemini/config/mcp_config.json` manually:
+
+```json
+{
+  "mcpServers": {
+    "moraine": {
+      "command": "moraine",
+      "args": ["run", "mcp"]
+    }
+  }
+}
+```
+
+To mirror the same global plugin bundle that setup installs, copy or symlink
+`plugins/moraine/` to `~/.gemini/config/plugins/moraine/` and remove any stale
+`~/.gemini/config/plugins/moraine/mcp_config.json` so the global
+`~/.gemini/config/mcp_config.json` launcher remains authoritative.
+
+For a workspace-scoped plugin, Antigravity scans only `.agents/plugins/` and
+`_agents/plugins/` at the workspace root. Copy or symlink `plugins/moraine/`
+into one of those directories, for example `.agents/plugins/moraine/`. The
+bundled workspace `mcp_config.json` launches `moraine run mcp -- --project-only`
+so retrieval stays scoped to the current project by default.
+
 ## Cursor
 
 Cursor reads MCP server definitions from `mcp.json`. For global use,

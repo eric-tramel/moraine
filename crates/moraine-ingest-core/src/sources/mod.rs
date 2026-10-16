@@ -1,6 +1,7 @@
 use serde_json::Value;
 use std::sync::OnceLock;
 
+pub(crate) mod antigravity;
 pub(crate) mod claude_code;
 pub(crate) mod codex;
 pub(crate) mod cursor;
@@ -182,6 +183,7 @@ pub(crate) fn registry() -> &'static SourceRegistry {
     static REGISTRY: OnceLock<SourceRegistry> = OnceLock::new();
     REGISTRY.get_or_init(|| {
         SourceRegistry::new()
+            .register(&antigravity::ANTIGRAVITY)
             .register(&codex::CODEX)
             .register(&claude_code::CLAUDE_CODE)
             .register(&cursor::CURSOR)

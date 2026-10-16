@@ -15,6 +15,7 @@ all rows that leave the adapter.
 
 | Harness | Module | Default provider | Typical format | Notes |
 | --- | --- | --- | --- | --- |
+| `antigravity` | `sources/antigravity.rs` | `google` | `jsonl` | Antigravity conversation transcripts under `~/.gemini/antigravity/brain/*/`; user requests, planner thoughts, tool requests, tool execution results, and system checkpoints. |
 | `codex` | `sources/codex.rs` | `openai` | `jsonl` | OpenAI/Codex events, response items, tool calls, compaction, token counts. |
 | `claude-code` | `sources/claude_code.rs` | `anthropic` | `jsonl` | Claude Code and local macOS Cowork message blocks, operational records, parent/tool external links, and Cowork root metadata. |
 | `kiro-cli` | `sources/kiro_cli.rs` | `kiro` | `kiro_session` | Kiro CLI prompt, assistant, tool-result, and compaction records. A same-named JSON sidecar supplies session cwd, title, model, and aggregate token/credit metadata. |

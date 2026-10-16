@@ -34,6 +34,7 @@ Moraine ships session trace ingestion adapters for these agent harnesses:
 
 | Harness | Config value | Session traces ingested |
 | --- | --- | --- |
+| [Google Antigravity](https://antigravity.google/) | `antigravity` | JSONL conversation transcripts under `~/.gemini/antigravity/brain/*/.system_generated/logs/transcript.jsonl` |
 | [Codex](https://developers.openai.com/codex) | `codex` | JSONL session files under `~/.codex/sessions` |
 | [Claude Code](https://code.claude.com/docs/en/overview) | `claude-code` | JSONL project session files under `~/.claude/projects` |
 | [Kiro CLI](https://kiro.dev/docs/cli/) | `kiro-cli` | Paired JSONL transcripts and JSON metadata under `$KIRO_HOME/sessions/cli` when set, or `~/.kiro/sessions/cli` |

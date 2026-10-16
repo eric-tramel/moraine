@@ -1,0 +1,5 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "name": "moraine",
+  "description": "Moraine MCP session search, realtime agent awareness, and sanitized bug reports for Antigravity."
+}
