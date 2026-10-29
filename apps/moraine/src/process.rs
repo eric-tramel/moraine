@@ -4,7 +4,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -972,12 +972,29 @@ pub(crate) fn start_background_service(
         let _ = child.wait();
         return Err(error);
     }
+    if service == Service::Backend {
+        wait_for_backend_endpoints(cfg, &mut child)?;
+    }
     Ok(StartOutcome {
         service,
         state: StartState::Started,
         pid: Some(child.id()),
         log_path: Some(log_path(paths, service).display().to_string()),
     })
+}
+
+fn wait_for_backend_endpoints(cfg: &AppConfig, child: &mut Child) -> Result<()> {
+    for _ in 0..100 {
+        let endpoints = backend_endpoint_status(cfg);
+        if endpoints.socket_listening && endpoints.http_listening {
+            return Ok(());
+        }
+        if let Some(status) = child.try_wait().context("failed to poll backend")? {
+            bail!("backend exited during startup ({status}); see the backend log");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
