@@ -593,6 +593,7 @@ fn builtin_rules() -> Result<Vec<RuleSpec>> {
             &["lin_api_"],
         ),
         RuleSpec::literal("notion-token", r"\bsecret_[0-9A-Za-z]{30,}\b", &["secret_"]),
+        RuleSpec::literal("inline-base64", r"[0-9A-Za-z+/]{1024,}={0,2}", &["base64"]),
         RuleSpec::generic(
             "generic-api-key",
             r#"(?i)\b(?:api[_-]?key|access[_-]?token|auth(?:orization)?|bearer|client[_-]?secret|credential|passwd|password|private[_-]?key|secret|token)\b["']?\s*[:=]\s*["']?([0-9A-Za-z_./+=-]{20,})["']?"#,
@@ -866,6 +867,22 @@ mod tests {
                 scrubbed.text
             );
         }
+    }
+
+    #[test]
+    fn strips_inline_base64_media() {
+        let redactor = redactor();
+        let blob = "iVBORw0KGgo".repeat(200);
+        let input = format!(
+            r#"{{"url":"data:image/png;base64,{blob}"}} {{"type":"base64","data":"{blob}"}} short=aGVsbG8="#
+        );
+
+        let scrubbed = redactor.scrub_text(&input);
+
+        assert_eq!(
+            scrubbed.text,
+            r#"{"url":"data:image/png;base64,[REDACTED:inline-base64]"} {"type":"base64","data":"[REDACTED:inline-base64]"} short=aGVsbG8="#
+        );
     }
 
     #[test]
