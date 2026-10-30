@@ -30,22 +30,14 @@
   <uncompressed_cache_size>__UNCOMPRESSED_CACHE_BYTES__</uncompressed_cache_size>
   <mark_cache_size>__MARK_CACHE_BYTES__</mark_cache_size>
 
+  <merge_tree>
+    <default_compression_codec>ZSTD(3)</default_compression_codec>
+  </merge_tree>
+
   <query_log>
     <database>system</database>
     <table>query_log</table>
+    <ttl>event_date + INTERVAL 7 DAY DELETE</ttl>
     <flush_interval_milliseconds>7500</flush_interval_milliseconds>
   </query_log>
-
-  <metric_log>
-    <database>system</database>
-    <table>metric_log</table>
-    <collect_interval_milliseconds>1000</collect_interval_milliseconds>
-    <flush_interval_milliseconds>7000</flush_interval_milliseconds>
-  </metric_log>
-
-  <asynchronous_metric_log>
-    <database>system</database>
-    <table>asynchronous_metric_log</table>
-    <flush_interval_milliseconds>7000</flush_interval_milliseconds>
-  </asynchronous_metric_log>
 </clickhouse>
