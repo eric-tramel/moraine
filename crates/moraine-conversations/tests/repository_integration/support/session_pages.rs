@@ -12,7 +12,7 @@ const SESSIONS_ASC: [&str; 3] = ["sess_a", "sess_b", "sess_c"];
 pub(crate) fn is_session_page_select(query: &str) -> bool {
     query.starts_with("SELECT\n  session_id,\n  min(")
         && query.contains("AS last_event_time")
-        && query.contains("FROM `moraine`.`events` FINAL")
+        && query.contains("FROM `moraine`.`events`\n  WHERE")
 }
 
 fn quoted_after(query: &str, marker: &str) -> Option<String> {

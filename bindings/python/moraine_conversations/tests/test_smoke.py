@@ -65,7 +65,7 @@ def _ordered_sessions(query: str) -> list[dict]:
 
 def _rows_for_query(query: str) -> list[dict]:
     # Page-first listing, phase 1: narrow page selection returning session ids.
-    if query.startswith("SELECT\n  session_id,\n  min(") and "FROM `moraine`.`events` FINAL" in query:
+    if query.startswith("SELECT\n  session_id,\n  min(") and "FROM `moraine`.`events`\n  WHERE" in query:
         limit = int(re.search(r"LIMIT (\d+)", query).group(1))
         return [{"session_id": row["session_id"]} for row in _ordered_sessions(query)[:limit]]
 

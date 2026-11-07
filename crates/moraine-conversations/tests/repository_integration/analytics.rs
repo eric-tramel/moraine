@@ -5,7 +5,7 @@ async fn session_analytics_assembles_canonical_views_and_public_steps() {
     let responses = vec![
         ScriptedResponse::rows(
             &[
-                "FROM `moraine`.`events` FINAL",
+                "FROM `moraine`.`events`\n  WHERE notEmpty(trimBoth(session_id))",
                 "min(ifNull(parseDateTime64BestEffortOrNull(record_ts), ingested_at)) AS first_event_time",
                 "WHERE notEmpty(trimBoth(session_id))",
                 "ORDER BY last_event_time DESC, session_id DESC",
@@ -173,7 +173,7 @@ async fn session_analytics_assembles_canonical_views_and_public_steps() {
 async fn session_analytics_empty_and_timed_limit_sql_are_deterministic() {
     let (repo, state) = build_scripted_repo(vec![ScriptedResponse::rows(
         &[
-            "FROM `moraine`.`events` FINAL",
+            "FROM `moraine`.`events`\n  WHERE notEmpty(trimBoth(session_id))",
             "HAVING last_event_time >= now() - INTERVAL 86400 SECOND",
             "ORDER BY last_event_time DESC, session_id DESC",
             "LIMIT 200",
