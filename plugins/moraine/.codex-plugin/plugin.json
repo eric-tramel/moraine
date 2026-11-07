@@ -1,6 +1,6 @@
 {
   "name": "moraine",
-  "version": "0.7.7",
+  "version": "0.7.8",
   "description": "Codex plugin for Moraine MCP session search, realtime agent awareness, and sanitized bug reports.",
   "author": {
     "name": "Moraine maintainers",
