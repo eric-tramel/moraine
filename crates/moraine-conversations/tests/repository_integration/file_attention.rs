@@ -82,13 +82,20 @@ async fn file_attention_merges_normalized_exact_lookup_with_suffix_fallback() {
         .find(|query| query.contains("repo_rel_path = 'crates/foo.rs'"))
         .expect("normalized exact file_attention query should be captured");
     assert!(
-        !exact_query.contains("SELECT * FROM `moraine`.`events` FINAL"),
-        "payload_json must not be read through FINAL: {exact_query}"
+        !exact_query.contains("FINAL"),
+        "exact file_attention must resolve versions with argMax, not FINAL: {exact_query}"
     );
     assert!(
-        exact_query.contains("(session_id, event_uid, event_version) IN (")
-            && exact_query.contains("FROM `moraine`.`events`\nWHERE session_id IN ("),
-        "events hydration must use narrow winning keys, then a keyed read: {exact_query}"
+        exact_query.contains("argMax(tuple(session_id, project_id, repo_rel_path, worktree_root), (event_version, ingested_at))")
+            && exact_query.contains("HAVING argMax(toUInt8(project_id = 'project-a' AND repo_rel_path = 'crates/foo.rs'), (event_version, ingested_at))"),
+        "locator must pick the current version, then re-apply the filter to it: {exact_query}"
+    );
+    assert!(
+        exact_query.contains("PREWHERE session_id IN (")
+            && exact_query.contains("(session_id, event_uid, event_version) IN (")
+            && exact_query.contains("max(event_version) AS win_version")
+            && exact_query.contains("argMax(tool_phase, event_version) AS w_tool_phase"),
+        "events hydration must use narrow winning keys, then a keyed payload read: {exact_query}"
     );
     assert!(exact_query.contains("project_id = 'project-a'"));
     assert!(exact_query.contains("tool_phase = 'request'"));
@@ -200,8 +207,10 @@ async fn file_attention_project_scope_recovers_durable_only_deleted_root() {
             "'/worktree-a'",
             "arrayFirst(root -> legacy_candidate_root = root, project_roots)",
             "ti.event_project_id = '' AND verified_project_root != ''",
-            "SELECT groupArray(worktree_root) FROM `moraine`.`file_attention_project_roots` FINAL",
+            "SELECT groupArray(worktree_root) FROM (",
+            "FROM `moraine`.`file_attention_project_roots`",
             "WHERE project_id = 'git:new-project-id' AND worktree_root != ''",
+            "GROUP BY worktree_root",
         ],
         json!([{
             "session_id": "sess-pre-digest",
@@ -263,8 +272,10 @@ async fn file_attention_project_scope_excludes_unmapped_pruned_legacy_root() {
     let suffix_response = ScriptedResponse::rows(
         &[
             "has(project_roots, ti.worktree_root)",
-            "SELECT groupArray(worktree_root) FROM `moraine`.`file_attention_project_roots` FINAL",
+            "SELECT groupArray(worktree_root) FROM (",
+            "FROM `moraine`.`file_attention_project_roots`",
             "WHERE project_id = 'git:new-project-id' AND worktree_root != ''",
+            "GROUP BY worktree_root",
         ],
         json!([]),
     )
@@ -367,7 +378,7 @@ async fn file_attention_all_scope_keeps_the_configured_server_floor_only() {
     let queries = state.queries.lock().expect("queries lock").clone();
     let attention_queries = queries
         .iter()
-        .filter(|query| query.contains("FROM `moraine`.`events` FINAL"))
+        .filter(|query| query.contains("moraine_tool_io"))
         .collect::<Vec<_>>();
     assert_eq!(attention_queries.len(), 2);
     for query in attention_queries {
@@ -462,4 +473,85 @@ async fn file_attention_project_scope_without_identity_stays_closed() {
         state.queries.lock().expect("queries lock").is_empty(),
         "an unknown request project must stay closed without issuing a backend query"
     );
+}
+
+fn file_attention_shape_query(
+    harness: Option<&str>,
+    mutations_only: bool,
+    apply_project_scope: bool,
+) -> FileAttentionQuery {
+    FileAttentionQuery {
+        rel: "README.md".to_string(),
+        normalized_project_id: Some("project-a".to_string()),
+        normalized_project_roots: vec!["/worktree-a".to_string()],
+        derive_legacy_roots: true,
+        apply_project_scope,
+        start_unix_ms: Some(1),
+        end_unix_ms: Some(2_000_000_000_000),
+        harness: harness.map(str::to_string),
+        source_name: None,
+        tool: Some("edit".to_string()),
+        mutations_only,
+        max_rows: 10,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn file_attention_sql_never_uses_final_and_evaluates_each_candidate_set_once() {
+    for (harness, mutations_only, apply_project_scope) in [
+        (None, false, false),
+        (None, true, false),
+        (Some("claude-code"), false, false),
+        (Some("claude-code"), true, true),
+    ] {
+        let (repo, state) = build_repo().await;
+        repo.file_attention(file_attention_shape_query(
+            harness,
+            mutations_only,
+            apply_project_scope,
+        ))
+        .await
+        .expect("file_attention query succeeds");
+
+        let queries = state.queries.lock().expect("queries lock").clone();
+        let attention_queries = queries
+            .iter()
+            .filter(|query| query.contains("mcp_event_locator"))
+            .collect::<Vec<_>>();
+        assert_eq!(attention_queries.len(), 2, "exact + suffix: {queries:?}");
+        for query in attention_queries {
+            assert!(
+                !query.contains("FINAL"),
+                "file_attention SQL must not use FINAL: {query}"
+            );
+            // The candidate-session and candidate-key subqueries are rendered
+            // identically at every use so ClickHouse builds each IN set once.
+            let sessions_sets = query
+                .matches("session_id IN (SELECT session_id FROM (SELECT event_uid, cur.1")
+                .count();
+            assert!(
+                sessions_sets >= 2,
+                "events and navigation share one session set: {query}"
+            );
+            assert!(
+                query.contains(
+                    "(session_id, event_uid) IN (\n  SELECT session_id, event_uid FROM ("
+                ) || query.contains(
+                    "(session_id, event_uid) IN (\n        SELECT session_id, event_uid FROM ("
+                ),
+                "candidate key set missing: {query}"
+            );
+            assert!(
+                !query.contains("SELECT * FROM `moraine`.`events`"),
+                "payload_json must not be read as SELECT *: {query}"
+            );
+            if mutations_only {
+                assert!(query.contains("NOT IN ('read'"));
+                assert!(query.contains("lowerUTF8(w_tool_name) NOT IN"));
+            }
+            if let Some(harness) = harness {
+                assert!(query.contains(&format!("w_harness = '{harness}'")));
+            }
+        }
+    }
 }
