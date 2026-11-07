@@ -321,7 +321,7 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
             );
         }
 
-        if query.contains("FROM `moraine`.`mcp_event_locator` FINAL")
+        if query.contains("argMax(tuple(session_id, project_id, repo_rel_path, worktree_root)")
             && query.contains("repo_rel_path = 'crates/foo.rs'")
             && query.contains("project_id = 'project-a'")
             && !query.contains("JSONExtractString(input_json")
@@ -350,8 +350,7 @@ pub(crate) async fn spawn_mock_server(options: MockOptions) -> (String, Arc<Mock
             );
         }
 
-        if (query.contains("JSONHas(payload_json, 'moraine_tool_io')")
-            || query.contains("JSONHas(e.payload_json, 'moraine_tool_io')"))
+        if query.contains("JSONExtractRaw(payload_json, 'moraine_tool_io')")
             && query.contains("JSONExtractString(input_json, 'path')")
             && query.contains("crates/foo.rs")
         {

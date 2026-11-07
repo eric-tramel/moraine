@@ -3,76 +3,183 @@ use super::*;
 const FILE_ATTENTION_READ_TOOL_NAMES_SQL: &str =
     "'read', 'readfile', 'read_file', 'notebookread', 'notebook_read', 'view', 'cat', 'grep', 'rg', 'glob', 'ls', 'list', 'find'";
 
-/// Canonical (`FINAL`-equivalent) `events` rows for the `(session_id,
-/// event_uid)` keys returned by `candidates_sql`.
+/// Per-statement settings. `max_threads` bounds the payload read: every reader
+/// thread holds one decompressed `payload_json` granule (~16 MiB on 2.5 KiB
+/// rows, several times that on tool-heavy stores), so peak memory is roughly
+/// `max_threads x granule`. Two threads measured 53 MiB against 110 MiB at the
+/// default on the same keyed read; the read touches few granules, so the
+/// latency cost is small.
+const FILE_ATTENTION_QUERY_SETTINGS: [(&str, &str); 2] =
+    [("join_use_nulls", "1"), ("max_threads", "2")];
+
+/// Sort key that picks the current `mcp_event_locator` row per `event_uid`.
 ///
-/// `events FINAL` over `SELECT *` merges every part's `payload_json` granules
-/// in order and exceeded the 1 GiB cap on a 10M-row read, because the keyed
-/// `IN` alone did not stop the in-order read from spanning many sessions. The
-/// winning versions are instead chosen by a narrow-column `FINAL` restricted
-/// to the candidate sessions (`session_id` leads the sort key, so this prunes
-/// on the primary key), and the wide columns are read by exact
-/// `(session_id, event_uid, event_version)` without `FINAL`
-/// (see `payload_rows_by_keys_sql`).
-fn candidate_events_sql(events_ref: &str, candidates_sql: &str, select_list: &str) -> String {
-    let sessions = "SELECT session_id FROM (CANDIDATES)".replace("CANDIDATES", candidates_sql);
-    let keys = format!(
-        "SELECT session_id, event_uid, event_version
-    FROM {events_ref} FINAL
-    WHERE session_id IN ({sessions})
-      AND (session_id, event_uid) IN (
-        {candidates_sql}
-      )"
-    );
-    payload_rows_by_keys_sql(events_ref, &sessions, select_list, &keys)
+/// `ReplacingMergeTree(event_version)` keeps the highest `event_version`. Rows
+/// with an equal version are re-derivations of the same `events` row and
+/// differ at most in `ingested_at`, so `ingested_at` is the deterministic
+/// tie-break (latest wins, as the engine would pick the last inserted row).
+const LOCATOR_VERSION_KEY: &str = "(event_version, ingested_at)";
+
+/// Current locator rows whose *current* version satisfies `filter`; the
+/// equivalent of `mcp_event_locator FINAL WHERE <filter>` without `FINAL`.
+///
+/// `FINAL` merges every part across the whole unpartitioned table (2.78M rows,
+/// ~297 MiB on a 1.6M-event store) even though the filter keeps a few hundred
+/// keys. Here the filter first selects candidate `event_uid`s from the plain
+/// table (any version may match), then only those keys are aggregated with
+/// `argMax(.., version)`, and `HAVING` re-applies the filter to the winning
+/// version so keys that matched only through a stale version drop out.
+///
+/// Yields `event_uid, session_id, project_id, repo_rel_path, worktree_root`.
+fn current_locator_sql(locator: &str, filter: &str) -> String {
+    format!(
+        "SELECT event_uid, cur.1 AS session_id, cur.2 AS project_id, cur.3 AS repo_rel_path, cur.4 AS worktree_root
+  FROM (
+    SELECT
+      event_uid,
+      argMax(tuple(session_id, project_id, repo_rel_path, worktree_root), {LOCATOR_VERSION_KEY}) AS cur
+    FROM {locator}
+    WHERE event_uid IN (SELECT event_uid FROM {locator} WHERE {filter})
+    GROUP BY event_uid
+    HAVING argMax(toUInt8({filter}), {LOCATOR_VERSION_KEY})
+  )"
+    )
+}
+
+/// `(session ids, (session_id, event_uid) keys)` candidate subqueries for the
+/// current locator rows matching `filter`. Every consumer interpolates exactly
+/// these two strings, so ClickHouse builds each `IN` set once per statement.
+fn locator_candidate_sets(locator: &str, filter: &str) -> (String, String) {
+    let current = current_locator_sql(locator, filter);
+    (
+        format!("SELECT session_id FROM ({current})"),
+        format!("SELECT session_id, event_uid FROM ({current})"),
+    )
+}
+
+/// Predicates on the narrow `events` columns that must hold for the winning
+/// version of an event (`w_*` aliases of [`hydrated_tool_events_sql`]). They
+/// shrink the key set before any `payload_json` is read.
+fn narrow_event_predicates(query: &FileAttentionQuery) -> String {
+    let mut clauses = vec![
+        "w_tool_phase = 'request'
+    AND NOT (lowerUTF8(w_tool_name) = 'file_attention' OR endsWith(lowerUTF8(w_tool_name), '_file_attention'))"
+            .to_string(),
+    ];
+    if let Some(tool) = query.tool.as_deref() {
+        clauses.push(format!("lower(w_tool_name) = lower({})", sql_quote(tool)));
+    }
+    if let Some(harness) = query.harness.as_deref() {
+        clauses.push(format!("w_harness = {}", sql_quote(harness)));
+    }
+    if query.mutations_only {
+        clauses.push(format!(
+            "lowerUTF8(w_tool_name) NOT IN ({FILE_ATTENTION_READ_TOOL_NAMES_SQL})"
+        ));
+    }
+    clauses.join("\n    AND ")
+}
+
+/// Tool-call `events` rows at their winning version, without `FINAL`.
+///
+/// 1. Winning keys: a narrow-column `argMax` over only the candidate
+///    sessions/keys (primary-key prefix `session_id`), keeping keys whose
+///    winning version satisfies `narrow_predicates`. Equal versions are
+///    re-derivations of one content-addressed row, so `max(event_version)`
+///    needs no further tie-break.
+/// 2. Wide read: `payload_json` is read only for those exact
+///    `(session_id, event_uid, event_version)` keys (`PREWHERE`), and reduced
+///    to the `moraine_tool_io` object in the same SELECT so the wide column
+///    never survives past the read.
+///
+/// With `scope = None` (legacy schema without the locator) the aggregation
+/// runs over every key of the table, still narrow-column only (it used to be
+/// `SELECT * FROM events FINAL`).
+fn hydrated_tool_events_sql(
+    events_ref: &str,
+    scope: Option<(&str, &str)>,
+    narrow_predicates: &str,
+    with_event_scope: bool,
+) -> String {
+    let (winner_where, session_prune) = match scope {
+        Some((sessions, keys)) => (
+            format!("session_id IN ({sessions})\n      AND (session_id, event_uid) IN (\n        {keys}\n      )"),
+            format!("session_id IN ({sessions})\n    AND "),
+        ),
+        None => ("1".to_string(), String::new()),
+    };
+    let event_scope = if with_event_scope {
+        ",
+      project_id AS event_project_id,
+      worktree_root AS event_worktree_root"
+    } else {
+        ""
+    };
+    format!(
+        "(SELECT
+  session_id, event_uid, tool_call_id, harness, tool_name, tool_phase, source_name, cwd{event_scope_names},
+  JSONExtractString(tool_io, 'input_json') AS input_json,
+  JSONExtractString(tool_io, 'input_preview') AS input_preview,
+  JSONExtractString(tool_io, 'output_preview') AS output_preview,
+  JSONExtractString(tool_io, 'project_id') AS project_id,
+  JSONExtractString(tool_io, 'repo_rel_path') AS repo_rel_path,
+  JSONExtractString(tool_io, 'worktree_root') AS worktree_root
+FROM (
+  SELECT
+      session_id, event_uid, tool_call_id, harness, tool_name, tool_phase, source_name, cwd{event_scope},
+      JSONExtractRaw(payload_json, 'moraine_tool_io') AS tool_io
+  FROM {events_ref}
+  PREWHERE {session_prune}(session_id, event_uid, event_version) IN (
+    SELECT session_id, event_uid, win_version AS event_version
+    FROM (
+      SELECT
+        session_id,
+        event_uid,
+        max(event_version) AS win_version,
+        argMax(tool_phase, event_version) AS w_tool_phase,
+        argMax(tool_name, event_version) AS w_tool_name,
+        argMax(harness, event_version) AS w_harness
+      FROM {events_ref}
+      WHERE {winner_where}
+      GROUP BY session_id, event_uid
+    )
+    WHERE {narrow_predicates}
+  )
+)
+WHERE tool_io != '')",
+        event_scope_names = if with_event_scope {
+            ", event_project_id, event_worktree_root"
+        } else {
+            ""
+        },
+    )
 }
 
 impl ClickHouseConversationRepository {
-    fn tool_events_source(&self, rel: &str, use_candidate_index: bool) -> String {
+    fn tool_events_source(&self, query: &FileAttentionQuery, use_candidate_index: bool) -> String {
         let events_ref = self.table_ref("events");
-        let events = if use_candidate_index {
+        let narrow = narrow_event_predicates(query);
+        if use_candidate_index {
             let locator = self.table_ref("mcp_event_locator");
-            let rel_sql = sql_quote(rel);
-            let slash_rel_sql = sql_quote(&format!("/{rel}"));
-            let candidates = format!(
-                "SELECT session_id, event_uid
-  FROM {locator} FINAL
-  WHERE arrayExists(path -> path = {rel_sql} OR endsWith(path, {slash_rel_sql}), path_tokens)"
-            );
-            format!("({})", candidate_events_sql(&events_ref, &candidates, "*"))
+            let (sessions, keys) =
+                locator_candidate_sets(&locator, &suffix_locator_filter(&query.rel));
+            hydrated_tool_events_sql(&events_ref, Some((&sessions, &keys)), &narrow, true)
         } else {
-            canonical_events_source(&events_ref)
-        };
-        let event_scope_columns = if use_candidate_index {
-            ",
-  e.project_id AS event_project_id,
-  e.worktree_root AS event_worktree_root"
-        } else {
-            ""
-        };
-        format!(
-            "(SELECT
-  e.session_id AS session_id,
-  e.event_uid AS event_uid,
-  e.tool_call_id AS tool_call_id,
-  e.harness AS harness,
-  e.tool_name AS tool_name,
-  e.tool_phase AS tool_phase,
-  JSONExtractString(JSONExtractRaw(e.payload_json, 'moraine_tool_io'), 'input_json') AS input_json,
-  JSONExtractString(JSONExtractRaw(e.payload_json, 'moraine_tool_io'), 'input_preview') AS input_preview,
-  JSONExtractString(JSONExtractRaw(e.payload_json, 'moraine_tool_io'), 'output_preview') AS output_preview,
-  JSONExtractString(JSONExtractRaw(e.payload_json, 'moraine_tool_io'), 'project_id') AS project_id,
-  JSONExtractString(JSONExtractRaw(e.payload_json, 'moraine_tool_io'), 'repo_rel_path') AS repo_rel_path,
-  JSONExtractString(JSONExtractRaw(e.payload_json, 'moraine_tool_io'), 'worktree_root') AS worktree_root,
-  e.source_name AS source_name,
-  e.cwd AS cwd{event_scope_columns}
-FROM {events} AS e
-WHERE JSONHas(e.payload_json, 'moraine_tool_io'))"
-        )
+            hydrated_tool_events_sql(&events_ref, None, &narrow, false)
+        }
     }
 
-    fn file_attention_navigation_source(&self, candidate_predicate: &str) -> String {
-        let locator = self.table_ref("mcp_event_locator");
+    /// Navigation `(event_time, event_order, turn_seq)` for the candidate
+    /// events. Ordinals depend on the whole session, so every event of the
+    /// candidate sessions is reduced to its highest `event_version` (no
+    /// `FINAL`), windowed, and only then restricted to the candidate keys.
+    ///
+    /// The reduction is `ORDER BY (session_id, event_uid, event_version DESC)
+    /// LIMIT 1 BY (session_id, event_uid)` rather than an `argMax` `GROUP BY`:
+    /// the order matches the table's sort key, so ClickHouse streams it
+    /// (~12 MiB over 250k rows) where a hash aggregation held ~50 MiB of
+    /// per-key state, and no `argMax` tuple of wide columns is materialized.
+    fn file_attention_navigation_source(&self, sessions: &str, keys: &str) -> String {
         let navigation = self.table_ref("mcp_event_navigation");
         format!(
             "(SELECT
@@ -96,13 +203,18 @@ FROM (
       ORDER BY sort_time, source_file, source_generation, source_offset, source_line_no, emission_index, event_uid
       ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
     ) AS running_user_count
-  FROM {navigation} FINAL
-  WHERE session_id IN (
-    SELECT session_id FROM {locator} FINAL WHERE {candidate_predicate}
+  FROM (
+    SELECT
+      session_id, event_uid, sort_time, source_file, source_generation, source_offset,
+      source_line_no, emission_index, display_time, turn_index, is_user_message
+    FROM {navigation}
+    WHERE session_id IN ({sessions})
+    ORDER BY session_id, event_uid, event_version DESC
+    LIMIT 1 BY session_id, event_uid
   )
 )
 WHERE (session_id, event_uid) IN (
-  SELECT session_id, event_uid FROM {locator} FINAL WHERE {candidate_predicate}
+  {keys}
 ))"
         )
     }
@@ -226,10 +338,11 @@ WHERE (session_id, event_uid) IN (
         } else {
             "project_id != ''".to_string()
         };
-        let exact_candidate_predicate =
-            format!("{project_predicate} AND repo_rel_path = {rel_sql}");
+        let exact_candidate_filter = format!("{project_predicate} AND repo_rel_path = {rel_sql}");
+        let (candidate_sessions, candidate_keys) =
+            locator_candidate_sets(&locator, &exact_candidate_filter);
         let attention_navigation =
-            self.file_attention_navigation_source(&exact_candidate_predicate);
+            self.file_attention_navigation_source(&candidate_sessions, &candidate_keys);
 
         let mut inner_clauses = vec![
             "e.tool_phase = 'request'
@@ -269,26 +382,22 @@ WHERE (session_id, event_uid) IN (
         };
 
         let limit_plus = query.max_rows.saturating_add(1);
-        let params = [("join_use_nulls", "1")];
+        let params = FILE_ATTENTION_QUERY_SETTINGS;
 
         let normalized_root_condition = single_path_sql("ti.worktree_root");
 
-        let candidate_events = candidate_events_sql(
+        let candidate_events = hydrated_tool_events_sql(
             &events,
-            &format!(
-                "SELECT session_id, event_uid
-        FROM {locator} FINAL
-        WHERE {exact_candidate_predicate}"
-            ),
-            "session_id, event_uid, tool_call_id, harness, tool_name, tool_phase, source_name, cwd, payload_json",
+            Some((&candidate_sessions, &candidate_keys)),
+            &narrow_event_predicates(query),
+            false,
         );
+        let matched_ids = current_locator_sql(&locator, &exact_candidate_filter);
 
         let sql = format!(
             "WITH matched_ids AS (
-    SELECT session_id, event_uid, project_id, repo_rel_path, worktree_root
-    FROM {locator} FINAL
-    WHERE {project_predicate}
-      AND repo_rel_path = {rel_sql}
+    SELECT session_id, event_uid, repo_rel_path, worktree_root
+    FROM ({matched_ids})
   ),
   matched AS (
     SELECT
@@ -299,13 +408,14 @@ WHERE (session_id, event_uid) IN (
       e.source_name AS source_name,
       e.tool_name AS tool_name,
       e.tool_phase AS tool_phase,
-      JSONExtractString(JSONExtractRaw(e.payload_json, 'moraine_tool_io'), 'input_preview') AS input_preview,
-      JSONExtractString(JSONExtractRaw(e.payload_json, 'moraine_tool_io'), 'output_preview') AS output_preview,
+      e.input_preview AS input_preview,
+      e.output_preview AS output_preview,
       mi.repo_rel_path AS repo_rel_path,
       mi.worktree_root AS worktree_root,
       e.cwd AS cwd
     FROM (
-      {candidate_events}
+      SELECT session_id, event_uid, tool_call_id, harness, tool_name, tool_phase, source_name, cwd, input_preview, output_preview
+      FROM {candidate_events}
     ) AS e
     ANY INNER JOIN matched_ids AS mi
       ON mi.session_id = e.session_id AND mi.event_uid = e.event_uid
@@ -387,14 +497,13 @@ SELECT {}, arrayJoin([{roots}]), toUInt64(toUnixTimestamp64Milli(now64(3)))",
     ) -> RepoResult<Vec<FileAttentionTouch>> {
         let rel = query.rel.as_str();
 
-        let tool_events = self.tool_events_source(rel, use_candidate_index);
+        let tool_events = self.tool_events_source(query, use_candidate_index);
         let rel_sql = sql_quote(rel);
         let slash_rel_sql = sql_quote(&format!("/{rel}"));
         let attention_navigation = if use_candidate_index {
-            let candidate_predicate = format!(
-                "arrayExists(path -> path = {rel_sql} OR endsWith(path, {slash_rel_sql}), path_tokens)"
-            );
-            self.file_attention_navigation_source(&candidate_predicate)
+            let locator = self.table_ref("mcp_event_locator");
+            let (sessions, keys) = locator_candidate_sets(&locator, &suffix_locator_filter(rel));
+            self.file_attention_navigation_source(&sessions, &keys)
         } else {
             let trace = self.table_ref("v_conversation_trace");
             format!(
@@ -555,8 +664,11 @@ WHERE (session_id, event_uid) IN (SELECT session_id, event_uid FROM matched))"
                 format!(
                     "arrayDistinct(arrayConcat(
       {registered_roots_array},
-      (SELECT groupArray(worktree_root) FROM {durable_roots} FINAL
-       WHERE project_id = {project_id_sql} AND worktree_root != '')
+      (SELECT groupArray(worktree_root) FROM (
+         SELECT worktree_root FROM {durable_roots}
+         WHERE project_id = {project_id_sql} AND worktree_root != ''
+         GROUP BY worktree_root
+       ))
     ))"
                 )
             } else {
@@ -612,7 +724,7 @@ WHERE (session_id, event_uid) IN (SELECT session_id, event_uid FROM matched))"
         };
 
         let limit_plus = query.max_rows.saturating_add(1);
-        let params = [("join_use_nulls", "1")];
+        let params = FILE_ATTENTION_QUERY_SETTINGS;
 
         let normalized_tool_columns = if normalized_schema_available {
             ", project_id, repo_rel_path, worktree_root, event_project_id, event_worktree_root"
@@ -659,6 +771,16 @@ WHERE (session_id, event_uid) IN (SELECT session_id, event_uid FROM matched))"
 
         self.map_backend(self.query_rows_with_params(&sql, None, &params).await)
     }
+}
+
+/// Locator filter for the legacy suffix fallback: any normalized path token
+/// equal to, or ending with `/`, the requested path tail.
+fn suffix_locator_filter(rel: &str) -> String {
+    format!(
+        "arrayExists(path -> path = {} OR endsWith(path, {}), path_tokens)",
+        sql_quote(rel),
+        sql_quote(&format!("/{rel}"))
+    )
 }
 
 fn single_path_sql(expression: &str) -> String {
