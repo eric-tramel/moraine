@@ -9,7 +9,9 @@ use anyhow::{bail, Context, Result};
 use serde_json::{Map, Value};
 use toml_edit::{value as toml_value, Table};
 
-use super::{prime_agent, CommandSpec, ConfigTarget, McpPlan, McpPlanStep, SetupMcpTarget};
+use super::{
+    prime_agent, CommandRunner, CommandSpec, ConfigTarget, McpPlan, McpPlanStep, SetupMcpTarget,
+};
 
 pub(super) mod nac;
 
@@ -28,6 +30,9 @@ pub(super) struct SetupPathContext {
     pub(super) nac_home: Option<PathBuf>,
     pub(super) prime_agent_dir: Option<PathBuf>,
     pub(super) current_exe: Option<PathBuf>,
+    /// Git ref the plugin marketplaces are pinned to (`MORAINE_PLUGIN_REF` or the
+    /// release tag baked into this build).
+    pub(super) plugin_ref: String,
     pub(super) nac_snapshot: OnceCell<std::result::Result<nac::ConfigSnapshot, String>>,
     pub(super) nac_expected_content: OnceCell<Vec<u8>>,
 }
@@ -48,6 +53,7 @@ impl SetupPathContext {
                 &env::current_dir().context("failed to resolve setup launch directory")?,
             )?,
             current_exe: env::current_exe().ok(),
+            plugin_ref: moraine_config::plugin_ref(),
             nac_snapshot: OnceCell::new(),
             nac_expected_content: OnceCell::new(),
         })
@@ -65,6 +71,7 @@ impl SetupPathContext {
             nac_home: None,
             prime_agent_dir: home.as_ref().map(|home| home.join(".prime").join("agent")),
             current_exe: None,
+            plugin_ref: moraine_config::BUILD_PLUGIN_REF.to_string(),
             nac_snapshot: OnceCell::new(),
             nac_expected_content: OnceCell::new(),
         }
@@ -79,6 +86,15 @@ impl SetupPathContext {
         self.codex_home = codex_home;
         self.claude_config_dir = claude_config_dir;
         self
+    }
+
+    /// `$CODEX_HOME/config.toml`, falling back to `~/.codex/config.toml`.
+    fn codex_config_path(&self) -> Option<PathBuf> {
+        let dir = match &self.codex_home {
+            Some(dir) => self.resolve_from_launch(dir),
+            None => self.resolve_from_launch(self.home.as_ref()?).join(".codex"),
+        };
+        Some(dir.join("config.toml"))
     }
 
     fn resolve_from_launch(&self, path: &Path) -> PathBuf {
@@ -711,6 +727,163 @@ fn is_real_file(path: &Path) -> bool {
         .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
 }
 
+const MARKETPLACE_REPO: &str = "eric-tramel/moraine";
+
+/// How the `moraine` plugin marketplace is currently registered with a harness
+/// CLI, relative to the ref setup wants it pinned to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum MarketplaceState {
+    Absent,
+    Pinned,
+    /// Registered from a different source or ref (including unpinned).
+    Stale,
+    /// The registration could not be inspected; carries the reason.
+    Unknown(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum MarketplaceAction {
+    Remove,
+    Add,
+}
+
+#[derive(Debug, Clone)]
+pub(super) enum MarketplaceInspector {
+    Claude {
+        expected_ref: String,
+    },
+    Codex {
+        config_path: Option<PathBuf>,
+        expected_ref: String,
+    },
+}
+
+impl MarketplaceInspector {
+    pub(super) fn label(&self) -> &'static str {
+        match self {
+            Self::Claude { .. } => "Claude Code",
+            Self::Codex { .. } => "Codex",
+        }
+    }
+
+    pub(super) fn inspect(&self, runner: &mut dyn CommandRunner) -> MarketplaceState {
+        match self {
+            Self::Claude { expected_ref } => inspect_claude_marketplace(runner, expected_ref),
+            Self::Codex {
+                config_path,
+                expected_ref,
+            } => inspect_codex_marketplace(config_path.as_deref(), expected_ref),
+        }
+    }
+}
+
+/// Run-condition attached to a plan step: whether the step runs depends on the
+/// marketplace state observed when the plan executes.
+#[derive(Debug, Clone)]
+pub(super) struct MarketplaceGate {
+    pub(super) inspector: MarketplaceInspector,
+    action: MarketplaceAction,
+}
+
+impl MarketplaceGate {
+    fn new(inspector: MarketplaceInspector, action: MarketplaceAction) -> Self {
+        Self { inspector, action }
+    }
+
+    pub(super) fn should_run(&self, state: &MarketplaceState) -> bool {
+        match (self.action, state) {
+            (MarketplaceAction::Remove, MarketplaceState::Stale) => true,
+            (MarketplaceAction::Remove, _) => false,
+            (MarketplaceAction::Add, MarketplaceState::Pinned) => false,
+            (MarketplaceAction::Add, _) => true,
+        }
+    }
+}
+
+fn inspect_claude_marketplace(
+    runner: &mut dyn CommandRunner,
+    expected_ref: &str,
+) -> MarketplaceState {
+    let command = CommandSpec::new("claude", ["plugin", "marketplace", "list", "--json"]);
+    let report = match runner.run(&command) {
+        Ok(report) if report.success => report,
+        Ok(report) => {
+            return MarketplaceState::Unknown(format!(
+                "`{}` exited with status {}",
+                command.display(),
+                report
+                    .status_code
+                    .map_or_else(|| "unknown".to_string(), |code| code.to_string())
+            ))
+        }
+        Err(exc) => return MarketplaceState::Unknown(format!("{exc:#}")),
+    };
+    classify_claude_marketplaces(&report.stdout, expected_ref)
+}
+
+fn classify_claude_marketplaces(json: &str, expected_ref: &str) -> MarketplaceState {
+    let entries: Vec<Value> = match serde_json::from_str(json) {
+        Ok(entries) => entries,
+        Err(exc) => {
+            return MarketplaceState::Unknown(format!(
+                "could not parse marketplace list JSON: {exc}"
+            ))
+        }
+    };
+    let Some(entry) = entries
+        .iter()
+        .find(|entry| entry.get("name").and_then(Value::as_str) == Some("moraine"))
+    else {
+        return MarketplaceState::Absent;
+    };
+    let field = |key: &str| entry.get(key).and_then(Value::as_str);
+    if field("source") == Some("github")
+        && field("repo") == Some(MARKETPLACE_REPO)
+        && field("ref") == Some(expected_ref)
+    {
+        MarketplaceState::Pinned
+    } else {
+        MarketplaceState::Stale
+    }
+}
+
+fn inspect_codex_marketplace(config_path: Option<&Path>, expected_ref: &str) -> MarketplaceState {
+    let Some(path) = config_path else {
+        return MarketplaceState::Unknown(
+            "neither CODEX_HOME nor HOME is set, so the Codex config cannot be located".to_string(),
+        );
+    };
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(exc) if exc.kind() == std::io::ErrorKind::NotFound => {
+            return MarketplaceState::Absent;
+        }
+        Err(exc) => {
+            return MarketplaceState::Unknown(format!("failed to read {}: {exc}", path.display()))
+        }
+    };
+    let doc = match text.parse::<toml_edit::DocumentMut>() {
+        Ok(doc) => doc,
+        Err(exc) => {
+            return MarketplaceState::Unknown(format!("failed to parse {}: {exc}", path.display()))
+        }
+    };
+    let Some(entry) = doc
+        .get("marketplaces")
+        .and_then(|marketplaces| marketplaces.get("moraine"))
+    else {
+        return MarketplaceState::Absent;
+    };
+    let source = entry.get("source").and_then(|value| value.as_str());
+    let source_matches = source.is_some_and(|source| source.contains(MARKETPLACE_REPO));
+    let ref_matches = entry.get("ref").and_then(|value| value.as_str()) == Some(expected_ref);
+    if source_matches && ref_matches {
+        MarketplaceState::Pinned
+    } else {
+        MarketplaceState::Stale
+    }
+}
+
 pub(super) fn mcp_plan(
     target: SetupMcpTarget,
     config_target: &ConfigTarget,
@@ -724,25 +897,50 @@ pub(super) fn mcp_plan(
         ),
         _ => None,
     };
+    let claude_inspector = MarketplaceInspector::Claude {
+        expected_ref: paths.plugin_ref.clone(),
+    };
+    let codex_inspector = MarketplaceInspector::Codex {
+        config_path: paths.codex_config_path(),
+        expected_ref: paths.plugin_ref.clone(),
+    };
     Ok(match target {
         SetupMcpTarget::ClaudeCode => McpPlan {
             target,
             action: super::McpAction::Execute,
             steps: vec![
+                McpPlanStep::required(CommandSpec::new(
+                    "claude",
+                    ["plugin", "marketplace", "remove", "moraine"],
+                ))
+                .gated(
+                    MarketplaceGate::new(claude_inspector.clone(), MarketplaceAction::Remove),
+                    "",
+                )
+                .with_progress(
+                    "Removing Claude Code marketplace pinned to another source",
+                    "Claude Code marketplace removed for repin",
+                    "Claude Code marketplace removal warning",
+                    "Claude Code marketplace removal failed",
+                ),
                 McpPlanStep::warn_and_continue(
                     CommandSpec::new(
                         "claude",
                         [
-                            "plugin",
-                            "marketplace",
-                            "add",
-                            "eric-tramel/moraine",
-                            "--sparse",
-                            ".claude-plugin",
-                            "plugins",
+                            "plugin".to_string(),
+                            "marketplace".to_string(),
+                            "add".to_string(),
+                            format!("eric-tramel/moraine#{}", paths.plugin_ref),
+                            "--sparse".to_string(),
+                            ".claude-plugin".to_string(),
+                            "plugins".to_string(),
                         ],
                     ),
                     "Claude marketplace add failed; continuing because the marketplace may already exist",
+                )
+                .gated(
+                    MarketplaceGate::new(claude_inspector, MarketplaceAction::Add),
+                    "Claude Code marketplace already pinned to the expected ref",
                 )
                 .with_progress(
                     "Adding Claude Code plugin marketplace",
@@ -784,6 +982,7 @@ pub(super) fn mcp_plan(
                     CommandSpec::new("claude", ["mcp", "remove", "moraine", "--scope", "user"]),
                     "Existing manual Claude Code MCP registration could not be removed; continuing in case it was absent",
                 )
+                .tolerate_failure_output("No MCP server named")
                 .with_config_writes_before()
                 .with_progress(
                     "Cleaning up old Claude Code MCP registration",
@@ -819,6 +1018,20 @@ pub(super) fn mcp_plan(
             target,
             action: super::McpAction::Execute,
             steps: vec![
+                McpPlanStep::required(CommandSpec::new(
+                    "codex",
+                    ["plugin", "marketplace", "remove", "moraine"],
+                ))
+                .gated(
+                    MarketplaceGate::new(codex_inspector.clone(), MarketplaceAction::Remove),
+                    "",
+                )
+                .with_progress(
+                    "Removing Codex marketplace pinned to another source",
+                    "Codex marketplace removed for repin",
+                    "Codex marketplace removal warning",
+                    "Codex marketplace removal failed",
+                ),
                 McpPlanStep::warn_and_continue(
                     CommandSpec::new(
                         "codex",
@@ -827,6 +1040,8 @@ pub(super) fn mcp_plan(
                             "marketplace",
                             "add",
                             "eric-tramel/moraine",
+                            "--ref",
+                            paths.plugin_ref.as_str(),
                             "--sparse",
                             ".agents/plugins",
                             "--sparse",
@@ -836,6 +1051,10 @@ pub(super) fn mcp_plan(
                         ],
                     ),
                     "Codex marketplace add failed; continuing because the marketplace may already exist",
+                )
+                .gated(
+                    MarketplaceGate::new(codex_inspector, MarketplaceAction::Add),
+                    "Codex marketplace already pinned to the expected ref",
                 )
                 .with_progress(
                     "Adding Codex plugin marketplace",
@@ -1698,6 +1917,7 @@ mod tests {
             nac_home: None,
             prime_agent_dir: None,
             current_exe: None,
+            plugin_ref: moraine_config::BUILD_PLUGIN_REF.to_string(),
             nac_snapshot: OnceCell::new(),
             nac_expected_content: OnceCell::new(),
         };
@@ -1725,6 +1945,7 @@ mod tests {
             nac_home: Some(nac_home.clone()),
             prime_agent_dir: None,
             current_exe: None,
+            plugin_ref: moraine_config::BUILD_PLUGIN_REF.to_string(),
             nac_snapshot: OnceCell::new(),
             nac_expected_content: OnceCell::new(),
         };
@@ -1762,6 +1983,7 @@ mod tests {
             nac_home: Some(nac_home),
             prime_agent_dir: None,
             current_exe: None,
+            plugin_ref: moraine_config::BUILD_PLUGIN_REF.to_string(),
             nac_snapshot: OnceCell::new(),
             nac_expected_content: OnceCell::new(),
         };
@@ -1795,6 +2017,7 @@ mod tests {
             nac_home: Some(nac_home),
             prime_agent_dir: None,
             current_exe: None,
+            plugin_ref: moraine_config::BUILD_PLUGIN_REF.to_string(),
             nac_snapshot: OnceCell::new(),
             nac_expected_content: OnceCell::new(),
         };
@@ -1827,6 +2050,7 @@ mod tests {
             nac_home: None,
             prime_agent_dir: None,
             current_exe: None,
+            plugin_ref: moraine_config::BUILD_PLUGIN_REF.to_string(),
             nac_snapshot: OnceCell::new(),
             nac_expected_content: OnceCell::new(),
         };
@@ -1854,6 +2078,7 @@ mod tests {
             nac_home: Some(PathBuf::from("nac-state")),
             prime_agent_dir: None,
             current_exe: None,
+            plugin_ref: moraine_config::BUILD_PLUGIN_REF.to_string(),
             nac_snapshot: OnceCell::new(),
             nac_expected_content: OnceCell::new(),
         };
@@ -1900,6 +2125,7 @@ mod tests {
             nac_home: Some(PathBuf::from("relative-nac")),
             prime_agent_dir: None,
             current_exe: None,
+            plugin_ref: moraine_config::BUILD_PLUGIN_REF.to_string(),
             nac_snapshot: OnceCell::new(),
             nac_expected_content: OnceCell::new(),
         };
@@ -1931,6 +2157,7 @@ mod tests {
             nac_home: Some(nac_home.clone()),
             prime_agent_dir: None,
             current_exe: None,
+            plugin_ref: moraine_config::BUILD_PLUGIN_REF.to_string(),
             nac_snapshot: OnceCell::new(),
             nac_expected_content: OnceCell::new(),
         };
@@ -1978,6 +2205,7 @@ mod tests {
                 nac_home: Some(nac_home.clone()),
                 prime_agent_dir: None,
                 current_exe: None,
+                plugin_ref: moraine_config::BUILD_PLUGIN_REF.to_string(),
                 nac_snapshot: OnceCell::new(),
                 nac_expected_content: OnceCell::new(),
             };
@@ -2007,6 +2235,7 @@ mod tests {
             nac_home: Some(nac_home),
             prime_agent_dir: None,
             current_exe: None,
+            plugin_ref: moraine_config::BUILD_PLUGIN_REF.to_string(),
             nac_snapshot: OnceCell::new(),
             nac_expected_content: OnceCell::new(),
         };

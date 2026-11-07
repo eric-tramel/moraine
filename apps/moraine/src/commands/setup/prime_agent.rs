@@ -821,6 +821,7 @@ mod tests {
             nac_home: None,
             prime_agent_dir: Some(agent.clone()),
             current_exe: Some(moraine),
+            plugin_ref: moraine_config::BUILD_PLUGIN_REF.to_string(),
             nac_snapshot: OnceCell::new(),
             nac_expected_content: OnceCell::new(),
         };

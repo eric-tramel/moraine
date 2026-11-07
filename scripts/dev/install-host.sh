@@ -51,6 +51,11 @@ options:
                       instead of rebuilding (fast re-install).
   -h, --help          Show this help.
 
+environment:
+  MORAINE_PLUGIN_REF  Git ref baked into the build for plugin marketplace
+                      pinning by `moraine setup` (default: main). Must be
+                      fetchable from GitHub (a pushed branch, tag, or SHA).
+
 what it does:
   1. Builds a release bundle for the host target via
      scripts/package-moraine-release.sh (native; bun monitor build + cargo
@@ -203,7 +208,12 @@ build_bundle() {
   fi
 
   mkdir -p "$DIST_DIR"
-  echo "[install-host] building release bundle for $triple (label $label)" >&2
+  # `moraine setup` pins the Claude Code / Codex plugin marketplaces to this
+  # ref (default: the release tag v<version>, which a tip build has not been
+  # tagged as yet). Claude/Codex fetch the ref from GitHub, so an unpushed SHA
+  # would not resolve; track `main` unless the caller overrides it.
+  export MORAINE_PLUGIN_REF="${MORAINE_PLUGIN_REF:-main}"
+  echo "[install-host] building release bundle for $triple (label $label, plugin ref $MORAINE_PLUGIN_REF)" >&2
   # GITHUB_REF_NAME stamps the bundle manifest's version field with our label.
   GITHUB_REF_NAME="$label" "$PACKAGE_SCRIPT" "$triple" "$DIST_DIR" >&2
 }

@@ -4,6 +4,7 @@ use std::process::Command;
 
 fn main() {
     println!("cargo:rerun-if-env-changed=MORAINE_BUILD_GIT_SHA");
+    println!("cargo:rerun-if-env-changed=MORAINE_PLUGIN_REF");
 
     let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("manifest dir"));
     let git_sha = env::var("MORAINE_BUILD_GIT_SHA")
@@ -37,9 +38,18 @@ fn main() {
     let package_version = env::var("CARGO_PKG_VERSION").expect("package version");
     let build_version = match git_sha.as_deref() {
         Some(sha) => format!("{package_version}+g{sha}"),
-        None => package_version,
+        None => package_version.clone(),
     };
     println!("cargo:rustc-env=MORAINE_BUILD_VERSION={build_version}");
+
+    // Git ref the setup command pins plugin marketplaces to. Release builds use
+    // the matching `v<version>` tag; dev installs override it at build time.
+    let plugin_ref = env::var("MORAINE_PLUGIN_REF")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| format!("v{package_version}"));
+    println!("cargo:rustc-env=MORAINE_PLUGIN_REF={plugin_ref}");
 }
 
 fn git_output(manifest_dir: &Path, args: &[&str]) -> Option<String> {
