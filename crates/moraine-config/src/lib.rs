@@ -12,6 +12,28 @@ use std::path::{Component, Path, PathBuf};
 
 pub const BUILD_VERSION: &str = env!("MORAINE_BUILD_VERSION");
 
+/// Environment variable that overrides [`BUILD_PLUGIN_REF`] at runtime.
+pub const PLUGIN_REF_ENV: &str = "MORAINE_PLUGIN_REF";
+
+/// Git ref (default `v<version>`) that `moraine setup` pins the Claude Code and
+/// Codex plugin marketplaces to. Set `MORAINE_PLUGIN_REF` at build time to bake
+/// in a different value.
+pub const BUILD_PLUGIN_REF: &str = env!("MORAINE_PLUGIN_REF");
+
+/// Resolve the plugin marketplace ref: a non-empty runtime `MORAINE_PLUGIN_REF`
+/// wins over the baked build default.
+pub fn plugin_ref() -> String {
+    resolve_plugin_ref(std::env::var(PLUGIN_REF_ENV).ok().as_deref())
+}
+
+fn resolve_plugin_ref(runtime: Option<&str>) -> String {
+    runtime
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(BUILD_PLUGIN_REF)
+        .to_string()
+}
+
 pub const KNOWN_INGEST_HARNESSES: &[&str] = &[
     "codex",
     "claude-code",
@@ -2382,6 +2404,22 @@ fn git_common_dir(root: &Path) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn plugin_ref_runtime_value_overrides_baked_default() {
+        assert_eq!(super::resolve_plugin_ref(Some("v9.9.9")), "v9.9.9");
+        assert_eq!(super::resolve_plugin_ref(Some("  main ")), "main");
+    }
+
+    #[test]
+    fn plugin_ref_ignores_empty_runtime_value() {
+        assert_eq!(super::resolve_plugin_ref(None), super::BUILD_PLUGIN_REF);
+        assert_eq!(super::resolve_plugin_ref(Some("")), super::BUILD_PLUGIN_REF);
+        assert_eq!(
+            super::resolve_plugin_ref(Some("  ")),
+            super::BUILD_PLUGIN_REF
+        );
+    }
+
     use super::*;
 
     fn write_temp_config(contents: &str, label: &str) -> PathBuf {

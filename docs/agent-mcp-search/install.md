@@ -107,6 +107,10 @@ claude plugin marketplace update moraine
 claude plugin update moraine@moraine
 ```
 
+`moraine setup` pins this marketplace to the CLI's own release tag
+(`eric-tramel/moraine#v<version>`) so a stable CLI never installs plugin content
+from `main`. See [Plugin marketplace pinning](#plugin-marketplace-pinning).
+
 Start a new Claude Code session after installation or update so it loads the
 current plugin version.
 
@@ -167,6 +171,32 @@ codex mcp add moraine --url http://127.0.0.1:8080/mcp
 
 The actual URL follows the selected Moraine config. Restart Codex after setup
 or plugin update so it loads the current skills and MCP registration.
+
+### Plugin marketplace pinning
+
+`moraine setup` registers the Claude Code and Codex `moraine` marketplaces
+pinned to a git ref, by default the release tag matching the CLI version
+(`v<version>`). That keeps plugin content compatible with the CLI that
+installed it; an unpinned marketplace would track `main`, which can change
+incompatibly between releases.
+
+- Claude Code: `claude plugin marketplace add eric-tramel/moraine#<ref> --sparse ...`
+- Codex: `codex plugin marketplace add eric-tramel/moraine --ref <ref> --sparse ...`
+
+Setup inspects the existing registration first (`claude plugin marketplace list
+--json`, or `[marketplaces.moraine]` in `$CODEX_HOME/config.toml`). If the
+marketplace is absent it is added pinned; if it already points at the right
+ref it is only refreshed; if it points at a different source or ref (for
+example an older unpinned install) setup removes it and adds the pinned source.
+For Claude Code, removing a marketplace also uninstalls its plugins, so setup
+reinstalls `moraine@moraine` afterwards. If inspection fails, setup warns and
+adds the pinned marketplace without removing anything.
+
+Set `MORAINE_PLUGIN_REF` in the environment to override the ref for a single
+run, for example `MORAINE_PLUGIN_REF=main moraine setup` to follow `main`. The
+ref must be fetchable from GitHub. Builds can bake in a different default by
+setting `MORAINE_PLUGIN_REF` at compile time; `make install` does this with
+`main` so tip-of-branch builds do not pin to the previous release's tag.
 
 Security note: the user-scoped endpoint searches the host-wide Moraine history
 visible to your user. Enable it only in trusted Codex environments. For

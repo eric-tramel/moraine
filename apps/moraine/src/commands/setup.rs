@@ -1694,6 +1694,28 @@ impl SetupProgress {
         );
     }
 
+    fn command_skipped(&self, step: &McpPlanStep) {
+        if !self.style.enabled() || step.skip_label.is_empty() {
+            return;
+        }
+        eprintln!(
+            "   {} {}",
+            self.style.mark("✓", "[ok]", Style::new().green()),
+            self.style.dim(step.skip_label)
+        );
+    }
+
+    fn warning(&self, message: &str) {
+        if !self.style.enabled() {
+            return;
+        }
+        eprintln!(
+            "   {} {}",
+            self.style.mark("!", "[warn]", Style::new().yellow()),
+            self.style.dim(message)
+        );
+    }
+
     fn command_success(&self, step: &McpPlanStep) {
         if !self.style.enabled() {
             return;
@@ -1955,7 +1977,29 @@ fn execute_mcp_plan_with_progress(
     let mut config_files = Vec::new();
     let mut config_writes_applied = false;
 
+    let mut marketplace_state: Option<harnesses::MarketplaceState> = None;
     for step in &plan.steps {
+        if let Some(gate) = &step.gate {
+            if marketplace_state.is_none() {
+                let state = gate.inspector.inspect(runner);
+                if let harnesses::MarketplaceState::Unknown(reason) = &state {
+                    let message = format!(
+                        "Could not inspect the {} plugin marketplace ({reason}); adding it without checking for a stale source",
+                        gate.inspector.label()
+                    );
+                    progress.warning(&message);
+                    warnings.push(message);
+                }
+                marketplace_state = Some(state);
+            }
+            let state = marketplace_state
+                .as_ref()
+                .expect("state was just inspected");
+            if !gate.should_run(state) {
+                progress.command_skipped(step);
+                continue;
+            }
+        }
         if step.apply_config_writes_before {
             failed = apply_mcp_config_writes(&plan.config_writes, progress, &mut config_files);
             config_writes_applied = true;
@@ -2070,8 +2114,11 @@ struct McpPlan {
 impl McpPlan {
     #[cfg(test)]
     fn for_target(target: SetupMcpTarget, config_target: &ConfigTarget) -> Self {
-        let paths = harnesses::SetupPathContext::from_env()
+        let mut paths = harnesses::SetupPathContext::from_env()
             .expect("setup path context should resolve the current directory");
+        // Never inspect the developer's real Codex marketplace config.
+        paths.codex_home = Some(env::temp_dir().join("moraine-setup-test-no-codex-home"));
+        paths.plugin_ref = "v0.0.0-test".to_string();
         Self::for_target_with_paths(
             target,
             config_target,
@@ -2200,6 +2247,11 @@ struct McpPlanStep {
     failure_policy: CommandFailurePolicy,
     success_stdout_contains: Option<&'static str>,
     apply_config_writes_before: bool,
+    /// A non-zero exit whose output contains this text counts as success.
+    tolerated_failure_output: Option<&'static str>,
+    /// When set, the step only runs if the gate approves the inspected state.
+    gate: Option<harnesses::MarketplaceGate>,
+    skip_label: &'static str,
     progress_label: &'static str,
     success_label: &'static str,
     warning_label: &'static str,
@@ -2213,6 +2265,9 @@ impl McpPlanStep {
             failure_policy: CommandFailurePolicy::Required,
             success_stdout_contains: None,
             apply_config_writes_before: false,
+            tolerated_failure_output: None,
+            gate: None,
+            skip_label: "",
             progress_label: "Running setup command",
             success_label: "Command completed",
             warning_label: "Command completed with warning",
@@ -2226,6 +2281,9 @@ impl McpPlanStep {
             failure_policy: CommandFailurePolicy::Required,
             success_stdout_contains: Some(marker),
             apply_config_writes_before: false,
+            tolerated_failure_output: None,
+            gate: None,
+            skip_label: "",
             progress_label: "Running setup command",
             success_label: "Command completed",
             warning_label: "Command completed with warning",
@@ -2239,11 +2297,25 @@ impl McpPlanStep {
             failure_policy: CommandFailurePolicy::WarnAndContinue(message),
             success_stdout_contains: None,
             apply_config_writes_before: false,
+            tolerated_failure_output: None,
+            gate: None,
+            skip_label: "",
             progress_label: "Running optional setup command",
             success_label: "Optional command completed",
             warning_label: "Optional command skipped",
             error_label: "Optional command failed",
         }
+    }
+
+    fn tolerate_failure_output(mut self, marker: &'static str) -> Self {
+        self.tolerated_failure_output = Some(marker);
+        self
+    }
+
+    fn gated(mut self, gate: harnesses::MarketplaceGate, skip_label: &'static str) -> Self {
+        self.gate = Some(gate);
+        self.skip_label = skip_label;
+        self
     }
 
     fn with_config_writes_before(mut self) -> Self {
@@ -2267,6 +2339,14 @@ impl McpPlanStep {
 
     fn command_failure(&self, result: &CommandRunReport) -> Option<String> {
         if !result.success {
+            if let Some(marker) = self.tolerated_failure_output {
+                let marker = marker.to_ascii_lowercase();
+                if result.stdout.to_ascii_lowercase().contains(&marker)
+                    || result.stderr.to_ascii_lowercase().contains(&marker)
+                {
+                    return None;
+                }
+            }
             return Some(format!(
                 "{} exited with status {}",
                 self.command.display(),
@@ -3325,6 +3405,12 @@ mod tests {
             env::remove_var(key);
             Self { key, previous }
         }
+
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = env::var_os(key);
+            env::set_var(key, value);
+            Self { key, previous }
+        }
     }
 
     impl Drop for ScopedEnvironmentVariable {
@@ -3788,6 +3874,7 @@ mod tests {
             nac_home: Some(nac_home),
             prime_agent_dir: None,
             current_exe: None,
+            plugin_ref: moraine_config::BUILD_PLUGIN_REF.to_string(),
             nac_snapshot: std::cell::OnceCell::new(),
             nac_expected_content: std::cell::OnceCell::new(),
         };
@@ -3861,6 +3948,7 @@ mod tests {
             nac_home: Some(nac_home),
             prime_agent_dir: None,
             current_exe: None,
+            plugin_ref: moraine_config::BUILD_PLUGIN_REF.to_string(),
             nac_snapshot: std::cell::OnceCell::new(),
             nac_expected_content: std::cell::OnceCell::new(),
         };
@@ -3900,6 +3988,7 @@ mod tests {
             nac_home: Some(nac_home),
             prime_agent_dir: None,
             current_exe: None,
+            plugin_ref: moraine_config::BUILD_PLUGIN_REF.to_string(),
             nac_snapshot: std::cell::OnceCell::new(),
             nac_expected_content: std::cell::OnceCell::new(),
         };
@@ -3971,6 +4060,7 @@ mod tests {
             nac_home: Some(nac_home.clone()),
             prime_agent_dir: None,
             current_exe: None,
+            plugin_ref: moraine_config::BUILD_PLUGIN_REF.to_string(),
             nac_snapshot: std::cell::OnceCell::new(),
             nac_expected_content: std::cell::OnceCell::new(),
         };
@@ -4994,14 +5084,20 @@ host = "127.42.0.9"
         };
         let plan = McpPlan::for_target(SetupMcpTarget::Codex, &target);
         let commands = plan.commands();
-        assert_eq!(commands.len(), 5);
+        assert_eq!(commands.len(), 6);
         assert_eq!(
             commands[0].args,
+            vec!["plugin", "marketplace", "remove", "moraine"]
+        );
+        assert_eq!(
+            commands[1].args,
             vec![
                 "plugin",
                 "marketplace",
                 "add",
                 "eric-tramel/moraine",
+                "--ref",
+                "v0.0.0-test",
                 "--sparse",
                 ".agents/plugins",
                 "--sparse",
@@ -5011,13 +5107,13 @@ host = "127.42.0.9"
             ]
         );
         assert_eq!(
-            commands[1].args,
+            commands[2].args,
             vec!["plugin", "marketplace", "upgrade", "moraine"]
         );
-        assert_eq!(commands[2].args, vec!["plugin", "add", "moraine@moraine"]);
-        assert_eq!(commands[3].args, vec!["mcp", "remove", "moraine"]);
+        assert_eq!(commands[3].args, vec!["plugin", "add", "moraine@moraine"]);
+        assert_eq!(commands[4].args, vec!["mcp", "remove", "moraine"]);
         assert_eq!(
-            commands[4].args,
+            commands[5].args,
             vec!["mcp", "add", "moraine", "--url", DEFAULT_MCP_HTTP_ENDPOINT,]
         );
     }
@@ -5030,37 +5126,41 @@ host = "127.42.0.9"
         };
         let plan = McpPlan::for_target(SetupMcpTarget::ClaudeCode, &target);
         let commands = plan.commands();
-        assert_eq!(commands.len(), 6);
+        assert_eq!(commands.len(), 7);
         assert_eq!(
             commands[0].args,
+            vec!["plugin", "marketplace", "remove", "moraine"]
+        );
+        assert_eq!(
+            commands[1].args,
             vec![
                 "plugin",
                 "marketplace",
                 "add",
-                "eric-tramel/moraine",
+                "eric-tramel/moraine#v0.0.0-test",
                 "--sparse",
                 ".claude-plugin",
                 "plugins",
             ]
         );
         assert_eq!(
-            commands[1].args,
+            commands[2].args,
             vec!["plugin", "marketplace", "update", "moraine"]
         );
         assert_eq!(
-            commands[2].args,
+            commands[3].args,
             vec!["plugin", "install", "moraine@moraine"]
         );
         assert_eq!(
-            commands[3].args,
+            commands[4].args,
             vec!["plugin", "update", "moraine@moraine"]
         );
         assert_eq!(
-            commands[4].args,
+            commands[5].args,
             vec!["mcp", "remove", "moraine", "--scope", "user"]
         );
         assert_eq!(
-            commands[5].args,
+            commands[6].args,
             vec![
                 "mcp",
                 "add",
@@ -5198,6 +5298,10 @@ host = "127.42.0.9"
         let _ = fs::remove_dir_all(external);
     }
 
+    fn claude_list_command() -> CommandSpec {
+        CommandSpec::new("claude", ["plugin", "marketplace", "list", "--json"])
+    }
+
     #[test]
     fn claude_marketplace_add_failure_continues_to_refresh() {
         let target = ConfigTarget {
@@ -5208,18 +5312,21 @@ host = "127.42.0.9"
         let commands = plan.commands();
         let mut runner = FakeRunner::default()
             .with_existing("claude")
-            .with_response(commands[0].clone(), false, "marketplace already exists")
-            .with_response(commands[1].clone(), true, "")
+            .with_output_response(claude_list_command(), true, "[]", "")
+            .with_response(commands[1].clone(), false, "marketplace already exists")
             .with_response(commands[2].clone(), true, "")
             .with_response(commands[3].clone(), true, "")
             .with_response(commands[4].clone(), true, "")
-            .with_response(commands[5].clone(), true, "");
+            .with_response(commands[5].clone(), true, "")
+            .with_response(commands[6].clone(), true, "");
 
         let report = execute_mcp_plan(plan, &mut runner).expect("execute Claude plan");
 
         assert_eq!(report.status, SetupStatus::Ok);
         assert!(!report.warnings.is_empty());
-        assert_eq!(runner.ran, commands);
+        let mut expected = vec![claude_list_command()];
+        expected.extend(commands[1..].iter().cloned());
+        assert_eq!(runner.ran, expected);
     }
 
     #[test]
@@ -5232,8 +5339,9 @@ host = "127.42.0.9"
         let commands = plan.commands();
         let mut runner = FakeRunner::default()
             .with_existing("claude")
-            .with_response(commands[0].clone(), true, "")
-            .with_response(commands[1].clone(), false, "marketplace update failed");
+            .with_output_response(claude_list_command(), true, "[]", "")
+            .with_response(commands[1].clone(), true, "")
+            .with_response(commands[2].clone(), false, "marketplace update failed");
 
         let report = execute_mcp_plan(plan, &mut runner).expect("execute Claude plan");
 
@@ -5242,8 +5350,15 @@ host = "127.42.0.9"
             .error
             .as_deref()
             .expect("error")
-            .contains(&commands[1].display()));
-        assert_eq!(runner.ran, commands[..2]);
+            .contains(&commands[2].display()));
+        assert_eq!(
+            runner.ran,
+            vec![
+                claude_list_command(),
+                commands[1].clone(),
+                commands[2].clone()
+            ]
+        );
     }
 
     #[test]
@@ -5256,10 +5371,11 @@ host = "127.42.0.9"
         let commands = plan.commands();
         let mut runner = FakeRunner::default()
             .with_existing("claude")
-            .with_response(commands[0].clone(), true, "")
+            .with_output_response(claude_list_command(), true, "[]", "")
             .with_response(commands[1].clone(), true, "")
             .with_response(commands[2].clone(), true, "")
-            .with_response(commands[3].clone(), false, "plugin update failed");
+            .with_response(commands[3].clone(), true, "")
+            .with_response(commands[4].clone(), false, "plugin update failed");
 
         let report = execute_mcp_plan(plan, &mut runner).expect("execute Claude plan");
 
@@ -5268,8 +5384,250 @@ host = "127.42.0.9"
             .error
             .as_deref()
             .expect("error")
-            .contains(&commands[3].display()));
-        assert_eq!(runner.ran, commands[..4]);
+            .contains(&commands[4].display()));
+        let mut expected = vec![claude_list_command()];
+        expected.extend(commands[1..5].iter().cloned());
+        assert_eq!(runner.ran, expected);
+    }
+
+    fn pin_paths(codex_home: Option<PathBuf>, plugin_ref: &str) -> harnesses::SetupPathContext {
+        let mut paths = harnesses::SetupPathContext::with_home(Some(temp_path("pin-home")));
+        paths.codex_home = codex_home;
+        paths.plugin_ref = plugin_ref.to_string();
+        paths
+    }
+
+    fn pin_plan(target: SetupMcpTarget, paths: &harnesses::SetupPathContext) -> McpPlan {
+        let config = ConfigTarget {
+            path: PathBuf::from("/tmp/config.toml"),
+            source: ConfigTargetSource::HomeDefault,
+        };
+        McpPlan::for_target_with_paths(target, &config, paths, Some(DEFAULT_MCP_HTTP_ENDPOINT))
+            .expect("build pin plan")
+    }
+
+    /// Runner where every planned command succeeds.
+    fn all_ok_runner(program: &str, plan: &McpPlan) -> FakeRunner {
+        let mut runner = FakeRunner::default().with_existing(program);
+        for command in plan.commands() {
+            runner = runner.with_response(command, true, "");
+        }
+        runner
+    }
+
+    fn is_marketplace(command: &CommandSpec, verb: &str) -> bool {
+        command.args.len() > 2 && command.args[1] == "marketplace" && command.args[2] == verb
+    }
+
+    fn position(ran: &[CommandSpec], pred: impl Fn(&CommandSpec) -> bool) -> Option<usize> {
+        ran.iter().position(pred)
+    }
+
+    fn run_claude_pin(list_stdout: &str, list_ok: bool) -> (McpTargetReport, Vec<CommandSpec>) {
+        let paths = pin_paths(None, "v1.2.3");
+        let plan = pin_plan(SetupMcpTarget::ClaudeCode, &paths);
+        let mut runner = all_ok_runner("claude", &plan).with_output_response(
+            claude_list_command(),
+            list_ok,
+            list_stdout,
+            "",
+        );
+        let report = execute_mcp_plan(plan, &mut runner).expect("execute Claude plan");
+        (report, runner.ran)
+    }
+
+    #[test]
+    fn claude_absent_marketplace_gets_pinned_add_without_remove() {
+        let (report, ran) = run_claude_pin("[]", true);
+        assert_eq!(report.status, SetupStatus::Ok);
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+        assert!(position(&ran, |c| is_marketplace(c, "remove")).is_none());
+        let add = position(&ran, |c| is_marketplace(c, "add")).expect("add runs");
+        assert_eq!(ran[add].args[3], "eric-tramel/moraine#v1.2.3");
+    }
+
+    #[test]
+    fn claude_unpinned_or_mismatched_marketplace_is_removed_then_pinned_and_reinstalled() {
+        for entry in [
+            r#"[{"name":"moraine","source":"github","repo":"eric-tramel/moraine"}]"#,
+            r#"[{"name":"other","source":"github","repo":"x/y"},{"name":"moraine","source":"github","repo":"eric-tramel/moraine","ref":"v0.7.2"}]"#,
+            r#"[{"name":"moraine","source":"directory","path":"/src/moraine"}]"#,
+        ] {
+            let (report, ran) = run_claude_pin(entry, true);
+            assert_eq!(report.status, SetupStatus::Ok, "{entry}");
+            let remove = position(&ran, |c| is_marketplace(c, "remove")).expect("remove runs");
+            let add = position(&ran, |c| is_marketplace(c, "add")).expect("add runs");
+            let install = position(&ran, |c| {
+                c.args.first().is_some_and(|a| a == "plugin")
+                    && c.args.get(1).is_some_and(|a| a == "install")
+            })
+            .expect("plugin reinstall runs");
+            assert!(remove < add && add < install, "{entry}: {ran:?}");
+            assert_eq!(ran[add].args[3], "eric-tramel/moraine#v1.2.3");
+        }
+    }
+
+    #[test]
+    fn claude_already_pinned_marketplace_is_left_alone() {
+        let (report, ran) = run_claude_pin(
+            r#"[{"name":"moraine","source":"github","repo":"eric-tramel/moraine","ref":"v1.2.3"}]"#,
+            true,
+        );
+        assert_eq!(report.status, SetupStatus::Ok);
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+        assert!(position(&ran, |c| is_marketplace(c, "remove")).is_none());
+        assert!(position(&ran, |c| is_marketplace(c, "add")).is_none());
+        assert!(position(&ran, |c| is_marketplace(c, "update")).is_some());
+    }
+
+    #[test]
+    fn claude_inspection_failure_warns_and_falls_back_to_pinned_add() {
+        for (stdout, ok) in [("", false), ("not json", true)] {
+            let (report, ran) = run_claude_pin(stdout, ok);
+            assert_eq!(report.status, SetupStatus::Ok);
+            assert!(report
+                .warnings
+                .iter()
+                .any(|w| w.contains("Could not inspect the Claude Code plugin marketplace")));
+            assert!(position(&ran, |c| is_marketplace(c, "remove")).is_none());
+            let add = position(&ran, |c| is_marketplace(c, "add")).expect("add runs");
+            assert_eq!(ran[add].args[3], "eric-tramel/moraine#v1.2.3");
+        }
+    }
+
+    #[test]
+    fn claude_fresh_setup_without_registered_mcp_server_has_no_warnings() {
+        let paths = pin_paths(None, "v1.2.3");
+        let plan = pin_plan(SetupMcpTarget::ClaudeCode, &paths);
+        let remove_mcp = plan
+            .commands()
+            .into_iter()
+            .find(|c| {
+                c.args.first().is_some_and(|a| a == "mcp")
+                    && c.args.get(1).is_some_and(|a| a == "remove")
+            })
+            .expect("mcp remove step");
+        let mut runner = all_ok_runner("claude", &plan)
+            .with_output_response(claude_list_command(), true, "[]", "")
+            .with_response(
+                remove_mcp,
+                false,
+                "No MCP server named \"moraine\" in user scope",
+            );
+        let report = execute_mcp_plan(plan, &mut runner).expect("execute Claude plan");
+        assert_eq!(report.status, SetupStatus::Ok);
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    }
+
+    #[test]
+    fn claude_mcp_remove_other_failures_still_warn() {
+        let paths = pin_paths(None, "v1.2.3");
+        let plan = pin_plan(SetupMcpTarget::ClaudeCode, &paths);
+        let remove_mcp = plan
+            .commands()
+            .into_iter()
+            .find(|c| {
+                c.args.first().is_some_and(|a| a == "mcp")
+                    && c.args.get(1).is_some_and(|a| a == "remove")
+            })
+            .expect("mcp remove step");
+        let mut runner = all_ok_runner("claude", &plan)
+            .with_output_response(claude_list_command(), true, "[]", "")
+            .with_response(remove_mcp, false, "permission denied");
+        let report = execute_mcp_plan(plan, &mut runner).expect("execute Claude plan");
+        assert_eq!(report.status, SetupStatus::Ok);
+        assert_eq!(report.warnings.len(), 1);
+    }
+
+    #[test]
+    fn plugin_ref_env_override_wins_over_baked_default() {
+        let _guard = ScopedEnvironmentVariable::set("MORAINE_PLUGIN_REF", "feature-branch");
+        let paths = harnesses::SetupPathContext::from_env().expect("path context");
+        assert_eq!(paths.plugin_ref, "feature-branch");
+        let plan = pin_plan(SetupMcpTarget::ClaudeCode, &paths);
+        assert!(plan.commands().iter().any(|c| c
+            .args
+            .iter()
+            .any(|a| a == "eric-tramel/moraine#feature-branch")));
+        drop(_guard);
+        let _empty = ScopedEnvironmentVariable::set("MORAINE_PLUGIN_REF", "");
+        let paths = harnesses::SetupPathContext::from_env().expect("path context");
+        assert_eq!(paths.plugin_ref, moraine_config::BUILD_PLUGIN_REF);
+    }
+
+    fn codex_home_with(config: Option<&str>) -> PathBuf {
+        let home = temp_path("codex-pin-home");
+        fs::create_dir_all(&home).expect("create codex home");
+        if let Some(config) = config {
+            fs::write(home.join("config.toml"), config).expect("write codex config");
+        }
+        home
+    }
+
+    fn run_codex_pin(config: Option<&str>) -> (McpTargetReport, Vec<CommandSpec>) {
+        let home = codex_home_with(config);
+        let paths = pin_paths(Some(home.clone()), "v1.2.3");
+        let plan = pin_plan(SetupMcpTarget::Codex, &paths);
+        let mut runner = all_ok_runner("codex", &plan);
+        let report = execute_mcp_plan(plan, &mut runner).expect("execute Codex plan");
+        let _ = fs::remove_dir_all(home);
+        (report, runner.ran)
+    }
+
+    #[test]
+    fn codex_absent_marketplace_gets_pinned_add_without_remove() {
+        for config in [None, Some("model = \"x\"\n")] {
+            let (report, ran) = run_codex_pin(config);
+            assert_eq!(report.status, SetupStatus::Ok);
+            assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+            assert!(position(&ran, |c| is_marketplace(c, "remove")).is_none());
+            let add = position(&ran, |c| is_marketplace(c, "add")).expect("add runs");
+            let ref_flag = ran[add]
+                .args
+                .iter()
+                .position(|a| a == "--ref")
+                .expect("--ref");
+            assert_eq!(ran[add].args[ref_flag + 1], "v1.2.3");
+        }
+    }
+
+    #[test]
+    fn codex_unpinned_or_mismatched_marketplace_is_removed_then_pinned() {
+        for config in [
+            "[marketplaces.moraine]\nsource_type = \"git\"\nsource = \"https://github.com/eric-tramel/moraine.git\"\n",
+            "[marketplaces.moraine]\nsource_type = \"git\"\nsource = \"https://github.com/eric-tramel/moraine.git\"\nref = \"v0.7.2\"\n",
+            "[marketplaces.moraine]\nsource_type = \"local\"\nsource = \"/src/moraine\"\n",
+        ] {
+            let (report, ran) = run_codex_pin(Some(config));
+            assert_eq!(report.status, SetupStatus::Ok);
+            let remove = position(&ran, |c| is_marketplace(c, "remove")).expect("remove runs");
+            let add = position(&ran, |c| is_marketplace(c, "add")).expect("add runs");
+            assert!(remove < add, "{ran:?}");
+        }
+    }
+
+    #[test]
+    fn codex_already_pinned_marketplace_is_left_alone() {
+        let (report, ran) = run_codex_pin(Some(
+            "[marketplaces.moraine]\nsource_type = \"git\"\nsource = \"https://github.com/eric-tramel/moraine.git\"\nref = \"v1.2.3\"\n",
+        ));
+        assert_eq!(report.status, SetupStatus::Ok);
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+        assert!(position(&ran, |c| is_marketplace(c, "remove")).is_none());
+        assert!(position(&ran, |c| is_marketplace(c, "add")).is_none());
+        assert!(position(&ran, |c| is_marketplace(c, "upgrade")).is_some());
+    }
+
+    #[test]
+    fn codex_unparseable_config_warns_and_falls_back_to_pinned_add() {
+        let (report, ran) = run_codex_pin(Some("[marketplaces.moraine\nbroken"));
+        assert_eq!(report.status, SetupStatus::Ok);
+        assert!(report
+            .warnings
+            .iter()
+            .any(|w| w.contains("Could not inspect the Codex plugin marketplace")));
+        assert!(position(&ran, |c| is_marketplace(c, "remove")).is_none());
+        assert!(position(&ran, |c| is_marketplace(c, "add")).is_some());
     }
 
     #[test]
@@ -5868,6 +6226,7 @@ host = "127.42.0.9"
             nac_home: Some(nac_home.clone()),
             prime_agent_dir: None,
             current_exe: None,
+            plugin_ref: moraine_config::BUILD_PLUGIN_REF.to_string(),
             nac_snapshot: std::cell::OnceCell::new(),
             nac_expected_content: std::cell::OnceCell::new(),
         };
@@ -6544,14 +6903,15 @@ watch_root = "~/.codex/sessions"
         let commands = plan.commands();
         let mut runner = FakeRunner::default()
             .with_existing("codex")
-            .with_response(commands[0].clone(), true, "")
             .with_response(commands[1].clone(), true, "")
             .with_response(commands[2].clone(), true, "")
             .with_response(commands[3].clone(), true, "")
-            .with_response(commands[4].clone(), true, "");
+            .with_response(commands[4].clone(), true, "")
+            .with_response(commands[5].clone(), true, "");
         let report = execute_mcp_plan(plan, &mut runner).expect("execute mcp");
         assert_eq!(report.status, SetupStatus::Ok);
-        assert_eq!(runner.ran, commands);
+        // The marketplace is absent, so the repin remove step is skipped.
+        assert_eq!(runner.ran, commands[1..]);
     }
 
     #[test]
@@ -6564,15 +6924,15 @@ watch_root = "~/.codex/sessions"
         let commands = plan.commands();
         let mut runner = FakeRunner::default()
             .with_existing("codex")
-            .with_response(commands[0].clone(), true, "")
             .with_response(commands[1].clone(), true, "")
             .with_response(commands[2].clone(), true, "")
-            .with_response(commands[3].clone(), false, "server not found")
-            .with_response(commands[4].clone(), true, "");
+            .with_response(commands[3].clone(), true, "")
+            .with_response(commands[4].clone(), false, "server not found")
+            .with_response(commands[5].clone(), true, "");
         let report = execute_mcp_plan(plan, &mut runner).expect("execute mcp");
         assert_eq!(report.status, SetupStatus::Ok);
         assert!(!report.warnings.is_empty());
-        assert_eq!(runner.ran, commands);
+        assert_eq!(runner.ran, commands[1..]);
     }
 
     #[test]
@@ -6585,17 +6945,17 @@ watch_root = "~/.codex/sessions"
         let commands = plan.commands();
         let mut runner = FakeRunner::default()
             .with_existing("codex")
-            .with_response(commands[0].clone(), true, "")
             .with_response(commands[1].clone(), true, "")
-            .with_response(commands[2].clone(), false, "plugin install failed");
+            .with_response(commands[2].clone(), true, "")
+            .with_response(commands[3].clone(), false, "plugin install failed");
         let report = execute_mcp_plan(plan, &mut runner).expect("execute mcp");
         assert_eq!(report.status, SetupStatus::Error);
         assert!(report
             .error
             .as_deref()
             .expect("error")
-            .contains(&commands[2].display()));
-        assert_eq!(runner.ran, commands[..3]);
+            .contains(&commands[3].display()));
+        assert_eq!(runner.ran, commands[1..4]);
     }
 
     #[test]
