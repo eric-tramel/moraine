@@ -1,6 +1,6 @@
 [package]
 name = "moraine-mcp"
-version = "0.7.5"
+version = "0.7.6"
 edition = "2021"
 description = "Moraine MCP stdio entry and unified backend daemon"
 
