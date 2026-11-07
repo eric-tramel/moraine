@@ -328,7 +328,10 @@ FORMAT JSONEachRow",
           / (toFloat64(p.tf) + k1 * (1.0 - b + b * (toFloat64(p.doc_len) / avgdl))))) AS score,
       uniqExact(p.term) AS matched_terms
     FROM {postings} AS p FINAL
-    ALL INNER JOIN {locator} AS l FINAL
+    ALL INNER JOIN (
+      SELECT * FROM {locator} FINAL
+      WHERE event_uid IN (SELECT doc_id FROM {postings} PREWHERE term IN q_terms)
+    ) AS l
       ON l.event_uid = p.doc_id AND l.event_version = p.post_version
     PREWHERE p.term IN q_terms
     WHERE {filters}
@@ -515,7 +518,10 @@ FORMAT JSONEachRow",
       toUInt64(uniqExact(p.term)) AS matched_terms,
       toInt64(toUnixTimestamp64Milli(any(l.sort_time))) AS event_unix_ms
     FROM term_postings AS p
-    ALL INNER JOIN {locator} AS l FINAL
+    ALL INNER JOIN (
+      SELECT * FROM {locator} FINAL
+      WHERE event_uid IN (SELECT doc_id FROM {postings} PREWHERE term IN q_terms)
+    ) AS l
       ON l.event_uid = p.doc_id AND l.event_version = p.post_version
     WHERE {filters}
     GROUP BY p.doc_id
@@ -678,7 +684,8 @@ SELECT
   '' AS session_title, '' AS session_slug, '' AS session_summary,
   s.session_completed AS session_completed
 FROM hydrated AS h
-ALL INNER JOIN {locator} AS l FINAL ON l.event_uid = h.event_uid
+ALL INNER JOIN (SELECT * FROM {locator} FINAL WHERE event_uid IN event_uids) AS l
+  ON l.event_uid = h.event_uid
 ALL INNER JOIN nav_derived AS n ON n.event_uid = h.event_uid
 ANY LEFT JOIN turn_totals AS t
   ON t.session_id = n.session_id AND t.derived_turn_seq = n.derived_turn_seq
@@ -731,7 +738,8 @@ SELECT
   h.phase, h.source_ref, toUInt32(l.doc_len) AS doc_len, h.text_preview, h.text_content,
   h.payload_json, toUInt8(l.has_codex_mcp) AS has_codex_mcp
 FROM hydrated AS h
-ANY INNER JOIN {locator} AS l FINAL ON l.event_uid = h.event_uid
+ANY INNER JOIN (SELECT * FROM {locator} FINAL WHERE event_uid IN {event_uids_array}) AS l
+  ON l.event_uid = h.event_uid
 FORMAT JSONEachRow"
         ))
     }
