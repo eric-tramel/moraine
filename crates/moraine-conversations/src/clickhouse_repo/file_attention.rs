@@ -3,6 +3,30 @@ use super::*;
 const FILE_ATTENTION_READ_TOOL_NAMES_SQL: &str =
     "'read', 'readfile', 'read_file', 'notebookread', 'notebook_read', 'view', 'cat', 'grep', 'rg', 'glob', 'ls', 'list', 'find'";
 
+/// Canonical (`FINAL`-equivalent) `events` rows for the `(session_id,
+/// event_uid)` keys returned by `candidates_sql`.
+///
+/// `events FINAL` over `SELECT *` merges every part's `payload_json` granules
+/// in order and exceeded the 1 GiB cap on a 10M-row read, because the keyed
+/// `IN` alone did not stop the in-order read from spanning many sessions. The
+/// winning versions are instead chosen by a narrow-column `FINAL` restricted
+/// to the candidate sessions (`session_id` leads the sort key, so this prunes
+/// on the primary key), and the wide columns are read by exact
+/// `(session_id, event_uid, event_version)` without `FINAL`
+/// (see `payload_rows_by_keys_sql`).
+fn candidate_events_sql(events_ref: &str, candidates_sql: &str, select_list: &str) -> String {
+    let sessions = "SELECT session_id FROM (CANDIDATES)".replace("CANDIDATES", candidates_sql);
+    let keys = format!(
+        "SELECT session_id, event_uid, event_version
+    FROM {events_ref} FINAL
+    WHERE session_id IN ({sessions})
+      AND (session_id, event_uid) IN (
+        {candidates_sql}
+      )"
+    );
+    payload_rows_by_keys_sql(events_ref, &sessions, select_list, &keys)
+}
+
 impl ClickHouseConversationRepository {
     fn tool_events_source(&self, rel: &str, use_candidate_index: bool) -> String {
         let events_ref = self.table_ref("events");
@@ -10,14 +34,12 @@ impl ClickHouseConversationRepository {
             let locator = self.table_ref("mcp_event_locator");
             let rel_sql = sql_quote(rel);
             let slash_rel_sql = sql_quote(&format!("/{rel}"));
-            format!(
-                "(SELECT * FROM {events_ref} FINAL
-WHERE (session_id, event_uid) IN (
-  SELECT session_id, event_uid
+            let candidates = format!(
+                "SELECT session_id, event_uid
   FROM {locator} FINAL
-  WHERE arrayExists(path -> path = {rel_sql} OR endsWith(path, {slash_rel_sql}), path_tokens)
-))"
-            )
+  WHERE arrayExists(path -> path = {rel_sql} OR endsWith(path, {slash_rel_sql}), path_tokens)"
+            );
+            format!("({})", candidate_events_sql(&events_ref, &candidates, "*"))
         } else {
             canonical_events_source(&events_ref)
         };
@@ -251,6 +273,16 @@ WHERE (session_id, event_uid) IN (
 
         let normalized_root_condition = single_path_sql("ti.worktree_root");
 
+        let candidate_events = candidate_events_sql(
+            &events,
+            &format!(
+                "SELECT session_id, event_uid
+        FROM {locator} FINAL
+        WHERE {exact_candidate_predicate}"
+            ),
+            "session_id, event_uid, tool_call_id, harness, tool_name, tool_phase, source_name, cwd, payload_json",
+        );
+
         let sql = format!(
             "WITH matched_ids AS (
     SELECT session_id, event_uid, project_id, repo_rel_path, worktree_root
@@ -273,12 +305,7 @@ WHERE (session_id, event_uid) IN (
       mi.worktree_root AS worktree_root,
       e.cwd AS cwd
     FROM (
-      SELECT * FROM {events} FINAL
-      WHERE (session_id, event_uid) IN (
-        SELECT session_id, event_uid
-        FROM {locator} FINAL
-        WHERE {exact_candidate_predicate}
-      )
+      {candidate_events}
     ) AS e
     ANY INNER JOIN matched_ids AS mi
       ON mi.session_id = e.session_id AND mi.event_uid = e.event_uid

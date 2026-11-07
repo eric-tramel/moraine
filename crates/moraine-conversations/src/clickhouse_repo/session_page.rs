@@ -10,7 +10,7 @@
 //! Listing is now two phases:
 //!
 //! 1. **Page selection** ([`SessionPageSelect`]): a narrow `GROUP BY session_id`
-//!    directly over `events FINAL` that reads only `session_id`, `record_ts`
+//!    directly over `events` (no `FINAL`, see below) that reads only `session_id`, `record_ts`
 //!    and `ingested_at` (plus a few narrow columns when a mode/harness/source
 //!    filter must be resolved from event rows). No `payload_json`, no windows.
 //!    Time bounds, the keyset cursor, ordering and `LIMIT` apply here.
@@ -18,6 +18,41 @@
 //!    aggregates computed only for the selected ids. The turn-sequence window
 //!    is inlined with its `session_id IN (...)` restriction on the innermost
 //!    `events FINAL` read, so the window only ever sees page sessions.
+//!
+//! # Why phase 1 does not use `FINAL`
+//!
+//! `events` is a `ReplacingMergeTree(event_version)` ordered by
+//! `(session_id, event_uid)`, so `FINAL` merges every part in key order. On a
+//! 1.63M-event / 202-part store that in-order merge alone peaked at 1,022 MiB
+//! (code 241 under the 1 GiB cap) even on three narrow columns; the same query
+//! without `FINAL` ran in 15 MiB. Phase 1 therefore reads rows as stored, which
+//! can include exact duplicates and superseded versions of one
+//! `(session_id, event_uid)`. Every aggregate is shown to tolerate that:
+//!
+//! * `min`/`max` of the event time are idempotent, so exact duplicates cannot
+//!   change them. A superseded version differs only in `event_version` and
+//!   `ingested_at` (always, on re-ingest) and, for sources whose events mutate
+//!   in place (Cursor bubbles), possibly payload; `record_ts` is the record's
+//!   own timestamp and does not change with a re-ingest. `ingested_at` is read
+//!   only when `record_ts` is unparseable, and a later re-ingest can only move
+//!   that fallback (and so `last_event_time`) later, by the re-ingest delay.
+//!   Phase 1 only selects and orders the page and applies time bounds; phase 2
+//!   recomputes the exact (`FINAL`) times for the page, so the worst outcome is
+//!   a session ranked by a slightly later time in that rare fallback case.
+//! * `mode` is `countIf(...) > 0` existence logic: duplicates never change it.
+//!   A superseded version could only matter if it differed in `event_kind`,
+//!   `payload_type`, `tool_name` or `source_name`; those are part of event
+//!   identity for the semantic UID, so versions of one `event_uid` agree.
+//! * `latest_harness` / `latest_source_name` are `argMax` keyed by
+//!   `(event_ts, event_uid, event_version)`. Exact duplicates give identical
+//!   keys and values. Adding `event_version` makes a superseded version of the
+//!   latest event lose to its replacement, instead of tying on
+//!   `(event_ts, event_uid)` and picking an arbitrary row as `FINAL`-less
+//!   `argMax` otherwise would.
+//!
+//! No aggregate here is a `count()`, `sum()` or other duplicate-sensitive
+//! reduction. Phase 2 and the other readers keep `FINAL`, restricted to the
+//! page's session ids.
 //!
 //! Remaining cost: phase 1 filters on time, which is not in the `events`
 //! ORDER BY, so it still scans the narrow columns of the whole table. Its
@@ -88,12 +123,12 @@ impl SessionPageSelect<'_> {
             ));
         }
         if self.harness.is_some() || self.source_name.is_some() {
-            columns.extend(["event_ts", "event_uid"]);
+            columns.extend(["event_ts", "event_uid", "event_version"]);
         }
         if self.harness.is_some() {
             columns.push("harness");
             extra_aggregates.push(
-                ",\n  ifNull(argMax(nullIf(harness, ''), tuple(event_ts, event_uid)), '') AS latest_harness"
+                ",\n  ifNull(argMax(nullIf(harness, ''), tuple(event_ts, event_uid, event_version)), '') AS latest_harness"
                     .to_string(),
             );
         }
@@ -102,7 +137,7 @@ impl SessionPageSelect<'_> {
         }
         if self.source_name.is_some() {
             extra_aggregates.push(
-                ",\n  ifNull(argMax(nullIf(source_name, ''), tuple(event_ts, event_uid)), '') AS latest_source_name"
+                ",\n  ifNull(argMax(nullIf(source_name, ''), tuple(event_ts, event_uid, event_version)), '') AS latest_source_name"
                     .to_string(),
             );
         }
@@ -151,8 +186,7 @@ impl SessionPageSelect<'_> {
         // A blank session_id is never a real session (e.g. the orphan
         // Workflow-journal events ingested before #386's exclusion). Drop them
         // so they never consume a LIMIT slot or anchor the keyset cursor.
-        // `session_id` leads the events ORDER BY, so the WHERE is applied
-        // before FINAL merges.
+        // `session_id` leads the events ORDER BY, so the WHERE prunes granules.
         let mut where_clauses = vec!["notEmpty(trimBoth(session_id))".to_string()];
         if let Some(scope) = &self.scope_clause {
             where_clauses.push(scope.clone());
@@ -166,7 +200,7 @@ impl SessionPageSelect<'_> {
   max({event_time}) AS last_event_time{extra_aggregates}
 FROM (
   SELECT {columns}
-  FROM {events_ref} FINAL
+  FROM {events_ref}
   WHERE {where_sql}
 )
 GROUP BY session_id
@@ -204,7 +238,7 @@ pub(super) struct TraceExtras<'a> {
 /// `FINAL` (`keys_sql`) and the wide read is a plain primary-key read of just
 /// those rows. It can return a row more than once only if identical versions
 /// were inserted twice; callers either aggregate idempotently or `ANY JOIN`.
-fn payload_rows_by_keys_sql(
+pub(super) fn payload_rows_by_keys_sql(
     events_ref: &str,
     session_ids_sql: &str,
     select_list: &str,
@@ -469,8 +503,9 @@ mod tests {
         let sql = select(ConversationListSort::Desc).to_sql();
         assert_no_view_chain(&sql);
         assert!(sql.contains(
-            "SELECT session_id, record_ts, ingested_at\n  FROM `moraine`.`events` FINAL"
+            "SELECT session_id, record_ts, ingested_at\n  FROM `moraine`.`events`\n  WHERE"
         ));
+        assert!(!sql.contains("FINAL"), "{sql}");
         assert!(!sql.contains("payload_json"));
         assert!(!sql.contains("OVER ("));
         assert!(sql.contains("WHERE notEmpty(trimBoth(session_id))"));
@@ -506,9 +541,11 @@ mod tests {
         assert_no_view_chain(&sql);
         assert!(!sql.contains("payload_json"), "{sql}");
         assert!(sql.contains("session_mode = 'tool_calling'"));
+        assert!(!sql.contains("FINAL"), "{sql}");
         assert!(sql.contains("latest_harness = 'codex'"));
+        assert!(sql.contains("tuple(event_ts, event_uid, event_version)"));
         assert!(sql.contains("latest_source_name = 'host-codex'"));
-        // Scope applies before FINAL merges, not after aggregation.
+        // Scope applies to the row scan, not after aggregation.
         let (inner, _) = sql.rsplit_once("\n)\nGROUP BY session_id").unwrap();
         assert!(inner.contains("session_id IN (SELECT 'scoped')"));
     }

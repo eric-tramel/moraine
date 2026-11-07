@@ -81,6 +81,15 @@ async fn file_attention_merges_normalized_exact_lookup_with_suffix_fallback() {
         .iter()
         .find(|query| query.contains("repo_rel_path = 'crates/foo.rs'"))
         .expect("normalized exact file_attention query should be captured");
+    assert!(
+        !exact_query.contains("SELECT * FROM `moraine`.`events` FINAL"),
+        "payload_json must not be read through FINAL: {exact_query}"
+    );
+    assert!(
+        exact_query.contains("(session_id, event_uid, event_version) IN (")
+            && exact_query.contains("FROM `moraine`.`events`\nWHERE session_id IN ("),
+        "events hydration must use narrow winning keys, then a keyed read: {exact_query}"
+    );
     assert!(exact_query.contains("project_id = 'project-a'"));
     assert!(exact_query.contains("tool_phase = 'request'"));
     assert!(exact_query.contains("harness = 'codex'"));
