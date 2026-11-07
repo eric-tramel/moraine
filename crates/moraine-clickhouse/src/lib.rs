@@ -842,6 +842,18 @@ impl ClickHouseClient {
 
             let sql = materialize_migration_sql(migration.sql, &self.cfg.database)?;
             for statement in split_sql_statements(&sql) {
+                if migration.version == "035" && is_events_final_backfill_035(&statement) {
+                    self.backfill_events_final_by_partition(&statement)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "failed migration {} statement: {}",
+                                migration.name,
+                                truncate_for_error(&statement)
+                            )
+                        })?;
+                    continue;
+                }
                 let statement = self
                     .prepare_migration_statement(migration.version, &statement)
                     .await
@@ -988,6 +1000,44 @@ impl ClickHouseClient {
                 Err(error_for_cause(cause, "adaptive migration attempt cancelled").into())
             }
         }
+    }
+
+    /// Runs one migration-035 `INSERT ... FROM events FINAL` backfill once per
+    /// active partition of `events`.
+    ///
+    /// A single global FINAL read opens every part in sort order and buffers
+    /// wide `payload_json` granules from all of them at once, which exceeds
+    /// the 1 GiB statement budget on real stores (hash sharding does not help,
+    /// since each shard still opens every part). `events` is partitioned by
+    /// `cityHash64(session_id) % 64` and `session_id` is a sort-key prefix, so
+    /// no `(session_id, event_uid)` key spans partitions and per-partition FINAL
+    /// is equivalent to global FINAL.
+    ///
+    /// Re-running after a partial earlier attempt is safe: the navigation and
+    /// turn seek tables are ReplacingMergeTree and the version seek table is
+    /// ReplacingMergeTree(event_version), so re-inserted identical rows
+    /// collapse; `mcp_session_mutation_signals` is AggregatingMergeTree holding
+    /// `uniqExact`/`sumDistinct` states, which are idempotent when the same
+    /// distinct row hashes are merged again.
+    async fn backfill_events_final_by_partition(&self, statement: &str) -> Result<()> {
+        let list_sql = format!(
+            "SELECT DISTINCT partition_id FROM system.parts \
+             WHERE active AND database = {} AND table = 'events' ORDER BY partition_id",
+            escape_literal(&self.cfg.database)
+        );
+        let text = self
+            .request_text_with_options(&list_sql, None, Some(&self.cfg.database), false, None, &[])
+            .await
+            .context("failed listing active events partitions")?;
+        for partition_id in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+            let sql = add_partition_predicate(statement, partition_id)?;
+            self.request_adaptive_migration_attempt(&sql)
+                .await
+                .with_context(|| {
+                    format!("migration 035 backfill failed for events partition {partition_id}")
+                })?;
+        }
+        Ok(())
     }
 
     async fn backfill_search_postings_adaptive(&self) -> Result<()> {
@@ -1760,6 +1810,51 @@ fn is_event_uid_lookup_insert(statement: &str) -> bool {
         == Some("event_uid_lookup_033")
 }
 
+const EVENTS_FINAL_BACKFILL_035_TARGETS: [&str; 4] = [
+    "mcp_event_navigation_seek",
+    "mcp_event_turn_seek",
+    "mcp_event_version_seek",
+    "mcp_session_mutation_signals",
+];
+
+/// True for the four migration-035 `INSERT INTO <seek table> ... FROM
+/// <db>.events FINAL` backfills (by target table and source clause).
+fn is_events_final_backfill_035(statement: &str) -> bool {
+    let compact = statement.split_whitespace().collect::<Vec<_>>().join(" ");
+    let Some(tail) = compact.strip_prefix("INSERT INTO ") else {
+        return false;
+    };
+    let target = tail
+        .split_whitespace()
+        .next()
+        .and_then(|target| target.rsplit('.').next())
+        .map(|target| target.trim_matches('`'));
+    target.is_some_and(|t| EVENTS_FINAL_BACKFILL_035_TARGETS.contains(&t))
+        && compact.contains(".events FINAL WHERE ")
+}
+
+/// Adds `AND _partition_id = '<id>'` to the WHERE clause that follows
+/// `events FINAL`, ahead of any GROUP BY / SETTINGS.
+fn add_partition_predicate(statement: &str, partition_id: &str) -> Result<String> {
+    let from = statement
+        .find("events FINAL")
+        .ok_or_else(|| anyhow::anyhow!("statement has no `events FINAL` source"))?;
+    let where_rel = statement[from..]
+        .find("\nWHERE ")
+        .ok_or_else(|| anyhow::anyhow!("statement has no WHERE clause after `events FINAL`"))?;
+    let cond_start = from + where_rel + "\nWHERE ".len();
+    let cond_end = statement[cond_start..]
+        .find('\n')
+        .map_or(statement.len(), |i| cond_start + i);
+    Ok(format!(
+        "{}({}) AND _partition_id = {}{}",
+        &statement[..cond_start],
+        &statement[cond_start..cond_end],
+        escape_literal(partition_id),
+        &statement[cond_end..]
+    ))
+}
+
 fn rewrite_max_memory_usage(statement: &str, budget: u64) -> String {
     let mut out = String::with_capacity(statement.len() + 16);
     let needle = "max_memory_usage";
@@ -2034,6 +2129,207 @@ mod tests {
         });
         format!("http://{addr}")
     }
+    #[derive(Clone)]
+    struct PartitionBackfillMockState {
+        queries: Arc<Mutex<Vec<String>>>,
+        partitions: &'static str,
+        fail_partition: Option<&'static str>,
+    }
+
+    async fn spawn_partition_backfill_mock_server(state: PartitionBackfillMockState) -> String {
+        async fn handler(
+            State(state): State<PartitionBackfillMockState>,
+            Query(params): Query<HashMap<String, String>>,
+            body: Bytes,
+        ) -> (StatusCode, String) {
+            let mut params = params;
+            if !params.contains_key("query") && !body.is_empty() {
+                params.insert(
+                    "query".to_string(),
+                    String::from_utf8_lossy(&body).into_owned(),
+                );
+            }
+            let query = params.get("query").cloned().unwrap_or_default();
+            state.queries.lock().expect("mutex").push(query.clone());
+            if query.contains("FROM system.parts") {
+                return (StatusCode::OK, state.partitions.to_string());
+            }
+            if let Some(id) = state.fail_partition {
+                if query.contains(&format!("_partition_id = '{id}'")) {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Code: 241. DB::Exception: Memory limit exceeded".to_string(),
+                    );
+                }
+            }
+            (StatusCode::OK, String::new())
+        }
+
+        let app = Router::new().route("/", post(handler)).with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind partition backfill mock listener");
+        let addr = listener.local_addr().expect("mock addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}")
+    }
+
+    fn migration_035_statements() -> Vec<String> {
+        let migration = bundled_migrations()
+            .into_iter()
+            .find(|migration| migration.version == "035")
+            .expect("migration 035 must be registered");
+        let sql =
+            materialize_migration_sql(migration.sql, "moraine").expect("materialize migration 035");
+        split_sql_statements(&sql)
+    }
+
+    #[test]
+    fn migration_035_matcher_selects_exactly_the_four_events_final_backfills() {
+        let statements = migration_035_statements();
+        let matched = statements
+            .iter()
+            .filter(|s| is_events_final_backfill_035(s))
+            .collect::<Vec<_>>();
+        assert_eq!(matched.len(), 4, "{matched:?}");
+        for (statement, target) in matched.iter().zip(EVENTS_FINAL_BACKFILL_035_TARGETS) {
+            assert!(
+                statement.starts_with(&format!("INSERT INTO moraine.{target}")),
+                "{statement}"
+            );
+        }
+        assert!(!statements
+            .iter()
+            .filter(|s| !s.starts_with("INSERT INTO"))
+            .any(|s| is_events_final_backfill_035(s)));
+        assert!(!is_events_final_backfill_035(
+            "INSERT INTO moraine.other SELECT 1 FROM moraine.events FINAL WHERE 1"
+        ));
+    }
+
+    #[test]
+    fn add_partition_predicate_precedes_group_by_and_settings() {
+        for statement in migration_035_statements()
+            .iter()
+            .filter(|s| is_events_final_backfill_035(s))
+        {
+            let sql = add_partition_predicate(statement, "7").expect("rewrite");
+            let predicate = sql.find("AND _partition_id = '7'").expect("predicate");
+            assert!(predicate > sql.find("events FINAL").unwrap());
+            assert!(predicate < sql.find("SETTINGS").unwrap());
+            if let Some(group_by) = sql.find("GROUP BY") {
+                assert!(predicate < group_by, "{sql}");
+            }
+            assert!(sql.contains("max_memory_usage = 1073741824"));
+            assert_eq!(sql.matches("_partition_id").count(), 1);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn migration_035_backfills_once_per_listed_partition() {
+        let queries = Arc::new(Mutex::new(Vec::new()));
+        let base_url = spawn_partition_backfill_mock_server(PartitionBackfillMockState {
+            queries: queries.clone(),
+            partitions: "0\n12\n63\n",
+            fail_partition: None,
+        })
+        .await;
+        let client = ClickHouseClient::new(test_clickhouse_config(base_url)).expect("new client");
+        let statements = migration_035_statements();
+        let backfills = statements
+            .iter()
+            .filter(|s| is_events_final_backfill_035(s))
+            .collect::<Vec<_>>();
+
+        for statement in &backfills {
+            owned(
+                &client,
+                client.backfill_events_final_by_partition(statement),
+            )
+            .await
+            .expect("partitioned backfill");
+        }
+
+        let queries = queries.lock().expect("mutex");
+        let listings = queries
+            .iter()
+            .filter(|q| q.contains("FROM system.parts"))
+            .collect::<Vec<_>>();
+        assert_eq!(listings.len(), 4);
+        assert!(listings[0].contains("database = 'moraine'"));
+        assert!(listings[0].contains("table = 'events'"));
+        let inserts = queries
+            .iter()
+            .filter(|q| q.starts_with("INSERT INTO"))
+            .collect::<Vec<_>>();
+        assert_eq!(inserts.len(), 12);
+        for (i, query) in inserts.iter().enumerate() {
+            let target = EVENTS_FINAL_BACKFILL_035_TARGETS[i / 3];
+            let id = ["0", "12", "63"][i % 3];
+            assert!(query.starts_with(&format!("INSERT INTO moraine.{target}")));
+            let predicate = query
+                .find(&format!("_partition_id = '{id}'"))
+                .expect("partition predicate");
+            assert!(predicate < query.find("SETTINGS").unwrap());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn migration_035_with_no_parts_runs_no_backfill() {
+        let queries = Arc::new(Mutex::new(Vec::new()));
+        let base_url = spawn_partition_backfill_mock_server(PartitionBackfillMockState {
+            queries: queries.clone(),
+            partitions: "",
+            fail_partition: None,
+        })
+        .await;
+        let client = ClickHouseClient::new(test_clickhouse_config(base_url)).expect("new client");
+        let statement = migration_035_statements()
+            .into_iter()
+            .find(|s| is_events_final_backfill_035(s))
+            .expect("backfill statement");
+
+        owned(
+            &client,
+            client.backfill_events_final_by_partition(&statement),
+        )
+        .await
+        .expect("empty backfill");
+
+        let queries = queries.lock().expect("mutex");
+        assert!(queries.iter().any(|q| q.contains("FROM system.parts")));
+        assert!(!queries.iter().any(|q| q.starts_with("INSERT INTO")));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn migration_035_partition_failure_names_the_partition() {
+        let queries = Arc::new(Mutex::new(Vec::new()));
+        let base_url = spawn_partition_backfill_mock_server(PartitionBackfillMockState {
+            queries: queries.clone(),
+            partitions: "3\n9\n20\n",
+            fail_partition: Some("9"),
+        })
+        .await;
+        let client = ClickHouseClient::new(test_clickhouse_config(base_url)).expect("new client");
+        let statement = migration_035_statements()
+            .into_iter()
+            .find(|s| is_events_final_backfill_035(s))
+            .expect("backfill statement");
+
+        let err = owned(
+            &client,
+            client.backfill_events_final_by_partition(&statement),
+        )
+        .await
+        .expect_err("partition 9 must fail");
+
+        assert!(format!("{err:#}").contains("events partition 9"), "{err:#}");
+        let queries = queries.lock().expect("mutex");
+        assert!(!queries.iter().any(|q| q.contains("_partition_id = '20'")));
+    }
+
     #[derive(Clone)]
     struct AdaptiveBackfillMockState {
         queries: Arc<Mutex<Vec<String>>>,
